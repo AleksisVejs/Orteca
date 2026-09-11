@@ -1,0 +1,86 @@
+/* Orteca design language.
+   Warm near-black, warm off-white text, sand accent. Flat, thin borders,
+   lots of negative space. No gradients, no glow, no glass. */
+
+:root {
+  /* surfaces */
+  --bg: #0f0f0e;
+  --surface: #161615;
+  --surface-hover: #1d1d1b;
+  --border: #272521;
+  --border-strong: #3a3630;
+
+  /* text */
+  --text: #ece8e0;
+  --text-dim: #9a958b;
+  --text-faint: #6b675f;
+
+  /* accent: warm sand. used sparingly. */
+  --accent: #d9c8a4;
+  --accent-dim: #8d8064;
+
+  /* state: restrained, never saturated */
+  --ok: #7f9b77;
+  --warn: #c0a15e;
+  --err: #b87a6b;
+
+  /* type */
+  --font: ui-sans-serif, "Inter", "Segoe UI Variable Text", "Segoe UI",
+    system-ui, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", "Consolas", monospace;
+
+  /* rhythm */
+  --r: 4px;
+  --pad: 20px;
+  --gap: 12px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* Shared primitives. Kept here because two components is not a design system. */
+.btn {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  padding: 7px 16px;
+  color: var(--text);
+  transition: background 90ms ease, border-color 90ms ease;
+}
+.btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--accent-dim);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}

@@ -54,8 +54,7 @@ pub fn git_state(dir: &Path) -> GitState {
         return GitState::default();
     };
 
-    let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|b| b != "HEAD"); // detached
+    let branch = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
 
     let status = git(dir, &["status", "--porcelain"]).unwrap_or_default();
     let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
@@ -149,6 +148,7 @@ mod tests {
         // No commits yet: a repo, but no HEAD.
         assert!(git_state(&dir).is_repo);
         assert!(git_state(&dir).head.is_none());
+        assert_eq!(git_state(&dir).branch.as_deref(), Some("main"));
 
         std::fs::write(dir.join("a.txt"), "one").unwrap();
         run(&["add", "-A"]);
@@ -164,6 +164,52 @@ mod tests {
         assert!(dirty.dirty);
         assert_eq!(dirty.dirty_count, 1);
 
+        run(&["checkout", "--detach", "-q"]);
+        assert!(git_state(&dir).branch.is_none());
+        assert!(git_state(&dir).head.is_some());
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn root_identity_survives_subdirectories_and_separators() {
+        let dir = temp_dir("spaces-\u{e9}");
+        let dir = dir.join("repo with spaces");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap().success());
+        let store = crate::store::Store::in_memory().unwrap();
+        let root = git_state(&dir).root.unwrap();
+        for path in [dir.clone(), dir.join("sub"), PathBuf::from(format!("{}\\", dir.display())), PathBuf::from(&root)] {
+            let found = git_state(&path).root.unwrap();
+            assert_eq!(found, root);
+            store.touch_project(&found, "repo").unwrap();
+        }
+        assert_eq!(store.recent_projects(10).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_paths_return_errors() {
+        let dir = temp_dir("invalid");
+        let file = dir.join("file");
+        std::fs::write(&file, "text").unwrap();
+        assert!(validate_dir(file.to_str().unwrap()).is_err());
+        assert!(validate_dir(dir.join("missing").to_str().unwrap()).is_err());
+        assert!(validate_dir("").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_git_does_not_panic() {
+        if std::env::var_os("ORTECA_TEST_NO_GIT").is_some() {
+            assert!(!git_state(&std::env::temp_dir()).is_repo);
+            return;
+        }
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "project::tests::missing_git_does_not_panic"])
+            .env("ORTECA_TEST_NO_GIT", "1")
+            .env("PATH", "")
+            .output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
     }
 }

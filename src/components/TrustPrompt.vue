@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { TrustFinding } from "../types";
 
-defineProps<{ name: string; findings: TrustFinding[] }>();
+defineProps<{ name: string; findings: TrustFinding[]; error?: string | null }>();
 defineEmits<{ trust: []; cancel: [] }>();
 </script>
 
@@ -21,6 +21,7 @@ defineEmits<{ trust: []; cancel: [] }>();
         </li>
       </ul>
 
+      <p v-if="error" role="alert">{{ error }}</p>
       <footer>
         <button class="btn" @click="$emit('cancel')">Cancel</button>
         <button class="btn primary" @click="$emit('trust')">Trust and open</button>

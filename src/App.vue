@@ -32,7 +32,13 @@ async function open(path: string) {
 async function confirmTrust() {
   const result = pendingTrust.value;
   if (!result) return;
-  await trustProject(result.project.path, true);
+  try {
+    await trustProject(result.project.path, true);
+  } catch (e) {
+    openError.value = isAppError(e) ? e.message : String(e);
+    return;
+  }
+  if (pendingTrust.value !== result) return;
   result.project.trusted = true;
   pendingTrust.value = null;
   opened.value = result;
@@ -52,6 +58,7 @@ function close() {
     v-if="pendingTrust"
     :name="pendingTrust.project.name"
     :findings="pendingTrust.trustFindings"
+    :error="openError"
     @trust="confirmTrust"
     @cancel="pendingTrust = null"
   />

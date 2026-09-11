@@ -108,8 +108,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     let applied: u32 =
         conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied as usize) {
-        conn.execute_batch(sql)?;
-        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -126,6 +128,27 @@ mod tests {
         assert_eq!(before, MIGRATIONS.len() as u32);
         // Re-running must be a no-op, not a "table already exists" error.
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE blocker (id); CREATE INDEX projects_recent ON blocker(id);").unwrap();
+        assert!(migrate(&conn).is_err());
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'projects'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tables, 0);
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn repeated_opens_order_three_projects() {
+        let store = Store::in_memory().unwrap();
+        for name in ["a", "b", "c", "b", "a", "c", "a"] {
+            store.touch_project(name, name).unwrap();
+        }
+        let paths: Vec<_> = store.recent_projects(10).unwrap().into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["a", "c", "b"]);
     }
 
     #[test]

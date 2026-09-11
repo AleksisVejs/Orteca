@@ -30,7 +30,7 @@ pub enum Line {
 
 /// A live CLI process. Dropping this kills the whole tree.
 pub struct Run {
-    pub lines: mpsc::Receiver<Line>,
+    pub lines: mpsc::UnboundedReceiver<Line>,
     stdin: Option<ChildStdin>,
     _job: Job,
 }
@@ -78,29 +78,38 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
-    // 256 is generous: a chatty agent emits a few hundred events per run, and a
-    // full channel back-pressures the reader rather than dropping events.
-    let (tx, rx) = mpsc::channel(256);
+    // A paused consumer must not prevent the process from draining its pipes.
+    // ponytail: output is buffered in memory; spool to disk if large runs need a cap.
+    let (tx, rx) = mpsc::unbounded_channel();
 
     let out_tx = tx.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let event = match serde_json::from_str::<Value>(&line) {
-                Ok(v) => Line::Json(v),
-                Err(_) => Line::Text(line),
+    let out = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while let Ok(size) = reader.read_line(&mut line).await {
+            if size == 0 { break; }
+            // EOF can leave valid-looking JSON that was never a complete JSONL event.
+            let complete = line.ends_with('\n');
+            if complete {
+                line.pop();
+                if line.ends_with('\r') { line.pop(); }
+            }
+            let event = match complete.then(|| serde_json::from_str::<Value>(&line)) {
+                Some(Ok(v)) => Line::Json(v),
+                _ => Line::Text(line.clone()),
             };
-            if out_tx.send(event).await.is_err() {
+            if out_tx.send(event).is_err() {
                 return;
             }
+            line.clear();
         }
     });
 
     let err_tx = tx.clone();
-    tokio::spawn(async move {
+    let err = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if err_tx.send(Line::Text(line)).await.is_err() {
+            if err_tx.send(Line::Text(line)).is_err() {
                 return;
             }
         }
@@ -108,7 +117,9 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
 
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|s| s.code());
-        let _ = tx.send(Line::Exit(code)).await;
+        let _ = out.await;
+        let _ = err.await;
+        let _ = tx.send(Line::Exit(code));
     });
 
     Ok(Run {
@@ -195,5 +206,78 @@ mod tests {
         assert!(saw_json, "JSON line should parse");
         assert!(saw_text, "non-JSON line should pass through as text");
         assert_eq!(exit, Some(Some(0)));
+    }
+
+    #[tokio::test]
+    async fn exit_follows_all_output() {
+        let mut run = spawn("node", &["-e", "for(let i=0;i<2000;i++)console.log('{}')"], &std::env::temp_dir()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut count = 0;
+        while let Some(line) = run.lines.recv().await {
+            match line {
+                Line::Json(_) => count += 1,
+                Line::Exit(_) => { assert_eq!(count, 2000); return; }
+                _ => {}
+            }
+        }
+        panic!("no exit");
+    }
+
+    #[tokio::test]
+    async fn unterminated_json_is_text() {
+        let mut run = spawn("node", &["-e", "process.stdout.write('{}')"], &std::env::temp_dir()).unwrap();
+        let mut saw_text = false;
+        while let Some(line) = run.lines.recv().await {
+            match line {
+                Line::Json(_) => panic!("unterminated line was parsed as JSON"),
+                Line::Text(t) => saw_text = t == "{}",
+                _ => {}
+            }
+        }
+        assert!(saw_text);
+    }
+
+    #[tokio::test]
+    async fn steering_and_cancel_mid_write() {
+        let mut run = spawn("node", &["-e", "process.stdin.once('data',d=>{console.log(JSON.stringify({input:d.toString().trim()}));process.stdout.write('{\"partial\":');console.error('ready')});setInterval(()=>{},1000)"], &std::env::temp_dir()).unwrap();
+        run.send_line("continue").await.unwrap();
+        let mut steered = false;
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), run.lines.recv()).await.unwrap().unwrap();
+            match line {
+                Line::Json(v) => steered = v["input"] == "continue",
+                Line::Text(t) if t == "ready" => break,
+                _ => {}
+            }
+        }
+        let Run { mut lines, stdin, _job } = run;
+        drop(_job);
+        drop(stdin);
+        let mut partial = false;
+        while let Some(line) = tokio::time::timeout(std::time::Duration::from_secs(5), lines.recv()).await.unwrap() {
+            match line {
+                Line::Json(v) => { assert_eq!(v["input"], "continue"); steered = true; }
+                Line::Text(t) => partial |= t == "{\"partial\":",
+                _ => {}
+            }
+        }
+        assert!(steered && partial);
+    }
+
+    #[tokio::test]
+    async fn paused_consumer_does_not_stall_process() {
+        let mut run = spawn("node", &["-e", "console.log(JSON.stringify({pid:process.pid}));for(let i=0;i<10000;i++)console.log('{}')"], &std::env::temp_dir()).unwrap();
+        let Some(Line::Json(first)) = run.lines.recv().await else { panic!("no pid") };
+        let pid = first["pid"].as_u64().unwrap() as u32;
+        for _ in 0..100 {
+            if !is_alive(pid) { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("paused consumer blocked process exit");
+    }
+
+    #[test]
+    fn assigning_an_invalid_process_fails() {
+        assert!(Job::new().unwrap().assign(0).is_err());
     }
 }

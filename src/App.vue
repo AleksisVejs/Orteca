@@ -10,19 +10,25 @@ import type { OpenedProject } from "./types";
 const opened = ref<OpenedProject | null>(null);
 const pendingTrust = ref<OpenedProject | null>(null);
 const openError = ref<string | null>(null);
+let openRequest = 0;
 
 async function open(path: string) {
+  const request = ++openRequest;
+  opened.value = null;
+  pendingTrust.value = null;
   openError.value = null;
   let result: OpenedProject;
   try {
     result = await openProject(path);
   } catch (e) {
+    if (request !== openRequest) return;
     openError.value = isAppError(e) ? e.message : String(e);
     return;
   }
+  if (request !== openRequest) return;
 
-  // Repo-controlled agent config needs consent once, before anything runs.
-  if (result.trustFindings.length > 0 && !result.project.trusted) {
+  // Custom instruction filenames and future config formats cannot bypass consent.
+  if (!result.project.trusted) {
     pendingTrust.value = result;
     return;
   }
@@ -35,6 +41,7 @@ async function confirmTrust() {
   try {
     await trustProject(result.project.path, true);
   } catch (e) {
+    if (pendingTrust.value !== result) return;
     openError.value = isAppError(e) ? e.message : String(e);
     return;
   }
@@ -45,6 +52,8 @@ async function confirmTrust() {
 }
 
 function close() {
+  ++openRequest;
+  pendingTrust.value = null;
   opened.value = null;
   openError.value = null;
 }

@@ -9,10 +9,11 @@ mod job;
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use job::Job;
@@ -32,7 +33,14 @@ pub enum Line {
 pub struct Run {
     pub lines: mpsc::UnboundedReceiver<Line>,
     stdin: Option<ChildStdin>,
-    _job: Job,
+    _job: Arc<Job>,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        // The exit waiter also owns the job, so cancellation cannot wait for last close.
+        let _ = self._job.terminate();
+    }
 }
 
 impl Run {
@@ -58,21 +66,14 @@ impl Run {
 
 /// Spawn `program` with `args` in `cwd`, inside a fresh Job Object.
 pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
-    let job = Job::new()?;
-
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+    let job = Arc::new(Job::new()?);
+    let mut child = spawn_suspended(program, args, cwd)?;
 
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("child exited before it could be adopted"))?;
     job.assign(pid)?;
+    job::resume(pid)?;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -87,12 +88,16 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         while let Ok(size) = reader.read_line(&mut line).await {
-            if size == 0 { break; }
+            if size == 0 {
+                break;
+            }
             // EOF can leave valid-looking JSON that was never a complete JSONL event.
             let complete = line.ends_with('\n');
             if complete {
                 line.pop();
-                if line.ends_with('\r') { line.pop(); }
+                if line.ends_with('\r') {
+                    line.pop();
+                }
             }
             let event = match complete.then(|| serde_json::from_str::<Value>(&line)) {
                 Some(Ok(v)) => Line::Json(v),
@@ -115,8 +120,11 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
         }
     });
 
+    let exit_job = Arc::clone(&job);
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|s| s.code());
+        // Detached descendants can otherwise keep inherited output pipes open forever.
+        let _ = exit_job.terminate();
         let _ = out.await;
         let _ = err.await;
         let _ = tx.send(Line::Exit(code));
@@ -127,6 +135,18 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
         stdin,
         _job: job,
     })
+}
+
+fn spawn_suspended(program: &str, args: &[&str], cwd: &Path) -> io::Result<Child> {
+    Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0)
+        .kill_on_drop(true)
+        .spawn()
 }
 
 #[cfg(all(test, windows))]
@@ -147,6 +167,54 @@ mod tests {
             let _ = CloseHandle(handle);
             ok && code == STILL_ACTIVE.0 as u32
         }
+    }
+
+    #[tokio::test]
+    async fn child_cannot_execute_before_job_assignment() {
+        let mut child = spawn_suspended(
+            "node",
+            &["-e", "console.log('escaped')"],
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut line),
+        )
+        .await;
+        child.kill().await.unwrap();
+        assert!(
+            output.is_err(),
+            "child executed before job assignment: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_is_reported_when_descendant_keeps_pipes_open() {
+        let mut run = spawn("node", &["-e", "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:['ignore',process.stdout,process.stderr]});console.log(JSON.stringify({pid:c.pid}));c.unref()"], &std::env::temp_dir()).unwrap();
+        let mut descendant = None;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(line) = run.lines.recv().await {
+                match line {
+                    Line::Json(v) => descendant = v["pid"].as_u64().map(|pid| pid as u32),
+                    Line::Exit(code) => {
+                        assert_eq!(code, Some(0));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("missing exit");
+        })
+        .await;
+        drop(run);
+        assert!(result.is_ok(), "descendant pipes hid the parent's exit");
+        assert!(
+            !is_alive(descendant.unwrap()),
+            "descendant survived parent exit"
+        );
     }
 
     /// The whole point of the Job Object: cancelling must take the grandchild
@@ -210,13 +278,21 @@ mod tests {
 
     #[tokio::test]
     async fn exit_follows_all_output() {
-        let mut run = spawn("node", &["-e", "for(let i=0;i<2000;i++)console.log('{}')"], &std::env::temp_dir()).unwrap();
+        let mut run = spawn(
+            "node",
+            &["-e", "for(let i=0;i<2000;i++)console.log('{}')"],
+            &std::env::temp_dir(),
+        )
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let mut count = 0;
         while let Some(line) = run.lines.recv().await {
             match line {
                 Line::Json(_) => count += 1,
-                Line::Exit(_) => { assert_eq!(count, 2000); return; }
+                Line::Exit(_) => {
+                    assert_eq!(count, 2000);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -225,7 +301,12 @@ mod tests {
 
     #[tokio::test]
     async fn unterminated_json_is_text() {
-        let mut run = spawn("node", &["-e", "process.stdout.write('{}')"], &std::env::temp_dir()).unwrap();
+        let mut run = spawn(
+            "node",
+            &["-e", "process.stdout.write('{}')"],
+            &std::env::temp_dir(),
+        )
+        .unwrap();
         let mut saw_text = false;
         while let Some(line) = run.lines.recv().await {
             match line {
@@ -243,20 +324,29 @@ mod tests {
         run.send_line("continue").await.unwrap();
         let mut steered = false;
         loop {
-            let line = tokio::time::timeout(std::time::Duration::from_secs(5), run.lines.recv()).await.unwrap().unwrap();
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), run.lines.recv())
+                .await
+                .unwrap()
+                .unwrap();
             match line {
                 Line::Json(v) => steered = v["input"] == "continue",
                 Line::Text(t) if t == "ready" => break,
                 _ => {}
             }
         }
-        let Run { mut lines, stdin, _job } = run;
-        drop(_job);
-        drop(stdin);
+        run._job.terminate().unwrap();
+        run.close_stdin();
         let mut partial = false;
-        while let Some(line) = tokio::time::timeout(std::time::Duration::from_secs(5), lines.recv()).await.unwrap() {
+        while let Some(line) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run.lines.recv())
+                .await
+                .unwrap()
+        {
             match line {
-                Line::Json(v) => { assert_eq!(v["input"], "continue"); steered = true; }
+                Line::Json(v) => {
+                    assert_eq!(v["input"], "continue");
+                    steered = true;
+                }
                 Line::Text(t) => partial |= t == "{\"partial\":",
                 _ => {}
             }
@@ -267,10 +357,14 @@ mod tests {
     #[tokio::test]
     async fn paused_consumer_does_not_stall_process() {
         let mut run = spawn("node", &["-e", "console.log(JSON.stringify({pid:process.pid}));for(let i=0;i<10000;i++)console.log('{}')"], &std::env::temp_dir()).unwrap();
-        let Some(Line::Json(first)) = run.lines.recv().await else { panic!("no pid") };
+        let Some(Line::Json(first)) = run.lines.recv().await else {
+            panic!("no pid")
+        };
         let pid = first["pid"].as_u64().unwrap() as u32;
         for _ in 0..100 {
-            if !is_alive(pid) { return; }
+            if !is_alive(pid) {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("paused consumer blocked process exit");

@@ -19,8 +19,8 @@ use store::{Project, Store};
 struct OpenedProject {
     project: Project,
     git: GitState,
-    /// Non-empty means the repo can make a provider CLI run its own config.
-    /// The UI must get consent before any agent runs here.
+    /// Known configuration sources and scan limitations, including ancestor paths.
+    /// The UI requires consent for every untrusted project, even with no findings.
     trust_findings: Vec<TrustFinding>,
 }
 

@@ -8,10 +8,10 @@ defineEmits<{ trust: []; cancel: [] }>();
 <template>
   <div class="scrim">
     <section class="panel">
-      <h2>{{ name }} carries agent configuration</h2>
+      <h2>Trust {{ name }}?</h2>
       <p>
-        Agent CLIs load these from the repository itself, before Orteca sees
-        anything. Open it only if you trust where the code came from.
+        Agent CLIs can load instructions and run configuration from this project
+        and its parent folders. Open it only if you trust where the code came from.
       </p>
 
       <ul>
@@ -41,6 +41,8 @@ defineEmits<{ trust: []; cancel: [] }>();
 }
 
 .panel {
+  max-height: calc(100dvh - 2 * var(--pad));
+  overflow-y: auto;
   width: 100%;
   max-width: 520px;
   background: var(--surface);

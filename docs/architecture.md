@@ -6,8 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 and 2 are built and green: `cargo test` passes 8 tests,
-`npm run build` type-checks clean. Milestones 3-8 are not started.
+Milestones 1 and 2 are implemented. Their acceptance checks are documented in
+`docs/m1-m2-verification.md`. Milestones 3-8 are not started.
 
 What exists and works:
 
@@ -67,9 +67,12 @@ Consequence: a non-bare `-p` run loads the *target repo's* `.claude/settings.jso
 hooks and `.mcp.json` **with no trust prompt**. Orteca opens arbitrary local repos,
 so this is a real code-execution path.
 
-**Mitigation (must ship in MVP):** on first open of a project, scan for
-`.claude/settings.json`, `.claude/hooks`, `.mcp.json`, `CLAUDE.md`. If present,
-show them once and require the user to trust the project. Store the decision.
+**Mitigation:** every untrusted project requires consent, including projects with
+no recognized configuration. The scan explains known sources in the repository,
+nested folders and ancestors. It groups `.claude`, `.codex` and `.agents` resources
+and reports unreadable paths, links and scan limits. Custom filenames therefore
+cannot bypass consent. Git discovery disables `core.fsmonitor` before consent.
+The decision is stored for that repository.
 
 ## 3. Codex — verified integration surface
 

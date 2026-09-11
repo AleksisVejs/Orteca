@@ -18,6 +18,8 @@ tokio = { version = "1", features = ["process", "io-util", "sync", "rt-multi-thr
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",
+  # CreateJobObjectW takes SECURITY_ATTRIBUTES, so it is gated behind this.
+  "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
 ] }

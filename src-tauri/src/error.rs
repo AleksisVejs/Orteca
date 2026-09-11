@@ -17,7 +17,6 @@ pub enum ErrorKind {
     NotAGitRepo,
     Io,
     Db,
-    GitFailed,
 }
 
 impl AppError {

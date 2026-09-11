@@ -1,6 +1,6 @@
 // Mirrors the serde shapes in src-tauri. Keep in step with src-tauri/src.
 
-export type ErrorKind = "notFound" | "notAGitRepo" | "io" | "db" | "gitFailed";
+export type ErrorKind = "notFound" | "notAGitRepo" | "io" | "db";
 
 export interface AppError {
   kind: ErrorKind;

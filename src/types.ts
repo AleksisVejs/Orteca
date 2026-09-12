@@ -194,11 +194,21 @@ export interface FileStat {
   origin: Origin | null;
 }
 
+/** Medians of the last finished runs in this project on the same route kind
+ *  and provider. Only sent once there are at least five, and always an
+ *  estimate: the same route is not the same work. */
+export interface Baseline {
+  runs: number;
+  medianTokens: number;
+  medianCalls: number;
+}
+
 export interface TaskResult {
   taskId: number;
   /** `cancelled` is the user stopping the run, `budgetReached` a ceiling the
-   *  route declared: neither is a win, neither is a fault. */
-  status: "done" | "cancelled" | "failed" | "budgetReached";
+   *  route declared, and `reviewRejected` an explicit review stop: none is a
+   *  win, and none is a provider fault. */
+  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected";
   summary: string;
   failure: string | null;
   /** null when the run ended before the provider reported any numbers. */
@@ -214,6 +224,8 @@ export interface TaskResult {
    *  calls-avoided figure, and it is exact. */
   callsUsed: number;
   turnsUsed: number;
-  /** Set when a ceiling stopped the run; `status` is then `budgetReached`. */
+  /** Set when a ceiling or review outcome stopped the run. */
   budgetStop: BudgetStop | null;
+  /** null until the project has enough comparable runs to compare against. */
+  baseline: Baseline | null;
 }

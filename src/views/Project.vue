@@ -293,6 +293,7 @@ const OUTCOME: Record<TaskResult["status"], string> = {
   cancelled: "Stopped",
   failed: "Failed",
   budgetReached: "Budget reached",
+  reviewRejected: "Review requested changes",
 };
 
 /** What the route spent against what it was allowed. Both numbers are exact:
@@ -306,6 +307,26 @@ const calls = computed(() => {
     stages: r.route.stages,
     ran: r.stages.map((s) => s.stage),
   };
+});
+
+/** Every stage the route declared, and whether it ran. Stages run in order,
+ *  so the ones that ran are always the front of the route. */
+const routeSteps = computed(() => {
+  const r = result.value;
+  if (!r) return [];
+  return r.route.stages.map((stage, i) => ({ stage, ran: i < r.stages.length }));
+});
+
+/** This run against the median of comparable finished runs here. Only for a
+ *  run that finished, only once the backend has a baseline, and always
+ *  labelled an estimate. `change` is positive when this run used fewer. */
+const comparison = computed(() => {
+  const r = result.value;
+  const t = tokens.value;
+  if (!r?.baseline || r.status !== "done" || !t || r.baseline.medianTokens <= 0) return null;
+  // Cache reads excluded, as in the baseline: a warm cache is not less work.
+  const change = Math.round((1 - (t.total - t.cached) / r.baseline.medianTokens) * 100);
+  return { ...r.baseline, change, size: Math.abs(change) };
 });
 
 /** The diff split by whose change it is. A file untouched since before the
@@ -474,6 +495,23 @@ const AUTH: Record<Auth, string> = {
           if you want to spend more on this.
         </p>
 
+        <!-- The route as decided before anything ran: what ran, what did not. -->
+        <ol class="route">
+          <template v-for="(step, i) in routeSteps" :key="step.stage">
+            <li v-if="i" class="arrow" aria-hidden="true">→</li>
+            <li :class="{ ran: step.ran }">
+              {{ step.stage }}<span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
+            </li>
+          </template>
+        </ol>
+        <p class="note reason">
+          {{ result.route.reason }}
+          <template v-if="result.route.candidatePaths.length">
+            · brief named
+            <span class="mono">{{ result.route.candidatePaths.join(", ") }}</span>
+          </template>
+        </p>
+
         <!-- Four tiles. Every one labelled, none faked when unknown. -->
         <div class="tiles">
           <div v-if="calls" class="tile">
@@ -510,6 +548,19 @@ const AUTH: Record<Auth, string> = {
             <span class="note">Git-visible files changed by this run</span>
           </div>
         </div>
+
+        <!-- No savings claim without a measured baseline, and never unlabelled. -->
+        <p v-if="comparison" class="note compare">
+          <span :class="{ good: comparison.change > 0 }">
+            {{ comparison.size }}% {{ comparison.change >= 0 ? "fewer" : "more" }} uncached tokens
+          </span>
+          than the median of the last {{ comparison.runs }} finished runs of this
+          route here ({{ formatTokens(comparison.medianTokens) }}), estimated.
+        </p>
+        <p v-else-if="result.status === 'done' && tokens" class="note compare">
+          No savings figure yet: that needs five finished runs of this route here
+          to compare against.
+        </p>
 
         <ul class="diff">
           <li v-for="f in changed.byRun" :key="f.path">
@@ -606,6 +657,14 @@ const AUTH: Record<Auth, string> = {
 </template>
 
 <style scoped>
+.hidden-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .project {
   min-height: 100%;
   max-width: 720px;
@@ -849,8 +908,39 @@ textarea:disabled {
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
-.figure.good {
+.good {
   color: var(--accent);
+}
+
+.route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.route li {
+  padding: 1px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+}
+.route li.ran {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.route li.arrow {
+  padding: 0;
+  border: none;
+}
+.reason {
+  margin: 6px 0 16px;
+}
+.compare {
+  margin: 0 0 12px;
 }
 
 .diff {

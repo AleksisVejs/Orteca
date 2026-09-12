@@ -11,6 +11,7 @@
 //! inside it. A task that crosses a ceiling stops and says so; it never quietly
 //! promotes itself to a longer route.
 
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::ProviderId;
@@ -328,6 +329,9 @@ const STOPWORDS: &[&str] = &[
 pub struct RepoSignals {
     /// Tracked paths, as `git ls-files` reports them.
     pub tracked_paths: Vec<String>,
+    /// Paths touched by the last 50 commits. A ranking signal, never a match
+    /// on its own.
+    pub recent_paths: Vec<String>,
     pub prior_failures: u32,
 }
 
@@ -356,25 +360,89 @@ fn nouns(prompt: &str) -> Vec<String> {
     words
 }
 
-/// Tracked paths the prompt names or gestures at. Path text only: no file is
-/// opened, hashed or read. Ranking and a file cache are Milestone 7's job.
-fn candidates(prompt: &str, tracked: &[String]) -> Vec<String> {
+const TEST_WORDS: &[&str] = &["test", "tests", "spec"];
+
+/// What a file is named for, with its extension and any test marker removed:
+/// `src/slug.rs`, `tests/test_slug.py` and `slug_test.rs` all give `slug`.
+fn stem(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?.split('.').next()?.to_ascii_lowercase();
+    let words: Vec<&str> = name
+        .split(['_', '-'])
+        .filter(|w| !w.is_empty() && !TEST_WORDS.contains(w))
+        .collect();
+    (!words.is_empty()).then(|| words.join("_"))
+}
+
+fn is_test(path: &str) -> bool {
+    path.to_ascii_lowercase()
+        .split(['/', '.', '_', '-'])
+        .any(|w| TEST_WORDS.contains(&w))
+}
+
+/// Tracked paths the prompt is about, most likely first, and how many of them
+/// matched a word of the prompt. Path text and git history only: no file is
+/// opened, hashed or read.
+///
+/// A file named for a prompt word scores 3, a path merely containing one 1.
+/// Being touched in the last 50 commits adds 2. A test named like a hit is
+/// listed beside it even when the prompt never mentioned it, but does not
+/// count towards the blast radius, which measures what the prompt points at.
+fn candidates(prompt: &str, repo: &RepoSignals) -> (usize, Vec<String>) {
     let nouns = nouns(prompt);
     if nouns.is_empty() {
-        return Vec::new();
+        return (0, Vec::new());
     }
-    let mut hits: Vec<String> = tracked
+    let mut scored: Vec<(u32, &String)> = repo
+        .tracked_paths
         .iter()
-        .filter(|path| {
+        .filter_map(|path| {
             let lower = path.to_ascii_lowercase();
-            nouns.iter().any(|noun| lower.contains(noun.as_str()))
+            let name = lower.rsplit('/').next();
+            let stem = stem(path);
+            let score: u32 = nouns
+                .iter()
+                .map(|noun| {
+                    if name == Some(noun.as_str()) || stem.as_deref() == Some(noun.as_str()) {
+                        3
+                    } else if lower.contains(noun.as_str()) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            (score > 0).then_some((score, path))
         })
-        .cloned()
         .collect();
-    // Shallowest and shortest first: `src/run.rs` is a likelier subject than
-    // `src/deep/nested/run_helpers_generated.rs`.
-    hits.sort_by_key(|p| (p.matches('/').count(), p.len(), p.clone()));
-    hits
+    let stems: HashSet<String> = scored
+        .iter()
+        .filter(|(_, p)| !is_test(p))
+        .filter_map(|(_, p)| stem(p))
+        .collect();
+    let paired = |path: &str| is_test(path) && stem(path).is_some_and(|s| stems.contains(&s));
+    // A paired test never widens the blast radius, even one the prompt named.
+    let hits = scored.iter().filter(|(_, p)| !paired(p)).count();
+    let listed: HashSet<&String> = scored.iter().map(|(_, p)| *p).collect();
+    let tests: Vec<&String> = repo
+        .tracked_paths
+        .iter()
+        .filter(|path| paired(path) && !listed.contains(path))
+        .collect();
+    scored.extend(tests.into_iter().map(|path| (1, path)));
+    let recent: HashSet<&String> = repo.recent_paths.iter().collect();
+    for (score, path) in &mut scored {
+        if recent.contains(path) {
+            *score += 2;
+        }
+    }
+    // Ties go shallowest and shortest first: `src/run.rs` is a likelier
+    // subject than `src/deep/nested/run_helpers_generated.rs`.
+    scored.sort_by(|(a, pa), (b, pb)| {
+        b.cmp(a).then_with(|| {
+            (pa.matches('/').count(), pa.len(), pa).cmp(&(pb.matches('/').count(), pb.len(), pb))
+        })
+    });
+    (hits, scored.into_iter().map(|(_, p)| p.clone()).collect())
 }
 
 /// Read a prompt and its repository into numbers. Pure: same inputs, same
@@ -404,7 +472,7 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
     }
     let risk = risk.min(10);
 
-    let hits = candidates(prompt, &repo.tracked_paths);
+    let (blast_radius, hits) = candidates(prompt, repo);
     let signals = Signals {
         complexity,
         risk,
@@ -415,7 +483,7 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
         bug: contains_any(&text, BUG),
         refactor: contains_any(&text, REFACTOR),
         frontend: contains_any(&text, FRONTEND),
-        blast_radius: hits.len(),
+        blast_radius,
         prior_failures: repo.prior_failures,
     };
     (signals, hits)
@@ -561,8 +629,8 @@ pub fn brief(
 
     if !route.candidate_paths.is_empty() {
         out.push_str(
-            "\nStart here. These tracked paths match the task; read the ones you need and \
-             ignore the rest:\n",
+            "\nStart here. These tracked paths match the task, most likely first; read the \
+             ones you need and ignore the rest:\n",
         );
         for path in &route.candidate_paths {
             out.push_str("- ");
@@ -654,8 +722,31 @@ mod tests {
     fn repo(paths: &[&str]) -> RepoSignals {
         RepoSignals {
             tracked_paths: paths.iter().map(|p| (*p).to_string()).collect(),
-            prior_failures: 0,
+            ..Default::default()
         }
+    }
+
+    /// Name beats substring, recent history breaks what depth would decide, and
+    /// a test is listed beside the file it tests without widening the blast
+    /// radius.
+    #[test]
+    fn candidates_are_ranked_by_name_recency_and_paired_tests() {
+        let signals = RepoSignals {
+            tracked_paths: ["slugs.txt", "docs/slug-notes.md", "slugify.rs", "src/deep/slug.rs"]
+                .map(String::from)
+                .to_vec(),
+            recent_paths: vec!["docs/slug-notes.md".into()],
+            prior_failures: 0,
+        };
+        let r = route("tidy the slug code", Mode::Balanced, &signals);
+        assert_eq!(r.candidate_paths, ["docs/slug-notes.md", "src/deep/slug.rs", "slugs.txt", "slugify.rs"]);
+
+        let r = balanced("fix slug.rs", &["src/deep/slug.rs", "tests/test_slug.py", "src/other.rs"]);
+        assert_eq!(r.candidate_paths, ["src/deep/slug.rs", "tests/test_slug.py"]);
+        assert_eq!(r.signals.blast_radius, 1, "a paired test widened the blast radius");
+        // Named by the prompt too: still paired, still not blast radius.
+        let r = balanced("fix slug tests", &["src/slug.rs", "tests/test_slug.py"]);
+        assert_eq!(r.signals.blast_radius, 1, "a named paired test widened the blast radius");
     }
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {
@@ -784,7 +875,7 @@ mod tests {
 
         let broad = RepoSignals {
             tracked_paths: (0..40).map(|i| format!("src/widget/{i}_widget.rs")).collect(),
-            prior_failures: 0,
+            ..Default::default()
         };
         let r = route(prompt, Mode::Balanced, &broad);
         assert!(r.signals.blast_radius > 5, "blast radius was {}", r.signals.blast_radius);

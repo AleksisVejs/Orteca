@@ -26,7 +26,7 @@ use crate::proc::{self, Line};
 use crate::project::{self, FileStat};
 use crate::providers::{claude, FailureKind, ProviderEvent, ProviderId, Steering, Usage};
 use crate::routing::{self, Route, Stage, StageNote};
-use crate::store::Store;
+use crate::store::{Baseline, Store};
 
 // Commands the agent may never run, in either shell. Deny beats allow, so these
 // hold even though `--allowedTools` grants Bash and PowerShell outright.
@@ -67,6 +67,39 @@ fn claude_deny(writes: bool) -> Vec<String> {
             .chain(CLAUDE_EDIT_TOOLS.iter().map(|t| (*t).to_string()))
             .collect()
     }
+}
+
+/// Claude has no read-only sandbox. Non-writing stages therefore receive a
+/// read/check allowlist instead of broad shell access; denying Edit/Write alone
+/// is not enough because a shell command can write the same file.
+fn claude_allowed(stage: Stage) -> Vec<String> {
+    if stage.writes() {
+        return ["Bash", "PowerShell"].into_iter().map(str::to_string).collect();
+    }
+
+    let mut tools = vec![
+        "Read".to_string(),
+        "Grep".to_string(),
+        "Glob".to_string(),
+        // Exact commands, not prefixes: `git diff --output=<file>` writes.
+        "Bash(git diff)".to_string(),
+        "Bash(git diff --stat)".to_string(),
+        "Bash(git status)".to_string(),
+        "Bash(git status --short)".to_string(),
+    ];
+    if stage == Stage::Verify {
+        // Not read-only, and not claimed to be: these run the repository's own
+        // scripts, which the user consented to when trusting the project. What
+        // they write still lands in the run's diff. Plan and Review get none.
+        tools.extend([
+            "Bash(npm test *)",
+            "Bash(npm run build *)",
+            "Bash(node --test *)",
+            "Bash(cargo test *)",
+            "Bash(cargo clippy *)",
+        ].into_iter().map(str::to_string));
+    }
+    tools
 }
 
 /// What a user can still do to a run that is already going.
@@ -180,7 +213,8 @@ const CANCEL_PAYLOAD: &str = r#"{"kind":"cancel","data":{"by":"user"}}"#;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetStop {
-    /// Which ceiling: `calls`, `turns` or `tokens`.
+    /// Which ceiling or explicit stage outcome: `calls`, `turns`, `tokens` or
+    /// `review`.
     pub limit: &'static str,
     pub allowed: u64,
     pub observed: u64,
@@ -195,7 +229,7 @@ pub struct BudgetStop {
 #[serde(rename_all = "camelCase")]
 pub struct TaskResult {
     pub task_id: i64,
-    /// `done`, `cancelled`, `failed` or `budgetReached`.
+    /// `done`, `cancelled`, `failed`, `budgetReached` or `reviewRejected`.
     pub status: &'static str,
     /// The provider's final answer, or its last message if it reports no final
     /// field. Empty is possible and is not an error.
@@ -218,8 +252,11 @@ pub struct TaskResult {
     pub calls_used: u32,
     /// Provider turns that completed. Exact for the same reason.
     pub turns_used: u32,
-    /// Set when a ceiling stopped the run. `status` is then `budgetReached`.
+    /// Set when a ceiling or review outcome stopped the run.
     pub budget_stop: Option<BudgetStop>,
+    /// Comparable finished runs in this project, once there are five. The UI
+    /// shows no savings figure without it.
+    pub baseline: Option<Baseline>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -266,33 +303,38 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             }),
         ]
         .concat(),
-        ProviderId::Claude => [vec![
-            arg("-p"),
-            arg("--output-format"),
-            arg("stream-json"),
-            arg("--verbose"),
-            arg("--permission-mode"),
-            arg("acceptEdits"),
-            // Streaming input is what makes a mid-task instruction possible:
-            // the prompt goes in as a user message and the process keeps
-            // reading, so another one can follow while the turn is running.
-            // The run then ends when Orteca closes stdin, not at the first
-            // result. Verified against the CLI, including a second turn.
-            arg("--input-format"),
-            arg("stream-json"),
-            // Nothing is listening for a permission prompt. With the default
-            // `host` target a headless run hangs forever waiting for an answer
-            // no one can give; `none` denies instead, so the agent is told no
-            // and carries on.
-            arg("--permission-prompts"),
-            arg("none"),
-            // acceptEdits only auto-approves edits. Without this the agent can
-            // write code but never run the test that proves the code works.
-            arg("--allowedTools"),
-            arg("Bash"),
-            arg("PowerShell"),
-            arg("--disallowedTools"),
-        ], claude_deny(writes), turn_limit(plan), schema_arg(plan)].concat(),
+        ProviderId::Claude => {
+            let mut args = vec![
+                arg("-p"),
+                arg("--output-format"),
+                arg("stream-json"),
+                arg("--verbose"),
+                arg("--permission-mode"),
+                arg("acceptEdits"),
+                // Streaming input is what makes a mid-task instruction possible:
+                // the prompt goes in as a user message and the process keeps
+                // reading, so another one can follow while the turn is running.
+                // The run then ends when Orteca closes stdin, not at the first
+                // result. Verified against the CLI, including a second turn.
+                arg("--input-format"),
+                arg("stream-json"),
+                // Nothing is listening for a permission prompt. With the default
+                // `host` target a headless run hangs forever waiting for an answer
+                // no one can give; `none` denies instead, so the agent is told no
+                // and carries on.
+                arg("--permission-prompts"),
+                arg("none"),
+                arg("--allowedTools"),
+            ];
+            args.extend(claude_allowed(plan.stage));
+            // The denylist narrows the write-stage shell grant and removes
+            // native edit tools from every non-writing stage.
+            args.push(arg("--disallowedTools"));
+            args.extend(claude_deny(writes));
+            args.extend(turn_limit(plan));
+            args.extend(schema_arg(plan));
+            args
+        }
     }
 }
 
@@ -536,6 +578,11 @@ struct Context {
     /// merge it into, and resuming this one as well would pay twice to say the
     /// same thing.
     final_stage: bool,
+    /// The current stage plus the stages after it. Used to tell the user what
+    /// a turn ceiling left unstarted.
+    remaining: Vec<Stage>,
+    /// The route's cumulative token ceiling, checked after every turn.
+    max_reported_tokens: Option<u64>,
 }
 
 impl Context {
@@ -617,6 +664,8 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         dir,
         plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None },
         final_stage: true,
+        remaining: Vec::new(),
+        max_reported_tokens: route.budget.max_reported_tokens,
     };
     let mut state = State {
         outcome: Outcome::default(),
@@ -644,7 +693,11 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
 
     let stages = route.stages.clone();
     for (index, stage) in stages.iter().copied().enumerate() {
-        if state.outcome.failure.is_some() || state.outcome.cancelled || state.halt {
+        if state.outcome.failure.is_some()
+            || state.outcome.cancelled
+            || state.halt
+            || state.budget_stop.is_some()
+        {
             break;
         }
         // Checked before the stage, never during it. Orteca cannot interrupt a
@@ -662,6 +715,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             schema: write_schema(task_id, stage),
         };
         ctx.final_stage = index + 1 == stages.len();
+        ctx.remaining = stages[index..].to_vec();
         state.outcome.begin_stage();
         state.structured = None;
         state.session = None;
@@ -723,7 +777,11 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     // wrong - and not a success, because the route did not finish. The work,
     // the diff and the usage are all kept exactly as they are.
     let mut status = if state.budget_stop.is_some() && outcome.failure.is_none() && !outcome.cancelled {
-        "budgetReached"
+        if state.budget_stop.as_ref().is_some_and(|stop| stop.limit == "review") {
+            "reviewRejected"
+        } else {
+            "budgetReached"
+        }
     } else {
         outcome.status()
     };
@@ -736,11 +794,17 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         .map(|n| n.summary.clone())
         .find(|s| !s.trim().is_empty())
         .unwrap_or_else(|| outcome.summary());
+    // Read before this task closes, so it is never its own comparison. A
+    // baseline that cannot be read is no baseline, not a failed run.
+    let baseline = serde_json::to_value(route.kind)
+        .ok()
+        .and_then(|kind| store.baseline(task_id, kind.as_str()?, id.program()).ok().flatten());
     if let Err(e) = store.finish_task(
         task_id,
         status,
         &summary,
         &serde_json::to_string(&diff).unwrap_or_else(|_| "[]".into()),
+        state.calls_used,
     ) {
         status = "failed";
         outcome.failure = Some(format!("could not finish task record: {}", e.message));
@@ -759,6 +823,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         calls_used: state.calls_used,
         turns_used: state.turns_used,
         budget_stop: state.budget_stop,
+        baseline,
     }
 }
 
@@ -787,20 +852,27 @@ fn gate(route: &Route, state: &State, index: usize, stages: &[Stage]) -> Option<
             ),
         );
     }
-    if let Some(limit) = budget.max_reported_tokens {
-        let used = state.reported_tokens();
-        if used > limit {
-            return stop(
-                "tokens",
-                limit,
-                used,
-                format!(
-                    "This run has reported {used} tokens, past the {limit} this route budgeted.                      Nothing further was started; the work so far is kept."
-                ),
-            );
-        }
+    if let Some(stop) = token_stop(budget.max_reported_tokens, state.reported_tokens(), remaining.clone()) {
+        return Some(stop);
     }
     None
+}
+
+/// The stop a token ceiling leaves behind, once cumulative reported tokens are
+/// past it. Usage only arrives with a completed turn, so this can only ever
+/// act between turns - it never claims to interrupt one.
+fn token_stop(limit: Option<u64>, used: u64, remaining: Vec<Stage>) -> Option<BudgetStop> {
+    let limit = limit?;
+    (used > limit).then(|| BudgetStop {
+        limit: "tokens",
+        allowed: limit,
+        observed: used,
+        remaining,
+        message: format!(
+            "This run has reported {used} tokens, past the {limit} this route budgeted. \
+             Nothing further was started; the work so far is kept."
+        ),
+    })
 }
 
 /// Close out one stage: validate whatever artifact came back, log it, and hand
@@ -822,11 +894,22 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
     // known, and adding a fix call would be Orteca deciding to spend more on
     // the user's behalf. The findings are the result; what to do about them is
     // the user's to choose.
+    // A review that hit a budget stop did not complete; that stop is the result.
     if stage == Stage::Review
-        && artifact.as_ref().is_some_and(|a| !routing::review_passed(a))
+        && state.budget_stop.is_none()
+        && !artifact.as_ref().is_some_and(routing::review_passed)
     {
+        let remaining = ctx.remaining.iter().skip(1).copied().collect();
+        let stop = BudgetStop {
+            limit: "review",
+            allowed: 0,
+            observed: 0,
+            remaining,
+            message: "The review did not return a valid pass. Its findings are kept; deciding whether to change the work is up to you.".into(),
+        };
         state.halt = true;
-        let _ = note(store, ctx, "budget", REVIEW_STOPPED);
+        state.budget_stop = Some(stop.clone());
+        let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
     }
     StageNote { stage, summary: state.outcome.summary(), artifact }
 }
@@ -873,8 +956,6 @@ fn artifact_payload(stage: Stage, artifact: Option<&serde_json::Value>) -> Strin
     })
     .to_string()
 }
-
-const REVIEW_STOPPED: &str = r#"{"kind":"budget","data":{"decision":"stopped","limit":"review","reason":"the review asked for changes, so no further stage was started"}}"#;
 
 /// Run one process to its end. Says whether the task is finished or is being
 /// picked back up somewhere else.
@@ -931,6 +1012,14 @@ async fn attempt(
                 // Before parsing: the recording is what the CLI said, not what
                 // Orteca understood of it.
                 state.recording.write(&value);
+                // Only stages with a schema may produce an artifact. This is
+                // provider-specific machine output, not a best-effort parse of
+                // ordinary closing prose.
+                if ctx.plan.schema.is_some() {
+                    if let Some(structured) = ctx.id.structured_output(&value) {
+                        state.structured = Some(structured);
+                    }
+                }
                 let events = ctx.id.parse_line(&value);
                 // Each parser understands a subset of its CLI's event types and
                 // silently drops the rest. Harmless for the stream, fatal for
@@ -953,11 +1042,25 @@ async fn attempt(
                     if let ProviderEvent::Started { session_id } = &event {
                         state.session = Some(session_id.clone());
                     }
-                    // Claude enforces `--max-turns` itself and reports hitting
-                    // it as an error. It is Orteca's own ceiling coming back, so
-                    // it is recorded as a budget stop with the work intact - not
-                    // as a run that broke.
-                    if let ProviderEvent::Failed { kind: FailureKind::BudgetReached, .. } = &event {
+                    let provider_budget_reached = matches!(
+                        &event,
+                        ProviderEvent::Failed { kind: FailureKind::BudgetReached, .. }
+                    );
+                    if let ProviderEvent::Done { structured, turns, .. } = &event {
+                        // Kept raw. Whether it is an artifact is decided by the
+                        // stage's own contract once the stage is over.
+                        if structured.is_some() {
+                            state.structured = structured.clone();
+                        }
+                        state.turns_used = state.turns_used.saturating_add(*turns);
+                        state.turns_this_call = state.turns_this_call.saturating_add(*turns);
+                    }
+                    state.outcome.absorb(&event);
+                    // `absorb` quite correctly records provider failures, but
+                    // this particular failure is the route's own ceiling. It
+                    // must remain a budget outcome, and the process must be
+                    // stopped before it can enter another stage.
+                    if provider_budget_reached {
                         state.outcome.failure = None;
                         if state.budget_stop.is_none() {
                             let stop = turn_stop(ctx, state);
@@ -965,17 +1068,9 @@ async fn attempt(
                             state.budget_stop = Some(stop);
                         }
                         state.outcome.finished = true;
+                        run.cancel();
+                        ending = Some(Next::Ended);
                     }
-                    if let ProviderEvent::Done { structured, .. } = &event {
-                        // Kept raw. Whether it is an artifact is decided by the
-                        // stage's own contract once the stage is over.
-                        if structured.is_some() {
-                            state.structured = structured.clone();
-                        }
-                        state.turns_used = state.turns_used.saturating_add(1);
-                        state.turns_this_call = state.turns_this_call.saturating_add(1);
-                    }
-                    state.outcome.absorb(&event);
                     if matches!(event, ProviderEvent::Done { .. }) {
                         match ctx.id.steering() {
                             // The CLI ends itself once its one turn is done.
@@ -1001,15 +1096,30 @@ async fn attempt(
                 // an "unfinished" process would mean never enforcing this at
                 // all. A run that used every turn it was given did reach its
                 // ceiling, and saying so is the honest reading.
-                if ending.is_none()
-                    && state.budget_stop.is_none()
-                    && ctx.plan.max_turns.is_some_and(|max| state.turns_this_call >= max)
-                {
-                    let stop = turn_stop(ctx, state);
-                    let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
-                    state.budget_stop = Some(stop);
-                    run.cancel();
-                    ending = Some(Next::Ended);
+                // The token ceiling is held to the same place: cumulative usage
+                // across every stage so far, checked as each result reports it
+                // (Claude reports only per result, which may span several turns),
+                // so a stage that keeps taking turns stops at the first one
+                // that crosses it rather than only at the next stage boundary.
+                // A process already ending toward a resume is still drained
+                // through here: a turn it completed may cross the ceiling, and
+                // then the resume must not start.
+                if !matches!(ending, Some(Next::Ended)) && state.budget_stop.is_none() {
+                    let stop = if ctx.plan.max_turns.is_some_and(|max| state.turns_this_call >= max) {
+                        Some(turn_stop(ctx, state))
+                    } else {
+                        token_stop(
+                            ctx.max_reported_tokens,
+                            state.reported_tokens(),
+                            ctx.remaining.iter().skip(1).copied().collect(),
+                        )
+                    };
+                    if let Some(stop) = stop {
+                        let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
+                        state.budget_stop = Some(stop);
+                        run.cancel();
+                        ending = Some(Next::Ended);
+                    }
                 }
                 if ending.is_none() && state.apply_now_pending {
                     ending = restart_held(ctx, state, &run);
@@ -1165,7 +1275,7 @@ fn turn_stop(ctx: &Context, state: &State) -> BudgetStop {
         limit: "turns",
         allowed: allowed.into(),
         observed: state.turns_this_call.into(),
-        remaining: Vec::new(),
+        remaining: ctx.remaining.iter().skip(1).copied().collect(),
         message: format!(
             "The {} stage reached its ceiling of {allowed} turns. What it had already \
              done is kept; carrying on is up to you.",
@@ -1430,13 +1540,13 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_stop_is_rewritten_by_the_run_ending_but_not_by_a_single_turn() {
         let mut answered = Outcome::default();
-        answered.absorb(&ProviderEvent::Done { result: "shipped".into(), structured: None });
+        answered.absorb(&ProviderEvent::Done { result: "shipped".into(), structured: None, turns: 1 });
         answered.finished = true;
         answered.cancelled = true;
         assert_eq!(answered.status(), "done", "the run had already ended");
 
         let mut mid_turn = Outcome::default();
-        mid_turn.absorb(&ProviderEvent::Done { result: "turn one".into(), structured: None });
+        mid_turn.absorb(&ProviderEvent::Done { result: "turn one".into(), structured: None, turns: 1 });
         mid_turn.cancelled = true;
         assert!(mid_turn.done, "a turn did answer");
         assert_eq!(mid_turn.status(), "cancelled", "but the run was stopped mid-work");
@@ -1779,6 +1889,9 @@ ping -n 60 127.0.0.1 >nul
             for tool in CLAUDE_EDIT_TOOLS {
                 assert!(claude.iter().any(|a| a == tool), "{} could still call {tool}", stage.name());
             }
+            assert!(claude.contains(&"Read".to_string()), "{} lost read access", stage.name());
+            assert!(!claude.contains(&"Bash".to_string()), "{} received arbitrary Bash", stage.name());
+            assert!(!claude.contains(&"PowerShell".to_string()), "{} received arbitrary PowerShell", stage.name());
         }
         // Implement still writes, or nothing would ever change.
         let codex = args(ProviderId::Codex, &plan_for(Stage::Implement)).join(" ");
@@ -1831,6 +1944,22 @@ ping -n 60 127.0.0.1 >nul
                  console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:input}}}}));\
                  for(let i=0;i<{turns};i++)console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:10,output_tokens:1}}}}));\
                  process.exitCode=0;}});"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A Codex-shaped shim whose completed agent message contains the value
+    /// constrained by `--output-schema`.
+    fn codex_artifact_shim(request: &Request, artifact: &serde_json::Value) {
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        let text = serde_json::to_string(&artifact.to_string()).unwrap();
+        std::fs::write(
+            request.dir.join("fake.js"),
+            format!(
+                "const text={text};\
+                 console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text}}}}));\
+                 console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));"
             ),
         )
         .unwrap();
@@ -1947,9 +2076,15 @@ ping -n 60 127.0.0.1 >nul
             &RepoSignals::default(),
         );
         assert_eq!(route.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
-        let request = routed(&store, "stages", route);
+        let mut request = routed(&store, "stages", route);
         let dir = request.dir.clone();
-        answering_shim(&request, 1);
+        claude_shim(
+            &mut request,
+            &serde_json::json!({
+                "findings": [],
+                "verdict": "pass"
+            }),
+        );
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
@@ -1963,6 +2098,31 @@ ping -n 60 127.0.0.1 >nul
         assert!(calls[0].contains("Do not edit any file"), "the plan stage was allowed to edit");
         assert!(calls[1].contains("Make the change"));
         assert!(calls[3].contains("Verify"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_schema_output_becomes_a_valid_stage_artifact() {
+        let store = Store::in_memory().unwrap();
+        let mut route = one_call("make a plan");
+        route.stages = vec![Stage::Plan];
+        let request = routed(&store, "codex-artifact", route);
+        let dir = request.dir.clone();
+        let artifact = serde_json::json!({
+            "objective": "rename it",
+            "constraints": [],
+            "affected_areas": [],
+            "implementation_steps": [],
+            "risks": [],
+            "tests_required": []
+        });
+        codex_artifact_shim(&request, &artifact);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done");
+        assert_eq!(result.stages.len(), 1);
+        assert_eq!(result.stages[0].artifact, Some(artifact));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2009,6 +2169,31 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn a_turn_budget_stop_prevents_later_stages() {
+        let store = Store::in_memory().unwrap();
+        let mut route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        route.budget.max_turns = Some(1);
+        let request = routed(&store, "turn-stop-route", route);
+        let dir = request.dir.clone();
+        answering_shim(&request, 3);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "budgetReached");
+        assert_eq!(result.failure, None);
+        assert_eq!(result.calls_used, 1, "the next stage started after a turn stop");
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Plan]
+        );
+        let stop = result.budget_stop.expect("no turn budget stop");
+        assert_eq!(stop.limit, "turns");
+        assert_eq!(stop.remaining, [Stage::Implement, Stage::Verify]);
+        assert_eq!(briefs(&dir).len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The rule the milestone turns on: after a budget stop nothing escalates.
     /// Not a longer route, not one more call, not a quiet retry.
     #[tokio::test]
@@ -2035,6 +2220,23 @@ ping -n 60 127.0.0.1 >nul
             .map(|v| v["data"]["stage"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(stages, ["plan"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_max_turns_is_reported_as_a_budget_stop() {
+        let store = Store::in_memory().unwrap();
+        let mut request = routed(&store, "claude-turn-stop", one_call("fix the typo"));
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        std::fs::write(&request.program, "@echo off\r\necho {\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"ceiling\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}\r\nexit /b 0\r\n").unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "budgetReached");
+        assert_eq!(result.failure, None);
+        assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("turns"));
+        assert!(result.usage.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2084,6 +2286,29 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(stop.limit, "tokens");
         assert!(stop.observed > stop.allowed);
         assert_eq!(stop.remaining, [Stage::Implement, Stage::Verify]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Cumulative usage is checked as each turn reports it, not only between
+    /// stages: a one-stage route has no boundary at all, and still stops at the
+    /// turn that crossed its ceiling.
+    #[tokio::test]
+    async fn cumulative_usage_stops_a_stage_between_turns() {
+        let store = Store::in_memory().unwrap();
+        let mut route = one_call("fix the typo in the readme");
+        // 11 tokens a turn, so the third turn crosses it.
+        route.budget.max_reported_tokens = Some(25);
+        let request = routed(&store, "token-turns", route);
+        let dir = request.dir.clone();
+        answering_shim(&request, 4);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "budgetReached");
+        assert_eq!(result.failure, None);
+        let stop = result.budget_stop.expect("no token stop was reported");
+        assert_eq!(stop.limit, "tokens");
+        assert_eq!(stop.observed, 33, "the stop was not taken at the turn that crossed the ceiling");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2157,14 +2382,40 @@ ping -n 60 127.0.0.1 >nul
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
+        assert_eq!(result.status, "reviewRejected");
         assert_eq!(result.calls_used, 3, "a call was spent after the review rejected the work");
         assert_eq!(result.stages.len(), 3, "Verify ran after a review that rejected the work");
         assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
         let artifact = result.stages.last().unwrap().artifact.as_ref().expect("the review artifact was dropped");
         assert_eq!(artifact["verdict"], "changes_requested");
+        let stop = result.budget_stop.as_ref().expect("review stop was not returned");
+        assert_eq!(stop.limit, "review");
+        assert_eq!(stop.remaining, [Stage::Verify]);
         // Recorded, so the findings are not only on screen.
         let logged = store.event_payloads(task).into_iter().find(|v| v["kind"] == "artifact" && v["data"]["stage"] == "review");
         assert_eq!(logged.expect("no artifact row")["data"]["valid"], true);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_review_artifact_rejects_the_route_without_verify() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "add an authorization check before the delete endpoint",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let mut request = routed(&store, "missing-review", route);
+        let dir = request.dir.clone();
+        claude_shim(&mut request, &serde_json::json!({"objective": "not a review"}));
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "reviewRejected");
+        assert_eq!(result.stages.len(), 3);
+        assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
+        assert!(result.stages.last().unwrap().artifact.is_none());
+        assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("review"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

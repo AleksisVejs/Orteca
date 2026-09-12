@@ -14,7 +14,19 @@ use crate::providers::{CostQuality, Usage};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_tasks.sql"),
+    include_str!("../migrations/0003_calls.sql"),
 ];
+
+/// What comparable finished runs in a project have cost. Always an estimate:
+/// "comparable" means the same route kind on the same provider, which is not
+/// the same work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Baseline {
+    pub runs: u32,
+    pub median_tokens: u64,
+    pub median_calls: u32,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,15 +150,15 @@ impl Store {
     /// did not need. A re-worded retry counts as a fresh task, which errs
     /// towards the cheaper route.
     ///
-    /// `budgetReached` counts. A run that ran out of budget did not finish its
-    /// work either, and pretending otherwise would leave a task looping on the
-    /// route that could not fit it.
+    /// `budgetReached` and `reviewRejected` count. A run that ran out of budget
+    /// or was rejected by review did not finish its work, and pretending
+    /// otherwise would leave a task looping on a route that could not finish.
     pub fn prior_failures(&self, project_id: i64, prompt: &str) -> Result<u32> {
         let conn = self.0.lock().expect("store poisoned");
         Ok(conn.query_row(
             "SELECT COUNT(*) FROM tasks
               WHERE project_id = ?1 AND prompt = ?2
-                AND status IN ('failed', 'budgetReached')",
+                AND status IN ('failed', 'budgetReached', 'reviewRejected')",
             params![project_id, prompt],
             |r| r.get(0),
         )?)
@@ -210,19 +222,51 @@ impl Store {
         status: &str,
         summary: &str,
         diff_stat_json: &str,
+        calls_used: u32,
     ) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
         let changed = conn.execute(
             "UPDATE tasks
-                SET status = ?2, summary = ?3, diff_stat_json = ?4,
+                SET status = ?2, summary = ?3, diff_stat_json = ?4, calls_used = ?5,
                     ended_at = datetime('now')
               WHERE id = ?1",
-            params![task_id, status, summary, diff_stat_json],
+            params![task_id, status, summary, diff_stat_json, calls_used],
         )?;
         if changed == 0 {
             return Err(AppError::new(ErrorKind::NotFound, "task record no longer exists"));
         }
         Ok(())
+    }
+
+    /// The median of the last 20 runs in this task's project that finished
+    /// `done` on the same route kind, provider and mode, and reported usage.
+    /// Tokens exclude cache reads, so a warm cache does not read as less work. `None`
+    /// below five of them: a median of two runs is an anecdote, and the screen
+    /// shows absolute numbers until there is more.
+    pub fn baseline(&self, task_id: i64, route_kind: &str, provider: &str) -> Result<Option<Baseline>> {
+        const MIN_RUNS: usize = 5;
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT u.input_tokens + u.output_tokens, t.calls_used
+               FROM tasks t JOIN usage u ON u.task_id = t.id
+              WHERE (t.project_id, t.mode) = (SELECT project_id, mode FROM tasks WHERE id = ?1)
+                AND t.id != ?1 AND t.status = 'done' AND t.calls_used IS NOT NULL
+                AND u.input_tokens IS NOT NULL AND u.provider = ?3
+                AND json_extract(t.route_json, '$.kind') = ?2
+              ORDER BY t.id DESC LIMIT 20",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id, route_kind, provider], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() < MIN_RUNS {
+            return Ok(None);
+        }
+        let (mut tokens, mut calls): (Vec<i64>, Vec<i64>) = rows.into_iter().unzip();
+        Ok(Some(Baseline {
+            runs: tokens.len() as u32,
+            median_tokens: median(&mut tokens) as u64,
+            median_calls: median(&mut calls) as u32,
+        }))
     }
 
     pub fn set_trusted(&self, path: &str, trusted: bool) -> Result<()> {
@@ -265,6 +309,13 @@ fn read_project(conn: &Connection, path: &str) -> Result<Project> {
         }
         other => other.into(),
     })
+}
+
+/// The upper middle of an even count. Good enough for a figure labelled
+/// estimated; not a statistic anyone should quote.
+fn median(values: &mut [i64]) -> i64 {
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 fn quality_name(q: CostQuality) -> &'static str {
@@ -329,7 +380,7 @@ mod tests {
 
     #[test]
     fn missing_task_cannot_be_finished_successfully() {
-        assert!(Store::in_memory().unwrap().finish_task(99, "done", "", "[]").is_err());
+        assert!(Store::in_memory().unwrap().finish_task(99, "done", "", "[]", 1).is_err());
     }
 
     #[test]
@@ -426,7 +477,7 @@ mod tests {
         for kind in ["started", "toolUse", "done"] {
             store.append_event(task, "run", kind, "codex", "{}").unwrap();
         }
-        store.finish_task(task, "done", "all set", "[]").unwrap();
+        store.finish_task(task, "done", "all set", "[]", 1).unwrap();
 
         let conn = store.0.lock().unwrap();
         let kinds: Vec<String> = conn
@@ -459,18 +510,56 @@ mod tests {
         let other = store.touch_project("C:/b", "b").unwrap();
         let close = |id: i64, prompt: &str, status: &str| {
             let task = store.create_task(new_task(id, prompt, "balanced")).unwrap();
-            store.finish_task(task, status, "", "[]").unwrap();
+            store.finish_task(task, status, "", "[]", 1).unwrap();
         };
         close(project.id, "do it", "failed");
         close(project.id, "do it", "budgetReached");
+        close(project.id, "do it", "reviewRejected");
         close(project.id, "do it", "done");
         close(project.id, "do it", "cancelled");
         // A different prompt, and the same prompt in a different project.
         close(project.id, "do something else", "failed");
         close(other.id, "do it", "failed");
 
-        assert_eq!(store.prior_failures(project.id, "do it").unwrap(), 2);
+        assert_eq!(store.prior_failures(project.id, "do it").unwrap(), 3);
         assert_eq!(store.prior_failures(project.id, "never asked").unwrap(), 0);
+    }
+
+    /// No savings figure from a handful of runs, and none from runs that are
+    /// not comparable: another route, provider, mode or project, or a run that
+    /// did not finish. Cache reads never count as tokens spent.
+    #[test]
+    fn a_baseline_needs_five_comparable_finished_runs() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let other = store.touch_project("C:/b", "b").unwrap();
+        let run_in = |mode: &str, project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
+            let route = format!(r#"{{"kind":"{kind}"}}"#);
+            let task = store.create_task(NewTask { route_json: Some(&route), ..new_task(project_id, "p", mode) }).unwrap();
+            let usage = Usage { input_tokens: tokens, cached_input_tokens: tokens * 10, output_tokens: 0, reasoning_tokens: 0, cost_usd: None, cost_quality: CostQuality::Unavailable };
+            store.record_usage(task, None, provider, Some(&usage)).unwrap();
+            store.finish_task(task, status, "", "[]", 1).unwrap();
+            task
+        };
+        let run = |project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
+            run_in("balanced", project_id, kind, provider, status, tokens)
+        };
+        for tokens in [100, 400, 200, 300] {
+            run(project.id, "implementOnce", "codex", "done", tokens);
+        }
+        run(project.id, "implementOnce", "codex", "budgetReached", 1);
+        run(project.id, "planned", "codex", "done", 1);
+        run(project.id, "implementOnce", "claude", "done", 1);
+        run(other.id, "implementOnce", "codex", "done", 1);
+        run_in("efficient", project.id, "implementOnce", "codex", "done", 1);
+        let current = store.create_task(new_task(project.id, "p", "balanced")).unwrap();
+        assert_eq!(store.baseline(current, "implementOnce", "codex").unwrap(), None);
+
+        run(project.id, "implementOnce", "codex", "done", 500);
+        assert_eq!(
+            store.baseline(current, "implementOnce", "codex").unwrap(),
+            Some(Baseline { runs: 5, median_tokens: 300, median_calls: 1 })
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, OUTCOME, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -50,7 +50,7 @@ const oneCall = {
   signals: { complexity: 0, risk: 0, blastRadius: 1 }, candidatePaths: [], preferredProviders: ['codex'],
 };
 
-const finished = { taskId: 1, status: 'failed', failure: 'spawn failed', summary: '', usage: null, diff: [], dirtyAtStart: false, route: oneCall, stages: [], callsUsed: 1, turnsUsed: 1, budgetStop: null };
+const finished = { taskId: 1, status: 'failed', failure: 'spawn failed', summary: '', usage: null, diff: [], dirtyAtStart: false, route: oneCall, stages: [], callsUsed: 1, turnsUsed: 1, budgetStop: null, baseline: null };
 
 test('completion before invoke resolves never leaves the screen running', async () => {
   const { state, listeners } = await projectView({ startTask: async (...args) => {
@@ -414,4 +414,27 @@ test('with no snapshot the screen says it cannot tell, and claims nothing', asyn
   await state.run();
   assert.equal(state.changed.value.unknown, true);
   assert.equal(state.changed.value.beforeRun.length, 0);
+});
+
+test('the route shows what ran, and a saving is only claimed against a baseline', async () => {
+  const usage = { inputTokens: 60, cachedInputTokens: 500, outputTokens: 15, reasoningTokens: 0, costUsd: null, costQuality: 'unavailable' };
+  const done = {
+    ...finished, status: 'done', failure: null, summary: 'ok', usage,
+    route: { ...oneCall, kind: 'planned', stages: ['plan', 'implement', 'verify'] },
+    stages: [{ stage: 'plan', summary: '', artifact: null }, { stage: 'implement', summary: 'ok', artifact: null }],
+  };
+  const { state } = await projectView({ startTask: async () => done });
+  await state.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(state.routeSteps.value)), [
+    { stage: 'plan', ran: true }, { stage: 'implement', ran: true }, { stage: 'verify', ran: false },
+  ]);
+  assert.equal(state.comparison.value, null, 'no baseline, no comparison');
+
+  const measured = await projectView({ startTask: async () => ({ ...done, baseline: { runs: 5, medianTokens: 100, medianCalls: 3 } }) });
+  await measured.state.run();
+  assert.equal(measured.state.comparison.value.change, 25, 'cache reads are not counted against the baseline');
+
+  const stopped = await projectView({ startTask: async () => ({ ...done, status: 'budgetReached', baseline: { runs: 5, medianTokens: 100, medianCalls: 3 } }) });
+  await stopped.state.run();
+  assert.equal(stopped.state.comparison.value, null, 'an unfinished run is not a saving');
 });

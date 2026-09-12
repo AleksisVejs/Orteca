@@ -34,12 +34,44 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
                 ProviderEvent::Done {
                     result: String::new(),
                     structured: None,
+                    turns: 1,
                 },
             ]
         }
         "turn.failed" => vec![failed(message_of(&v["error"]))],
         "error" => vec![failed(message_of(v))],
         _ => Vec::new(),
+    }
+}
+
+/// Codex's `--output-schema` constrains the final agent message, but the JSONL
+/// stream still carries that value in the message's `text` field. Accept the
+/// explicit structured fields used by newer clients as well, so upgrading the
+/// CLI does not silently turn artifacts back into prose.
+pub fn structured_output(v: &Value) -> Option<Value> {
+    match v["type"].as_str().unwrap_or_default() {
+        "turn.completed" => ["structured_output", "structuredOutput", "output", "result"]
+            .iter()
+            .find_map(|key| json_value(v.get(*key))),
+        "item.completed" => {
+            let item = &v["item"];
+            if !matches!(item["type"].as_str(), Some("agent_message" | "output_text")) {
+                return None;
+            }
+            ["structured_output", "structuredOutput", "output", "text"]
+                .iter()
+                .find_map(|key| json_value(item.get(*key)))
+        }
+        _ => None,
+    }
+}
+
+fn json_value(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    match value {
+        Value::Object(_) | Value::Array(_) => Some(value.clone()),
+        Value::String(text) => serde_json::from_str(text).ok(),
+        _ => None,
     }
 }
 
@@ -101,5 +133,36 @@ mod tests {
         }}));
         let ProviderEvent::Usage(u) = &events[0] else { panic!("missing usage") };
         assert_eq!(u.input_tokens + u.cached_input_tokens + u.output_tokens, 120);
+    }
+
+    #[test]
+    fn schema_constrained_agent_message_is_exposed_as_structured_output() {
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "{\"objective\":\"rename it\",\"constraints\":[],\"affected_areas\":[],\"implementation_steps\":[],\"risks\":[],\"tests_required\":[]}"
+            }
+        });
+        assert_eq!(
+            structured_output(&line),
+            Some(serde_json::json!({
+                "objective": "rename it",
+                "constraints": [],
+                "affected_areas": [],
+                "implementation_steps": [],
+                "risks": [],
+                "tests_required": []
+            }))
+        );
+    }
+
+    #[test]
+    fn ordinary_codex_text_is_not_an_artifact() {
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": { "type": "agent_message", "text": "I checked the change." }
+        });
+        assert_eq!(structured_output(&line), None);
     }
 }

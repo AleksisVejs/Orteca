@@ -165,6 +165,7 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
         mode,
         &routing::RepoSignals {
             tracked_paths: project::tracked_paths(&dir),
+            recent_paths: project::recent_paths(&dir),
             prior_failures: store.prior_failures(record.id, &prompt)?,
         },
     );

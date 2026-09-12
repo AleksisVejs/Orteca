@@ -42,6 +42,11 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
     }
 }
 
+/// Claude returns a schema-constrained value in the final result event.
+pub fn structured_output(v: &Value) -> Option<Value> {
+    (v["type"] == "result").then(|| v.get("structured_output").cloned()).flatten()
+}
+
 fn block(b: &Value) -> Option<ProviderEvent> {
     match b["type"].as_str()? {
         "text" => Some(ProviderEvent::Text(b["text"].as_str()?.to_string())),
@@ -127,6 +132,7 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
         ProviderEvent::Done {
             result: text,
             structured: v.get("structured_output").cloned(),
+            turns: n(&v["num_turns"]).max(1) as u32,
         }
     };
 

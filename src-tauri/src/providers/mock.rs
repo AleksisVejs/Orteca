@@ -90,6 +90,7 @@ mod tests {
             Some(&ProviderEvent::Done {
                 result: "The index already orders recents by opened_seq.".into(),
                 structured: None,
+                turns: 4,
             })
         );
     }

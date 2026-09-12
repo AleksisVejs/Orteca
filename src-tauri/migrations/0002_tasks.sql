@@ -5,7 +5,7 @@ CREATE TABLE tasks (
   mode           TEXT    NOT NULL,
   -- NULL until routing lands; a single-stage run has no route to record.
   route_json     TEXT,
-  status         TEXT    NOT NULL,   -- running | done | cancelled | failed
+  status         TEXT    NOT NULL,   -- running | done | cancelled | failed | budgetReached | reviewRejected
   branch         TEXT,
   base_commit    TEXT,
   dirty_at_start INTEGER NOT NULL DEFAULT 0,

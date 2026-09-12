@@ -136,6 +136,9 @@ pub enum ProviderEvent {
         /// empty there and the caller keeps the last `Text` instead.
         result: String,
         structured: Option<Value>,
+        /// Model turns this result covers. Claude reports several per result
+        /// (`num_turns`); a Codex `turn.completed` is exactly one.
+        turns: u32,
     },
     Failed {
         kind: FailureKind,
@@ -271,6 +274,20 @@ impl ProviderId {
         match self {
             Self::Claude => claude::parse_line(v),
             Self::Codex => codex::parse_line(v),
+        }
+    }
+
+    /// Return a schema-constrained artifact from a raw provider event.
+    ///
+    /// This is deliberately separate from `parse_line`: normal assistant text
+    /// is never treated as data, and the runner calls this only for a stage
+    /// that actually supplied an output schema. Codex 0.154 emits its
+    /// schema-constrained final value as the text of the completed agent
+    /// message, while Claude puts it in `structured_output` on the result.
+    pub fn structured_output(self, v: &Value) -> Option<Value> {
+        match self {
+            Self::Claude => claude::structured_output(v),
+            Self::Codex => codex::structured_output(v),
         }
     }
 

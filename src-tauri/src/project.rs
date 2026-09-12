@@ -303,6 +303,19 @@ pub fn tracked_paths(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Paths touched by the last 50 commits, as `git log` names them. A ranking
+/// signal only: a repository with no history simply has none.
+pub fn recent_paths(dir: &Path) -> Vec<String> {
+    git_output(dir, &["-c", "core.quotepath=false", "log", "-n", "50", "--name-only", "--format="])
+        .unwrap_or_default()
+        .lines()
+        .filter(|p| !p.is_empty())
+        // ponytail: one huge commit can list every file; the cap bounds it.
+        .take(5_000)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Display name for a project directory: the folder name.
 pub fn display_name(path: &Path) -> String {
     path.file_name()

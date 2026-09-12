@@ -53,16 +53,70 @@ fn block(b: &Value) -> Option<ProviderEvent> {
     }
 }
 
-/// One line of "what did it touch" for the activity stream, not an argument
-/// dump. serde_json orders keys, so `command` and `file_path` win over prose.
+/// The input fields that say what a tool call is about, best first.
+///
+/// This used to be left to key ordering: `serde_json` builds a `BTreeMap`, so
+/// iteration is alphabetical, and `command` and `file_path` do sort ahead of
+/// the prose fields beside them. But Write's input is `{content, file_path}`,
+/// where `content` sorts first - so every file an agent wrote showed 120
+/// characters of the file's own body instead of its name. Name the fields
+/// rather than hoping at their spelling.
+const IDENTIFYING: &[&str] = &[
+    "file_path", "command", "pattern", "path", "url", "query", "description", "prompt",
+];
+
+/// One line of "what did it touch" for the activity stream, not an argument dump.
 fn summarize(input: &Value) -> String {
-    input
-        .as_object()
-        .into_iter()
-        .flatten()
-        .find_map(|(_, v)| v.as_str())
-        .map(|s| s.chars().take(120).collect())
+    let Some(object) = input.as_object() else {
+        return String::new();
+    };
+    IDENTIFYING
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        // A tool nobody listed still says something rather than nothing.
+        .or_else(|| object.values().find_map(Value::as_str))
         .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(input: Value) -> String {
+        let block = serde_json::json!({"type": "tool_use", "name": "T", "input": input});
+        match super::block(&block) {
+            Some(ProviderEvent::ToolUse { summary, .. }) => summary,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The bug: a Write call is `{content, file_path}`, and taking whichever
+    /// string came first meant the activity stream printed the contents of
+    /// every file an agent wrote instead of its name.
+    #[test]
+    fn a_tool_call_is_summarised_by_what_it_touched_not_by_what_it_carried() {
+        assert_eq!(
+            summary(serde_json::json!({"content": "fn main() {}", "file_path": "src/main.rs"})),
+            "src/main.rs",
+            "a Write must name the file, not quote it"
+        );
+        assert_eq!(summary(serde_json::json!({"command": "cargo test", "description": "run tests"})), "cargo test");
+        assert_eq!(summary(serde_json::json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})), "a.rs");
+        assert_eq!(summary(serde_json::json!({"pattern": "TODO", "path": "src"})), "TODO");
+        // Nothing recognised: still better than an empty line.
+        assert_eq!(summary(serde_json::json!({"whatever": "something"})), "something");
+        assert_eq!(summary(serde_json::json!({"count": 3})), "");
+    }
+
+    /// Cut by characters, never by bytes: a multi-byte path would panic.
+    #[test]
+    fn a_long_summary_is_cut_without_splitting_a_character() {
+        let long = "é".repeat(200);
+        assert_eq!(summary(serde_json::json!({"file_path": long})).chars().count(), 120);
+    }
 }
 
 /// Only the final `result` carries trustworthy numbers. Per-message `usage`

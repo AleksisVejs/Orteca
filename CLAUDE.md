@@ -61,7 +61,7 @@ in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css
   and `.mcp.json` with no prompt, which is why every untrusted project must be consented
   to, even one with zero findings. Don't weaken `trust_scan` or make consent conditional.
 - **Never invoke a real provider CLI from a test.** Tests replay recorded JSONL through
-  the mock provider. Neither `claude` nor `codex` is installed on the dev machine, and
+  the mock provider. Both CLIs are installed but neither can complete a run, and
   "CLI missing" is a first-class UI state, not an error.
 - **Never run a destructive git command** (`push --force`, `reset --hard`, `clean -fd`).
   Orteca reads git state and captures diffs; it does not rewrite the user's repo.

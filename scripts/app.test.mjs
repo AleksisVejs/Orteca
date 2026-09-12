@@ -25,7 +25,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, task, running, result, runError, tokens, lines, providerError, install, installing, installError, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -33,6 +33,7 @@ async function projectView(api = {}) {
     onTaskEvent: async fn => { listeners.event = fn; return () => {}; },
     onTaskDone: async fn => { listeners.done = fn; return () => {}; },
     onInstallEvent: async () => () => {},
+    onSignInEvent: async () => () => {},
     isAppError: e => !!e?.message,
     ...api,
   });
@@ -156,3 +157,31 @@ test('cancelling pending consent does not reopen on late completion', async () =
   assert.equal(state.opened.value, null);
 });
 
+
+test('a signed-out CLI blocks the run and offers sign-in instead', async () => {
+  // The bug this guards: auth used to be guessed from a credential file that
+  // exists for users who have never signed in, so Run was enabled for a run
+  // that could only fail. Detection now reports the CLI's own answer.
+  const { state } = await projectView({
+    detectProviders: async () => [{ id: 'codex', path: 'fake.exe', auth: 'signedOut' }],
+  });
+  assert.equal(state.canRun.value, false, 'signed out must not be runnable');
+
+  // "unknown" means the CLI could not be asked, which is not a reason to block.
+  const asked = await projectView({
+    detectProviders: async () => [{ id: 'codex', path: 'fake.exe', auth: 'unknown' }],
+  });
+  assert.equal(asked.state.canRun.value, true);
+});
+
+test('sign-in failure stays visible and never claims a login', async () => {
+  const { state } = await projectView({
+    detectProviders: async () => [{ id: 'codex', path: 'fake.exe', auth: 'signedOut' }],
+    signInProvider: async () => { throw Error('codex is still signed out'); },
+  });
+  await state.signIn('codex');
+  assert.equal(state.signingIn.value, null);
+  assert.match(state.signInError.value, /still signed out/);
+  assert.equal(state.providers.value[0].auth, 'signedOut', 'a failed sign-in must not upgrade auth');
+  assert.equal(state.canRun.value, false);
+});

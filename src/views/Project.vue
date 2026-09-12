@@ -5,6 +5,8 @@ import {
   installProvider,
   isAppError,
   onInstallEvent,
+  onSignInEvent,
+  signInProvider,
   startTask,
 } from "../api";
 import type {
@@ -54,12 +56,41 @@ async function install(ids: ProviderId[]) {
   installing.value = null;
   installLine.value = "";
 }
+// Sign-in is the CLI's own browser flow. Orteca starts it and shows its output;
+// it never renders a login form and never handles a credential.
+const signingIn = ref<ProviderId | null>(null);
+const signInLine = ref("");
+const signInError = ref<string | null>(null);
+
+async function signIn(id: ProviderId) {
+  if (signingIn.value !== null || installing.value !== null || running.value) return;
+  signInError.value = null;
+  signingIn.value = id;
+  signInLine.value = "starting sign-in…";
+  try {
+    const fresh = await signInProvider(id);
+    providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
+  } catch (e) {
+    signInError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    signingIn.value = null;
+    signInLine.value = "";
+  }
+}
+
+const selected = computed(() => providers.value.find((p) => p.id === provider.value));
+
+/// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
+/// and refusing to run on a guess would be the same mistake in the other
+/// direction. The run itself reports an auth failure honestly either way.
 const canRun = computed(
   () =>
     !running.value &&
     installing.value === null &&
+    signingIn.value === null &&
     task.value.trim().length > 0 &&
-    installed.value.some((p) => p.id === provider.value),
+    !!selected.value?.path &&
+    selected.value.auth !== "signedOut",
 );
 
 // One run at a time. The stream and the result are the whole screen while it
@@ -86,6 +117,9 @@ onMounted(async () => {
   stop = await Promise.all([
     onInstallEvent((id, line) => {
       if (installing.value === id) installLine.value = line;
+    }),
+    onSignInEvent((id, line) => {
+      if (signingIn.value === id) signInLine.value = line;
     }),
   ]);
 });
@@ -280,9 +314,22 @@ const AUTH: Record<Auth, string> = {
       <ul v-else class="card providers">
         <li v-for="p in providers" :key="p.id">
           <span class="who">{{ p.program }}</span>
-          <template v-if="p.path">
+          <template v-if="p.path && signingIn === p.id">
+            <span class="note grow">{{ signInLine }}</span>
+          </template>
+          <template v-else-if="p.path">
             <span class="mono">{{ p.version ?? "version unknown" }}</span>
-            <span class="note">{{ AUTH[p.auth] }}</span>
+            <span :class="p.auth === 'signedOut' ? 'missing' : 'note'">
+              {{ AUTH[p.auth] }}
+            </span>
+            <button
+              v-if="p.auth === 'signedOut'"
+              class="link"
+              :disabled="signingIn !== null || installing !== null || running"
+              @click="signIn(p.id)"
+            >
+              sign in
+            </button>
             <span v-if="p.costQuality === 'unavailable'" class="note">
               tokens only, no cost
             </span>
@@ -316,14 +363,17 @@ const AUTH: Record<Auth, string> = {
         </span>
       </p>
       <p v-if="installError" class="missing">{{ installError }}</p>
+      <p v-if="signInError" class="missing">{{ signInError }}</p>
+      <p v-if="signingIn" class="note">
+        Approve the sign-in in your browser. Orteca never sees your password.
+      </p>
     </section>
   </main>
 </template>
 
 <style scoped>
 .project {
-  height: 100%;
-  overflow-y: auto;
+  min-height: 100%;
   max-width: 720px;
   margin: 0 auto;
   padding: 56px var(--pad) 72px;

@@ -65,8 +65,7 @@ async function forget(path: string) {
 
 <style scoped>
 .launch {
-  height: 100%;
-  overflow-y: auto;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
   justify-content: center;

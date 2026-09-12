@@ -475,9 +475,19 @@ rides along with metrics. Each slice ends commit-ready with tests.
 
 ## 16. Notes for whoever picks this up
 
-- Neither `claude` nor `codex` is installed on the current dev machine. That is
-  fine and worth keeping: Milestone 3 must handle "CLI missing" as a first-class
-  state, and the `mock` provider is what tests run against either way.
+- Both CLIs are now installed on the dev machine (`@anthropic-ai/claude-code`
+  2.1.269, `@openai/codex` 0.154.0), but neither is usable for a full run:
+  `claude` is logged out and `codex` is out of credits. "CLI missing" stays a
+  first-class state, and `mock` is still what tests run against.
+- The argv in `run::args` was checked against both CLIs' `--help` on 2026-09-12.
+  Every flag exists. The happy path is still unproven: no successful agent run
+  has ever gone end to end.
+- **Auth comes from the CLI, never from a credential file.** `claude auth status
+  --json` and `codex login status` are the only sources. The old check - does
+  `~/.claude/.credentials.json` exist - reported a saved login for a user who had
+  never signed in, because on Windows that file also holds MCP server tokens.
+  A signed-out provider now disables Run and offers `sign_in_provider`, which
+  spawns the CLI's own browser flow. Orteca renders no login form.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

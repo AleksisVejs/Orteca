@@ -44,7 +44,8 @@ export interface OpenedProject {
 
 export type ProviderId = "claude" | "codex";
 
-/** How the CLI authenticates. Orteca never reads a credential, only its presence. */
+/** How the CLI authenticates, as reported by the CLI itself. Orteca never reads
+ *  a credential and never renders a login form. */
 export type Auth = "subscription" | "apiKey" | "signedOut" | "unknown";
 
 export type CostQuality = "exact" | "estimated" | "unavailable";

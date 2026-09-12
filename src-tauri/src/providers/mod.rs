@@ -190,10 +190,9 @@ impl ProviderId {
             id: self,
             program: self.program(),
             version: path.as_deref().and_then(version_of),
-            auth: if path.is_some() {
-                self.auth()
-            } else {
-                Auth::Unknown
+            auth: match path.as_deref() {
+                Some(p) => self.auth(p),
+                None => Auth::Unknown,
             },
             path: path.map(|p| p.display().to_string()),
             cost_quality: match self {
@@ -204,32 +203,65 @@ impl ProviderId {
         }
     }
 
-    /// Existence check only. Orteca never reads a credential file and never
-    /// asks for a password; the CLI owns auth.
-    fn auth(self) -> Auth {
-        let (key, credential) = match self {
-            Self::Claude => ("ANTHROPIC_API_KEY", ".claude/.credentials.json"),
-            Self::Codex => ("CODEX_API_KEY", ".codex/auth.json"),
-        };
-        if env::var_os(key).is_some_and(|v| !v.is_empty()) {
-            return Auth::ApiKey;
+    /// The arguments that make a CLI report its own auth state.
+    pub fn auth_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["auth", "status", "--json"],
+            Self::Codex => &["login", "status"],
         }
-        match home().map(|h| h.join(credential)) {
-            Some(p) if credential_file_exists(&p) => Auth::Subscription,
-            _ => Auth::SignedOut,
+    }
+
+    /// The arguments that start an interactive sign-in. `--claudeai` is already
+    /// the default, but naming it skips the "which account type" prompt - and
+    /// Orteca spawns this with stdin closed, so a prompt would deadlock.
+    pub fn login_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["auth", "login", "--claudeai"],
+            Self::Codex => &["login"],
+        }
+    }
+
+    /// Ask the CLI. A credential file existing proves nothing: on Windows
+    /// `~/.claude/.credentials.json` holds MCP server tokens and is present for
+    /// a user who has never signed in, so the old existence check reported a
+    /// saved login right up until the run failed. Orteca still never reads a
+    /// credential - it reads the CLI's own answer about one.
+    fn auth(self, path: &Path) -> Auth {
+        let Some((lines, code)) = capture(path, self.auth_args()) else {
+            return Auth::Unknown;
+        };
+        let text = lines.join(" ");
+        match self {
+            // `--json` is the documented default, but parse defensively: an
+            // unreadable answer is Unknown, never an optimistic "signed in".
+            Self::Claude => match serde_json::from_str::<Value>(&text) {
+                Ok(v) => match v["loggedIn"].as_bool() {
+                    Some(false) => Auth::SignedOut,
+                    Some(true) if v["authMethod"].as_str().is_some_and(is_key) => Auth::ApiKey,
+                    Some(true) => Auth::Subscription,
+                    None => Auth::Unknown,
+                },
+                Err(_) => Auth::Unknown,
+            },
+            Self::Codex => {
+                let lower = text.to_ascii_lowercase();
+                if lower.contains("not logged in") || code != Some(0) {
+                    Auth::SignedOut
+                } else if is_key(&lower) {
+                    Auth::ApiKey
+                } else if lower.contains("logged in") {
+                    Auth::Subscription
+                } else {
+                    Auth::Unknown
+                }
+            }
         }
     }
 }
 
-fn home() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
-}
-
-fn credential_file_exists(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+fn is_key(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("apikey") || s.contains("api key") || s.contains("api-key")
 }
 
 /// Resolve a program against PATH x PATHEXT.
@@ -273,23 +305,38 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
         })
 }
 
-fn version_of(path: &Path) -> Option<String> {
+/// Run a CLI to completion and collect its non-empty stdout lines with its exit
+/// code. Blocking with a deadline on purpose: detection runs before any UI is
+/// drawn, and a CLI that hangs must not hang the launch screen. `None` means it
+/// could not be asked at all - never a fabricated answer.
+fn capture(path: &Path, args: &[&str]) -> Option<(Vec<String>, Option<i32>)> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
     runtime.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let mut run = crate::proc::spawn(&path.to_string_lossy(), &["--version"], &env::temp_dir()).ok()?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // Never in the user's project: detection runs before anyone has
+            // consented to that repository, same reason npm install uses temp.
+            let mut run = crate::proc::spawn(&path.to_string_lossy(), args, &env::temp_dir()).ok()?;
             run.close_stdin();
-            let mut first = None;
+            let mut lines = Vec::new();
             while let Some(line) = run.lines.recv().await {
                 match line {
-                    crate::proc::Line::Exit(code) => return (code == Some(0)).then_some(first).flatten(),
-                    crate::proc::Line::Text(text) if first.is_none() && !text.trim().is_empty() => first = Some(text.trim().to_string()),
+                    crate::proc::Line::Exit(code) => return Some((lines, code)),
+                    crate::proc::Line::Text(text) if !text.trim().is_empty() => {
+                        lines.push(text.trim().to_string())
+                    }
+                    // `--json` output arrives already parsed; put it back.
+                    crate::proc::Line::Json(value) => lines.push(value.to_string()),
                     _ => {}
                 }
             }
             None
         }).await.ok().flatten()
     })
+}
+
+fn version_of(path: &Path) -> Option<String> {
+    let (lines, code) = capture(path, &["--version"])?;
+    (code == Some(0)).then(|| lines.into_iter().next()).flatten()
 }
 
 #[cfg(test)]
@@ -377,18 +424,64 @@ echo 1.2.3
         std::fs::remove_dir_all(cwd).unwrap();
     }
 
+    /// A shim standing in for a CLI, so auth detection is tested without ever
+    /// invoking a real provider.
+    fn shim(label: &str, body: &str) -> PathBuf {
+        let cwd = temp_dir(label);
+        let path = cwd.join("agent.cmd");
+        std::fs::write(&path, format!("@echo off
+{body}
+")).unwrap();
+        path
+    }
+
     #[test]
-    fn credential_detection_rejects_directories_and_empty_files() {
-        let cwd = temp_dir("credentials");
-        let credential = cwd.join("auth.json");
-        std::fs::create_dir(&credential).unwrap();
-        assert!(!credential_file_exists(&credential));
-        std::fs::remove_dir(&credential).unwrap();
-        std::fs::write(&credential, "").unwrap();
-        assert!(!credential_file_exists(&credential));
-        std::fs::write(&credential, "{}").unwrap();
-        assert!(credential_file_exists(&credential));
-        std::fs::remove_dir_all(cwd).unwrap();
+    fn claude_auth_comes_from_the_cli_not_a_credential_file() {
+        // The exact shape `claude auth status --json` returned when logged out.
+        let out = shim("claude-out", r#"echo {"loggedIn":false,"authMethod":"none"}"#);
+        assert_eq!(ProviderId::Claude.auth(&out), Auth::SignedOut);
+
+        let sub = shim("claude-sub", r#"echo {"loggedIn":true,"authMethod":"claudeai"}"#);
+        assert_eq!(ProviderId::Claude.auth(&sub), Auth::Subscription);
+
+        let key = shim("claude-key", r#"echo {"loggedIn":true,"authMethod":"apiKey"}"#);
+        assert_eq!(ProviderId::Claude.auth(&key), Auth::ApiKey);
+    }
+
+    /// `--json` pretty-prints across several lines, so the answer has to be
+    /// reassembled before it parses. A one-line fixture would not catch this.
+    #[test]
+    fn a_pretty_printed_auth_answer_is_reassembled() {
+        let pretty = shim(
+            "claude-pretty",
+            "echo {
+echo   \"loggedIn\": false,
+echo   \"authMethod\": \"none\"
+echo }",
+        );
+        assert_eq!(ProviderId::Claude.auth(&pretty), Auth::SignedOut);
+    }
+
+    #[test]
+    fn codex_auth_reads_the_status_line() {
+        let out = shim("codex-out", "echo Not logged in");
+        assert_eq!(ProviderId::Codex.auth(&out), Auth::SignedOut);
+
+        // The exact line `codex login status` returned while logged in.
+        let sub = shim("codex-sub", "echo Logged in using ChatGPT");
+        assert_eq!(ProviderId::Codex.auth(&sub), Auth::Subscription);
+    }
+
+    /// The failure that matters: an unreadable or non-zero answer must never
+    /// be optimistic. Reporting a saved login the user does not have is how the
+    /// old file-existence check sent people into a run that could only fail.
+    #[test]
+    fn an_unreadable_auth_answer_is_never_reported_as_signed_in() {
+        let garbage = shim("claude-garbage", "echo not json at all");
+        assert_eq!(ProviderId::Claude.auth(&garbage), Auth::Unknown);
+
+        let broken = shim("codex-broken", "exit /b 1");
+        assert_eq!(ProviderId::Codex.auth(&broken), Auth::SignedOut);
     }
 
     #[test]

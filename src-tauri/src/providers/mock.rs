@@ -4,9 +4,11 @@
 //! and a real run would spend the user's subscription. Only the *process* is
 //! faked here — normalisation is the same code a live run goes through.
 //!
-//! Provenance: `fixtures/*.jsonl` are written to the event shapes verified in
-//! `docs/architecture.md`, not captured from a live session. Replace a file
-//! with a real capture the first time one is available; nothing else changes.
+//! Provenance: `*-run.jsonl` are written to the event shapes verified in
+//! `docs/architecture.md`. `claude-auth-failure.jsonl` and
+//! `codex-usage-limit.jsonl` are real captures from the argv in `run::args`,
+//! recorded 2026-09-12 - both CLIs refused before doing any work, which is why
+//! the happy paths are still hand-written.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -273,5 +275,51 @@ mod tests {
         let line = serde_json::json!({"type": "something.new", "payload": 1});
         assert!(ProviderId::Claude.parse_line(&line).is_empty());
         assert!(ProviderId::Codex.parse_line(&line).is_empty());
+    }
+
+    /// Real capture: `claude` installed but logged out. The trap is that the
+    /// final event says `subtype: "success"` while `is_error` is true, so a
+    /// parser keying on subtype alone would report a clean run that did nothing.
+    #[test]
+    fn a_logged_out_claude_capture_is_a_failure_not_a_success() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("claude-auth-failure.jsonl");
+        let events = replay(ProviderId::Claude, &path).expect("fixture should be readable");
+
+        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Done { .. })),
+            "a refused run must never report Done"
+        );
+        let failure = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::Failed { kind, message } => Some((kind, message)),
+                _ => None,
+            })
+            .expect("a refused run reports a failure");
+        assert_eq!(*failure.0, FailureKind::AuthExpired);
+        assert!(failure.1.contains("/login"));
+        // Zero tokens billed is not a zero-cost run, it is an unknown one.
+        assert_eq!(usage(&events).cost_quality, CostQuality::Unavailable);
+    }
+
+    /// Real capture: `codex` logged in but out of credits. It never emits
+    /// `turn.completed`, so there is no usage event at all - the run must still
+    /// surface as a UsageLimit failure rather than an empty stream.
+    #[test]
+    fn an_out_of_credit_codex_capture_reports_a_usage_limit() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("codex-usage-limit.jsonl");
+        let events = replay(ProviderId::Codex, &path).expect("fixture should be readable");
+
+        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Usage(_))));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderEvent::Failed { kind: FailureKind::UsageLimit, .. }
+        )));
     }
 }

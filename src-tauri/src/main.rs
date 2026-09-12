@@ -150,35 +150,29 @@ async fn install_provider(app: AppHandle, provider: ProviderId) -> Result<Detect
     Ok(detected)
 }
 
-async fn npm_install(provider: ProviderId, npm: &std::path::Path, emit: impl Fn(String)) -> Result<()> {
-    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _install = INSTALL.try_lock().map_err(|_| AppError::new(ErrorKind::Invalid, "Another provider installation is already running."))?;
-    let package = provider.package();
-    // Never in the user's project: a repository's own .npmrc can point npm at
-    // another registry, and this runs before anyone has consented to anything.
-    let mut run = proc::spawn(
-        &npm.to_string_lossy(),
-        &["install", "--global", package],
-        &std::env::temp_dir(),
-    )?;
+/// Spawn a tool, stream every line to the UI as it arrives, and wait for it to
+/// exit. Returns the exit code and the last few lines, because both npm and the
+/// provider CLIs explain a failure on the way down rather than at the end.
+///
+/// Always runs in the temp directory, never the user's project: a repository's
+/// own `.npmrc` can redirect the registry and its `.claude/settings.json` hooks
+/// run on CLI startup - and this happens before anyone has consented to it.
+async fn stream_tool(
+    program: &std::path::Path,
+    args: &[&str],
+    emit: impl Fn(String),
+) -> Result<(Option<i32>, Vec<String>)> {
+    let mut run = proc::spawn(&program.to_string_lossy(), args, &std::env::temp_dir())?;
+    // Closed on purpose: nothing here can answer a prompt, so a CLI that wants
+    // one must fail fast instead of hanging a button forever.
     run.close_stdin();
 
-    // npm says why it failed on the way down, so keep the tail for the message.
     let mut tail: Vec<String> = Vec::new();
     while let Some(line) = run.lines.recv().await {
         let text = match line {
             Line::Text(text) => text,
             Line::Json(value) => value.to_string(),
-            Line::Exit(code) => {
-                return if code == Some(0) {
-                    Ok(())
-                } else {
-                    Err(AppError::new(
-                        ErrorKind::Io,
-                        format!("npm could not install {package}: {}", tail.join(" ")),
-                    ))
-                };
-            }
+            Line::Exit(code) => return Ok((code, tail)),
         };
         if text.trim().is_empty() {
             continue;
@@ -191,7 +185,73 @@ async fn npm_install(provider: ProviderId, npm: &std::path::Path, emit: impl Fn(
     }
     Err(AppError::new(
         ErrorKind::Io,
-        format!("npm stopped without saying whether {package} installed"),
+        format!("{} stopped without reporting an exit code", program.display()),
+    ))
+}
+
+async fn npm_install(provider: ProviderId, npm: &std::path::Path, emit: impl Fn(String)) -> Result<()> {
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _install = INSTALL.try_lock().map_err(|_| AppError::new(ErrorKind::Invalid, "Another provider installation is already running."))?;
+    let package = provider.package();
+    let (code, tail) = stream_tool(npm, &["install", "--global", package], emit).await?;
+    if code == Some(0) {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            ErrorKind::Io,
+            format!("npm could not install {package}: {}", tail.join(" ")),
+        ))
+    }
+}
+
+/// Run the provider CLI's own sign-in and re-detect afterwards. Orteca opens no
+/// login page and never sees a password: the CLI prints a URL, the user approves
+/// it in their browser, and the CLI writes its own credential. All Orteca does
+/// is start it, show the output, and ask the CLI again when it is done.
+#[tauri::command(async)]
+async fn sign_in_provider(app: AppHandle, provider: ProviderId) -> Result<Detected> {
+    static SIGN_IN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _lock = SIGN_IN
+        .try_lock()
+        .map_err(|_| AppError::new(ErrorKind::Invalid, "A sign-in is already running."))?;
+
+    let program = providers::which(provider.program()).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::CliMissing,
+            format!("{} is not installed or not on PATH.", provider.program()),
+        )
+    })?;
+
+    // A browser round trip is slow but not unbounded. Without this the button
+    // would hang forever on a login the user abandoned - cancel arrives in M5.
+    let stream = stream_tool(&program, provider.login_args(), |line| {
+        let _ = app.emit("sign-in-event", (provider, line));
+    });
+    let (code, tail) = tokio::time::timeout(std::time::Duration::from_secs(300), stream)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                ErrorKind::Io,
+                format!("{} sign-in timed out after 5 minutes.", provider.program()),
+            )
+        })??;
+
+    let detected = tauri::async_runtime::spawn_blocking(move || provider.detect())
+        .await
+        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?;
+
+    // The CLI's own answer decides, not its exit code: a sign-in that reports
+    // success but left the CLI signed out is still signed out.
+    if detected.auth == providers::Auth::Subscription || detected.auth == providers::Auth::ApiKey {
+        return Ok(detected);
+    }
+    Err(AppError::new(
+        ErrorKind::Invalid,
+        if tail.is_empty() {
+            format!("{} is still signed out (exit {code:?}).", provider.program())
+        } else {
+            format!("{} is still signed out: {}", provider.program(), tail.join(" "))
+        },
     ))
 }
 
@@ -222,6 +282,7 @@ fn main() {
             open_project,
             detect_providers,
             install_provider,
+            sign_in_provider,
             recent_projects,
             start_task,
             trust_project,

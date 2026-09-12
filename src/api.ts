@@ -52,3 +52,14 @@ export const installProvider = (provider: ProviderId) =>
 
 export const onInstallEvent = (fn: (provider: ProviderId, line: string) => void) =>
   listen<[ProviderId, string]>("install-event", (e) => fn(e.payload[0], e.payload[1]));
+
+/**
+ * Runs the CLI's own sign-in. Orteca shows no login form and never sees a
+ * password: the CLI prints a URL, the user approves it in their browser.
+ * Resolves with the fresh detection, or throws if it is still signed out.
+ */
+export const signInProvider = (provider: ProviderId) =>
+  invoke<Detected>("sign_in_provider", { provider });
+
+export const onSignInEvent = (fn: (provider: ProviderId, line: string) => void) =>
+  listen<[ProviderId, string]>("sign-in-event", (e) => fn(e.payload[0], e.payload[1]));

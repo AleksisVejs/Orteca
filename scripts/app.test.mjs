@@ -35,7 +35,7 @@ async function projectView(api = {}) {
     onInstallEvent: async () => () => {},
     onSignInEvent: async () => () => {},
     cancelTask: async () => {},
-    sendInstruction: async () => {},
+    sendInstruction: async () => ({ disposition: 'live' }),
     isAppError: e => !!e?.message,
     ...api,
   });
@@ -214,7 +214,10 @@ test('an instruction is shown as the user’s own words and clears the box', asy
   let release;
   const { state } = await projectView({
     detectProviders: async () => [{ id: 'claude', path: 'fake.exe', steering: 'live' }],
-    sendInstruction: async (taskId, text, applyNow) => { sent = { taskId, text, applyNow }; },
+    sendInstruction: async (taskId, text, applyNow) => {
+      sent = { taskId, text, applyNow };
+      return { disposition: 'live' };
+    },
     startTask: async (...args) => {
       const [onEvent, onTask] = args.filter(arg => typeof arg === 'function');
       onTask(4);
@@ -235,6 +238,29 @@ test('an instruction is shown as the user’s own words and clears the box', asy
   assert.equal(mine[0].text, 'use tabs');
 
   release({ ...finished, status: 'done', failure: null, summary: 'done' });
+  await running;
+});
+
+test('a too-late instruction stays in the box and is not shown as delivered', async () => {
+  let release;
+  const { state } = await projectView({
+    detectProviders: async () => [{ id: 'claude', path: 'fake.exe', steering: 'live' }],
+    sendInstruction: async () => ({ disposition: 'tooLate' }),
+    startTask: async (...args) => {
+      args.filter(arg => typeof arg === 'function')[1](6);
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+
+  const running = state.run();
+  state.instruction.value = 'keep this request';
+  await state.instruct(false);
+
+  assert.match(state.instructionError.value, /finished before/);
+  assert.equal(state.instruction.value, 'keep this request');
+  assert.equal(state.lines.value.filter(l => l.kind === 'instruction').length, 0);
+
+  release({ ...finished, status: 'done', failure: null });
   await running;
 });
 

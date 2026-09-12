@@ -8,6 +8,7 @@ import type {
   Project,
   ProviderEvent,
   ProviderId,
+  InstructionReceipt,
   TaskResult,
 } from "./types";
 
@@ -70,7 +71,7 @@ export const cancelTask = (taskId: number) =>
  * the instruction rather than waiting for a boundary that may never come.
  */
 export const sendInstruction = (taskId: number, text: string, applyNow: boolean) =>
-  invoke<void>("send_instruction", { taskId, text, applyNow });
+  invoke<InstructionReceipt>("send_instruction", { taskId, text, applyNow });
 
 /** Installs the CLI with npm. Resolves with the fresh detection, or throws. */
 export const installProvider = (provider: ProviderId) =>

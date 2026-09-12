@@ -81,44 +81,6 @@ fn summarize(input: &Value) -> String {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn summary(input: Value) -> String {
-        let block = serde_json::json!({"type": "tool_use", "name": "T", "input": input});
-        match super::block(&block) {
-            Some(ProviderEvent::ToolUse { summary, .. }) => summary,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// The bug: a Write call is `{content, file_path}`, and taking whichever
-    /// string came first meant the activity stream printed the contents of
-    /// every file an agent wrote instead of its name.
-    #[test]
-    fn a_tool_call_is_summarised_by_what_it_touched_not_by_what_it_carried() {
-        assert_eq!(
-            summary(serde_json::json!({"content": "fn main() {}", "file_path": "src/main.rs"})),
-            "src/main.rs",
-            "a Write must name the file, not quote it"
-        );
-        assert_eq!(summary(serde_json::json!({"command": "cargo test", "description": "run tests"})), "cargo test");
-        assert_eq!(summary(serde_json::json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})), "a.rs");
-        assert_eq!(summary(serde_json::json!({"pattern": "TODO", "path": "src"})), "TODO");
-        // Nothing recognised: still better than an empty line.
-        assert_eq!(summary(serde_json::json!({"whatever": "something"})), "something");
-        assert_eq!(summary(serde_json::json!({"count": 3})), "");
-    }
-
-    /// Cut by characters, never by bytes: a multi-byte path would panic.
-    #[test]
-    fn a_long_summary_is_cut_without_splitting_a_character() {
-        let long = "é".repeat(200);
-        assert_eq!(summary(serde_json::json!({"file_path": long})).chars().count(), 120);
-    }
-}
-
 /// Only the final `result` carries trustworthy numbers. Per-message `usage`
 /// reports the output count the API had at `message_start`, and one API
 /// response can produce several assistant messages all repeating that same
@@ -171,4 +133,42 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
 
 fn n(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(input: Value) -> String {
+        let block = serde_json::json!({"type": "tool_use", "name": "T", "input": input});
+        match super::block(&block) {
+            Some(ProviderEvent::ToolUse { summary, .. }) => summary,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The bug: a Write call is `{content, file_path}`, and taking whichever
+    /// string came first meant the activity stream printed the contents of
+    /// every file an agent wrote instead of its name.
+    #[test]
+    fn a_tool_call_is_summarised_by_what_it_touched_not_by_what_it_carried() {
+        assert_eq!(
+            summary(serde_json::json!({"content": "fn main() {}", "file_path": "src/main.rs"})),
+            "src/main.rs",
+            "a Write must name the file, not quote it"
+        );
+        assert_eq!(summary(serde_json::json!({"command": "cargo test", "description": "run tests"})), "cargo test");
+        assert_eq!(summary(serde_json::json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})), "a.rs");
+        assert_eq!(summary(serde_json::json!({"pattern": "TODO", "path": "src"})), "TODO");
+        // Nothing recognised: still better than an empty line.
+        assert_eq!(summary(serde_json::json!({"whatever": "something"})), "something");
+        assert_eq!(summary(serde_json::json!({"count": 3})), "");
+    }
+
+    /// Cut by characters, never by bytes: a multi-byte path would panic.
+    #[test]
+    fn a_long_summary_is_cut_without_splitting_a_character() {
+        let long = "é".repeat(200);
+        assert_eq!(summary(serde_json::json!({"file_path": long})).chars().count(), 120);
+    }
 }

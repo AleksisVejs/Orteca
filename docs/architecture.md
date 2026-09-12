@@ -138,7 +138,7 @@ What is honestly available:
 only after >= 5 comparable tasks in that project give a rolling median baseline, and is
 labelled `estimated`. `baselines` table exists from day one to collect this.
 
-**4.2 The "context engine" as specified duplicates work the agents already do.**
+**4.2 The context engine must cut exploration, and it must enforce a budget.**
 
 Sending curated file *contents* fights the agent's own retrieval and often pays for
 the same bytes twice. The leverage is cheaper: a tight brief that **names paths** so
@@ -146,10 +146,46 @@ the agent stops hunting, plus a `--max-turns` ceiling.
 
 MVP context engine = ripgrep + path heuristics + `git log` recency → a ranked list of
 ~10 likely paths, pasted into the prompt as "start here". Not file contents. Not
-embeddings. Not an AST index.
+embeddings. Not an AST index. It also gives every route an `ExecutionBudget`:
+
+```text
+max_agent_calls     maximum provider processes/stages
+max_turns           provider turn ceiling where the CLI supports one
+max_reported_tokens cumulative reported usage; checked after each completed turn
+preferred_tier      cheapest capable provider/model tier for this task class
+```
+
+The token value is an **inter-turn guard**, not a dishonest promise that Orteca
+can interrupt an unknown number of tokens midway through a provider turn. Once a
+completed turn crosses it, Orteca starts no later stage or resume automatically.
+It returns `budget reached` with the work, diff, usage, and a deliberate user
+choice to continue. A trivial task must not silently become a long-running
+session.
 
 **4.3 `project_symbols` / full repo indexing is premature.** Deferred. ripgrep is fast
 enough on a solo dev's repo and is always current.
+
+### 4.3.1 Observed efficiency baseline — 2026-09-12
+
+These are the values shown by the desktop provider-run summaries for the same
+throwaway slug-normalisation exercise. They are retained as an observed product
+baseline, not as a billing record: provider-reported token semantics and account
+allowance consumption are related but are not interchangeable.
+
+| Provider | Run | Outcome | Reported tokens | Cached tokens | Cached share | Reported cost |
+|---|---|---|---:|---:|---:|---:|
+| Codex | collapse repeated separators / trim boundaries | 6 tests passed | 89,751 | 81,920 | 91.3% | unavailable |
+| Codex | leading-punctuation regression | 7 tests passed | 109,115 | 104,064 | 95.4% | unavailable |
+| Codex | mixed spaces-and-punctuation regression | 7 tests passed | 257,144 | 238,592 | 92.8% | unavailable |
+| Claude | live-steered punctuation regression | 7 tests passed | 230,296 | 217,236 | 94.3% | $0.1033 estimated |
+| Claude | M5 completion confirmation | 7 tests passed | 164,616 | 157,473 | 95.7% | $0.0664 estimated |
+| **Total** | **five tiny-task runs** | **all functional** | **850,922** | **799,285** | **93.9%** | **$0.1697 estimated (Claude only)** |
+
+The code change was a two-file slug fix plus one focused test command. These
+numbers are therefore **not an acceptable efficient-task baseline**. High cache
+share explains repeated context reuse, not proportional work. M6/M7 are only
+complete when a comparable trivial task takes the one-call route and the new
+baseline is materially lower without reducing verification quality.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -359,12 +395,16 @@ signals: complexity 0-10, risk 0-10,
 
 | Condition | Route |
 |---|---|
-| complexity <= 3, risk <= 3, blast <= 5 | Understand → **Implement** → Verify |
+| complexity <= 3, risk <= 3, blast <= 5 | **Implement once** — inspect named paths, edit, run one focused verification inside that call; no Plan or Review |
 | architecture OR complexity >= 7 | Understand → **Plan** → Implement → Verify |
 | security OR authz OR schema_change | Understand → **Plan** → Implement → **Review** → Verify |
 | implement failed twice | escalate: Plan → Implement → Review |
 
-`Efficient` shifts thresholds up by 2 (fewer stages). `Balanced` as written.
+`Efficient` shifts thresholds up by 2 (fewer stages) and chooses the cheapest
+capable configured tier. `Balanced` uses the route as written. A route declares
+its call and turn ceilings before any provider is started; tiny tasks have a
+one-call ceiling. Escalation is never automatic after a budget stop: the user
+must choose to spend more.
 
 Capability → provider map lives in one table, not in the router:
 
@@ -386,7 +426,7 @@ User types an instruction while a task runs:
 | Running | Action |
 |---|---|
 | Claude (stdin open) | write `{"type":"user","message":{"role":"user","content":"..."}}` to its stdin. Live. |
-| Codex | hold. Apply at next stage boundary. UI says "will apply at next step". |
+| Codex | hold. Apply when the current process completes, or at the next stage boundary. UI says "will apply at next step". |
 | Between stages | merge into the next stage's brief. |
 | User picks "apply now" on Codex | Job Object close → `codex exec resume <id>` with the instruction prepended. Diff so far is preserved; nothing is reverted. |
 
@@ -396,18 +436,19 @@ never silently expires.
 ### Verified against the CLIs, not assumed
 
 The first draft of this section guessed `{"type":"user","text":"..."}`, which the
-CLI does not accept. These four facts came out of a live two-turn run and cost a
-few cents; `fixtures/claude-steered-run.jsonl` is that run, so they never need
-paying for again.
+CLI does not accept. These facts came out of live runs and are retained in
+fixtures and regression tests so they do not need paying for again.
 
 1. **The message shape is the Messages-API one**, nested under `message`.
    `--replay-user-messages` echoes an accepted message back, which is the cheap
    way to check this without reading the answer.
-2. **`result` is per *turn*, not per run.** Under `--input-format stream-json`
-   Claude emits a full `result` and then waits for the next message
-   indefinitely. The run ends when Orteca closes stdin — so `stream` counts the
-   turns it is owed and closes only when every user message has been answered.
-   Closing at the first `result` throws away an instruction sent during it.
+2. **A live instruction is part of the active turn.** A message written while
+   Claude is working is incorporated into that turn and does not necessarily
+   produce another `result`; the sandbox steering run completed both requests
+   with one result. A message written after a result starts another turn, as the
+   two-result fixture demonstrates. Orteca therefore closes stdin at the active
+   turn's result, and an instruction racing after that point is reported
+   `tooLate` rather than leaving the task waiting for a result that will not come.
 3. **Usage is per turn but `total_cost_usd` is a session running total.** In the
    recording the cost goes 0.0302 → 0.0405 while turn two's own output is six
    tokens. So `Usage::absorb` adds the tokens and replaces the cost. Treating
@@ -421,15 +462,18 @@ paying for again.
 
 **How it is built.** `run::Live` holds one control sender per live task, and
 `stream` selects over that channel alongside the CLI's output. `Control` is
-`Cancel` or `Instruct { text, apply_now }`. Every instruction is written to
-`task_events` with what became of it — `live`, `held`, `resumed` or `tooLate` —
-so one can never silently evaporate. A resume re-enters the same `stream` with
-new argv, keeping one event log, one token total and one diff baseline across
-both processes; the kill that hands over is not reported as a crash.
+`Cancel` or `Instruct { text, apply_now, reply }`. The reply is completed by the
+run loop, not when the control is merely enqueued, so the UI only clears words
+the provider can still take. Every instruction is written to `task_events` with
+its disposition — `live`, `held`, `resumed` or `tooLate`. A resume re-enters the
+same `stream` with new argv, keeping one event log, one token total and one diff
+baseline across both processes; the kill that hands over is not reported as a
+crash.
 
-A single-stage run has no stage boundary, so a held Codex instruction has
-nothing to apply itself to until Milestone 6. That is why "apply now" exists,
-and why the UI says plainly that Send will wait.
+A held Codex instruction is applied by resuming the session when its current
+process completes. "Apply now" ends that process early; if it arrives before
+Codex reports a session ID, the request remains pending and restarts as soon as
+the ID arrives. The UI says plainly that Send waits for the natural boundary.
 
 ## 10. Command and process safety
 
@@ -475,6 +519,11 @@ Orteca never runs a destructive git command. Diff captured with
 Ranking for a task brief: ripgrep the prompt's nouns → score by path match, name
 match, `git log -n 50` recency, test-file adjacency. Top ~10 paths go in the brief.
 
+The brief also carries its route budget and a concise completion contract:
+target paths, one focused test command when known, and the instruction to stop
+after success. It must not paste file contents, whole repository status, or a
+generic multi-stage checklist into a small task.
+
 ## 13. Inter-stage artifacts
 
 Enforced by `--json-schema` (Claude) and `--output-schema` (Codex). Not prose parsing.
@@ -503,8 +552,8 @@ Review artifact:
 | 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
 | 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
 | 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | done |
-| 6 | Classifier + multi-stage routes + structured artifacts + verify | Plan → Build → Review works | |
-| 7 | file_cache, path ranking, usage + baselines, route visual | metrics are honest and labelled | |
+| 6 | Classifier + budgeted routes + structured artifacts + verify | classifier adds no model call; a trivial task has a one-call route; every route has explicit call/turn ceilings and never auto-escalates after a budget stop | |
+| 7 | file_cache, path ranking, usage + baselines, route visual | brief names ranked paths without file contents; cumulative provider usage enforces the inter-turn token guard; comparable-task baselines make savings estimates honest | |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |
 
 Spec's 17 collapsed: detection folds into one slice, metrics into one, route visual
@@ -516,6 +565,10 @@ rides along with metrics. Each slice ends commit-ready with tests.
 2. **No savings percentage until a baseline exists.** Once a project has >= 5
    comparable tasks, show a rolling-median comparison labelled `estimated`.
    Before that, the result screen shows absolute tokens and calls avoided.
+3. **Efficiency is a control, not a slogan.** Do not claim a task was efficient
+   merely because most input was cached. The run must have a declared budget,
+   a small-task single-call path, and an honest budget-reached outcome before
+   Orteca can make that claim.
 
 ## 16. Notes for whoever picks this up
 

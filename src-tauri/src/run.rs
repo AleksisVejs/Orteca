@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AppError, ErrorKind};
 use crate::proc::{self, Line};
@@ -51,7 +51,7 @@ fn claude_deny() -> Vec<String> {
 }
 
 /// What a user can still do to a run that is already going.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Control {
     /// Stop now. Whatever the agent already wrote to the working tree stays
     /// written: Orteca captures a diff, it never reverts the user's files.
@@ -61,7 +61,28 @@ pub enum Control {
     /// `apply_now` is the user choosing not to wait for a boundary that a
     /// single-stage run never reaches - it ends the process and resumes the
     /// session carrying the instruction.
-    Instruct { text: String, apply_now: bool },
+    Instruct {
+        text: String,
+        apply_now: bool,
+        reply: oneshot::Sender<InstructionReceipt>,
+    },
+}
+
+/// What actually happened to an instruction, returned only after the run loop
+/// has handled it. Enqueueing a control message is not proof that stdin took it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstructionDisposition {
+    Live,
+    Held,
+    Resumed,
+    TooLate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionReceipt {
+    pub disposition: InstructionDisposition,
 }
 
 /// The runs a user can still reach, one sender per live task.
@@ -100,6 +121,30 @@ impl Live {
                 "That run has already finished.",
             ))
         }
+    }
+
+    /// Deliver an instruction and wait for the run loop's real disposition.
+    pub async fn instruct(
+        &self,
+        task_id: i64,
+        text: String,
+        apply_now: bool,
+    ) -> crate::error::Result<InstructionReceipt> {
+        let (reply, answer) = oneshot::channel();
+        self.send(
+            task_id,
+            Control::Instruct {
+                text,
+                apply_now,
+                reply,
+            },
+        )?;
+        answer.await.map_err(|_| {
+            AppError::new(
+                ErrorKind::NotFound,
+                "That run ended before it could confirm the instruction.",
+            )
+        })
     }
 }
 
@@ -360,6 +405,9 @@ struct State {
     held: Vec<String>,
     /// The provider's own session id, which is what a resume needs.
     session: Option<String>,
+    /// Apply-now arrived before Codex identified its session. Restart as soon
+    /// as the Started event supplies the ID instead of dropping the request.
+    apply_now_pending: bool,
 }
 
 /// What happens after one process ends.
@@ -383,6 +431,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         noise: Vec::new(),
         held: Vec::new(),
         session: None,
+        apply_now_pending: false,
     };
 
     // Usually one pass. A checkpoint provider told to apply an instruction now
@@ -451,19 +500,17 @@ async fn attempt(
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     launch: Launch,
 ) -> Next {
-    let State { outcome, recording, noise, held, session } = state;
-
     let borrowed: Vec<&str> = launch.argv.iter().map(String::as_str).collect();
     let mut run = match proc::spawn(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir) {
         Ok(run) => run,
         Err(e) => {
-            outcome.failure = Some(format!("could not start {}: {e}", ctx.id.program()));
+            state.outcome.failure = Some(format!("could not start {}: {e}", ctx.id.program()));
             return Next::Ended;
         }
     };
     // Prompt bytes bypass cmd.exe parsing and its command-line limit.
     if let Err(e) = run.send_line(&launch.opening).await {
-        outcome.failure = Some(format!("could not send prompt to {}: {e}", ctx.id.program()));
+        state.outcome.failure = Some(format!("could not send prompt to {}: {e}", ctx.id.program()));
     }
     // A checkpoint provider is told no more input is coming. A live one keeps
     // its stdin, because that is what an instruction travels down - which also
@@ -474,11 +521,6 @@ async fn attempt(
         run.close_stdin();
     }
 
-    // Turns Orteca is still waiting on. A live provider answers one user
-    // message per turn, and stdin has to stay open until the last one has been
-    // answered: closing it at the first result would cut off an instruction
-    // that was sent while that turn was still running.
-    let mut owed: u32 = 1;
     // Set once this process is known to be ending, so whatever it has already
     // written is still drained before the decision is acted on.
     let mut ending: Option<Next> = None;
@@ -489,7 +531,7 @@ async fn attempt(
             // left to kill - and again if the sender is dropped, so a closed
             // control channel cannot spin this loop.
             Some(action) = control.recv(), if ending.is_none() => {
-                ending = answer(action, store, ctx, outcome, held, session.as_deref(), &mut run, &mut owed).await;
+                ending = answer(action, store, ctx, state, &mut run).await;
                 continue;
             }
         };
@@ -498,7 +540,7 @@ async fn attempt(
             Line::Json(value) => {
                 // Before parsing: the recording is what the CLI said, not what
                 // Orteca understood of it.
-                recording.write(&value);
+                state.recording.write(&value);
                 let events = ctx.id.parse_line(&value);
                 // Each parser understands a subset of its CLI's event types and
                 // silently drops the rest. Harmless for the stream, fatal for
@@ -509,45 +551,46 @@ async fn attempt(
                 // complete while the stream stays readable.
                 if events.is_empty() {
                     if let Err(e) = store.append_event(ctx.task_id, STAGE, "unknown", ctx.id.program(), &value.to_string()) {
-                        outcome.failure = Some(format!("could not record run event: {}", e.message));
+                        state.outcome.failure = Some(format!("could not record run event: {}", e.message));
                         break;
                     }
                 }
                 for event in events {
                     if let Err(e) = record(store, ctx.task_id, ctx.id, &event).and_then(|()| emit(&event)) {
-                        outcome.failure = Some(format!("could not record or deliver run event: {}", e.message));
+                        state.outcome.failure = Some(format!("could not record or deliver run event: {}", e.message));
                         break;
                     }
                     if let ProviderEvent::Started { session_id } = &event {
-                        *session = Some(session_id.clone());
+                        state.session = Some(session_id.clone());
                     }
-                    outcome.absorb(&event);
+                    state.outcome.absorb(&event);
                     if matches!(event, ProviderEvent::Done { .. }) {
                         match ctx.id.steering() {
                             // The CLI ends itself once its one turn is done.
-                            Steering::Checkpoint => outcome.finished = true,
+                            Steering::Checkpoint => state.outcome.finished = true,
                             Steering::Live => {
-                                // A result per turn, not per run. The run ends
-                                // when every message has been answered and
-                                // Orteca closes stdin - never before, or an
-                                // instruction sent during this turn is lost.
-                                owed = owed.saturating_sub(1);
-                                if owed == 0 {
-                                    outcome.finished = true;
-                                    run.close_stdin();
-                                }
+                                // A live instruction accepted before this
+                                // result is incorporated into the same turn by
+                                // current Claude Code. It does not create a
+                                // second result, so this result completes every
+                                // instruction the open stdin accepted.
+                                state.outcome.finished = true;
+                                run.close_stdin();
                             }
                         }
                     }
                 }
-                if outcome.failure.is_some() { break; }
+                if state.outcome.failure.is_some() { break; }
+                if ending.is_none() && state.apply_now_pending {
+                    ending = restart_held(ctx, state, &run);
+                }
             }
             Line::Text(text) => {
                 if !text.trim().is_empty() {
-                    noise.push(text);
+                    state.noise.push(text);
                     // Only the tail matters for a failure message.
-                    if noise.len() > 5 {
-                        noise.remove(0);
+                    if state.noise.len() > 5 {
+                        state.noise.remove(0);
                     }
                 }
             }
@@ -555,7 +598,20 @@ async fn attempt(
                 // A process ended on purpose - stopped by the user, or handed
                 // over to a resume - has nothing to explain.
                 if ending.is_none() {
-                    outcome.exited(ctx.id, code, noise);
+                    state.outcome.exited(ctx.id, code, &state.noise);
+                    if state.outcome.failure.is_none()
+                        && ctx.id.steering() == Steering::Checkpoint
+                        && !state.held.is_empty()
+                    {
+                        if let Some(restart) = restart_held(ctx, state, &run) {
+                            ending = Some(restart);
+                        } else {
+                            state.outcome.failure = Some(
+                                "Codex finished without reporting a session, so its held instruction could not be applied."
+                                    .into(),
+                            );
+                        }
+                    }
                 }
                 break;
             }
@@ -570,68 +626,84 @@ async fn answer(
     action: Control,
     store: &Store,
     ctx: &Context,
-    outcome: &mut Outcome,
-    held: &mut Vec<String>,
-    session: Option<&str>,
+    state: &mut State,
     run: &mut proc::Run,
-    owed: &mut u32,
 ) -> Option<Next> {
     match action {
         Control::Cancel => {
             // Logged before the kill, because after it there may be no run
             // left to log anything.
             if let Err(e) = note(store, ctx, "cancel", CANCEL_PAYLOAD) {
-                outcome.failure = Some(format!("could not record the stop: {}", e.message));
+                state.outcome.failure = Some(format!("could not record the stop: {}", e.message));
                 return Some(Next::Ended);
             }
-            outcome.cancelled = true;
+            state.outcome.cancelled = true;
             // Not a drop: the exit waiter still has the last of the CLI's
             // output to hand over.
             run.cancel();
             Some(Next::Ended)
         }
-        Control::Instruct { text, apply_now } => {
+        Control::Instruct { text, apply_now, reply } => {
             // A resume needs a session to resume, and a provider only reports
             // one once it has started talking. Without it the instruction waits
             // rather than appearing to have been applied.
-            let resume = match (ctx.id.steering(), apply_now, session) {
-                (Steering::Checkpoint, true, Some(session)) => Some(session.to_string()),
-                _ => None,
-            };
-            let applied = match ctx.id.steering() {
+            let disposition = match ctx.id.steering() {
                 Steering::Live => {
                     // Straight down stdin, mid-turn. The only way this fails is
                     // a run whose stdin Orteca has already closed, which means
                     // the instruction arrived after the last turn ended.
                     match run.send_line(&claude::user_message(&text)).await {
                         Ok(()) => {
-                            // One more turn to wait for before stdin may close.
-                            *owed += 1;
-                            "live"
+                            InstructionDisposition::Live
                         }
-                        Err(_) => "tooLate",
+                        Err(_) => InstructionDisposition::TooLate,
                     }
                 }
                 Steering::Checkpoint => {
-                    held.push(text.clone());
-                    if resume.is_some() { "resumed" } else { "held" }
+                    state.held.push(text.clone());
+                    if apply_now && state.session.is_none() {
+                        state.apply_now_pending = true;
+                    }
+                    if apply_now && state.session.is_some() {
+                        InstructionDisposition::Resumed
+                    } else {
+                        InstructionDisposition::Held
+                    }
                 }
             };
             // Never lost, whatever became of it: the task log is the record of
             // what the user asked for, the ones that had to wait included.
-            if let Err(e) = note(store, ctx, "instruction", &instruction(&text, applied)) {
-                outcome.failure = Some(format!("could not record the instruction: {}", e.message));
+            if let Err(e) = note(store, ctx, "instruction", &instruction(&text, disposition)) {
+                state.outcome.failure = Some(format!("could not record the instruction: {}", e.message));
                 return Some(Next::Ended);
             }
-            let session = resume?;
-            let launch = Launch::resume(ctx.id, &session, held);
-            held.clear();
-            // The diff so far is kept and nothing is reverted: it is the
-            // session that carries the work forward, not the process.
-            run.cancel();
-            Some(Next::Restart(launch))
+            let _ = reply.send(InstructionReceipt { disposition });
+            if disposition == InstructionDisposition::Resumed {
+                restart_held(ctx, state, run)
+            } else {
+                None
+            }
         }
     }
+}
+
+/// Resume a checkpoint provider with every instruction accumulated since its
+/// last launch. Called immediately for Apply now, when a delayed session ID
+/// arrives, or at the natural process boundary for an ordinary Send.
+fn restart_held(ctx: &Context, state: &mut State, run: &proc::Run) -> Option<Next> {
+    let session = state.session.as_deref()?;
+    if state.held.is_empty() {
+        return None;
+    }
+    let launch = Launch::resume(ctx.id, session, &state.held);
+    state.held.clear();
+    state.apply_now_pending = false;
+    // The next attempt must prove its own completion. Keeping this true from
+    // the previous turn would let a failed resume exit zero and look done.
+    state.outcome.done = false;
+    state.outcome.finished = false;
+    run.cancel();
+    Some(Next::Restart(launch))
 }
 
 /// A row in the task log that no provider said - Orteca or the user did.
@@ -640,8 +712,8 @@ fn note(store: &Store, ctx: &Context, kind: &str, payload: &str) -> crate::error
     Ok(())
 }
 
-fn instruction(text: &str, applied: &str) -> String {
-    serde_json::json!({ "kind": "instruction", "data": { "text": text, "applied": applied } }).to_string()
+fn instruction(text: &str, disposition: InstructionDisposition) -> String {
+    serde_json::json!({ "kind": "instruction", "data": { "text": text, "applied": disposition } }).to_string()
 }
 
 /// Log the event, then show it. The log is the record; the emit is the view.
@@ -703,6 +775,23 @@ mod tests {
             id: ProviderId::Codex, program: dir.join("fake.cmd"), dir,
             prompt: "a\"b %PATH% & ^\n\\ --help".into(), base_commit: None, dirty_at_start: false, recording: None,
         }
+    }
+
+    async fn wait_for_kind(
+        hearing: &mut mpsc::UnboundedReceiver<&'static str>,
+        expected: &'static str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match hearing.recv().await {
+                    Some(kind) if kind == expected => break,
+                    Some(_) => {}
+                    None => panic!("event stream closed before `{expected}`"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for `{expected}`"));
     }
 
     #[tokio::test]
@@ -870,40 +959,37 @@ ping -n 60 127.0.0.1 >nul
         assert!(mid_turn.done, "a turn did answer");
         assert_eq!(mid_turn.status(), "cancelled", "but the run was stopped mid-work");
 
-        let mut stopped = Outcome::default();
-        stopped.cancelled = true;
+        let mut stopped = Outcome {
+            cancelled: true,
+            ..Outcome::default()
+        };
         // Terminating the job leaves no exit code at all, and that is expected.
         stopped.exited(ProviderId::Codex, None, &["killed".into()]);
         assert_eq!(stopped.failure, None);
         assert_eq!(stopped.status(), "cancelled");
     }
 
-    /// Steering a live provider. The instruction has to land while the turn is
-    /// still running, and the run must then wait for the extra turn instead of
-    /// ending at the first result - closing stdin there would throw the
-    /// instruction away after accepting it.
-    ///
-    /// Also the token arithmetic a steered run depends on: Claude reports usage
-    /// per turn but cost as a session running total, so two turns of one output
-    /// token each are two tokens, at the later cost and not the sum of both.
+    /// Current Claude Code incorporates an instruction received during work
+    /// into the current turn and emits one result for both messages. Waiting
+    /// for one result per input leaves the task running forever.
     #[tokio::test]
-    async fn a_live_provider_is_steered_mid_turn_and_the_run_waits_for_the_answer() {
+    async fn a_live_instruction_incorporated_into_one_result_finishes() {
         let store = Store::in_memory().unwrap();
         let mut request = task_request(&store, "steer-live");
         request.id = ProviderId::Claude;
         let dir = request.dir.clone();
         let task = request.task_id;
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        // Echoes each user message back as a turn, slowly enough that an
-        // instruction can arrive before the turn it belongs to has ended.
+        // Emits activity after the opening message, accepts the instruction,
+        // then reports both through a single final result like the real run.
         std::fs::write(dir.join("fake.js"), concat!(
-            "let buf='',turn=0;process.stdin.setEncoding('utf8');",
+            "let buf='',started=false,messages=[];process.stdin.setEncoding('utf8');",
             "process.stdin.on('data',d=>{buf+=d;const ls=buf.split('\\n');buf=ls.pop();",
             "for(const l of ls){if(!l.trim())continue;const text=JSON.parse(l).message.content;",
-            "console.log(JSON.stringify({type:'assistant',message:{content:[{type:'text',text}]}}));",
-            "const cost=++turn*0.01;",
-            "setTimeout(()=>console.log(JSON.stringify({type:'result',subtype:'success',result:text,",
-            "usage:{input_tokens:1,output_tokens:1},total_cost_usd:cost})),300);}});",
+            "messages.push(text);if(!started){started=true;",
+            "console.log(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'working'}]}}));",
+            "setTimeout(()=>console.log(JSON.stringify({type:'result',subtype:'success',result:messages.join(' + '),",
+            "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01})),300);}}});",
             "process.stdin.on('end',()=>setTimeout(()=>process.exit(0),400));",
         )).unwrap();
 
@@ -915,17 +1001,18 @@ ping -n 60 127.0.0.1 >nul
                 Ok(())
             }),
             async {
-                // The first text means turn one is under way but not finished.
-                while hearing.recv().await != Some("text") {}
-                live.send(task, Control::Instruct { text: "also tidy up".into(), apply_now: false }).unwrap();
+                // The first text means the shared turn is under way.
+                wait_for_kind(&mut hearing, "text").await;
+                let receipt = live.instruct(task, "also tidy up".into(), false).await.unwrap();
+                assert_eq!(receipt.disposition, InstructionDisposition::Live);
             }
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
-        assert_eq!(result.summary, "also tidy up", "the second turn never ran");
+        assert!(result.summary.ends_with("also tidy up"), "the live instruction was not incorporated");
         let usage = result.usage.expect("a steered run still reports usage");
-        assert_eq!(usage.output_tokens, 2, "each turn's tokens have to add up");
-        assert_eq!(usage.cost_usd, Some(0.02), "cost is a session total, not a sum");
+        assert_eq!(usage.output_tokens, 1, "one result must be counted once");
+        assert_eq!(usage.cost_usd, Some(0.01));
 
         let payload = store.event_payloads(task).into_iter()
             .find(|v| v["kind"] == "instruction")
@@ -935,20 +1022,64 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A checkpoint provider has no stdin to speak down, so an instruction
-    /// waits. It still has to be written to the log the moment it is given -
-    /// an instruction that silently evaporates is the failure this guards.
+    /// The control channel can still be live for the few milliseconds between
+    /// Claude's final result closing stdin and the process exit. Enqueueing in
+    /// that window must report too-late rather than claim delivery.
     #[tokio::test]
-    async fn a_checkpoint_provider_holds_an_instruction_it_cannot_take() {
+    async fn a_live_instruction_after_the_final_result_is_reported_too_late() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "steer-too-late");
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        let task = request.task_id;
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        std::fs::write(dir.join("fake.js"), concat!(
+            "process.stdin.resume();",
+            "console.log(JSON.stringify({type:'result',subtype:'success',result:'done',",
+            "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));",
+            "process.stdin.on('end',()=>setTimeout(()=>process.exit(0),500));",
+        )).unwrap();
+
+        let live = Live::default();
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
+        let (result, receipt) = tokio::join!(
+            stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
+            async {
+                wait_for_kind(&mut hearing, "done").await;
+                live.instruct(task, "one more thing".into(), false).await.unwrap()
+            }
+        );
+
+        assert_eq!(receipt.disposition, InstructionDisposition::TooLate);
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        let payload = store.event_payloads(task).into_iter()
+            .find(|v| v["kind"] == "instruction").expect("the late instruction was not logged");
+        assert_eq!(payload["data"]["applied"], "tooLate");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A checkpoint provider has no stdin to speak down, so an instruction
+    /// waits until the current process ends and is then applied by resuming the
+    /// session. Merely logging and dropping it is not enough.
+    #[tokio::test]
+    async fn a_checkpoint_instruction_is_applied_at_the_process_boundary() {
         let store = Store::in_memory().unwrap();
         let request = task_request(&store, "steer-held");
         let dir = request.dir.clone();
         let task = request.task_id;
-        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        // Talks, waits long enough to be steered, then finishes by itself.
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        // The first process finishes naturally. The held instruction must then
+        // enter the same session through a resumed process.
         std::fs::write(dir.join("fake.js"), concat!(
+            "const a=process.argv.slice(2);",
+            "if(!a.includes('resume')){",
+            "console.log(JSON.stringify({type:'thread.started',thread_id:'sess-held'}));",
             "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'working'}}));",
-            "setTimeout(()=>{console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));},700);",
+            "setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}})),700);",
+            "}else{let i='';process.stdin.setEncoding('utf8');process.stdin.on('data',d=>i+=d);",
+            "process.stdin.on('end',()=>{",
+            "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'boundary '+i.trim()}}));",
+            "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));});}",
         )).unwrap();
 
         let live = Live::default();
@@ -956,12 +1087,14 @@ ping -n 60 127.0.0.1 >nul
         let (result, ()) = tokio::join!(
             stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
             async {
-                while hearing.recv().await != Some("text") {}
-                live.send(task, Control::Instruct { text: "use tabs".into(), apply_now: false }).unwrap();
+                wait_for_kind(&mut hearing, "text").await;
+                let receipt = live.instruct(task, "use tabs".into(), false).await.unwrap();
+                assert_eq!(receipt.disposition, InstructionDisposition::Held);
             }
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert_eq!(result.summary, "boundary use tabs");
         let payload = store.event_payloads(task).into_iter()
             .find(|v| v["kind"] == "instruction")
             .expect("a held instruction still has to be recorded");
@@ -999,8 +1132,9 @@ ping -n 60 127.0.0.1 >nul
         let (result, ()) = tokio::join!(
             stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
             async {
-                while hearing.recv().await != Some("text") {}
-                live.send(task, Control::Instruct { text: "make it faster".into(), apply_now: true }).unwrap();
+                wait_for_kind(&mut hearing, "text").await;
+                let receipt = live.instruct(task, "make it faster".into(), true).await.unwrap();
+                assert_eq!(receipt.disposition, InstructionDisposition::Resumed);
             }
         );
 
@@ -1019,19 +1153,27 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Apply-now before the provider has said who it is. There is no session to
-    /// resume yet, so the instruction has to wait rather than look applied.
+    /// Apply-now before the provider has said who it is waits for the Started
+    /// event and then immediately resumes instead of evaporating.
     #[tokio::test]
-    async fn applying_now_without_a_session_yet_holds_instead_of_pretending() {
+    async fn applying_now_before_the_session_id_resumes_when_it_arrives() {
         let store = Store::in_memory().unwrap();
         let request = task_request(&store, "steer-nosession");
         let dir = request.dir.clone();
         let task = request.task_id;
-        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        // Never reports a thread id at all.
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        // There is enough time to submit Apply now after text but before the
+        // delayed session ID. Resumed, the shim reports the carried words.
         std::fs::write(dir.join("fake.js"), concat!(
+            "const a=process.argv.slice(2);",
+            "if(!a.includes('resume')){",
             "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'anonymous'}}));",
-            "setTimeout(()=>console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1}})),700);",
+            "setTimeout(()=>console.log(JSON.stringify({type:'thread.started',thread_id:'sess-late'})),500);",
+            "setInterval(()=>{},1000);",
+            "}else{let i='';process.stdin.setEncoding('utf8');process.stdin.on('data',d=>i+=d);",
+            "process.stdin.on('end',()=>{",
+            "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'late '+i.trim()}}));",
+            "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));});}",
         )).unwrap();
 
         let live = Live::default();
@@ -1039,15 +1181,17 @@ ping -n 60 127.0.0.1 >nul
         let (result, ()) = tokio::join!(
             stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
             async {
-                while hearing.recv().await != Some("text") {}
-                live.send(task, Control::Instruct { text: "hurry".into(), apply_now: true }).unwrap();
+                wait_for_kind(&mut hearing, "text").await;
+                let receipt = live.instruct(task, "hurry".into(), true).await.unwrap();
+                assert_eq!(receipt.disposition, InstructionDisposition::Held);
             }
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert_eq!(result.summary, "late hurry");
         let payload = store.event_payloads(task).into_iter()
             .find(|v| v["kind"] == "instruction").expect("not logged");
-        assert_eq!(payload["data"]["applied"], "held", "there was no session to resume");
+        assert_eq!(payload["data"]["applied"], "held", "the receipt was honest while the session was pending");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

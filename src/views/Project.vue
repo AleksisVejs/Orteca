@@ -146,7 +146,11 @@ async function instruct(applyNow: boolean) {
   sending.value = true;
   instructionError.value = null;
   try {
-    await sendInstruction(taskId.value, text, applyNow);
+    const receipt = await sendInstruction(taskId.value, text, applyNow);
+    if (receipt.disposition === "tooLate") {
+      instructionError.value = "The run finished before it could take that instruction.";
+      return;
+    }
     // Shown as the user's own words. Never pushed through `describe`, which
     // would file them among the things the agent said.
     stream.value.push({ kind: "instruction", text });

@@ -120,11 +120,16 @@ fn cancel_task(task_id: i64, live: State<run::Live>) -> Result<()> {
 /// not to wait - the process ends and its session is resumed carrying the
 /// instruction, with the diff so far left exactly as it is.
 #[tauri::command]
-fn send_instruction(task_id: i64, text: String, apply_now: bool, live: State<run::Live>) -> Result<()> {
+async fn send_instruction(
+    task_id: i64,
+    text: String,
+    apply_now: bool,
+    live: State<'_, run::Live>,
+) -> Result<run::InstructionReceipt> {
     let Some(text) = run::clean_prompt(&text) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type the instruction first."));
     };
-    live.send(task_id, run::Control::Instruct { text, apply_now })
+    live.instruct(task_id, text, apply_now).await
 }
 
 fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {

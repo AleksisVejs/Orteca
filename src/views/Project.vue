@@ -14,12 +14,17 @@ const modes: Mode[] = ["efficient", "balanced"];
 // Detected live on every open: a CLI can be installed or signed in behind us.
 // A missing CLI is shown, not thrown - the app is useful with neither present.
 const providers = ref<Detected[]>([]);
+const providerError = ref(false);
 onMounted(async () => {
-  providers.value = await detectProviders().catch(() => []);
+  try {
+    providers.value = await detectProviders();
+  } catch {
+    providerError.value = true;
+  }
 });
 
 const AUTH: Record<Auth, string> = {
-  subscription: "signed in",
+  subscription: "saved login",
   apiKey: "API key",
   signedOut: "not signed in",
   unknown: "",
@@ -56,7 +61,8 @@ const AUTH: Record<Auth, string> = {
 
     <section class="providers">
       <h2>Providers</h2>
-      <ul>
+      <p v-if="providerError" class="missing">detection unavailable</p>
+      <ul v-else>
         <li v-for="p in providers" :key="p.id">
           <span class="who">{{ p.program }}</span>
           <template v-if="p.path">

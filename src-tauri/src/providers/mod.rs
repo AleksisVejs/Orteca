@@ -10,6 +10,7 @@ pub mod codex;
 pub mod mock;
 
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -157,7 +158,7 @@ impl ProviderId {
             return Auth::ApiKey;
         }
         match home().map(|h| h.join(credential)) {
-            Some(p) if p.exists() => Auth::Subscription,
+            Some(p) if credential_file_exists(&p) => Auth::Subscription,
             _ => Auth::SignedOut,
         }
     }
@@ -169,20 +170,50 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn credential_file_exists(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
 /// Resolve a program against PATH x PATHEXT.
 ///
 /// `CreateProcess` only ever appends `.exe`, so an npm shim — which is how
 /// both CLIs install on Windows — is invisible to a bare program name. The
 /// resolved path is also what the process runner will spawn in Milestone 4.
 pub fn which(program: &str) -> Option<PathBuf> {
-    let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
-    env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
+    let path = env::var_os("PATH")?;
+    let pathext = env::var("PATHEXT").unwrap_or_default();
+    which_in(program, &path, &pathext, &env::current_dir().ok()?)
+}
+
+fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<PathBuf> {
+    let pathext = if pathext.split(';').any(|ext| !ext.trim().is_empty()) {
         pathext
-            .split(';')
-            .map(|ext| dir.join(format!("{program}{ext}")))
-            .chain(std::iter::once(dir.join(program)))
-            .find(|p| p.is_file())
-    })
+    } else {
+        ".COM;.EXE;.BAT;.CMD"
+    };
+    let extensions: Vec<String> = pathext
+        .split(';')
+        .map(|ext| ext.trim().trim_matches('"'))
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| {
+            if ext.starts_with('.') {
+                ext.to_string()
+            } else {
+                format!(".{ext}")
+            }
+        })
+        .collect();
+
+    env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            let dir = if dir.is_absolute() { dir } else { cwd.join(dir) };
+            extensions
+                .iter()
+                .map(|ext| dir.join(format!("{program}{ext}")))
+                .find(|candidate| candidate.is_file())
+        })
 }
 
 /// ponytail: no timeout. `--version` on a hung shim would block this call;
@@ -204,6 +235,70 @@ fn version_of(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("orteca-provider-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn which_normalises_pathext_and_relative_path_entries() {
+        let cwd = temp_dir("which-relative");
+        let bin = cwd.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("agent.CMD"), "").unwrap();
+        std::fs::write(bin.join("agent.EXE"), "").unwrap();
+
+        let found = which_in("agent", std::ffi::OsStr::new("bin"), "CMD;.EXE", &cwd);
+        assert_eq!(found, Some(bin.join("agent.CMD")));
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn which_uses_safe_defaults_without_current_directory_fallback() {
+        let cwd = temp_dir("which-defaults");
+        let bin = cwd.join("quoted bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("agent.EXE");
+        std::fs::write(&executable, "").unwrap();
+        let quoted = format!("\"{}\"", bin.display());
+
+        assert_eq!(
+            which_in("agent", std::ffi::OsStr::new(&quoted), "", &cwd),
+            Some(executable)
+        );
+        std::fs::write(cwd.join("agent.EXE"), "").unwrap();
+        assert_eq!(
+            which_in("agent", std::ffi::OsStr::new(""), ".EXE", &cwd),
+            None
+        );
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn credential_detection_rejects_directories_and_empty_files() {
+        let cwd = temp_dir("credentials");
+        let credential = cwd.join("auth.json");
+        std::fs::create_dir(&credential).unwrap();
+        assert!(!credential_file_exists(&credential));
+        std::fs::remove_dir(&credential).unwrap();
+        std::fs::write(&credential, "").unwrap();
+        assert!(!credential_file_exists(&credential));
+        std::fs::write(&credential, "{}").unwrap();
+        assert!(credential_file_exists(&credential));
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn version_detection_executes_a_cmd_shim() {
+        let cwd = temp_dir("cmd-version");
+        let shim = cwd.join("agent.cmd");
+        std::fs::write(&shim, "@echo off\r\necho agent 1.2.3\r\n").unwrap();
+        assert_eq!(version_of(&shim), Some("agent 1.2.3".into()));
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
 
     #[test]
     fn which_resolves_a_pathext_extension() {

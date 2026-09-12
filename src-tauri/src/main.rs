@@ -56,7 +56,7 @@ fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
 /// Live, never stored: a CLI can be installed or signed in while Orteca runs.
 /// Returns a row per provider - "not installed" is a state the UI shows, not
 /// an error, since the app is expected to run with neither CLI present.
-#[tauri::command]
+#[tauri::command(async)]
 fn detect_providers() -> Vec<Detected> {
     ProviderId::ALL.into_iter().map(ProviderId::detect).collect()
 }

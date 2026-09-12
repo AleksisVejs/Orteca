@@ -18,11 +18,18 @@ use super::{ProviderEvent, ProviderId};
 /// Read `fixture` as JSONL and normalise it exactly as a live run would be.
 /// Lines that are not JSON are dropped, the same way `proc` hands them off.
 pub fn replay(id: ProviderId, fixture: &Path) -> io::Result<Vec<ProviderEvent>> {
-    Ok(std::fs::read_to_string(fixture)?
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .flat_map(|v| id.parse_line(&v))
-        .collect())
+    let input = std::fs::read_to_string(fixture)?;
+    let mut events = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        let value = serde_json::from_str::<Value>(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid JSONL at line {}: {error}", index + 1),
+            )
+        })?;
+        events.extend(id.parse_line(&value));
+    }
+    Ok(events)
 }
 
 /// The bundled recording for a provider.
@@ -85,7 +92,7 @@ mod tests {
         assert_eq!(u.cost_usd, Some(0.0412));
         // Cache writes are billed as input, so they are not cached reads.
         assert_eq!(u.cached_input_tokens, 14300);
-        assert_eq!(u.input_tokens, 1840);
+        assert_eq!(u.input_tokens, 4040);
         assert_eq!(u.output_tokens, 612);
     }
 
@@ -123,6 +130,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_documented_item_type_is_normalised() {
+        let line = serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "item_1", "type": "agent_message", "text": "done"}
+        });
+        assert_eq!(
+            ProviderId::Codex.parse_line(&line),
+            vec![ProviderEvent::Text("done".into())]
+        );
+    }
+
+    #[test]
+    fn codex_top_level_error_is_a_failure() {
+        let line = serde_json::json!({"type": "error", "message": "connection lost"});
+        assert_eq!(
+            ProviderId::Codex.parse_line(&line),
+            vec![ProviderEvent::Failed {
+                kind: FailureKind::Crashed,
+                message: "connection lost".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn a_failed_claude_result_is_a_failure_not_a_done() {
         let line = serde_json::json!({
             "type": "result", "subtype": "error_max_turns", "is_error": true,
@@ -146,6 +177,47 @@ mod tests {
         let u = usage(&ProviderId::Claude.parse_line(&line));
         assert_eq!(u.cost_usd, None);
         assert_eq!(u.cost_quality, CostQuality::Unavailable);
+    }
+
+    #[test]
+    fn claude_cache_writes_are_counted_as_input() {
+        let line = serde_json::json!({
+            "type": "result", "subtype": "success", "result": "done",
+            "total_cost_usd": 0.1,
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "output_tokens": 2
+            }
+        });
+        let u = usage(&ProviderId::Claude.parse_line(&line));
+        assert_eq!(u.input_tokens, 30);
+        assert_eq!(u.cached_input_tokens, 30);
+    }
+
+    #[test]
+    fn a_zero_claude_cost_is_unknown_not_free() {
+        let line = serde_json::json!({
+            "type": "result", "subtype": "success", "result": "done",
+            "total_cost_usd": 0.0,
+            "usage": {"input_tokens": 10, "output_tokens": 2}
+        });
+        let u = usage(&ProviderId::Claude.parse_line(&line));
+        assert_eq!(u.cost_usd, None);
+        assert_eq!(u.cost_quality, CostQuality::Unavailable);
+    }
+
+    #[test]
+    fn malformed_fixture_lines_fail_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "orteca-malformed-fixture-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{not json}\n").unwrap();
+        let error = replay(ProviderId::Codex, &path).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -52,9 +52,10 @@ fn summarize(input: &Value) -> String {
 
 fn result(v: &Value) -> Vec<ProviderEvent> {
     let u = &v["usage"];
-    let cost = v["total_cost_usd"].as_f64();
+    let cost = v["total_cost_usd"].as_f64().filter(|cost| *cost > 0.0);
     let usage = Usage {
-        input_tokens: n(&u["input_tokens"]),
+        input_tokens: n(&u["input_tokens"])
+            .saturating_add(n(&u["cache_creation_input_tokens"])),
         cached_input_tokens: n(&u["cache_read_input_tokens"]),
         output_tokens: n(&u["output_tokens"]),
         reasoning_tokens: 0,

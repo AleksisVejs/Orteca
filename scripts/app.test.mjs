@@ -76,3 +76,15 @@ test('cancelling pending consent does not reopen on late completion', async () =
   await confirmation;
   assert.equal(state.opened.value, null);
 });
+
+test('provider detection runs off the synchronous invoke handler', () => {
+  const source = readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  assert.match(source, /#\[tauri::command\(async\)\]\s+fn detect_providers/);
+});
+
+test('provider detection failure is visible instead of looking like no providers', () => {
+  const source = readFileSync(new URL('../src/views/Project.vue', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /detectProviders\(\)\.catch\(\(\) => \[\]\)/);
+  assert.match(source, /providerError/);
+  assert.match(source, /detection unavailable/);
+});

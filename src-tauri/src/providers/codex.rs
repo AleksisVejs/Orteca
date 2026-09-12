@@ -41,13 +41,17 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             kind: FailureKind::Crashed,
             message: message_of(&v["error"]),
         }],
+        "error" => vec![ProviderEvent::Failed {
+            kind: FailureKind::Crashed,
+            message: message_of(v),
+        }],
         _ => Vec::new(),
     }
 }
 
 fn item(i: &Value) -> Option<ProviderEvent> {
-    match i["item_type"].as_str()? {
-        "assistant_message" => Some(ProviderEvent::Text(i["text"].as_str()?.to_string())),
+    match i["type"].as_str()? {
+        "agent_message" => Some(ProviderEvent::Text(i["text"].as_str()?.to_string())),
         "command_execution" => Some(ProviderEvent::ToolUse {
             name: "Shell".into(),
             summary: i["command"].as_str().unwrap_or_default().to_string(),

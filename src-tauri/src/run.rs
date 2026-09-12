@@ -1105,7 +1105,12 @@ async fn attempt(
                 // through here: a turn it completed may cross the ceiling, and
                 // then the resume must not start.
                 if !matches!(ending, Some(Next::Ended)) && state.budget_stop.is_none() {
-                    let stop = if ctx.plan.max_turns.is_some_and(|max| state.turns_this_call >= max) {
+                    // Claude enforces its own `--max-turns` and says so with
+                    // `error_max_turns`; a result that used exactly the ceiling
+                    // and succeeded did not run out.
+                    let stop = if ctx.id != ProviderId::Claude
+                        && ctx.plan.max_turns.is_some_and(|max| state.turns_this_call >= max)
+                    {
                         Some(turn_stop(ctx, state))
                     } else {
                         token_stop(
@@ -2220,6 +2225,27 @@ ping -n 60 127.0.0.1 >nul
             .map(|v| v["data"]["stage"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(stages, ["plan"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claude_result_that_used_every_turn_and_succeeded_is_done() {
+        let store = Store::in_memory().unwrap();
+        let mut route = one_call("fix the typo");
+        route.budget.max_turns = Some(2);
+        let mut request = routed(&store, "claude-full-turns", route);
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        std::fs::write(&request.program, "@echo off
+echo {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"result\":\"ok\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}
+exit /b 0
+").unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done");
+        assert!(result.budget_stop.is_none());
+        assert_eq!(result.turns_used, 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

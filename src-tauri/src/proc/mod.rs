@@ -157,7 +157,7 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
 ///
 /// One stable directory rather than one per run: Codex caches its runtimes
 /// under TEMP, and a fresh directory would re-pay that on every task.
-fn owned_temp() -> Option<PathBuf> {
+pub fn owned_temp() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
         .join("app.orteca")
         .join("tmp");

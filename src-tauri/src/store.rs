@@ -26,6 +26,20 @@ pub struct Project {
     pub last_opened_at: String,
 }
 
+/// Everything a task row needs at the moment it opens. A struct rather than
+/// eight positional arguments, which is how `mode` and `route_json` would end
+/// up swapped one day.
+pub struct NewTask<'a> {
+    pub project_id: i64,
+    pub prompt: &'a str,
+    pub mode: &'a str,
+    /// The route, serialised. Decided before any provider starts.
+    pub route_json: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub base_commit: Option<&'a str>,
+    pub dirty_at_start: bool,
+}
+
 pub struct Store(Mutex<Connection>, #[allow(dead_code)] Option<std::fs::File>);
 
 impl Store {
@@ -93,25 +107,49 @@ impl Store {
 
     /// Open a task in `running`. The baseline is written now, before the agent
     /// touches anything, so the diff at the end has something honest to compare
-    /// against.
-    pub fn create_task(
-        &self,
-        project_id: i64,
-        prompt: &str,
-        mode: &str,
-        branch: Option<&str>,
-        base_commit: Option<&str>,
-        dirty_at_start: bool,
-    ) -> Result<i64> {
+    /// against - and so is the route, which is decided before any provider is
+    /// started and must be readable afterwards whatever became of the run.
+    pub fn create_task(&self, task: NewTask) -> Result<i64> {
         let conn = self.0.lock().expect("store poisoned");
         conn.execute(
             "INSERT INTO tasks
-                (project_id, prompt, mode, status, branch, base_commit,
-                 dirty_at_start, started_at)
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, datetime('now'))",
-            params![project_id, prompt, mode, branch, base_commit, dirty_at_start],
+                (project_id, prompt, mode, route_json, status, branch,
+                 base_commit, dirty_at_start, started_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, datetime('now'))",
+            params![
+                task.project_id,
+                task.prompt,
+                task.mode,
+                task.route_json,
+                task.branch,
+                task.base_commit,
+                task.dirty_at_start
+            ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// How many earlier runs of this exact prompt in this project ended without
+    /// finishing. Two is what the architecture escalates on.
+    ///
+    /// Exact prompt text, deliberately: "the same task" has no other honest
+    /// definition available without a model call, and a fuzzy match that
+    /// escalated the wrong task would spend the user's money on a route they
+    /// did not need. A re-worded retry counts as a fresh task, which errs
+    /// towards the cheaper route.
+    ///
+    /// `budgetReached` counts. A run that ran out of budget did not finish its
+    /// work either, and pretending otherwise would leave a task looping on the
+    /// route that could not fit it.
+    pub fn prior_failures(&self, project_id: i64, prompt: &str) -> Result<u32> {
+        let conn = self.0.lock().expect("store poisoned");
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+              WHERE project_id = ?1 AND prompt = ?2
+                AND status IN ('failed', 'budgetReached')",
+            params![project_id, prompt],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn append_event(
@@ -263,6 +301,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn new_task<'a>(project_id: i64, prompt: &'a str, mode: &'a str) -> NewTask<'a> {
+        NewTask { project_id, prompt, mode, route_json: None, branch: None, base_commit: None, dirty_at_start: false }
+    }
+
     #[test]
     fn a_second_store_cannot_reconcile_a_live_instance() {
         let dir = std::env::temp_dir().join(format!("orteca-owner-{}", std::process::id()));
@@ -278,7 +320,7 @@ mod tests {
     fn usage_is_one_snapshot_per_task() {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("a", "a").unwrap();
-        let task = store.create_task(project.id, "test", "balanced", None, None, false).unwrap();
+        let task = store.create_task(new_task(project.id, "test", "balanced")).unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
         let count: i64 = store.0.lock().unwrap().query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
@@ -297,7 +339,7 @@ mod tests {
         let db = dir.join("test.db");
         let store = Store::open(&db).unwrap();
         let project = store.touch_project("a", "a").unwrap();
-        let task = store.create_task(project.id, "test", "balanced", None, None, false).unwrap();
+        let task = store.create_task(new_task(project.id, "test", "balanced")).unwrap();
         drop(store);
         let store = Store::open(&db).unwrap();
         let (status, ended): (String, Option<String>) = store.0.lock().unwrap().query_row("SELECT status, ended_at FROM tasks WHERE id=?1", [task], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
@@ -357,7 +399,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("C:/a", "a").unwrap();
         let task = store
-            .create_task(project.id, "do it", "balanced", Some("main"), Some("abc"), false)
+            .create_task(NewTask { branch: Some("main"), base_commit: Some("abc"), ..new_task(project.id, "do it", "balanced") })
             .unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
 
@@ -379,7 +421,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("C:/a", "a").unwrap();
         let task = store
-            .create_task(project.id, "do it", "efficient", None, None, true)
+            .create_task(NewTask { dirty_at_start: true, ..new_task(project.id, "do it", "efficient") })
             .unwrap();
         for kind in ["started", "toolUse", "done"] {
             store.append_event(task, "run", kind, "codex", "{}").unwrap();
@@ -405,6 +447,30 @@ mod tests {
             .unwrap();
         assert_eq!(status, "done");
         assert!(ended.is_some());
+    }
+
+    /// The escalation trigger. It has to count a budget stop as well: a run
+    /// that ran out of budget did not finish the work either, and a task that
+    /// keeps hitting the same ceiling must eventually be routed differently.
+    #[test]
+    fn only_unfinished_runs_of_the_same_prompt_count_towards_escalation() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let other = store.touch_project("C:/b", "b").unwrap();
+        let close = |id: i64, prompt: &str, status: &str| {
+            let task = store.create_task(new_task(id, prompt, "balanced")).unwrap();
+            store.finish_task(task, status, "", "[]").unwrap();
+        };
+        close(project.id, "do it", "failed");
+        close(project.id, "do it", "budgetReached");
+        close(project.id, "do it", "done");
+        close(project.id, "do it", "cancelled");
+        // A different prompt, and the same prompt in a different project.
+        close(project.id, "do something else", "failed");
+        close(other.id, "do it", "failed");
+
+        assert_eq!(store.prior_failures(project.id, "do it").unwrap(), 2);
+        assert_eq!(store.prior_failures(project.id, "never asked").unwrap(), 0);
     }
 
     #[test]

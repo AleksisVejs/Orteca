@@ -162,6 +162,34 @@ It returns `budget reached` with the work, diff, usage, and a deliberate user
 choice to continue. A trivial task must not silently become a long-running
 session.
 
+**Which of these the CLIs actually enforce — checked 2026-09-12, built in M6.**
+Asked for without a value, a real flag answers "argument missing" and an
+invented one answers "unknown option"; `--help` short-circuits before either, so
+it proves nothing on its own.
+
+| Ceiling | claude 2.1.269 | codex-cli 0.154.0 |
+|---|---|---|
+| `max_turns` | `--max-turns <turns>` — **exists**, though it is absent from `--help` | **none at all** |
+| artifact schema | `--json-schema <schema>`, inline JSON | `--output-schema <FILE>`, a path |
+| `max_reported_tokens` | none (`--max-budget-usd` is dollars, and only on API-key billing) | none |
+| `preferred_tier` | `--model <name>`, but see below | `--model <name>`, but see below |
+
+So: `max_turns` is passed straight to Claude, and for Codex **Orteca counts
+completed turns itself and ends the process at the ceiling.** The number is real
+either way; only who enforces it differs, and the UI is not told otherwise.
+`max_reported_tokens` is Orteca's own inter-turn guard for both, as above.
+
+`preferred_tier` reaches **no command line at all**. Both CLIs take a `--model`,
+but naming a tier is not the same as knowing which model id is cheapest-capable
+on this account today, and a guess would be billed to the user. The tier is
+recorded with the route so the decision stays auditable, and Milestone 7 can act
+on it once there is evidence about what each tier really costs here.
+
+A stage that has no business editing is **stopped** from editing rather than
+asked not to: `codex exec --sandbox read-only`, and for Claude — which has no
+sandbox flag — `--disallowedTools Edit Write NotebookEdit MultiEdit`. A Plan
+stage that edited the code would have skipped the Review the route put after it.
+
 **4.3 `project_symbols` / full repo indexing is premature.** Deferred. ripgrep is fast
 enough on a solo dev's repo and is always current.
 
@@ -241,8 +269,8 @@ src-tauri/
       codex.rs     exec --json parser
       mock.rs      replays fixtures/*.jsonl through the real parsers
     run.rs         one stage: argv, stream, event log, diff, result
-    routing.rs *   deterministic classifier + route builder
-    orchestrator.rs *  runs the route, owns the instruction queue
+    routing.rs     deterministic classifier + route builder + stage briefs
+    orchestrator.rs *  folded into run.rs — see below
 src/
   main.ts  App.vue  api.ts  types.ts
   views/      Launch.vue  Project.vue
@@ -252,9 +280,14 @@ scripts/make-icon.mjs
 ```
 
 `git.rs` never happened: baseline snapshot and diff capture are four functions
-next to `git_state`, and `project.rs` already owns every git call. `run.rs` is
-the single-stage runner; the orchestrator that owns a multi-stage route and an
-instruction queue arrives with routing in Milestone 6.
+next to `git_state`, and `project.rs` already owns every git call.
+
+`orchestrator.rs` never happened either. Milestone 6 turned `run.rs` from a
+single-stage runner into a route runner, and that cost a loop: the process
+lifetime, the event log, the instruction queue and the cancel path are all
+already there, and a second module would have had to borrow every one of them to
+own a `for` over four stages. The one-call route is still exactly the path
+Milestone 4 shipped, now with a budget attached.
 
 Merged away vs. spec: `optimization`, `execution`, `verification`, `metrics`,
 `safety`, `context` fold into the above. One store, not many. No Pinia — two
@@ -415,6 +448,47 @@ DEEP/REVIEW → claude    IMPLEMENT → codex    fallback: whichever is detected
 Every decision writes a `routing_decision` event with the signal values, so future
 adaptive routing has training data without a schema change.
 
+**As built (Milestone 6).** `routing.rs` is pure and makes no model call of any
+kind: keyword tables over the prompt, plus one `git ls-files` for blast radius
+and one `COUNT(*)` for prior failures. Same inputs, same route, every time.
+
+Rule order is not the table's order. The two escalating rules are tested first,
+because a prompt that scores trivially but touches authorisation is not a
+trivial task, and one that has already failed twice is not a candidate for the
+route that just failed it. The table also had no default row; there is now a
+`Standard` route — Implement → Verify — for everything in the middle.
+
+| Route | Stages | Calls |
+|---|---|---|
+| `ImplementOnce` | Implement | 1 |
+| `Standard` | Implement → Verify | 2 |
+| `Planned` | Plan → Implement → Verify | 3 |
+| `Escalated` | Plan → Implement → Review | 3 |
+| `Guarded` | Plan → Implement → Review → Verify | 4 |
+
+Two rules the spec did not write down, both of which exist to stop Orteca
+spending on its own initiative:
+
+- **A Review that returns `changes_requested` ends the route there.** No fix call
+  is added — that would be Orteca deciding to spend more — and no Verify call is
+  spent confirming what the review has already rejected. The findings are the
+  result; what to do about them is the user's to choose.
+- **A held instruction is delivered by the next stage's brief, not by resuming
+  the stage it arrived in** — unless that stage is the last one, where M5's
+  behaviour is unchanged. Resuming as well would pay for a second process to say
+  the same thing twice.
+
+"Failed twice" is matched on the exact prompt text in the same project, and
+counts a `budgetReached` run as not having finished. Exact text is the only
+honest definition available without a model call; a re-worded retry counts as a
+fresh task, which errs towards the cheaper route.
+
+Every stage runs on **the provider the user selected**. The capability map is
+recorded per stage and not acted on: routing a stage to a CLI the user has not
+signed into fails the run for a reason the screen never mentioned, and the
+router cannot see per-stage auth state yet. That waits for Milestone 7 with the
+tier.
+
 ## 9. Mid-task instructions — exact mechanics
 
 User types an instruction while a task runs:
@@ -511,6 +585,15 @@ Isolation choice at task start: `Current tree` (default) | `New branch` | `Workt
 Orteca never runs a destructive git command. Diff captured with
 `git diff <base_commit>` plus `git status` for untracked files.
 
+**As built.** A tree that is dirty at start is snapshotted before the first
+provider starts: every already-changed path, with a hash of its contents. After
+the run each diff entry is labelled `run` (clean before), `beforeRun` (changed
+before, byte-identical after — the user's, not counted as the run's work) or
+`both` (changed before and again; line counts are against the commit, so they
+include both). If git cannot produce the snapshot the origin is `null` and the
+screen falls back to saying it cannot tell. A file the run restored to the
+commit drops out of the diff and is not reported.
+
 ## 12. Project intelligence
 
 `file_cache` stores path + sha256 + language. Rescan on open: walk (respecting
@@ -543,6 +626,24 @@ Review artifact:
 
 `verdict: pass` → done, no fix call. This is where "calls avoided" is earned.
 
+**As built (Milestone 6).** Both flags exist and both are used: Claude takes the
+schema inline, Codex takes a file, written into the temp directory Orteca owns
+and never into the user's repository. Only Plan and Review contract for an
+artifact; Implement and Verify are judged by the diff and by what their own
+verification command printed, and wrapping a code change in a JSON envelope buys
+nothing.
+
+What an artifact is worth is decided *after* the stage, by a shallow check of
+required keys against the shape that stage contracted for. It is not a second
+JSON Schema validator — the provider's flag is that — it is there so a missing
+or half-built artifact is recorded as **invalid** rather than passed on as if it
+were a plan. Either way an `artifact` row is written, valid or not.
+
+When no artifact comes back, the stage's own closing words are forwarded to the
+next brief **verbatim and labelled unvalidated**. They are never mined for the
+fields the schema would have filled: reading prose into structured fields is
+exactly the guesswork the schema exists to remove.
+
 ## 14. Milestones — 8 slices, each runnable
 
 | # | Slice | Done when | State |
@@ -552,7 +653,7 @@ Review artifact:
 | 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
 | 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
 | 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | done |
-| 6 | Classifier + budgeted routes + structured artifacts + verify | classifier adds no model call; a trivial task has a one-call route; every route has explicit call/turn ceilings and never auto-escalates after a budget stop | |
+| 6 | Classifier + budgeted routes + structured artifacts + verify | classifier adds no model call; a trivial task has a one-call route; every route has explicit call/turn ceilings and never auto-escalates after a budget stop | done |
 | 7 | file_cache, path ranking, usage + baselines, route visual | brief names ranked paths without file contents; cumulative provider usage enforces the inter-turn token guard; comparable-task baselines make savings estimates honest | |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |
 
@@ -569,6 +670,17 @@ rides along with metrics. Each slice ends commit-ready with tests.
    merely because most input was cached. The run must have a declared budget,
    a small-task single-call path, and an honest budget-reached outcome before
    Orteca can make that claim.
+4. **`budgetReached` is a fifth task status, and its own outcome.** Not a
+   failure, because nothing went wrong; not a success, because the route did not
+   finish. The work, the diff and the reported usage are all kept exactly as they
+   are, and the remaining stages are named so the user knows what they are being
+   asked to decide about. Continuing is a fresh Run — a deliberate act — and
+   Orteca never takes it on their behalf.
+5. **The one exemption from the call ceiling is an instruction the user gave.**
+   A resume that carries a mid-task instruction is allowed past `max_agent_calls`
+   and is still counted and logged. The rule the budget enforces is that Orteca
+   never spends more *on its own initiative*; refusing here would lose an
+   instruction the user was promised would arrive.
 
 ## 16. Notes for whoever picks this up
 
@@ -624,6 +736,16 @@ rides along with metrics. Each slice ends commit-ready with tests.
   a *read* root; `/sandbox-add-read-dir` is an interactive TUI command. Until
   Codex offers one, an agent that reaches for npm burns several turns finding a
   way around it, and the cheapest mitigation is to tell it not to.
+- **A flag missing from `--help` is not a missing flag.** `claude --max-turns`
+  is real and accepted at 2.1.269 but undocumented in the help output, and the
+  budget in §4.2 would have been built around a ceiling Orteca could not set if
+  the help text had been taken as the answer. Ask the CLI for the flag with no
+  value: a real one says `option '--max-turns <turns>' argument missing`, an
+  invented one says `unknown option`. `--help` short-circuits before either
+  check and exits 0 whatever you put in front of it, so it proves nothing.
+- Codex has no turn ceiling at 0.154.0 and no way to add one. Orteca counts
+  `turn.completed` and closes the Job Object at the ceiling. This cannot stop a
+  turn that is already running, and neither the doc nor the UI says it can.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

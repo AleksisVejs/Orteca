@@ -14,6 +14,7 @@ import {
 import type {
   Auth,
   Detected,
+  Mode,
   OpenedProject,
   ProviderEvent,
   ProviderId,
@@ -30,6 +31,14 @@ const task = ref("");
 const providers = ref<Detected[]>([]);
 const providerError = ref(false);
 const provider = ref<ProviderId>("codex");
+
+// How readily the classifier takes the shorter route. Two modes, not three.
+// The route itself is decided in Rust before any CLI starts and costs nothing.
+const mode = ref<Mode>("balanced");
+const MODES: Array<{ id: Mode; label: string; hint: string }> = [
+  { id: "balanced", label: "Balanced", hint: "Plan and review where the work calls for it" },
+  { id: "efficient", label: "Efficient", hint: "Prefer the shortest route that still verifies" },
+];
 
 const installed = computed(() => providers.value.filter((p) => p.path));
 const missing = computed(() => providers.value.filter((p) => !p.path));
@@ -216,6 +225,7 @@ async function run() {
       props.opened.project.path,
       task.value,
       provider.value,
+      mode.value,
       (event) => {
         const text = describe(event);
         if (text === null) return;
@@ -276,12 +286,38 @@ function formatTokens(count: number): string {
   return count.toLocaleString("en-US");
 }
 
-/** A stopped run is its own outcome, not a quieter kind of failure. */
+/** A stopped run is its own outcome, not a quieter kind of failure. Nor is a
+ *  run that reached the budget its route declared. */
 const OUTCOME: Record<TaskResult["status"], string> = {
   done: "Finished",
   cancelled: "Stopped",
   failed: "Failed",
+  budgetReached: "Budget reached",
 };
+
+/** What the route spent against what it was allowed. Both numbers are exact:
+ *  Orteca chose the route, so it knows the ceiling as well as the spend. */
+const calls = computed(() => {
+  const r = result.value;
+  if (!r) return null;
+  return {
+    used: r.callsUsed,
+    allowed: r.route.budget.maxAgentCalls,
+    stages: r.route.stages,
+    ran: r.stages.map((s) => s.stage),
+  };
+});
+
+/** The diff split by whose change it is. A file untouched since before the
+ *  run is the user's, and is neither listed nor counted as this run's work. */
+const changed = computed(() => {
+  const diff = result.value?.diff ?? [];
+  return {
+    byRun: diff.filter((f) => f.origin !== "beforeRun"),
+    beforeRun: diff.filter((f) => f.origin === "beforeRun"),
+    unknown: !!result.value?.dirtyAtStart && diff.some((f) => f.origin === null),
+  };
+});
 
 const AUTH: Record<Auth, string> = {
   subscription: "saved login",
@@ -316,6 +352,19 @@ const AUTH: Record<Auth, string> = {
       ></textarea>
 
       <div class="controls">
+        <div class="segments">
+          <button
+            v-for="m in MODES"
+            :key="m.id"
+            class="seg"
+            :class="{ on: mode === m.id }"
+            :title="m.hint"
+            :disabled="running"
+            @click="mode = m.id"
+          >
+            {{ m.label }}
+          </button>
+        </div>
         <div v-if="installed.length" class="segments">
           <button
             v-for="p in installed"
@@ -415,9 +464,25 @@ const AUTH: Record<Auth, string> = {
           Stopped part-way. Anything the agent had already written is still on
           disk — Orteca reverts nothing.
         </p>
+        <!-- A budget stop hands the decision back rather than spending more.
+             Nothing here continues the run: that is a fresh Run, deliberately. -->
+        <p v-if="result.budgetStop" class="note caveat stopped">
+          {{ result.budgetStop.message }}
+        </p>
+        <p v-if="result.budgetStop?.remaining.length" class="note caveat stopped">
+          Not started: {{ result.budgetStop.remaining.join(" → ") }}. Run again
+          if you want to spend more on this.
+        </p>
 
-        <!-- Three tiles. Every one labelled, none faked when unknown. -->
+        <!-- Four tiles. Every one labelled, none faked when unknown. -->
         <div class="tiles">
+          <div v-if="calls" class="tile">
+            <span class="figure">{{ calls.used }} / {{ calls.allowed }}</span>
+            <span class="note">
+              agent {{ calls.allowed === 1 ? "call" : "calls" }} used —
+              {{ calls.ran.join(" → ") || "none" }}
+            </span>
+          </div>
           <div class="tile">
             <span class="figure">{{ tokens ? formatTokens(tokens.total) : "—" }}</span>
             <span class="note">
@@ -441,26 +506,35 @@ const AUTH: Record<Auth, string> = {
             </span>
           </div>
           <div class="tile">
-            <span class="figure">{{ result.diff.length }}</span>
-            <span class="note">Git-visible files changed</span>
+            <span class="figure">{{ changed.byRun.length }}</span>
+            <span class="note">Git-visible files changed by this run</span>
           </div>
         </div>
 
         <ul class="diff">
-          <li v-for="f in result.diff" :key="f.path">
+          <li v-for="f in changed.byRun" :key="f.path">
             <span class="mono path">{{ f.path }}</span>
             <span v-if="f.added !== null" class="note">
               +{{ f.added }} &minus;{{ f.deleted }}
             </span>
             <span v-else class="note">new or binary</span>
+            <span v-if="f.origin === 'both'" class="note">
+              already changed before this run; counts include both
+            </span>
           </li>
-          <li v-if="!result.diff.length && !result.failure" class="note">no Git-visible changes</li>
+          <li v-if="!changed.byRun.length && !result.failure" class="note">no Git-visible changes</li>
         </ul>
 
         <p class="note caveat">Git-ignored files are excluded from this diff.</p>
-        <p v-if="result.dirtyAtStart" class="note caveat">
+        <!-- Only when git could not snapshot the tree first. Otherwise the list
+             above is exact about whose change is whose. -->
+        <p v-if="changed.unknown" class="note caveat">
           This repository already had uncommitted changes, so some of the above
-          were not made by this run.
+          may not have been made by this run.
+        </p>
+        <p v-if="changed.beforeRun.length" class="note caveat">
+          Already changed before this run, and left as they were:
+          <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(", ") }}</span>
         </p>
       </div>
     </section>

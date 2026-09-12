@@ -4,6 +4,7 @@ mod error;
 mod proc;
 mod project;
 mod providers;
+mod routing;
 mod run;
 mod store;
 
@@ -14,7 +15,8 @@ use error::{AppError, ErrorKind, Result};
 use proc::Line;
 use project::{GitState, TrustFinding};
 use providers::{Detected, ProviderId};
-use store::{Project, Store};
+use routing::Mode;
+use store::{NewTask, Project, Store};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +91,7 @@ async fn start_task(
     path: String,
     prompt: String,
     provider: ProviderId,
+    mode: Mode,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
 ) -> Result<run::TaskResult> {
@@ -96,7 +99,7 @@ async fn start_task(
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
-    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider)).await
+    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode)).await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
@@ -132,7 +135,10 @@ async fn send_instruction(
     live.instruct(task_id, text, apply_now).await
 }
 
-fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {
+/// Everything that has to be true, and decided, before a provider starts: the
+/// project is trusted, the CLI exists, the baseline is taken, and the route and
+/// its ceilings are chosen and written down.
+fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode) -> Result<run::Request> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
     };
@@ -149,14 +155,32 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
     // The baseline is taken before the agent runs, so the diff afterwards has
     // something honest to compare against.
     let git = project::git_state(&dir);
-    let task_id = store.create_task(
-        record.id,
+    // A clean tree needs no snapshot: everything in the diff is the run's.
+    let before_run = if git.dirty { project::snapshot(&dir, git.head.as_deref()) } else { Some(Default::default()) };
+
+    // Routing spends no tokens and makes no model call: one `git ls-files`, one
+    // count of how this prompt has fared here before, and a table.
+    let route = routing::route(
         &prompt,
-        "balanced",
-        git.branch.as_deref(),
-        git.head.as_deref(),
-        git.dirty,
-    )?;
+        mode,
+        &routing::RepoSignals {
+            tracked_paths: project::tracked_paths(&dir),
+            prior_failures: store.prior_failures(record.id, &prompt)?,
+        },
+    );
+    // Stored before anything runs, so a run that dies in its first second still
+    // says what it was allowed to do.
+    let route_json = serde_json::to_string(&route).ok();
+
+    let task_id = store.create_task(NewTask {
+        project_id: record.id,
+        prompt: &prompt,
+        mode: mode.name(),
+        route_json: route_json.as_deref(),
+        branch: git.branch.as_deref(),
+        base_commit: git.head.as_deref(),
+        dirty_at_start: git.dirty,
+    })?;
 
     Ok(run::Request {
         task_id,
@@ -164,12 +188,13 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
         program,
         dir,
         prompt,
+        route,
         base_commit: git.head,
         dirty_at_start: git.dirty,
+        before_run,
         // A real run costs the user's subscription. Keeping its JSONL is what
         // makes the next one free, and is the only honest source of fixtures.
-        recording: recordings
-            .map(|dir| dir.join(format!("task-{task_id}-{}.jsonl", provider.program()))),
+        recordings,
     })
 }
 

@@ -197,6 +197,10 @@ mod tests {
         );
     }
 
+    /// Claude reports running out of `--max-turns` as an error result. It is
+    /// still not a `done` - the work was cut short - but it is Orteca's own
+    /// ceiling coming back, so it is filed as `BudgetReached` rather than as a
+    /// `Timeout` that would send the user looking for a hang.
     #[test]
     fn a_failed_claude_result_is_a_failure_not_a_done() {
         let line = serde_json::json!({
@@ -206,7 +210,7 @@ mod tests {
         assert_eq!(
             ProviderId::Claude.parse_line(&line).last(),
             Some(&ProviderEvent::Failed {
-                kind: FailureKind::Timeout,
+                kind: FailureKind::BudgetReached,
                 message: "error_max_turns".into(),
             })
         );

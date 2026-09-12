@@ -25,7 +25,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, OUTCOME, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -44,7 +44,13 @@ async function projectView(api = {}) {
   return { state, listeners };
 }
 
-const finished = { taskId: 1, status: 'failed', failure: 'spawn failed', summary: '', usage: null, diff: [], dirtyAtStart: false };
+const oneCall = {
+  kind: 'implementOnce', mode: 'balanced', stages: ['implement'], reason: 'small, low-risk and narrow',
+  budget: { maxAgentCalls: 1, maxTurns: 10, maxReportedTokens: 150000, preferredTier: 'cheapest' },
+  signals: { complexity: 0, risk: 0, blastRadius: 1 }, candidatePaths: [], preferredProviders: ['codex'],
+};
+
+const finished = { taskId: 1, status: 'failed', failure: 'spawn failed', summary: '', usage: null, diff: [], dirtyAtStart: false, route: oneCall, stages: [], callsUsed: 1, turnsUsed: 1, budgetStop: null };
 
 test('completion before invoke resolves never leaves the screen running', async () => {
   const { state, listeners } = await projectView({ startTask: async (...args) => {
@@ -321,4 +327,91 @@ test('sign-in failure stays visible and never claims a login', async () => {
   assert.match(state.signInError.value, /still signed out/);
   assert.equal(state.providers.value[0].auth, 'signedOut', 'a failed sign-in must not upgrade auth');
   assert.equal(state.canRun.value, false);
+});
+
+test('the chosen mode reaches the backend, which is what picks the route', async () => {
+  let sent = null;
+  const { state } = await projectView({
+    startTask: async (path, prompt, provider, mode) => {
+      sent = { provider, mode };
+      return { ...finished, status: 'done', failure: null, summary: 'done' };
+    },
+  });
+
+  // Balanced by default: the mode that routes as the architecture wrote it.
+  assert.equal(state.mode.value, 'balanced');
+  await state.run();
+  assert.equal(sent.mode, 'balanced');
+
+  state.mode.value = 'efficient';
+  await state.run();
+  assert.equal(sent.mode, 'efficient', 'the mode the user picked never reached the router');
+});
+
+test('a budget stop reads as its own outcome and never as a failure', async () => {
+  const stopped = {
+    ...finished,
+    status: 'budgetReached',
+    failure: null,
+    summary: 'got as far as the edit',
+    diff: [{ path: 'src/a.rs', added: 3, deleted: 1 }],
+    usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 2, reasoningTokens: 0, costUsd: null, costQuality: 'unavailable' },
+    route: { ...oneCall, kind: 'planned', stages: ['plan', 'implement', 'verify'], budget: { ...oneCall.budget, maxAgentCalls: 2 } },
+    stages: [{ stage: 'plan', summary: 'planned', artifact: null }, { stage: 'implement', summary: 'got as far as the edit', artifact: null }],
+    callsUsed: 2,
+    budgetStop: { limit: 'calls', allowed: 2, observed: 2, remaining: ['verify'], message: 'This route was given 2 agent calls, and they are used up.' },
+  };
+  const { state } = await projectView({ startTask: async () => stopped });
+  await state.run();
+
+  assert.equal(state.result.value.status, 'budgetReached');
+  assert.equal(state.OUTCOME.budgetReached, 'Budget reached', 'a budget stop must not be labelled a failure');
+  assert.equal(state.result.value.failure, null);
+  // The work survives the stop, and is what the screen has to show.
+  assert.equal(state.result.value.summary, 'got as far as the edit');
+  assert.equal(state.result.value.diff.length, 1);
+  assert.equal(state.tokens.value.total, 12);
+  // And the spend is shown against what was allowed, both exact.
+  // Through JSON: a computed hands back reactive proxies, which compare by
+  // reference rather than by what they hold.
+  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 2, allowed: 2, stages: ['plan', 'implement', 'verify'], ran: ['plan', 'implement'] });
+  assert.deepEqual(state.result.value.budgetStop.remaining, ['verify'], 'the user is not told what was left undone');
+});
+
+test('a trivial task reports the one call it was allowed', async () => {
+  const { state } = await projectView({
+    startTask: async () => ({ ...finished, status: 'done', failure: null, summary: 'fixed it', stages: [{ stage: 'implement', summary: 'fixed it', artifact: null }] }),
+  });
+  await state.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 1, allowed: 1, stages: ['implement'], ran: ['implement'] });
+  assert.equal(state.result.value.budgetStop, null);
+});
+
+test('a file that was already dirty is never counted as the run\'s work', async () => {
+  const { state } = await projectView({
+    startTask: async () => ({
+      ...finished, status: 'done', failure: null, summary: 'fixed it', dirtyAtStart: true,
+      diff: [
+        { path: 'src/slug.js', added: 1, deleted: 1, origin: 'run' },
+        { path: 'notes.md', added: 3, deleted: 0, origin: 'both' },
+        { path: 'stray.txt', added: null, deleted: null, origin: 'beforeRun' },
+      ],
+    }),
+  });
+  await state.run();
+  assert.deepEqual(state.changed.value.byRun.map(f => f.path), ['src/slug.js', 'notes.md']);
+  assert.deepEqual(state.changed.value.beforeRun.map(f => f.path), ['stray.txt']);
+  assert.equal(state.changed.value.unknown, false, 'a snapshotted diff must not fall back to the vague caveat');
+});
+
+test('with no snapshot the screen says it cannot tell, and claims nothing', async () => {
+  const { state } = await projectView({
+    startTask: async () => ({
+      ...finished, status: 'done', failure: null, summary: 'fixed it', dirtyAtStart: true,
+      diff: [{ path: 'stray.txt', added: null, deleted: null, origin: null }],
+    }),
+  });
+  await state.run();
+  assert.equal(state.changed.value.unknown, true);
+  assert.equal(state.changed.value.beforeRun.length, 0);
 });

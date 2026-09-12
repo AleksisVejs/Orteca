@@ -110,9 +110,11 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
     let outcome = if v["is_error"].as_bool().unwrap_or(false) || subtype != "success" {
         ProviderEvent::Failed {
             kind: match subtype {
-                // Not a clock timeout, but the same thing to a user: it ran out
-                // of budget before finishing.
-                "error_max_turns" => FailureKind::Timeout,
+                // The CLI hit the `--max-turns` ceiling Orteca gave it. That is
+                // a budget Orteca set being reached, not a fault of the run, so
+                // it is reported as itself and `run` turns it into the
+                // budget-reached outcome with the work so far intact.
+                "error_max_turns" => FailureKind::BudgetReached,
                 _ => classify_failure(&text),
             },
             message: if text.is_empty() {

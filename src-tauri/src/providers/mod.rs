@@ -147,6 +147,13 @@ pub enum ProviderEvent {
 /// `MalformedOutput` were dropped: they are the process runner's to report,
 /// and it does not exist until Milestone 4. Whichever of them that runner
 /// truly emits comes back then, one at a time.
+///
+/// `BudgetReached` arrived with Milestone 6 and is the exception that proves
+/// the rule: `claude --max-turns` makes the CLI itself report a ceiling it hit,
+/// as `subtype: error_max_turns`. It used to be filed as `Timeout`, which sent
+/// the user to look for a hang that never happened. Running out of a budget
+/// Orteca set is not a fault, and `run` turns it into the budget-reached
+/// outcome rather than a failed task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FailureKind {
@@ -154,6 +161,7 @@ pub enum FailureKind {
     UsageLimit,
     RateLimit,
     Timeout,
+    BudgetReached,
     Crashed,
 }
 
@@ -218,18 +226,28 @@ impl ProviderId {
     /// project forbids - so the sandbox has to be set through config. The
     /// override is validated: a bogus value is refused with the three variants
     /// named, which is how this spelling was confirmed without spending a run.
-    pub fn resume_args(self, session: &str) -> Vec<String> {
+    ///
+    /// `schema` is the stage's artifact contract. A resumed stage keeps it, or
+    /// the resume would quietly drop the shape the route asked for and the
+    /// stage would come back as prose nobody may parse.
+    pub fn resume_args(self, session: &str, schema: Option<&Path>) -> Vec<String> {
         let arg = str::to_string;
         match self {
-            Self::Codex => vec![
-                arg("exec"),
-                arg("resume"),
-                session.to_string(),
-                arg("-"),
-                arg("--json"),
-                arg("-c"),
-                arg("sandbox_mode=\"workspace-write\""),
-            ],
+            Self::Codex => [
+                vec![
+                    arg("exec"),
+                    arg("resume"),
+                    session.to_string(),
+                    arg("-"),
+                    arg("--json"),
+                    arg("-c"),
+                    arg("sandbox_mode=\"workspace-write\""),
+                ],
+                schema.map_or_else(Vec::new, |path| {
+                    vec![arg("--output-schema"), path.display().to_string()]
+                }),
+            ]
+            .concat(),
             // Claude never needs this: it takes instructions live, so there is
             // no session to pick back up.
             Self::Claude => Vec::new(),
@@ -494,13 +512,18 @@ then stop");
     /// Losing it would leave a resumed agent read-only while still exiting 0.
     #[test]
     fn a_resumed_codex_session_keeps_its_write_sandbox() {
-        let argv = ProviderId::Codex.resume_args("abc-123").join(" ");
+        let argv = ProviderId::Codex.resume_args("abc-123", None).join(" ");
         assert!(argv.contains("exec resume abc-123"));
         assert!(argv.contains("sandbox_mode=\"workspace-write\""));
         assert!(!argv.contains("danger"));
         assert!(argv.contains("--json"));
         // The prompt arrives on stdin, never as an argument.
-        assert!(ProviderId::Codex.resume_args("abc-123").contains(&"-".to_string()));
+        assert!(ProviderId::Codex.resume_args("abc-123", None).contains(&"-".to_string()));
+        // A resumed stage keeps the artifact contract its route asked for.
+        let schema = PathBuf::from("C:/tmp/plan.json");
+        let with_schema = ProviderId::Codex.resume_args("abc-123", Some(&schema));
+        assert!(with_schema.contains(&"--output-schema".to_string()));
+        assert!(with_schema.contains(&schema.display().to_string()));
     }
 
     fn temp_dir(label: &str) -> PathBuf {

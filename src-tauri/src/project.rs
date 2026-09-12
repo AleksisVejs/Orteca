@@ -166,6 +166,73 @@ pub struct FileStat {
     pub path: String,
     pub added: Option<u64>,
     pub deleted: Option<u64>,
+    /// Who made this change. `None` when there was no snapshot to compare
+    /// against, and the screen must then say it cannot tell.
+    pub origin: Option<Origin>,
+}
+
+/// Whether a changed file is this run's work, the user's, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Origin {
+    /// Clean when the run started.
+    Run,
+    /// Already changed when the run started, and byte-for-byte the same after.
+    BeforeRun,
+    /// Already changed when the run started, and different again after. The
+    /// line counts are measured against the commit, so they include both.
+    Both,
+}
+
+/// Every file that was already changed when a run started, with a fingerprint
+/// of its contents. Taken before the first provider starts.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot(Vec<(String, Option<u64>)>);
+
+/// Record what is already dirty, so the diff afterwards can tell the user's
+/// changes from the agent's. `None` if git cannot list them: an unknown origin
+/// is reported as unknown, never guessed as the run's.
+pub fn snapshot(dir: &Path, base: Option<&str>) -> Option<Snapshot> {
+    let dirty = diff_since(dir, base).ok()?;
+    Some(Snapshot(dirty.into_iter().map(|f| {
+        let print = fingerprint(&dir.join(&f.path));
+        (f.path, print)
+    }).collect()))
+}
+
+/// Label each entry of a finished run's diff against the snapshot taken
+/// before it. A file the run restored to the commit is no longer in the diff
+/// at all, and so is not labelled.
+pub fn attribute(dir: &Path, diff: &mut [FileStat], before: Option<&Snapshot>) {
+    let Some(before) = before else { return };
+    for file in diff {
+        file.origin = Some(match before.0.iter().find(|(path, _)| *path == file.path) {
+            None => Origin::Run,
+            Some((_, print)) if *print == fingerprint(&dir.join(&file.path)) => Origin::BeforeRun,
+            Some(_) => Origin::Both,
+        });
+    }
+}
+
+/// A content hash, streamed so a large file is never held in memory. `None`
+/// for anything that is not a readable file - a deleted path stays `None`
+/// until something recreates it. Only ever compared within one process.
+fn fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::Hasher;
+    struct Sink(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut file = std::fs::File::open(path).ok().filter(|f| f.metadata().is_ok_and(|m| m.is_file()))?;
+    let mut sink = Sink(Default::default());
+    std::io::copy(&mut file, &mut sink).ok()?;
+    Some(sink.0.finish())
 }
 
 /// What the working tree looks like compared with `base`, plus whatever is
@@ -200,6 +267,7 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
                 path: path.to_string(),
                 added: added.parse().ok(),
                 deleted: deleted.parse().ok(),
+                origin: None,
             });
         }
     }
@@ -209,9 +277,30 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
             path: path.to_string(),
             added: None,
             deleted: None,
+            origin: None,
         });
     }
     Ok(stats)
+}
+
+/// Every tracked path in the repository, as forward-slash relative paths.
+///
+/// One `git ls-files` and no file is opened: this is the cheap repository
+/// signal the classifier scores a prompt's blast radius against. Capped,
+/// because a monorepo should slow nothing down and a blast radius only has to
+/// be big enough to leave the one-call route.
+///
+/// A repository git cannot list is not an error here. The classifier simply
+/// sees no candidate paths and routes on the prompt alone.
+pub fn tracked_paths(dir: &Path) -> Vec<String> {
+    const CAP: usize = 20_000;
+    git_output(dir, &["ls-files", "-z"])
+        .unwrap_or_default()
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .take(CAP)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Display name for a project directory: the folder name.
@@ -293,6 +382,52 @@ mod tests {
         let text = stats.iter().find(|f| f.path == "é file.txt").unwrap();
         assert_eq!((text.added, text.deleted), (Some(1), Some(0)));
         assert_eq!(stats.iter().find(|f| f.path == "binary.dat").unwrap().added, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The sandbox case that prompted this: `stray.txt` was untracked before
+    /// the run and must not be reported as the agent's work.
+    #[test]
+    fn a_diff_tells_the_users_changes_from_the_runs() {
+        let dir = temp_dir("diff-origin");
+        let command = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        command(&["init", "-q"]);
+        command(&["config", "user.name", "test"]);
+        command(&["config", "user.email", "test@example.com"]);
+        for name in ["clean.txt", "edited.txt", "gone.txt"] {
+            std::fs::write(dir.join(name), "old\n").unwrap();
+        }
+        command(&["add", "."]);
+        command(&["commit", "-qm", "initial"]);
+        let base = git_state(&dir).head.unwrap();
+
+        // The user's own changes, before any run.
+        std::fs::write(dir.join("stray.txt"), "untracked\n").unwrap();
+        std::fs::write(dir.join("edited.txt"), "old\nmine\n").unwrap();
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        let before = snapshot(&dir, Some(&base)).expect("snapshot");
+
+        // The run: touches a clean file and one the user had already edited.
+        std::fs::write(dir.join("clean.txt"), "old\nagent\n").unwrap();
+        std::fs::write(dir.join("edited.txt"), "old\nmine\nagent\n").unwrap();
+        std::fs::write(dir.join("created.txt"), "agent\n").unwrap();
+
+        let mut diff = diff_since(&dir, Some(&base)).unwrap();
+        attribute(&dir, &mut diff, Some(&before));
+        let origin = |name: &str| diff.iter().find(|f| f.path == name).unwrap_or_else(|| panic!("missing {name}")).origin;
+        assert_eq!(origin("stray.txt"), Some(Origin::BeforeRun), "an untracked file from before the run was claimed");
+        assert_eq!(origin("gone.txt"), Some(Origin::BeforeRun), "a deletion from before the run was claimed");
+        assert_eq!(origin("edited.txt"), Some(Origin::Both));
+        assert_eq!(origin("clean.txt"), Some(Origin::Run));
+        assert_eq!(origin("created.txt"), Some(Origin::Run));
+
+        // No snapshot means no claim either way.
+        let mut unknown = diff_since(&dir, Some(&base)).unwrap();
+        attribute(&dir, &mut unknown, None);
+        assert!(unknown.iter().all(|f| f.origin.is_none()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

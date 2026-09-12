@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
   Detected,
+  Mode,
   OpenedProject,
   Project,
   ProviderEvent,
@@ -40,11 +41,18 @@ export const trustProject = (path: string, trusted: boolean) =>
 export const forgetProject = (path: string) =>
   invoke<void>("forget_project", { path });
 
-/** The channel exists before invocation; completion uses the invoke response. */
+/**
+ * The channel exists before invocation; completion uses the invoke response.
+ *
+ * `mode` picks how readily the classifier takes the shorter route. The route
+ * itself is chosen in Rust before any CLI starts, costs nothing, and comes back
+ * on the result.
+ */
 export const startTask = (
   path: string,
   prompt: string,
   provider: ProviderId,
+  mode: Mode,
   onEvent: (event: ProviderEvent) => void,
   onTask: (taskId: number) => void,
 ) => {
@@ -54,7 +62,7 @@ export const startTask = (
   // Without it there is nothing for Stop to name.
   const task = new Channel<number>();
   task.onmessage = onTask;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, events, task });
+  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, events, task });
 };
 
 /**

@@ -6,8 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 to 5 are implemented. The acceptance checks for 1 and 2 are
-documented in `docs/m1-m2-verification.md`. Milestones 6-8 are not started.
+Milestones 1 to 6 are implemented. The acceptance checks for 1 and 2 are
+documented in `docs/m1-m2-verification.md`. Milestones 7 and 8 are not started.
 
 What exists and works:
 
@@ -25,6 +25,13 @@ What exists and works:
 - Mid-task instructions: Claude takes one live on stdin mid-turn, Codex holds
   one until asked to apply it and then resumes its own session with it
 - Installing a missing CLI from the project screen, via the user's own npm
+- Routing with no model call: a keyword classifier picks one of five routes,
+  each with call, turn and token ceilings declared before a provider starts; a
+  trivial task is one Implement call that verifies itself
+- Plan and Review return schema-checked artifacts and cannot edit; a Review
+  asking for changes ends the route; a budget stop ends `budgetReached` and
+  never escalates on its own
+- A diff that tells the run's changes from files already dirty before it
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -254,7 +261,7 @@ A module is a folder only once it outgrows one file. Actual layout today,
 
 ```
 src-tauri/
-  migrations/0001_init.sql
+  migrations/0001_init.sql  0002_tasks.sql
   src/
     main.rs        Tauri commands + app setup
     error.rs       AppError { kind, message }, serialized to the frontend
@@ -268,7 +275,7 @@ src-tauri/
       claude.rs    stream-json parser
       codex.rs     exec --json parser
       mock.rs      replays fixtures/*.jsonl through the real parsers
-    run.rs         one stage: argv, stream, event log, diff, result
+    run.rs         route runner: stages, argv, stream, budgets, event log, diff, result
     routing.rs     deterministic classifier + route builder + stage briefs
     orchestrator.rs *  folded into run.rs — see below
 src/

@@ -11,7 +11,8 @@ token/cost metrics.
 
 `docs/architecture.md` is the source of truth — verified CLI flags, the routing model,
 the full SQLite schema, and the 8-milestone plan. Read it before designing anything.
-Milestones 1-5 are done; 6 (classifier and multi-stage routes) is next.
+Milestones 1-6 are done; 7 (file cache, path ranking, usage baselines, route
+visual) is next.
 
 ## Commands
 
@@ -34,13 +35,21 @@ Toolchain: Node 22, Rust 1.98 MSVC, VS 2022 Build Tools (`VC.Tools.x86.x64`).
 
 Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens and a modal.
 
-- `main.rs` — Tauri commands (`open_project`, `recent_projects`, `trust_project`,
-  `forget_project`) and app setup. The `Store` is Tauri managed state.
+- `main.rs` — Tauri commands (projects: `open_project`, `recent_projects`,
+  `trust_project`, `forget_project`; providers: `detect_providers`,
+  `install_provider`, `sign_in_provider`; runs: `start_task`, `cancel_task`,
+  `send_instruction`) and app setup. `start_task` routes the prompt and
+  snapshots a dirty tree before any CLI starts. The `Store` is Tauri managed state.
+- `routing.rs` — pure keyword classifier, route and ceilings per route, stage
+  briefs, artifact checks. No model call and no I/O beyond what `main.rs` hands it.
+- `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
+  budget stops, diff, `TaskResult`. It never spends past the route's ceilings.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the
   job handle. Never replace this with a plain kill.
-- `project.rs` — git state, path validation, and the **trust scan**.
+- `project.rs` — git state, path validation, the **trust scan**, and the diff,
+  whose entries are labelled `run` / `beforeRun` / `both` against a pre-run snapshot.
 - `store.rs` — SQLite via `rusqlite` (bundled), plain numbered `.sql` migrations in
   `src-tauri/migrations/`, no ORM.
 - `providers/` — `ProviderId::detect()` (PATH x PATHEXT resolution, `--version`,

@@ -515,6 +515,17 @@ rides along with metrics. Each slice ends commit-ready with tests.
   run above recorded a clean `done` with no trace of why it did nothing. Unparsed
   JSON lines are appended verbatim under `kind = 'unknown'` and are not emitted,
   so the log stays complete without putting shapes the UI cannot render on screen.
+- **npm cannot run inside Codex's Windows sandbox, and must not be made to.**
+  npm resolves its own path with a realpath that walks every ancestor, and it is
+  installed under the user profile, so it dies on `EPERM: lstat 'C:\Users\<user>'`
+  before it starts. PowerShell separately refuses to load `npm.ps1` under a
+  Restricted execution policy. `node` itself runs fine. The obvious fix -
+  `codex exec --add-dir <npm prefix>` - is **forbidden**: that prefix is
+  `%APPDATA%\npm`, where `claude` and `codex` themselves live, so granting it
+  would let an agent overwrite the provider CLIs. There is no headless way to add
+  a *read* root; `/sandbox-add-read-dir` is an interactive TUI command. Until
+  Codex offers one, an agent that reaches for npm burns several turns finding a
+  way around it, and the cheapest mitigation is to tell it not to.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

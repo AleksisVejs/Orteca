@@ -36,6 +36,11 @@ pub fn replay(id: ProviderId, fixture: &Path) -> io::Result<Vec<ProviderEvent>> 
     Ok(events)
 }
 
+/// A fixture by filename, for captures that are not a provider's happy path.
+pub fn named(file: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(file)
+}
+
 /// The bundled recording for a provider.
 pub fn fixture(id: ProviderId) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -122,6 +127,41 @@ mod tests {
         )));
         // Reasoning is not an assistant message and must not surface as text.
         assert!(!events.contains(&ProviderEvent::Text("Check the store before editing.".into())));
+    }
+
+    /// A real `codex exec` run, captured from the app on 2026-09-12: it edited
+    /// a file and ran seven commands. `codex-run.jsonl` beside it is written to
+    /// the shapes in `docs/architecture.md` and had never been checked against
+    /// a live write path, which is how the item types Codex reports its own
+    /// tool failures in went unnoticed until a run did nothing and said so.
+    #[test]
+    fn a_recorded_write_run_normalises_to_events() {
+        let events = replay(ProviderId::Codex, &named("codex-write-run.jsonl"))
+            .expect("a recording must load as a fixture");
+
+        // The edit the run was asked for.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProviderEvent::ToolUse { name, summary } if name == "Edit" && summary.ends_with("slug.js")
+            )),
+            "the file change is missing"
+        );
+        // Only completed commands become events; `item.started` carries none,
+        // which is why run::stream keeps those lines under `kind = unknown`.
+        let shells = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::ToolUse { name, .. } if name == "Shell"))
+            .count();
+        assert_eq!(shells, 7, "one event per completed command, not per start");
+
+        let u = usage(&events);
+        // Codex reports cached reads inside its input count; folding them in
+        // again would report this run as nine times the size it was.
+        assert_eq!(u.cached_input_tokens, 133_248);
+        assert_eq!(u.input_tokens, 150_095 - 133_248);
+        assert_eq!(u.cost_usd, None);
+        assert_eq!(u.cost_quality, CostQuality::Unavailable);
     }
 
     #[test]

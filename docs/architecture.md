@@ -6,8 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 and 2 are implemented. Their acceptance checks are documented in
-`docs/m1-m2-verification.md`. Milestones 3-8 are not started.
+Milestones 1, 2 and 3 are implemented. The acceptance checks for 1 and 2 are
+documented in `docs/m1-m2-verification.md`. Milestones 4-8 are not started.
 
 What exists and works:
 
@@ -16,6 +16,8 @@ What exists and works:
 - JSONL event reader over stdout, stdin held open for steering
 - SQLite with migrations, `projects` table
 - Open a project: git state, trust scan, recents
+- Provider detection (PATH resolution, version, auth mode), shown on the project
+  screen; `mock` replays JSONL fixtures through the real event parsers
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -184,7 +186,11 @@ src-tauri/
       job.rs
     project.rs     git state, trust scan, path validation
     store.rs       SQLite, migrations, projects
-    providers/ *   trait Provider + claude.rs + codex.rs + mock.rs
+    providers/     detect + event normalisation + mock fixture replay
+      mod.rs       ProviderId, Detected, ProviderEvent, `which`
+      claude.rs    stream-json parser
+      codex.rs     exec --json parser
+      mock.rs      replays fixtures/*.jsonl through the real parsers
     routing.rs *   deterministic classifier + route builder
     orchestrator.rs *  runs the route, owns the instruction queue
     git.rs *       baseline snapshot, diff capture
@@ -242,6 +248,26 @@ pub enum FailureKind {
 ```
 
 `mock.rs` replays recorded JSONL fixtures. CI never spends a subscription.
+
+**As built (Milestone 3).** No `async_trait` and no `Provider` trait yet: a
+`ProviderId` enum with `detect()` and `parse_line()` covers detection and
+normalisation, and dynamic dispatch has nothing to dispatch on until the
+orchestrator picks a provider at runtime in Milestone 4. `Invocation`,
+`Handle`, `Steering` and `CancelToken` land with the first real run.
+
+`parse_line` takes one raw JSONL line and returns zero or more events: a Claude
+`result` is both a `Usage` and an outcome, and one assistant message can hold
+text and a tool call together. `Done.result` is empty for Codex, which reports
+no final-answer field — the caller keeps the last `Text`.
+
+Fixtures in `src-tauri/fixtures/*.jsonl` are written to the event shapes
+verified above, not captured from a live session, because neither CLI is
+installed. Swap in a real capture when one exists; nothing else changes.
+
+Detection resolves the program against PATH x PATHEXT itself. `CreateProcess`
+only ever appends `.exe`, so `claude.cmd` — how both CLIs install on Windows —
+is invisible to a bare program name. The resolved path is what Milestone 4
+spawns.
 
 ## 7. SQLite schema — 6 tables
 
@@ -389,8 +415,8 @@ Review artifact:
 |---|---|---|---|
 | 1 | Tauri 2 + Vue 3 shell, design tokens, **Job Object process runner + JSONL reader** | app opens, can spawn and kill a process tree | done |
 | 2 | Launch screen, open project, recents, git state, **trust scan** | can open a real repo | done |
-| 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | next |
-| 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | |
+| 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
+| 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | next |
 | 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | |
 | 6 | Classifier + multi-stage routes + structured artifacts + verify | Plan → Build → Review works | |
 | 7 | file_cache, path ranking, usage + baselines, route visual | metrics are honest and labelled | |

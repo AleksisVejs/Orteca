@@ -2,7 +2,10 @@
 name = "orteca"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+# 1.77.2 is the floor, not 1.77: earlier releases mis-escape arguments passed
+# to a .bat/.cmd file (CVE-2024-24576), and both provider CLIs install on
+# Windows as npm .cmd shims that Orteca spawns with a user-written prompt.
+rust-version = "1.77.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

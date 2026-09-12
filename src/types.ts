@@ -36,3 +36,20 @@ export interface OpenedProject {
 }
 
 export type Mode = "efficient" | "balanced";
+
+export type ProviderId = "claude" | "codex";
+
+/** How the CLI authenticates. Orteca never reads a credential, only its presence. */
+export type Auth = "subscription" | "apiKey" | "signedOut" | "unknown";
+
+export type CostQuality = "exact" | "estimated" | "unavailable";
+
+/** A live detection. `path: null` means not installed — a state, not an error. */
+export interface Detected {
+  id: ProviderId;
+  program: string;
+  path: string | null;
+  version: string | null;
+  auth: Auth;
+  costQuality: CostQuality;
+}

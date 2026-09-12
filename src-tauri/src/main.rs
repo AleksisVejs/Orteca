@@ -2,9 +2,13 @@
 
 mod error;
 mod project;
-// Wired to provider invocation in Milestone 3.
+// Wired to provider invocation in Milestone 4.
 #[allow(dead_code)]
 mod proc;
+// Detection is live. Event normalisation and the mock are exercised by tests
+// until Milestone 4 runs a provider for real.
+#[allow(dead_code)]
+mod providers;
 mod store;
 
 use serde::Serialize;
@@ -12,6 +16,7 @@ use tauri::{Manager, State};
 
 use error::{AppError, ErrorKind, Result};
 use project::{GitState, TrustFinding};
+use providers::{Detected, ProviderId};
 use store::{Project, Store};
 
 #[derive(Serialize)]
@@ -48,6 +53,14 @@ fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
     })
 }
 
+/// Live, never stored: a CLI can be installed or signed in while Orteca runs.
+/// Returns a row per provider - "not installed" is a state the UI shows, not
+/// an error, since the app is expected to run with neither CLI present.
+#[tauri::command]
+fn detect_providers() -> Vec<Detected> {
+    ProviderId::ALL.into_iter().map(ProviderId::detect).collect()
+}
+
 #[tauri::command]
 fn recent_projects(store: State<Store>) -> Result<Vec<Project>> {
     store.recent_projects(8)
@@ -73,6 +86,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             open_project,
+            detect_providers,
             recent_projects,
             trust_project,
             forget_project

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import type { Mode, OpenedProject } from "../types";
+import { onMounted, ref } from "vue";
+import { detectProviders } from "../api";
+import type { Auth, Detected, Mode, OpenedProject } from "../types";
 
 defineProps<{ opened: OpenedProject }>();
 defineEmits<{ close: [] }>();
@@ -9,6 +10,20 @@ defineEmits<{ close: [] }>();
 const task = ref("");
 const mode = ref<Mode>("balanced");
 const modes: Mode[] = ["efficient", "balanced"];
+
+// Detected live on every open: a CLI can be installed or signed in behind us.
+// A missing CLI is shown, not thrown - the app is useful with neither present.
+const providers = ref<Detected[]>([]);
+onMounted(async () => {
+  providers.value = await detectProviders().catch(() => []);
+});
+
+const AUTH: Record<Auth, string> = {
+  subscription: "signed in",
+  apiKey: "API key",
+  signedOut: "not signed in",
+  unknown: "",
+};
 </script>
 
 <template>
@@ -38,6 +53,23 @@ const modes: Mode[] = ["efficient", "balanced"];
         {{ m }}
       </button>
     </div>
+
+    <section class="providers">
+      <h2>Providers</h2>
+      <ul>
+        <li v-for="p in providers" :key="p.id">
+          <span class="who">{{ p.program }}</span>
+          <template v-if="p.path">
+            <span class="mono">{{ p.version ?? "version unknown" }}</span>
+            <span class="note">{{ AUTH[p.auth] }}</span>
+            <span v-if="p.costQuality === 'unavailable'" class="note">
+              tokens only, no cost
+            </span>
+          </template>
+          <span v-else class="missing">not installed</span>
+        </li>
+      </ul>
+    </section>
   </main>
 </template>
 
@@ -110,5 +142,42 @@ textarea:focus {
 .mode.on {
   background: var(--surface);
   color: var(--accent);
+}
+
+.providers {
+  margin-top: 56px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.providers h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.providers ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.providers li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+}
+.who {
+  min-width: 64px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+}
+.note {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.missing {
+  font-size: 12px;
+  color: var(--warn);
 }
 </style>

@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","model":"claude-sonnet-5","cwd":"C:/repo","tools":["Read","Edit","Bash"],"permissionMode":"acceptEdits"}
+{"type":"assistant","session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","message":{"role":"assistant","content":[{"type":"text","text":"Reading the migration first."},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"src-tauri/migrations/0001_init.sql"}}]}}
+{"type":"user","session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"CREATE TABLE projects ("}]}}
+{"type":"assistant","session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"git diff --stat","description":"see what changed"}}]}}
+{"type":"assistant","session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","message":{"role":"assistant","content":[{"type":"text","text":"The index already orders recents by opened_seq."}]}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":18422,"num_turns":4,"session_id":"01J8Z9Q2K7C3N5P6R8T0V2X4Y6","result":"The index already orders recents by opened_seq.","total_cost_usd":0.0412,"usage":{"input_tokens":1840,"cache_creation_input_tokens":2200,"cache_read_input_tokens":14300,"output_tokens":612}}

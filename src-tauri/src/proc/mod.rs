@@ -7,7 +7,7 @@
 mod job;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -137,16 +137,41 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
     })
 }
 
+/// A temp directory Orteca owns, for every child it spawns.
+///
+/// Codex's Windows sandbox grants a write ACE on each of its write roots, and
+/// TEMP is one of them. When TEMP points somewhere the user cannot re-ACL -
+/// `E:\Temp` owned by BUILTIN\Administrators grants Modify, which does not
+/// include WRITE_DAC - `SetNamedSecurityInfoW` fails with ERROR_ACCESS_DENIED,
+/// the sandbox refuses to start, and the agent loses every tool while the run
+/// still exits 0. The inherited TEMP is not Orteca's to repair; the child's is.
+///
+/// One stable directory rather than one per run: Codex caches its runtimes
+/// under TEMP, and a fresh directory would re-pay that on every task.
+fn owned_temp() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join("app.orteca")
+        .join("tmp");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 fn spawn_suspended(program: &str, args: &[&str], cwd: &Path) -> io::Result<Child> {
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0)
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // Inherit the user's TEMP when Orteca has nowhere better; a missing
+    // LOCALAPPDATA is not a reason to refuse to run.
+    if let Some(temp) = owned_temp() {
+        command.env("TEMP", &temp).env("TMP", &temp);
+    }
+    command.spawn()
 }
 
 #[cfg(all(test, windows))]
@@ -368,6 +393,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("paused consumer blocked process exit");
+    }
+
+    /// A provider that has to re-ACL its own TEMP cannot do it when TEMP is a
+    /// directory the user only has Modify on. Codex fails that way and then
+    /// exits 0 with every tool gone, so the child gets a directory Orteca owns.
+    #[tokio::test]
+    async fn children_run_with_a_temp_directory_orteca_owns() {
+        let expected = owned_temp().expect("LOCALAPPDATA");
+        let mut run = spawn(
+            "node",
+            &["-e", "console.log(JSON.stringify({temp:process.env.TEMP,tmp:process.env.TMP}))"],
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+
+        let mut reported = None;
+        while let Some(line) = run.lines.recv().await {
+            if let Line::Json(v) = line {
+                reported = Some((
+                    v["temp"].as_str().unwrap_or_default().to_string(),
+                    v["tmp"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+        let (temp, tmp) = reported.expect("child reported no temp");
+        assert_eq!(std::path::Path::new(&temp), expected, "child inherited a TEMP Orteca does not own");
+        assert_eq!(std::path::Path::new(&tmp), expected, "TMP and TEMP must agree");
+
+        // The whole point: this directory has to accept a write.
+        let probe = expected.join("write-probe");
+        std::fs::write(&probe, "x").expect("owned temp must be writable");
+        std::fs::remove_file(&probe).unwrap();
     }
 
     #[test]

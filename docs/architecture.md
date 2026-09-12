@@ -501,6 +501,15 @@ rides along with metrics. Each slice ends commit-ready with tests.
   never signed in, because on Windows that file also holds MCP server tokens.
   A signed-out provider now disables Run and offers `sign_in_provider`, which
   spawns the CLI's own browser flow. Orteca renders no login form.
+- **A child's TEMP is part of the sandbox contract.** Codex's Windows sandbox
+  grants a write ACE on every write root, and TEMP is one of them. If TEMP is a
+  directory the user cannot re-ACL - `E:\Temp` owned by `BUILTIN\Administrators`
+  grants Modify, which excludes WRITE_DAC - `SetNamedSecurityInfoW` fails with
+  ERROR_ACCESS_DENIED, the sandbox never starts, and `codex exec` still **exits 0**
+  with a polite final message while the agent had no tools at all. `proc::spawn`
+  therefore gives every child a TEMP under `%LOCALAPPDATA%pp.orteca	mp`. The
+  workspace is also a write root, so a repository under such a directory fails the
+  same way and no environment variable can fix it - that one needs a real UI state.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

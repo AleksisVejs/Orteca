@@ -54,9 +54,29 @@ fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
 /// Returns a row per provider - "not installed" is a state the UI shows, not
 /// an error, since the app is expected to run with neither CLI present.
 #[tauri::command]
-async fn detect_providers() -> Result<Vec<Detected>> {
-    tauri::async_runtime::spawn_blocking(|| ProviderId::ALL.into_iter().map(ProviderId::detect).collect()).await
-        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))
+async fn detect_providers(found: tauri::ipc::Channel<Detected>) -> Result<Vec<Detected>> {
+    // Every provider at once, and each row is sent the moment it lands. Asking
+    // them one after another spent one CLI's start-up waiting on the previous
+    // one's, and the card stayed empty until the slowest had answered.
+    let probes: Vec<_> = ProviderId::ALL
+        .into_iter()
+        .map(|id| {
+            let found = found.clone();
+            tauri::async_runtime::spawn(async move {
+                let one = id.detect_async().await;
+                // A closed channel is the window going away, not a failed
+                // detection: the response still carries the full set.
+                let _ = found.send(one.clone());
+                one
+            })
+        })
+        .collect();
+
+    let mut detected = Vec::with_capacity(probes.len());
+    for probe in probes {
+        detected.push(probe.await.map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?);
+    }
+    Ok(detected)
 }
 
 /// Start one single-stage run and return its task id. The stream arrives as

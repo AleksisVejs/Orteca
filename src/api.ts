@@ -24,7 +24,12 @@ export async function pickFolder(): Promise<string | null> {
 export const openProject = (path: string) =>
   invoke<OpenedProject>("open_project", { path });
 
-export const detectProviders = () => invoke<Detected[]>("detect_providers");
+/** Rows arrive one at a time as each CLI answers; the response is the full set. */
+export const detectProviders = (onFound: (provider: Detected) => void) => {
+  const found = new Channel<Detected>();
+  found.onmessage = onFound;
+  return invoke<Detected[]>("detect_providers", { found });
+};
 
 export const recentProjects = () => invoke<Project[]>("recent_projects");
 

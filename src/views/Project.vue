@@ -32,6 +32,28 @@ const provider = ref<ProviderId>("codex");
 const installed = computed(() => providers.value.filter((p) => p.path));
 const missing = computed(() => providers.value.filter((p) => !p.path));
 
+// Asking a CLI what it is costs a process start each, so the answers take
+// seconds and arrive out of order. The card lists every provider from the
+// first frame and fills each row in as it replies, rather than showing an
+// empty box until the slowest one is done. `providers` still holds only
+// answers, so nothing downstream can mistake a pending row for a verdict.
+const ORDER: ProviderId[] = ["claude", "codex"];
+type Row = Detected & { pending?: true };
+const rows = computed<Row[]>(() =>
+  ORDER.map(
+    (id) =>
+      providers.value.find((p) => p.id === id) ?? {
+        id,
+        program: id,
+        path: null,
+        version: null,
+        auth: "unknown",
+        costQuality: "unavailable",
+        pending: true,
+      },
+  ),
+);
+
 // npm writes to one global folder, so two installs at once fight over it.
 // One at a time, in order, and the button says which one is going.
 const installing = ref<ProviderId | null>(null);
@@ -104,7 +126,9 @@ let stop: Array<() => void> = [];
 
 onMounted(async () => {
   try {
-    providers.value = await detectProviders();
+    providers.value = await detectProviders((one) => {
+      providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
+    });
     // Prefer whatever is actually installed over the default.
     const first = installed.value[0];
     if (first && !installed.value.some((p) => p.id === provider.value)) {
@@ -321,9 +345,12 @@ const AUTH: Record<Auth, string> = {
       <h2 class="label">Providers</h2>
       <p v-if="providerError" class="missing">detection unavailable</p>
       <ul v-else class="card providers">
-        <li v-for="p in providers" :key="p.id">
+        <li v-for="p in rows" :key="p.id">
           <span class="who">{{ p.program }}</span>
-          <template v-if="p.path && signingIn === p.id">
+          <template v-if="p.pending">
+            <span class="note grow">checking…</span>
+          </template>
+          <template v-else-if="p.path && signingIn === p.id">
             <span class="note grow">{{ signInLine }}</span>
           </template>
           <template v-else-if="p.path">

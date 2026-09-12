@@ -26,7 +26,7 @@ pub enum ProviderId {
 
 /// What a live detection found. "Not installed" is a state, not an error:
 /// the app is expected to run on a machine with neither CLI present.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Detected {
     pub id: ProviderId,
@@ -186,14 +186,49 @@ impl ProviderId {
 
     pub fn detect(self) -> Detected {
         let path = which(self.program());
+        let version = path.as_deref().and_then(version_of);
+        let auth = match path.as_deref() {
+            Some(p) => self.auth(p),
+            None => Auth::Unknown,
+        };
+        self.detected(path, version, auth)
+    }
+
+    /// The same answer as `detect`, with the two probes overlapped.
+    ///
+    /// Each one is a process start, and both CLIs are `.cmd` shims over a large
+    /// Node bundle that needs about two seconds before it prints a word. They
+    /// do not depend on each other, so asking in series paid that wait twice.
+    pub async fn detect_async(self) -> Detected {
+        let Some(path) = which(self.program()) else {
+            return self.detected(None, None, Auth::Unknown);
+        };
+        let (version, auth) = self.probe(path.clone()).await;
+        self.detected(Some(path), version, auth)
+    }
+
+    /// Ask one CLI both questions at once. Split out from `detect_async` so the
+    /// overlap can be measured against a shim instead of the real PATH.
+    async fn probe(self, path: PathBuf) -> (Option<String>, Auth) {
+        let (for_version, for_auth) = (path.clone(), path);
+        let version = tokio::task::spawn_blocking(move || version_of(&for_version));
+        let auth = tokio::task::spawn_blocking(move || self.auth(&for_auth));
+        // A probe that could not finish is exactly what `None` and `Unknown`
+        // already mean; neither is allowed to become an optimistic answer.
+        (
+            version.await.ok().flatten(),
+            auth.await.unwrap_or(Auth::Unknown),
+        )
+    }
+
+    /// One place builds a `Detected`, so the sync and overlapped paths cannot
+    /// drift into reporting the same machine differently.
+    fn detected(self, path: Option<PathBuf>, version: Option<String>, auth: Auth) -> Detected {
         Detected {
             id: self,
             program: self.program(),
-            version: path.as_deref().and_then(version_of),
-            auth: match path.as_deref() {
-                Some(p) => self.auth(p),
-                None => Auth::Unknown,
-            },
+            version,
+            auth,
             path: path.map(|p| p.display().to_string()),
             cost_quality: match self {
                 // Claude's own total is a client-side estimate, not a bill.
@@ -499,6 +534,31 @@ echo }",
         let shim = cwd.join("agent.cmd");
         std::fs::write(&shim, "@echo off\r\nping -n 6 127.0.0.1 >nul\r\necho too late\r\n").unwrap();
         assert_eq!(version_of(&shim), None);
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    /// Both questions cost a full Node start, so asking them in series spent
+    /// that wait twice and the Providers card sat empty for all of it.
+    #[tokio::test]
+    async fn the_two_probes_of_one_provider_overlap() {
+        let cwd = temp_dir("probe-overlap");
+        let shim = cwd.join("agent.cmd");
+        // Slow, and the same answer to either question - only timing matters.
+        std::fs::write(&shim, "@echo off
+ping -n 3 127.0.0.1 >nul
+echo agent 9.9.9
+").unwrap();
+
+        let started = std::time::Instant::now();
+        let (version, _) = ProviderId::Claude.probe(shim).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(version, Some("agent 9.9.9".into()), "the shim was not actually run");
+        // One probe is about two seconds here; in series the pair is about four.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "probes ran in series: {elapsed:?}"
+        );
         std::fs::remove_dir_all(cwd).unwrap();
     }
 

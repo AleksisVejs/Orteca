@@ -19,13 +19,31 @@ function app(api = {}) {
 
 const project = { project: { path: 'C:/repo', trusted: false }, trustFindings: [{}] };
 
+test('run history loads on open, refreshes after a run, and never shows a zero for unknown tokens', async () => {
+  const past = { id: 1, prompt: 'old', status: 'failed', startedAt: '2026-09-12 10:00:00', summary: null, routeKind: 'implementOnce', callsUsed: 1, provider: 'codex', tokens: null, cachedTokens: null, costUsd: null, costQuality: 'unavailable' };
+  let asked = 0;
+  const { state } = await projectView({
+    recentTasks: async () => (++asked === 1 ? [past] : [{ ...past, id: 2, status: 'done', tokens: 1200, costUsd: 0.01, costQuality: 'estimated' }, past]),
+    startTask: async () => ({ ...finished, status: 'done', failure: null }),
+  });
+  await new Promise(r => setTimeout(r));
+  assert.equal(state.historyLine(state.history.value[0]), 'implementOnce · 1 call · tokens unavailable · 2026-09-12 10:00 UTC');
+  await state.run();
+  assert.equal(state.history.value.length, 2);
+  assert.match(state.historyLine(state.history.value[0]), /1,200 tokens · \$0\.0100 estimated/);
+
+  const broken = await projectView({ recentTasks: async () => { throw new Error('db'); } });
+  await new Promise(r => setTimeout(r));
+  assert.equal(broken.state.historyError.value, true);
+});
+
 async function projectView(api = {}) {
   const source = readFileSync(new URL('../src/views/Project.vue', import.meta.url), 'utf8')
     .match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -35,6 +53,7 @@ async function projectView(api = {}) {
     onInstallEvent: async () => () => {},
     onSignInEvent: async () => () => {},
     cancelTask: async () => {},
+    recentTasks: async () => [],
     sendInstruction: async () => ({ disposition: 'live' }),
     isAppError: e => !!e?.message,
     ...api,

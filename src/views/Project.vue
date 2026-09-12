@@ -7,6 +7,7 @@ import {
   isAppError,
   onInstallEvent,
   onSignInEvent,
+  recentTasks,
   sendInstruction,
   signInProvider,
   startTask,
@@ -19,6 +20,7 @@ import type {
   ProviderEvent,
   ProviderId,
   TaskResult,
+  TaskSummary,
 } from "../types";
 
 const props = defineProps<{ opened: OpenedProject }>();
@@ -184,7 +186,22 @@ async function stopRun() {
 
 let stop: Array<() => void> = [];
 
+// Past runs here, reloaded after each one. A history that cannot be read says
+// so; it never blocks a run.
+const history = ref<TaskSummary[]>([]);
+const historyError = ref(false);
+
+async function loadHistory() {
+  try {
+    history.value = await recentTasks(props.opened.project.path);
+    historyError.value = false;
+  } catch {
+    historyError.value = true;
+  }
+}
+
 onMounted(async () => {
+  void loadHistory();
   try {
     providers.value = await detectProviders((one) => {
       providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
@@ -243,6 +260,7 @@ async function run() {
     running.value = false;
     stopping.value = false;
     taskId.value = null;
+    await loadHistory();
   }
 }
 
@@ -339,6 +357,21 @@ const changed = computed(() => {
     unknown: !!result.value?.dirtyAtStart && diff.some((f) => f.origin === null),
   };
 });
+
+const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, running: "Running" };
+
+/** A past run's metrics, each labelled, unknown spelled out rather than zeroed. */
+function historyLine(t: TaskSummary): string {
+  return [
+    t.routeKind,
+    t.callsUsed === null ? null : `${t.callsUsed} ${t.callsUsed === 1 ? "call" : "calls"}`,
+    t.tokens === null ? "tokens unavailable" : `${formatTokens(t.tokens)} tokens`,
+    t.costUsd === null ? null : `${formatCost(t.costUsd)} ${t.costQuality}`,
+    `${t.startedAt.slice(0, 16)} UTC`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
 
 const AUTH: Record<Auth, string> = {
   subscription: "saved login",
@@ -588,6 +621,18 @@ const AUTH: Record<Auth, string> = {
           <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(", ") }}</span>
         </p>
       </div>
+    </section>
+
+    <section v-if="history.length || historyError" class="block">
+      <h2 class="label">Recent runs</h2>
+      <p v-if="historyError" class="missing">history unavailable</p>
+      <ul v-else class="card history">
+        <li v-for="t in history" :key="t.id">
+          <span class="status">{{ HISTORY_STATUS[t.status] ?? t.status }}</span>
+          <span class="grow" :title="t.prompt">{{ t.prompt }}</span>
+          <span class="note">{{ historyLine(t) }}</span>
+        </li>
+      </ul>
     </section>
 
     <section class="block">
@@ -964,19 +1009,30 @@ textarea:disabled {
   margin: 0 0 16px;
 }
 
-.providers {
+.providers,
+.history {
   margin: 0;
   padding: 8px 18px;
   list-style: none;
 }
-.providers li {
+.providers li,
+.history li {
   display: flex;
   align-items: baseline;
   gap: 10px;
   padding: 7px 0;
 }
-.providers li + li {
+.providers li + li,
+.history li + li {
   border-top: 1px solid var(--border);
+}
+.status {
+  min-width: 96px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.history .grow {
+  color: var(--text);
 }
 .who {
   min-width: 64px;

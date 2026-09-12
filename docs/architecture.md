@@ -37,6 +37,11 @@ What exists and works:
 - Briefs name ranked candidate paths, never contents; the token ceiling is
   checked on cumulative usage after every turn; a finished run is compared to
   the median of comparable runs once five exist; the result shows the route
+- The project screen lists recent runs with their outcome, route, calls and
+  labelled usage
+- Codex is refused up front on a repository whose folder ACL the user cannot
+  change, instead of "finishing" with no tools (see §16)
+- CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -236,6 +241,32 @@ numbers are therefore **not an acceptable efficient-task baseline**. High cache
 share explains repeated context reuse, not proportional work. M6/M7 are only
 complete when a comparable trivial task takes the one-call route and the new
 baseline is materially lower without reducing verification quality.
+
+### 4.3.2 Re-measured through the router — 2026-09-13
+
+Same exercise, driven through the real `start_task` (routing, ceilings, event
+log) in a fresh `make-sandbox.mjs` repo, `balanced` mode, prompt: "Fix slug() in
+src/slug.js so repeated separators collapse to a single dash and leading or
+trailing separators are dropped. Make the tests in src/slug.test.js pass."
+
+| Provider | Route | Calls / turns | Outcome | Reported tokens | Cached | Uncached (in + out) | Reported cost |
+|---|---|---|---|---:|---:|---:|---:|
+| Claude 2.1.269 | implementOnce | 1 / 5 | fix correct, 3/3 tests pass; status `budgetReached` | 215,650 | 198,572 | 17,078 | $0.1116 estimated |
+| Codex 0.154.0 | implementOnce | 1 / 0 | `failed`: "Unable to verify model access" | — | — | — | unavailable |
+
+**The target is not met.** The router does its part: a trivial task takes one
+call, the brief names `src/slug.js` and `src/slug.test.js`, and the fix verifies
+itself. But the tokens are not lower. The Claude total sits inside the earlier
+164k-230k range, and its uncached share (17k) is above both earlier Claude runs
+(7k and 13k). Almost all of it is the CLI's own cached context, which routing
+does not touch. Codex could not be measured: its account did not grant model
+access.
+
+Found by the measurement: the token guard counts cache reads, so this ~190k
+cached context crosses the 150k `implementOnce` ceiling on its own. The guard
+also fires after the final stage's result with nothing left to stop, so a
+finished, correct run reads `budgetReached`. The baseline excludes cache reads,
+so the two disagree. Fix that before trusting a baseline.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -771,7 +802,9 @@ rides along with metrics. Each slice ends commit-ready with tests.
   with a polite final message while the agent had no tools at all. `proc::spawn`
   therefore gives every child a TEMP under `%LOCALAPPDATA%pp.orteca	mp`. The
   workspace is also a write root, so a repository under such a directory fails the
-  same way and no environment variable can fix it - that one needs a real UI state.
+  same way and no environment variable can fix it. `proc::can_change_acl` asks
+  for a WRITE_DAC handle on the repository before a Codex run and `prepare_run`
+  refuses with a message saying to move the repo or use claude.
 - **An event the parser cannot read is still written to the log.** Both parsers
   match a subset of their CLI's event types and drop the rest, which is how the
   run above recorded a clean `done` with no trace of why it did nothing. Unparsed

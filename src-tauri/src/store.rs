@@ -295,6 +295,57 @@ impl Store {
         conn.execute("DELETE FROM projects WHERE path = ?1", params![path])?;
         Ok(())
     }
+
+    /// A project's runs, newest first. Token counts stay NULL where the
+    /// provider reported none, as they are in `usage`.
+    pub fn recent_tasks(&self, project_id: i64, limit: u32) -> Result<Vec<TaskSummary>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.prompt, t.status, t.started_at, t.summary,
+                    json_extract(t.route_json, '$.kind'), t.calls_used, u.provider,
+                    u.input_tokens + u.cached_input_tokens + u.output_tokens,
+                    u.cached_input_tokens, u.cost_usd, u.cost_quality
+               FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
+              WHERE t.project_id = ?1
+              ORDER BY t.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit], |r| {
+            Ok(TaskSummary {
+                id: r.get(0)?,
+                prompt: r.get(1)?,
+                status: r.get(2)?,
+                started_at: r.get(3)?,
+                summary: r.get(4)?,
+                route_kind: r.get(5)?,
+                calls_used: r.get(6)?,
+                provider: r.get(7)?,
+                tokens: r.get(8)?,
+                cached_tokens: r.get(9)?,
+                cost_usd: r.get(10)?,
+                cost_quality: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+/// One row of a project's run history.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSummary {
+    pub id: i64,
+    pub prompt: String,
+    pub status: String,
+    /// SQLite `datetime('now')`: UTC, to the second.
+    pub started_at: String,
+    pub summary: Option<String>,
+    pub route_kind: Option<String>,
+    pub calls_used: Option<u32>,
+    pub provider: Option<String>,
+    pub tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub cost_quality: Option<String>,
 }
 
 fn read_project(conn: &Connection, path: &str) -> Result<Project> {
@@ -376,6 +427,23 @@ mod tests {
         store.record_usage(task, None, "codex", None).unwrap();
         let count: i64 = store.0.lock().unwrap().query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn history_is_newest_first_and_never_a_zero_for_unknown_usage() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let silent = store.create_task(new_task(project.id, "first", "balanced")).unwrap();
+        store.record_usage(silent, None, "codex", None).unwrap();
+        let measured = store.create_task(new_task(project.id, "second", "balanced")).unwrap();
+        let usage = Usage { input_tokens: 10, cached_input_tokens: 100, output_tokens: 5, reasoning_tokens: 0, cost_usd: Some(0.01), cost_quality: CostQuality::Estimated };
+        store.record_usage(measured, None, "claude", Some(&usage)).unwrap();
+        store.finish_task(measured, "done", "ok", "[]", 1).unwrap();
+
+        let rows = store.recent_tasks(project.id, 20).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [measured, silent]);
+        assert_eq!((rows[0].tokens, rows[0].calls_used, rows[0].cost_quality.as_deref()), (Some(115), Some(1), Some("estimated")));
+        assert_eq!((rows[1].tokens, rows[1].status.as_str()), (None, "running"));
     }
 
     #[test]

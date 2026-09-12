@@ -1,5 +1,22 @@
 // Mirrors the serde shapes in src-tauri. Keep in step with src-tauri/src.
 
+/** One past run. Token and cost fields are null where nothing was reported. */
+export interface TaskSummary {
+  id: number;
+  prompt: string;
+  status: TaskResult["status"] | "running";
+  /** UTC, to the second. */
+  startedAt: string;
+  summary: string | null;
+  routeKind: RouteKind | null;
+  callsUsed: number | null;
+  provider: ProviderId | null;
+  tokens: number | null;
+  cachedTokens: number | null;
+  costUsd: number | null;
+  costQuality: CostQuality | null;
+}
+
 export type ErrorKind =
   | "notFound"
   | "notAGitRepo"

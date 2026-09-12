@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Job Objects, PATHEXT resolution and the ACL probe are Windows-only.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # Tests build throwaway repos; git refuses to commit without an identity.
+      - run: |
+          git config --global user.name "Orteca CI"
+          git config --global user.email ci@orteca.invalid
+      - run: npm ci
+      - run: npm test
+      # Before cargo: tauri's context embeds dist/.
+      - run: npm run build
+      # No provider CLI is installed here, and no test needs one.
+      - run: cargo test
+        working-directory: src-tauri

@@ -11,8 +11,10 @@ token/cost metrics.
 
 `docs/architecture.md` is the source of truth — verified CLI flags, the routing model,
 the full SQLite schema, and the 8-milestone plan. Read it before designing anything.
-Milestones 1-6 are done; 7 (file cache, path ranking, usage baselines, route
-visual) is next.
+Milestones 1-6 are done. 7 is built except the file cache, which is deferred;
+8 has an unsigned NSIS installer and waits on a signing certificate. CI
+(`.github/workflows/ci.yml`) runs `npm test`, `npm run build` and `cargo test`
+on Windows.
 
 ## Commands
 
@@ -38,8 +40,9 @@ Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens an
 - `main.rs` — Tauri commands (projects: `open_project`, `recent_projects`,
   `trust_project`, `forget_project`; providers: `detect_providers`,
   `install_provider`, `sign_in_provider`; runs: `start_task`, `cancel_task`,
-  `send_instruction`) and app setup. `start_task` routes the prompt and
-  snapshots a dirty tree before any CLI starts. The `Store` is Tauri managed state.
+  `send_instruction`, `recent_tasks`) and app setup. `start_task` routes the
+  prompt, snapshots a dirty tree, and refuses Codex on a folder whose ACL the user
+  cannot change, all before any CLI starts. The `Store` is Tauri managed state.
 - `routing.rs` — pure keyword classifier, route and ceilings per route, stage
   briefs, artifact checks. No model call and no I/O beyond what `main.rs` hands it.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,

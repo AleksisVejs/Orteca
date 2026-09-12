@@ -151,6 +151,15 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
 
     let (dir, record) = trusted_dir(store, &path)?;
 
+    // Refused before a task row exists: Codex would otherwise report `done`
+    // on a run that could not read or edit anything.
+    if provider == ProviderId::Codex && !proc::can_change_acl(&dir) {
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "Codex cannot sandbox this repository: Windows does not let your account change permissions on its folder, so every tool would fail while the run looked finished. Move the repository into a folder you own, such as your user folder, or run it with claude.",
+        ));
+    }
+
     let Some(program) = providers::which(provider.program()) else {
         return Err(AppError::new(
             ErrorKind::CliMissing,
@@ -362,6 +371,13 @@ fn forget_project(path: String, store: State<Store>) -> Result<()> {
     store.forget_project(&path)
 }
 
+/// Past runs in this project, newest first.
+#[tauri::command]
+fn recent_tasks(path: String, store: State<Store>) -> Result<Vec<store::TaskSummary>> {
+    let dir = project::validate_dir(&path)?;
+    store.recent_tasks(store.project(&dir.to_string_lossy())?.id, 20)
+}
+
 fn main() {
     tauri::Builder::default()
         // First, so a second launch exits before setup tries the database the
@@ -389,7 +405,8 @@ fn main() {
             cancel_task,
             send_instruction,
             trust_project,
-            forget_project
+            forget_project,
+            recent_tasks
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Orteca");

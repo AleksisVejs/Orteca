@@ -165,6 +165,23 @@ pub fn owned_temp() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Whether this account may rewrite `dir`'s ACL, which Codex's Windows sandbox
+/// does to every write root, the workspace included. `owned_temp` fixes TEMP;
+/// a repository under a directory like `E:\Temp` cannot be fixed from here, and
+/// Codex there exits 0 having had no tools at all. Asking for a handle with
+/// WRITE_DAC changes nothing and fails exactly where the sandbox would.
+pub fn can_change_acl(dir: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    // A directory handle needs backup semantics.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .is_ok()
+}
+
 fn spawn_suspended(program: &str, args: &[&str], cwd: &Path) -> io::Result<Child> {
     let mut command = Command::new(program);
     command
@@ -434,6 +451,26 @@ mod tests {
         let probe = expected.join("write-probe");
         std::fs::write(&probe, "x").expect("owned temp must be writable");
         std::fs::remove_file(&probe).unwrap();
+    }
+
+    /// An OWNER RIGHTS ACE granting Modify strips the owner's implicit
+    /// WRITE_DAC, which is the `E:\Temp` shape without needing an admin.
+    #[test]
+    fn a_directory_whose_acl_cannot_be_changed_is_detected() {
+        let dir = std::env::temp_dir().join(format!("orteca-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(can_change_acl(&dir));
+        let user = std::env::var("USERNAME").unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/inheritance:r", "/grant", "*S-1-3-4:(OI)(CI)M", "/grant"])
+            .arg(format!("{user}:(OI)(CI)M"))
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success());
+        assert!(!can_change_acl(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

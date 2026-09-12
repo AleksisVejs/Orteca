@@ -11,6 +11,7 @@ import type {
   ProviderId,
   InstructionReceipt,
   TaskResult,
+  TaskSummary,
 } from "./types";
 
 export function isAppError(e: unknown): e is AppError {
@@ -40,6 +41,10 @@ export const trustProject = (path: string, trusted: boolean) =>
 
 export const forgetProject = (path: string) =>
   invoke<void>("forget_project", { path });
+
+/** This project's past runs, newest first. */
+export const recentTasks = (path: string) =>
+  invoke<TaskSummary[]>("recent_tasks", { path });
 
 /**
  * The channel exists before invocation; completion uses the invoke response.

@@ -11,7 +11,7 @@ token/cost metrics.
 
 `docs/architecture.md` is the source of truth — verified CLI flags, the routing model,
 the full SQLite schema, and the 8-milestone plan. Read it before designing anything.
-Milestones 1-3 are done; 4 (single-stage run end to end) is next.
+Milestones 1-4 are done; 5 (cancel and mid-task instruction) is next.
 
 ## Commands
 

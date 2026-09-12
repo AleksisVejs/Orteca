@@ -45,11 +45,24 @@ export const startTask = (
   prompt: string,
   provider: ProviderId,
   onEvent: (event: ProviderEvent) => void,
+  onTask: (taskId: number) => void,
 ) => {
   const events = new Channel<ProviderEvent>();
   events.onmessage = onEvent;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, events });
+  // The id lands as soon as the task row exists, long before the run resolves.
+  // Without it there is nothing for Stop to name.
+  const task = new Channel<number>();
+  task.onmessage = onTask;
+  return invoke<TaskResult>("start_task", { path, prompt, provider, events, task });
 };
+
+/**
+ * Stops a run and the whole process tree under it. Throws if the run has
+ * already ended - the backend will not claim to have stopped something that
+ * was already over.
+ */
+export const cancelTask = (taskId: number) =>
+  invoke<void>("cancel_task", { taskId });
 
 /** Installs the CLI with npm. Resolves with the fresh detection, or throws. */
 export const installProvider = (provider: ProviderId) =>

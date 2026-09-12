@@ -1,14 +1,19 @@
 //! A single-stage run: prompt -> one provider CLI -> stream -> diff -> result.
 //!
-//! Routing, extra stages and steering are later milestones. What is here is the
-//! whole honest path for one task: build the argv, spawn inside the Job Object,
-//! normalise every line through the provider's parser, write each event to the
-//! append-only log, and end with a diff the user can check.
+//! Routing and extra stages are later milestones, and mid-task instructions are
+//! the other half of this one. What is here is the whole honest path for a
+//! single task: build the argv, spawn inside the Job Object, normalise every
+//! line through the provider's parser, write each event to the append-only log,
+//! let the user stop it, and end with a diff they can check.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::Serialize;
+use tokio::sync::mpsc;
 
+use crate::error::{AppError, ErrorKind};
 use crate::proc::{self, Line};
 use crate::project::{self, FileStat};
 use crate::providers::{ProviderEvent, ProviderId, Usage};
@@ -45,12 +50,65 @@ fn claude_deny() -> Vec<String> {
         .collect()
 }
 
+/// What a user can still do to a run that is already going. The mid-task
+/// instruction is the other half of this milestone; stopping is what exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// Stop now. Whatever the agent already wrote to the working tree stays
+    /// written: Orteca captures a diff, it never reverts the user's files.
+    Cancel,
+}
+
+/// The runs a user can still reach, one sender per live task.
+///
+/// The sender is dropped the moment its run ends, so a control aimed at a task
+/// that has already finished is refused rather than quietly going nowhere -
+/// a Stop button that reports success while an agent keeps editing would be
+/// the worst kind of lie this app can tell.
+#[derive(Default)]
+pub struct Live(Mutex<HashMap<i64, mpsc::UnboundedSender<Control>>>);
+
+impl Live {
+    /// Register a run and hand back the end `stream` listens on.
+    fn open(&self, task_id: i64) -> mpsc::UnboundedReceiver<Control> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.0.lock().expect("live runs poisoned").insert(task_id, tx);
+        rx
+    }
+
+    fn close(&self, task_id: i64) {
+        self.0.lock().expect("live runs poisoned").remove(&task_id);
+    }
+
+    pub fn send(&self, task_id: i64, control: Control) -> crate::error::Result<()> {
+        let delivered = self
+            .0
+            .lock()
+            .expect("live runs poisoned")
+            .get(&task_id)
+            .is_some_and(|tx| tx.send(control).is_ok());
+        if delivered {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                ErrorKind::NotFound,
+                "That run has already finished.",
+            ))
+        }
+    }
+}
+
+/// The `task_events` row a stop leaves behind. Not a `ProviderEvent`: the
+/// provider did not say this, the user did. Without it a run stopped two
+/// seconds in is indistinguishable afterwards from one that died on its own.
+const CANCEL_PAYLOAD: &str = r#"{"kind":"cancel","data":{"by":"user"}}"#;
+
 /// What the UI gets when the run ends.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskResult {
     pub task_id: i64,
-    /// `done` or `failed`.
+    /// `done`, `cancelled` or `failed`.
     pub status: &'static str,
     /// The provider's final answer, or its last message if it reports no final
     /// field. Empty is possible and is not an error.
@@ -114,10 +172,17 @@ struct Outcome {
     usage: Option<Usage>,
     failure: Option<String>,
     done: bool,
+    /// The user stopped this run. Not a failure, and not a success either.
+    cancelled: bool,
 }
 
 impl Outcome {
     fn exited(&mut self, id: ProviderId, code: Option<i32>, noise: &[String]) {
+        // A run the user killed has no exit code worth reading: the tree was
+        // terminated, so "did not finish" is the expected outcome, not a fault.
+        if self.cancelled {
+            return;
+        }
         if self.failure.is_none() && (code != Some(0) || !self.done) {
             self.failure = Some(exit_message(id, code, noise));
         }
@@ -133,6 +198,18 @@ impl Outcome {
             }
             ProviderEvent::Failed { message, .. } => self.failure = Some(message.clone()),
             _ => {}
+        }
+    }
+
+    /// What the task row and the result screen both call this run. A stop that
+    /// lands after the provider already answered does not rewrite the answer.
+    fn status(&self) -> &'static str {
+        if self.failure.is_some() {
+            "failed"
+        } else if self.cancelled && !self.done {
+            "cancelled"
+        } else {
+            "done"
         }
     }
 
@@ -210,8 +287,11 @@ impl Recording {
     }
 }
 
-pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
+pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
     let Request { task_id, id, program, dir, prompt, base_commit, dirty_at_start, recording } = request;
+    // Registered before the CLI is even spawned: a run is stoppable from the
+    // moment the user can see it, including while a slow Node shim starts up.
+    let mut control = live.open(task_id);
     let mut recording = Recording::new(recording);
     let mut outcome = Outcome::default();
     // Non-JSON output is the only clue a CLI leaves when it dies badly.
@@ -227,7 +307,35 @@ pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEven
                 outcome.failure = Some(format!("could not send prompt to {}: {e}", id.program()));
             }
             run.close_stdin();
-            while let Some(line) = run.lines.recv().await {
+            // Stop has to be answered while the CLI is mid-sentence, which is
+            // why this is a select and not a plain receive.
+            let mut stopping = false;
+            loop {
+                let next = tokio::select! {
+                    line = run.lines.recv() => line,
+                    // Retired once the tree has been told to die - a second
+                    // stop has nothing left to kill - and again if the sender
+                    // is dropped, so a closed control channel cannot spin here.
+                    Some(action) = control.recv(), if !stopping => {
+                        match action {
+                            Control::Cancel => {
+                                // Logged before the kill, because after it
+                                // there may be no run left to log anything.
+                                if let Err(e) = store.append_event(task_id, STAGE, "cancel", id.program(), CANCEL_PAYLOAD) {
+                                    outcome.failure = Some(format!("could not record the stop: {}", e.message));
+                                    break;
+                                }
+                                outcome.cancelled = true;
+                                stopping = true;
+                                // Not a drop: the exit waiter still has the
+                                // last of the CLI's output to hand over.
+                                run.cancel();
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some(line) = next else { break };
                 match line {
                     Line::Json(value) => {
                         // Before parsing: the recording is what the CLI said,
@@ -275,6 +383,8 @@ pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEven
         }
     }
 
+    live.close(task_id);
+
     // A run that never reported usage has no honest number; this writes the
     // `unavailable` row rather than leaving the task looking free.
     if let Err(e) = store.record_usage(task_id, None, id.program(), outcome.usage.as_ref()) {
@@ -294,11 +404,7 @@ pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEven
             outcome.failure = Some(format!("{message}; could not log failure: {}", e.message));
         }
     }
-    let mut status = if outcome.failure.is_some() {
-        "failed"
-    } else {
-        "done"
-    };
+    let mut status = outcome.status();
     let summary = outcome.summary();
     if let Err(e) = store.finish_task(
         task_id,
@@ -391,7 +497,7 @@ mod tests {
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
         std::fs::write(dir.join("fake.js"), "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>input+=s);process.stdin.on('end',()=>{console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:input}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:80,output_tokens:20}}));process.exitCode=1;});").unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let result = stream(&store, request, |e| { events.borrow_mut().push(e.clone()); Ok(()) }).await;
+        let result = stream(&store, &Live::default(), request, |e| { events.borrow_mut().push(e.clone()); Ok(()) }).await;
         assert_eq!(result.summary, format!("{prompt}\n"));
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("code 1"));
@@ -419,7 +525,7 @@ mod tests {
         .unwrap();
 
         let emitted = std::cell::RefCell::new(Vec::new());
-        stream(&store, request, |e| { emitted.borrow_mut().push(e.kind()); Ok(()) }).await;
+        stream(&store, &Live::default(), request, |e| { emitted.borrow_mut().push(e.kind()); Ok(()) }).await;
 
         assert!(store.event_kinds(task).contains(&"unknown".to_string()), "unparsed line was dropped");
         let raw = store.event_payloads(task).into_iter()
@@ -453,7 +559,7 @@ mod tests {
         .unwrap();
 
         let live = std::cell::RefCell::new(Vec::new());
-        let result = stream(&store, request, |e| {
+        let result = stream(&store, &Live::default(), request, |e| {
             live.borrow_mut().push(serde_json::to_string(e).unwrap());
             Ok(())
         })
@@ -474,6 +580,77 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Stopping is the half of Milestone 5 that exists: the tree dies, what the
+    /// agent already said survives, and the task does not read afterwards as a
+    /// crash. Without the `cancel` row a run stopped two seconds in is
+    /// indistinguishable later from one that died on its own.
+    #[tokio::test]
+    async fn a_stopped_run_is_cancelled_and_keeps_what_it_already_said() {
+        let store = Store::in_memory().unwrap();
+        let request = task_request(&store, "cancel");
+        let dir = request.dir.clone();
+        let task = request.task_id;
+        // Answers once, then refuses to end on its own.
+        std::fs::write(
+            &request.program,
+            "@echo off
+echo {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"half an answer\"}}
+ping -n 60 127.0.0.1 >nul
+",
+        )
+        .unwrap();
+
+        let live = Live::default();
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
+        let (result, ()) = tokio::join!(
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
+            async {
+                // Stop only once the CLI has actually started talking, so this
+                // tests a running agent and not a race with its start-up.
+                assert_eq!(hearing.recv().await, Some("text"));
+                live.send(task, Control::Cancel).unwrap();
+            }
+        );
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.failure, None, "a stop the user asked for is not a failure");
+        assert_eq!(result.summary, "half an answer", "what the agent already said is kept");
+        assert!(store.event_kinds(task).contains(&"cancel".to_string()), "the log must record the stop");
+        // The sender goes with the run, so a late second click cannot claim to
+        // have stopped something that is already over.
+        assert!(live.send(task, Control::Cancel).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_control_cannot_reach_a_run_that_is_not_live() {
+        let live = Live::default();
+        assert!(live.send(7, Control::Cancel).is_err(), "nothing to stop yet");
+        let listening = live.open(7);
+        assert!(live.send(7, Control::Cancel).is_ok());
+        live.close(7);
+        assert!(live.send(7, Control::Cancel).is_err(), "a finished run cannot be stopped");
+        drop(listening);
+    }
+
+    #[test]
+    fn a_stop_that_arrives_after_the_answer_does_not_rewrite_it() {
+        let mut answered = Outcome::default();
+        answered.absorb(&ProviderEvent::Done { result: "shipped".into(), structured: None });
+        answered.cancelled = true;
+        assert_eq!(answered.status(), "done", "the run had already finished");
+
+        let mut stopped = Outcome::default();
+        stopped.cancelled = true;
+        // Terminating the job leaves no exit code at all, and that is expected.
+        stopped.exited(ProviderId::Codex, None, &["killed".into()]);
+        assert_eq!(stopped.failure, None);
+        assert_eq!(stopped.status(), "cancelled");
+    }
+
     #[tokio::test]
     async fn spawn_failure_is_returned_and_logged() {
         let store = Store::in_memory().unwrap();
@@ -481,7 +658,7 @@ mod tests {
         request.program = request.dir.join("missing.exe");
         let dir = request.dir.clone();
         let task = request.task_id;
-        let result = stream(&store, request, |_| Ok(())).await;
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("could not start codex"));
         assert!(store.event_payloads(task).iter().any(|v| v["kind"] == "failed"));
@@ -496,7 +673,7 @@ mod tests {
             let dir = request.dir.clone();
             std::fs::write(&request.program, "@echo off\r\necho {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\r\nexit /b 0\r\n").unwrap();
             if reject_storage { store.reject_events(); }
-            let result = stream(&store, request, |_| {
+            let result = stream(&store, &Live::default(), request, |_| {
                 if reject_storage { Ok(()) } else { Err(crate::error::AppError::new(crate::error::ErrorKind::Io, "window unavailable")) }
             }).await;
             assert_eq!(result.status, "failed");

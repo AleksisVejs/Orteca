@@ -6,8 +6,9 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 to 4 are implemented. The acceptance checks for 1 and 2 are
-documented in `docs/m1-m2-verification.md`. Milestones 5-8 are not started.
+Milestones 1 to 4 are implemented, and 5 is half done: a run can be stopped,
+but a mid-task instruction cannot be sent yet. The acceptance checks for 1 and 2
+are documented in `docs/m1-m2-verification.md`. Milestones 6-8 are not started.
 
 What exists and works:
 
@@ -20,6 +21,8 @@ What exists and works:
   screen; `mock` replays JSONL fixtures through the real event parsers
 - A single-stage run: prompt to one CLI, live stream, append-only event log,
   working-tree diff, and a result labelled with its cost quality
+- Stopping a live run: the Job Object takes the whole tree, the stop is written
+  to the event log, and the task ends `cancelled` rather than `failed`
 - Installing a missing CLI from the project screen, via the user's own npm
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
@@ -319,6 +322,8 @@ projects(id, path, name, trusted, trust_scanned_at, last_opened_at, opened_seq)
 
 tasks(id, project_id, prompt, mode, route_json, status, branch, base_commit,
       dirty_at_start, started_at, ended_at, summary, diff_stat_json)
+  -- status: 'running' | 'done' | 'cancelled' | 'failed'. A stop is its own
+  -- outcome: the work so far is real and nothing was reverted.
 
 task_events(id, task_id, ts, stage, kind, provider, payload_json)
   -- append-only. absorbs: agent_calls, commands, artifacts,
@@ -386,6 +391,22 @@ User types an instruction while a task runs:
 
 Every later stage brief includes the full accumulated constraint list. An instruction
 never silently expires.
+
+**Open before this is built.** `claude --input-format stream-json` exists and was
+checked against `--help`, but the exact JSON a user message has to be written in
+was *not* verified — `{"type":"user","text":"..."}` above is a guess, and the
+Claude Code streaming-input shape is closer to
+`{"type":"user","message":{"role":"user","content":"..."}}`. Verify it against a
+real run before trusting it, because getting it wrong breaks the prompt path that
+already works. Steering also means `run::stream` must stop calling
+`close_stdin()` straight after the prompt, and the argv must gain
+`--input-format stream-json`. Codex's side needs the session id from
+`ProviderEvent::Started` plus `codex exec resume <id> -` (both confirmed present
+in `codex exec resume --help`).
+
+Cancel is built and is the model for the rest: `run::Live` holds one control
+sender per live task, `stream` selects over that channel alongside the CLI's
+output, and `Control` grows an `Instruction` variant when steering lands.
 
 ## 10. Command and process safety
 
@@ -458,7 +479,7 @@ Review artifact:
 | 2 | Launch screen, open project, recents, git state, **trust scan** | can open a real repo | done |
 | 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
 | 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
-| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | next |
+| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | cancel done, steering next |
 | 6 | Classifier + multi-stage routes + structured artifacts + verify | Plan → Build → Review works | |
 | 7 | file_cache, path ranking, usage + baselines, route visual | metrics are honest and labelled | |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |

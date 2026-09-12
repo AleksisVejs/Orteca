@@ -33,13 +33,13 @@ pub enum Line {
 pub struct Run {
     pub lines: mpsc::UnboundedReceiver<Line>,
     stdin: Option<ChildStdin>,
-    _job: Arc<Job>,
+    job: Arc<Job>,
 }
 
 impl Drop for Run {
     fn drop(&mut self) {
         // The exit waiter also owns the job, so cancellation cannot wait for last close.
-        let _ = self._job.terminate();
+        let _ = self.job.terminate();
     }
 }
 
@@ -61,6 +61,15 @@ impl Run {
     /// Close stdin so the CLI knows no more input is coming.
     pub fn close_stdin(&mut self) {
         self.stdin = None;
+    }
+
+    /// Kill the whole tree now, without giving up the `Run`. Dropping it would
+    /// do the same killing but also close the receiver, and a stopped run still
+    /// has something to say: the exit waiter delivers what the CLI had already
+    /// written, then `Line::Exit`, so the caller ends on a drained stream
+    /// rather than on a truncated one.
+    pub fn cancel(&self) {
+        let _ = self.job.terminate();
     }
 }
 
@@ -133,7 +142,7 @@ pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
     Ok(Run {
         lines: rx,
         stdin,
-        _job: job,
+        job,
     })
 }
 
@@ -359,7 +368,7 @@ mod tests {
                 _ => {}
             }
         }
-        run._job.terminate().unwrap();
+        run.cancel();
         run.close_stdin();
         let mut partial = false;
         while let Some(line) =

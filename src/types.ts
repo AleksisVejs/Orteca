@@ -95,7 +95,8 @@ export interface FileStat {
 
 export interface TaskResult {
   taskId: number;
-  status: "done" | "failed";
+  /** `cancelled` is the user stopping the run: neither a win nor a fault. */
+  status: "done" | "cancelled" | "failed";
   summary: string;
   failure: string | null;
   /** null when the run ended before the provider reported any numbers. */

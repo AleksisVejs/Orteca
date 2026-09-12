@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
+  cancelTask,
   detectProviders,
   installProvider,
   isAppError,
@@ -116,11 +117,28 @@ const canRun = computed(
 );
 
 // One run at a time. The stream and the result are the whole screen while it
-// is going; nothing about a second run makes sense until cancel exists.
+// is going, and Stop is the only other thing worth doing.
 const running = ref(false);
 const stream = ref<Array<{ kind: string; text: string }>>([]);
 const result = ref<TaskResult | null>(null);
 const runError = ref<string | null>(null);
+
+// The backend sends this the moment the task row exists, which is what Stop
+// names. Until it arrives there is a run on screen that cannot yet be stopped,
+// so the button is disabled rather than lying about what it would do.
+const taskId = ref<number | null>(null);
+const stopping = ref(false);
+
+async function stopRun() {
+  if (!running.value || taskId.value === null || stopping.value) return;
+  stopping.value = true;
+  try {
+    await cancelTask(taskId.value);
+  } catch {
+    // The run ended between the click and the call. There is nothing left to
+    // stop, and the result about to arrive already says what happened.
+  }
+}
 
 let stop: Array<() => void> = [];
 
@@ -155,6 +173,8 @@ async function run() {
   stream.value = [];
   result.value = null;
   runError.value = null;
+  taskId.value = null;
+  stopping.value = false;
   running.value = true;
   try {
     result.value = await startTask(
@@ -167,12 +187,17 @@ async function run() {
         stream.value.push({ kind: event.kind, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text });
         if (stream.value.length > 500) stream.value.shift();
       },
+      (id) => {
+        taskId.value = id;
+      },
     );
   } catch (e) {
     running.value = false;
     runError.value = isAppError(e) ? e.message : String(e);
   } finally {
     running.value = false;
+    stopping.value = false;
+    taskId.value = null;
   }
 }
 
@@ -215,6 +240,13 @@ function formatCost(cost: number): string {
 function formatTokens(count: number): string {
   return count.toLocaleString("en-US");
 }
+
+/** A stopped run is its own outcome, not a quieter kind of failure. */
+const OUTCOME: Record<TaskResult["status"], string> = {
+  done: "Finished",
+  cancelled: "Stopped",
+  failed: "Failed",
+};
 
 const AUTH: Record<Auth, string> = {
   subscription: "saved login",
@@ -261,6 +293,14 @@ const AUTH: Record<Auth, string> = {
             {{ p.program }}
           </button>
         </div>
+        <button
+          v-if="running"
+          class="btn stop"
+          :disabled="taskId === null || stopping"
+          @click="stopRun"
+        >
+          {{ stopping ? "Stopping…" : "Stop" }}
+        </button>
         <button class="btn primary run" :disabled="!canRun" @click="run">
           {{ running ? "Running…" : "Run" }}
         </button>
@@ -285,12 +325,14 @@ const AUTH: Record<Auth, string> = {
     </section>
 
     <section v-if="result" class="block">
-      <h2 class="label">
-        {{ result.status === "done" ? "Finished" : "Failed" }}
-      </h2>
+      <h2 class="label">{{ OUTCOME[result.status] }}</h2>
       <div class="card outcome">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
         <p v-else-if="result.summary" class="summary">{{ result.summary }}</p>
+        <p v-if="result.status === 'cancelled'" class="note caveat stopped">
+          Stopped part-way. Anything the agent had already written is still on
+          disk — Orteca reverts nothing.
+        </p>
 
         <!-- Three tiles. Every one labelled, none faked when unknown. -->
         <div class="tiles">
@@ -516,6 +558,14 @@ textarea:disabled {
   margin-left: auto;
   padding: 7px 20px;
 }
+/* Never the primary button: stopping a run is not the obvious next step. */
+.stop {
+  margin-left: auto;
+  padding: 7px 16px;
+}
+.stop + .run {
+  margin-left: 0;
+}
 
 /* Blue means in flight, and only that. */
 .bar {
@@ -624,6 +674,9 @@ textarea:disabled {
 }
 .caveat {
   margin: 12px 0 0;
+}
+.stopped {
+  margin: 0 0 16px;
 }
 
 .providers {

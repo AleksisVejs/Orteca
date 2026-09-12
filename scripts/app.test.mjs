@@ -25,7 +25,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -34,6 +34,7 @@ async function projectView(api = {}) {
     onTaskDone: async fn => { listeners.done = fn; return () => {}; },
     onInstallEvent: async () => () => {},
     onSignInEvent: async () => () => {},
+    cancelTask: async () => {},
     isAppError: e => !!e?.message,
     ...api,
   });
@@ -157,6 +158,55 @@ test('cancelling pending consent does not reopen on late completion', async () =
   assert.equal(state.opened.value, null);
 });
 
+
+test('a run becomes stoppable as soon as it has an id, and a stop is not a failure', async () => {
+  let stopped = null;
+  let release;
+  const { state } = await projectView({
+    cancelTask: async id => {
+      stopped = id;
+      release({ ...finished, taskId: 7, status: 'cancelled', failure: null, summary: 'half an answer' });
+    },
+    startTask: async (...args) => {
+      const [onEvent, onTask] = args.filter(arg => typeof arg === 'function');
+      onEvent({ kind: 'text', data: 'half an answer' });
+      onTask(7);
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+
+  const running = state.run();
+  assert.equal(state.taskId.value, 7, 'Stop has nothing to name until the id arrives');
+  assert.equal(state.running.value, true);
+
+  await state.stopRun();
+  assert.equal(stopped, 7);
+  await running;
+
+  assert.equal(state.result.value.status, 'cancelled');
+  assert.equal(state.result.value.summary, 'half an answer', 'what the agent said is kept');
+  assert.equal(state.running.value, false);
+  assert.equal(state.taskId.value, null, 'a finished run must not stay stoppable');
+});
+
+test('a stop that lands after the run ended never becomes a run error', async () => {
+  let release;
+  const { state } = await projectView({
+    cancelTask: async () => { throw Error('That run has already finished.'); },
+    startTask: async (...args) => {
+      args.filter(arg => typeof arg === 'function')[1](9);
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+
+  const running = state.run();
+  await state.stopRun();
+  assert.equal(state.runError.value, null, 'a stop that arrived too late is not an error to report');
+
+  release({ ...finished, status: 'done', failure: null, summary: 'finished anyway' });
+  await running;
+  assert.equal(state.result.value.status, 'done', 'a late stop must not rewrite the real outcome');
+});
 
 test('a signed-out CLI blocks the run and offers sign-in instead', async () => {
   // The bug this guards: auth used to be guessed from a credential file that

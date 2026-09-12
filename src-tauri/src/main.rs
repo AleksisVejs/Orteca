@@ -79,8 +79,10 @@ async fn detect_providers(found: tauri::ipc::Channel<Detected>) -> Result<Vec<De
     Ok(detected)
 }
 
-/// Start one single-stage run and return its task id. The stream arrives as
-/// `task-event` payloads and ends with one `task-done`.
+/// Start one single-stage run. Events arrive on `events` and the response is
+/// the finished result; `task` carries the task id the moment the row exists,
+/// which is what `cancel_task` needs and what makes a run stoppable long
+/// before it resolves.
 #[tauri::command]
 async fn start_task(
     app: AppHandle,
@@ -88,6 +90,7 @@ async fn start_task(
     prompt: String,
     provider: ProviderId,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
+    task: tauri::ipc::Channel<i64>,
 ) -> Result<run::TaskResult> {
     let prepare_app = app.clone();
     // Beside the database, because a recording belongs to the run it came from.
@@ -95,8 +98,19 @@ async fn start_task(
     let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
     let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider)).await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
-    Ok(run::stream(&app.state::<Store>(), request, |event| events.send(event.clone())
+    // A closed channel is the window going away, not a reason to abandon a run
+    // that is already recorded; the result still comes back to whoever asked.
+    let _ = task.send(request.task_id);
+    Ok(run::stream(&app.state::<Store>(), &app.state::<run::Live>(), request, |event| events.send(event.clone())
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))).await)
+}
+
+/// Stop a running task and everything it spawned. Errors when the run has
+/// already ended, because a Stop that silently does nothing is worse than one
+/// that says it arrived too late.
+#[tauri::command]
+fn cancel_task(task_id: i64, live: State<run::Live>) -> Result<()> {
+    live.send(task_id, run::Control::Cancel)
 }
 
 fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {
@@ -303,6 +317,7 @@ fn main() {
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("orteca.db");
             app.manage(Store::open(&db).map_err(|e| e.message)?);
+            app.manage(run::Live::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -312,6 +327,7 @@ fn main() {
             sign_in_provider,
             recent_projects,
             start_task,
+            cancel_task,
             trust_project,
             forget_project
         ])

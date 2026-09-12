@@ -510,6 +510,11 @@ rides along with metrics. Each slice ends commit-ready with tests.
   therefore gives every child a TEMP under `%LOCALAPPDATA%pp.orteca	mp`. The
   workspace is also a write root, so a repository under such a directory fails the
   same way and no environment variable can fix it - that one needs a real UI state.
+- **An event the parser cannot read is still written to the log.** Both parsers
+  match a subset of their CLI's event types and drop the rest, which is how the
+  run above recorded a clean `done` with no trace of why it did nothing. Unparsed
+  JSON lines are appended verbatim under `kind = 'unknown'` and are not emitted,
+  so the log stays complete without putting shapes the UI cannot render on screen.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

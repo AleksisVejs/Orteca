@@ -176,7 +176,22 @@ pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEven
             while let Some(line) = run.lines.recv().await {
                 match line {
                     Line::Json(value) => {
-                        for event in id.parse_line(&value) {
+                        let events = id.parse_line(&value);
+                        // Each parser understands a subset of its CLI's event
+                        // types and silently drops the rest. Harmless for the
+                        // stream, fatal for the record: a Codex run whose tool
+                        // calls all failed said so in an item type this parser
+                        // does not know, and the log kept no trace of why the
+                        // run did nothing. Keep the raw line. It is not emitted
+                        // - the UI has no shape for it - so the log stays
+                        // complete while the stream stays readable.
+                        if events.is_empty() {
+                            if let Err(e) = store.append_event(task_id, STAGE, "unknown", id.program(), &value.to_string()) {
+                                outcome.failure = Some(format!("could not record run event: {}", e.message));
+                                break;
+                            }
+                        }
+                        for event in events {
                             if let Err(e) = record(store, task_id, id, &event).and_then(|()| emit(&event)) {
                                 outcome.failure = Some(format!("could not record or deliver run event: {}", e.message));
                                 break;
@@ -324,6 +339,38 @@ mod tests {
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("code 1"));
         assert!(!events.borrow().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The Codex run that did nothing: every tool call failed inside an item
+    /// type this parser does not know, so the log recorded a clean `done` and
+    /// kept no evidence at all. The raw line has to survive the parser.
+    #[tokio::test]
+    async fn an_event_the_parser_cannot_read_is_still_recorded() {
+        let store = Store::in_memory().unwrap();
+        let request = task_request(&store, "unknown-event");
+        let dir = request.dir.clone();
+        let task = request.task_id;
+        std::fs::write(
+            &request.program,
+            "@echo off
+             echo {\"type\":\"item.completed\",\"item\":{\"type\":\"unified_exec\",\"error\":\"sandbox setup failed\"}}
+             echo {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}
+             exit /b 0
+",
+        )
+        .unwrap();
+
+        let emitted = std::cell::RefCell::new(Vec::new());
+        stream(&store, request, |e| { emitted.borrow_mut().push(e.kind()); Ok(()) }).await;
+
+        assert!(store.event_kinds(task).contains(&"unknown".to_string()), "unparsed line was dropped");
+        let raw = store.event_payloads(task).into_iter()
+            .find(|v| v["item"]["type"] == "unified_exec")
+            .expect("raw payload was not kept verbatim");
+        assert_eq!(raw["item"]["error"], "sandbox setup failed", "the reason the run did nothing must survive");
+        // Logged, not shown: the UI has no shape for an event nobody parsed.
+        assert!(!emitted.borrow().contains(&"unknown"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

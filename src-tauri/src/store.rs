@@ -35,6 +35,13 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub fn event_kinds(&self, task: i64) -> Vec<String> {
+        let conn = self.0.lock().unwrap();
+        let mut statement = conn.prepare("SELECT kind FROM task_events WHERE task_id=?1 ORDER BY id").unwrap();
+        statement.query_map([task], |r| r.get::<_, String>(0)).unwrap().map(|k| k.unwrap()).collect()
+    }
+
+    #[cfg(test)]
     pub fn event_payloads(&self, task: i64) -> Vec<serde_json::Value> {
         let conn = self.0.lock().unwrap();
         let mut statement = conn.prepare("SELECT payload_json FROM task_events WHERE task_id=?1 ORDER BY id").unwrap();

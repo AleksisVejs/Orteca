@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use super::{CostQuality, FailureKind, ProviderEvent, Usage};
+use super::{classify_failure, CostQuality, FailureKind, ProviderEvent, Usage};
 
 pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
     match v["type"].as_str().unwrap_or_default() {
@@ -50,6 +50,12 @@ fn summarize(input: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Only the final `result` carries trustworthy numbers. Per-message `usage`
+/// reports the output count the API had at `message_start`, and one API
+/// response can produce several assistant messages all repeating that same
+/// placeholder - so summing them, or keeping the last, both understate the
+/// run. A run that dies before `result` therefore has no honest token count,
+/// and must be recorded as unavailable rather than as a zero.
 fn result(v: &Value) -> Vec<ProviderEvent> {
     let u = &v["usage"];
     let cost = v["total_cost_usd"].as_f64().filter(|cost| *cost > 0.0);
@@ -76,7 +82,7 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
                 // Not a clock timeout, but the same thing to a user: it ran out
                 // of budget before finishing.
                 "error_max_turns" => FailureKind::Timeout,
-                _ => FailureKind::Crashed,
+                _ => classify_failure(&text),
             },
             message: if text.is_empty() {
                 subtype.to_string()

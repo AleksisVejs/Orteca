@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use super::{CostQuality, FailureKind, ProviderEvent, Usage};
+use super::{classify_failure, CostQuality, ProviderEvent, Usage};
 
 pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
     match v["type"].as_str().unwrap_or_default() {
@@ -37,14 +37,8 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
                 },
             ]
         }
-        "turn.failed" => vec![ProviderEvent::Failed {
-            kind: FailureKind::Crashed,
-            message: message_of(&v["error"]),
-        }],
-        "error" => vec![ProviderEvent::Failed {
-            kind: FailureKind::Crashed,
-            message: message_of(v),
-        }],
+        "turn.failed" => vec![failed(message_of(&v["error"]))],
+        "error" => vec![failed(message_of(v))],
         _ => Vec::new(),
     }
 }
@@ -60,11 +54,15 @@ fn item(i: &Value) -> Option<ProviderEvent> {
             name: "Edit".into(),
             summary: changed_paths(&i["changes"]),
         }),
-        "error" => Some(ProviderEvent::Failed {
-            kind: FailureKind::Crashed,
-            message: message_of(i),
-        }),
+        "error" => Some(failed(message_of(i))),
         _ => None,
+    }
+}
+
+fn failed(message: String) -> ProviderEvent {
+    ProviderEvent::Failed {
+        kind: classify_failure(&message),
+        message,
     }
 }
 

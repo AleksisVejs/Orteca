@@ -242,8 +242,7 @@ pub struct Handle {
 }
 
 pub enum FailureKind {
-    CliMissing, AuthExpired, UsageLimit, RateLimit,
-    Timeout, Crashed, MalformedOutput, Cancelled,
+    AuthExpired, UsageLimit, RateLimit, Timeout, Crashed,
 }
 ```
 
@@ -259,6 +258,31 @@ orchestrator picks a provider at runtime in Milestone 4. `Invocation`,
 `result` is both a `Usage` and an outcome, and one assistant message can hold
 text and a tool call together. `Done.result` is empty for Codex, which reports
 no final-answer field — the caller keeps the last `Text`.
+
+`FailureKind` lists only what a parser produces. `CliMissing`, `Cancelled` and
+`MalformedOutput` were dropped, because they are the process runner's to report
+and it does not exist yet; whichever the runner truly emits comes back in
+Milestone 4, one at a time. The other three are live: neither CLI reports a
+machine-readable error code, so `classify_failure` matches the phrases both
+providers share in their free-text message and leaves anything unrecognised as
+`Crashed`. A wrong bucket sends the user to fix the wrong thing.
+
+**Usage is only ever read from Claude's final `result`, and that is a real
+limit, not an oversight.** Per-message `usage` reports the output count the API
+had at `message_start`, and one API response can produce several assistant
+messages that all repeat that same placeholder — so summing them and keeping
+the last are both wrong. A run cancelled or crashed before `result` therefore
+has no honest token count at all. Milestone 4 must record that as
+`cost_quality: unavailable` with no number; it must never write a zero, which
+reads as "this was free".
+
+**Verdict on the trait, asked and answered.** The enum stands. Milestone 4 adds
+`Invocation` and a `start()` that returns a `Handle`, and at that point there
+are two concrete implementations plus the mock to choose between at runtime —
+that is when a trait earns its keep. Nothing written here has to move: the call
+sites are `ProviderId::detect()` and `ProviderId::parse_line()`, and a trait
+would wrap them rather than replace them. Adding it now would be an interface
+with nothing dispatching through it.
 
 Fixtures in `src-tauri/fixtures/*.jsonl` are written to the event shapes
 verified above, not captured from a live session, because neither CLI is

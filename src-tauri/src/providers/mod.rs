@@ -96,16 +96,40 @@ pub enum ProviderEvent {
     },
 }
 
+/// Only the kinds a parser actually produces. `CliMissing`, `Cancelled` and
+/// `MalformedOutput` were dropped: they are the process runner's to report,
+/// and it does not exist until Milestone 4. Whichever of them that runner
+/// truly emits comes back then, one at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    CliMissing,
     AuthExpired,
     UsageLimit,
     RateLimit,
     Timeout,
     Crashed,
-    MalformedOutput,
-    Cancelled,
+}
+
+/// Neither CLI reports a machine-readable error code, so free text is the only
+/// signal there is. Match on the phrases both providers share, and leave
+/// anything unrecognised as `Crashed` rather than guessing it into a
+/// friendlier bucket - a wrong bucket sends the user to fix the wrong thing.
+pub fn classify_failure(message: &str) -> FailureKind {
+    let m = message.to_ascii_lowercase();
+    // "rate limit" first: a usage-limit message often mentions both.
+    if m.contains("rate limit") || m.contains("too many requests") {
+        FailureKind::RateLimit
+    } else if m.contains("usage limit") || m.contains("quota") || m.contains("credit balance") {
+        FailureKind::UsageLimit
+    } else if m.contains("oauth")
+        || m.contains("api key")
+        || m.contains("unauthorized")
+        || m.contains("authentication")
+        || m.contains("/login")
+    {
+        FailureKind::AuthExpired
+    } else {
+        FailureKind::Crashed
+    }
 }
 
 impl ProviderId {
@@ -241,6 +265,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn failures_are_classified_only_when_the_text_says_so() {
+        assert_eq!(
+            classify_failure("Claude AI usage limit reached|1751200000"),
+            FailureKind::UsageLimit
+        );
+        assert_eq!(
+            classify_failure("API Error: 429 rate limit exceeded"),
+            FailureKind::RateLimit
+        );
+        assert_eq!(
+            classify_failure("Your credit balance is too low"),
+            FailureKind::UsageLimit
+        );
+        assert_eq!(
+            classify_failure("OAuth token has expired, please run /login"),
+            FailureKind::AuthExpired
+        );
+        // An unrecognised message must not be dressed up as something actionable.
+        assert_eq!(
+            classify_failure("the model produced an unexpected response"),
+            FailureKind::Crashed
+        );
     }
 
     #[test]

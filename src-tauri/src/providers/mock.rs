@@ -222,6 +222,52 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
+    /// Guards the reason `result` is the only source of usage: nobody should
+    /// later "improve" this by summing assistant messages, whose output counts
+    /// are placeholders repeated across every message of one API response.
+    #[test]
+    fn an_interrupted_claude_run_reports_no_usage_rather_than_a_wrong_one() {
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "working"}],
+                        "usage": {"input_tokens": 900, "output_tokens": 4}}
+        });
+        let events = ProviderId::Claude.parse_line(&assistant);
+        assert_eq!(events, vec![ProviderEvent::Text("working".into())]);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Usage(_))));
+    }
+
+    #[test]
+    fn a_provider_error_message_picks_its_failure_kind() {
+        let claude = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "result": "Claude AI usage limit reached",
+            "usage": {"input_tokens": 10, "output_tokens": 2}
+        });
+        assert_eq!(
+            ProviderId::Claude.parse_line(&claude).last(),
+            Some(&ProviderEvent::Failed {
+                kind: FailureKind::UsageLimit,
+                message: "Claude AI usage limit reached".into(),
+            })
+        );
+
+        let codex = serde_json::json!({
+            "type": "turn.failed",
+            "error": {"message": "429 Too Many Requests"}
+        });
+        assert_eq!(
+            ProviderId::Codex.parse_line(&codex),
+            vec![ProviderEvent::Failed {
+                kind: FailureKind::RateLimit,
+                message: "429 Too Many Requests".into(),
+            }]
+        );
+    }
+
     #[test]
     fn unknown_lines_are_ignored_rather_than_guessed_at() {
         let line = serde_json::json!({"type": "something.new", "payload": 1});

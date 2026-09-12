@@ -34,6 +34,12 @@ fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
     let git = project::git_state(&dir);
 
     if !git.is_repo {
+        if !project::git_installed() {
+            return Err(AppError::new(
+                ErrorKind::NotFound,
+                "Git is not installed or not on PATH. Install Git for Windows, then open the project again.",
+            ));
+        }
         return Err(AppError::new(
             ErrorKind::NotAGitRepo,
             "Orteca needs a Git repository so it can show you exactly what changed.",
@@ -358,6 +364,14 @@ fn forget_project(path: String, store: State<Store>) -> Result<()> {
 
 fn main() {
     tauri::Builder::default()
+        // First, so a second launch exits before setup tries the database the
+        // running instance holds, and the user sees their window instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("orteca.db");

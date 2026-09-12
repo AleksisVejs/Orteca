@@ -334,6 +334,12 @@ pub fn validate_dir(path: &str) -> Result<PathBuf> {
     Ok(p.canonicalize()?)
 }
 
+/// A fresh machine may have no git at all, and every folder would then look
+/// like "not a repository".
+pub fn git_installed() -> bool {
+    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
 /// Run git and return trimmed stdout, or `None` if git failed or isn't there.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let text = git_output(dir, args).ok()?.trim().to_string();

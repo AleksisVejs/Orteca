@@ -8,7 +8,7 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 Milestones 1 to 6 are implemented, and 7 is in progress (see §14). The
 acceptance checks for 1 and 2 are documented in `docs/m1-m2-verification.md`.
-Milestone 8 is not started.
+Milestone 8 is in progress: the NSIS installer builds unsigned (see §16).
 
 What exists and works:
 
@@ -50,7 +50,12 @@ npm run tauri dev               # from the repo root
 
 Toolchain: Node 22, Rust 1.98 (MSVC), VS 2022 Build Tools with
 `Microsoft.VisualStudio.Component.VC.Tools.x86.x64`. WebView2 ships with
-Windows 11.
+Windows 11; on Windows 10 the installer fetches it with Tauri's default
+download bootstrapper, so a first install there needs a network connection.
+
+Installer: `npm run tauri build` writes a per-user NSIS setup to
+`src-tauri/target/release/bundle/nsis/`. No MSI: WiX adds a second toolchain
+for the same result, and per-user NSIS needs no admin prompt.
 
 ## 2. Claude Code — verified integration surface
 
@@ -701,7 +706,7 @@ comes back, the stage's own closing words are forwarded to the next brief
 | 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | done |
 | 6 | Classifier + budgeted routes + structured artifacts + verify | classifier adds no model call; a trivial task has a one-call route; every route has explicit call/turn ceilings and never auto-escalates after a budget stop | done |
 | 7 | file_cache, path ranking, usage + baselines, route visual | brief names ranked paths without file contents; cumulative provider usage enforces the inter-turn token guard; comparable-task baselines make savings estimates honest | ranking, token guard, baselines, route visual built; file_cache deferred |
-| 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |
+| 8 | MSI/NSIS installer, signing, first-run | installable Windows app | NSIS installer, single instance and missing-git first-run message built; signing waits on a certificate |
 
 Spec's 17 collapsed: detection folds into one slice, metrics into one, route visual
 rides along with metrics. Each slice ends commit-ready with tests.
@@ -799,3 +804,15 @@ rides along with metrics. Each slice ends commit-ready with tests.
   dev` runs from the repo root.
 - Every metric written to the `usage` table carries a `cost_quality` of
   `exact`, `estimated` or `unavailable`. Nothing reaches the UI without one.
+- **Signing needs a certificate the repo does not have.** Nothing is committed
+  for it: a thumbprint is machine-specific and a key never belongs in git. With
+  a code-signing certificate in the user store, sign at build time with
+  `npm run tauri build -- --config '{"bundle":{"windows":{"certificateThumbprint":"<sha1>","digestAlgorithm":"sha256","timestampUrl":"http://timestamp.digicert.com"}}}'`.
+  Tauri then signs the app exe and the installer with `signtool`. Unsigned
+  builds work but SmartScreen warns on first launch.
+- **First run on a clean machine.** The data directory is created by
+  `Store::open`. No git on PATH used to read as "not a git repository" for
+  every folder; `open_project` now says Git is missing. Missing CLIs were
+  already a normal state on the project screen. A second launch used to exit
+  with no window, because the running instance holds the database; the
+  single-instance plugin now focuses the existing window instead.

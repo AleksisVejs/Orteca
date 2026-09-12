@@ -1,27 +1,157 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import { detectProviders } from "../api";
-import type { Auth, Detected, Mode, OpenedProject } from "../types";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import {
+  detectProviders,
+  installProvider,
+  isAppError,
+  onInstallEvent,
+  startTask,
+} from "../api";
+import type {
+  Auth,
+  Detected,
+  OpenedProject,
+  ProviderEvent,
+  ProviderId,
+  TaskResult,
+} from "../types";
 
-defineProps<{ opened: OpenedProject }>();
+const props = defineProps<{ opened: OpenedProject }>();
 defineEmits<{ close: [] }>();
 
-// Task submission lands in Milestone 4.
 const task = ref("");
-const mode = ref<Mode>("balanced");
-const modes: Mode[] = ["efficient", "balanced"];
 
 // Detected live on every open: a CLI can be installed or signed in behind us.
 // A missing CLI is shown, not thrown - the app is useful with neither present.
 const providers = ref<Detected[]>([]);
 const providerError = ref(false);
+const provider = ref<ProviderId>("codex");
+
+const installed = computed(() => providers.value.filter((p) => p.path));
+const missing = computed(() => providers.value.filter((p) => !p.path));
+
+// npm writes to one global folder, so two installs at once fight over it.
+// One at a time, in order, and the button says which one is going.
+const installing = ref<ProviderId | null>(null);
+const installLine = ref("");
+const installError = ref<string | null>(null);
+
+async function install(ids: ProviderId[]) {
+  if (installing.value !== null || running.value) return;
+  installError.value = null;
+  for (const id of ids) {
+    installing.value = id;
+    installLine.value = "asking npm…";
+    try {
+      const fresh = await installProvider(id);
+      providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
+      provider.value = id;
+    } catch (e) {
+      installError.value = isAppError(e) ? e.message : String(e);
+      break;
+    }
+  }
+  installing.value = null;
+  installLine.value = "";
+}
+const canRun = computed(
+  () =>
+    !running.value &&
+    installing.value === null &&
+    task.value.trim().length > 0 &&
+    installed.value.some((p) => p.id === provider.value),
+);
+
+// One run at a time. The stream and the result are the whole screen while it
+// is going; nothing about a second run makes sense until cancel exists.
+const running = ref(false);
+const stream = ref<Array<{ kind: string; text: string }>>([]);
+const result = ref<TaskResult | null>(null);
+const runError = ref<string | null>(null);
+
+let stop: Array<() => void> = [];
+
 onMounted(async () => {
   try {
     providers.value = await detectProviders();
+    // Prefer whatever is actually installed over the default.
+    const first = installed.value[0];
+    if (first && !installed.value.some((p) => p.id === provider.value)) {
+      provider.value = first.id;
+    }
   } catch {
     providerError.value = true;
   }
+
+  stop = await Promise.all([
+    onInstallEvent((id, line) => {
+      if (installing.value === id) installLine.value = line;
+    }),
+  ]);
 });
+
+onUnmounted(() => stop.forEach((off) => off()));
+
+async function run() {
+  if (!canRun.value) return;
+  stream.value = [];
+  result.value = null;
+  runError.value = null;
+  running.value = true;
+  try {
+    result.value = await startTask(
+      props.opened.project.path,
+      task.value,
+      provider.value,
+      (event) => {
+        const text = describe(event);
+        if (text === null) return;
+        stream.value.push({ kind: event.kind, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text });
+        if (stream.value.length > 500) stream.value.shift();
+      },
+    );
+  } catch (e) {
+    running.value = false;
+    runError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    running.value = false;
+  }
+}
+
+/** One line per event. Usage and the final result have their own panel. */
+function describe(event: ProviderEvent): string | null {
+  switch (event.kind) {
+    case "started":
+      return `session ${event.data.sessionId}`;
+    case "text":
+      return event.data;
+    case "toolUse":
+      return `${event.data.name} ${event.data.summary}`.trim();
+    case "failed":
+      return event.data.message;
+    default:
+      return null;
+  }
+}
+
+const lines = computed(() => stream.value);
+
+/** Never a number without a label, and never a zero standing in for unknown. */
+const tokens = computed(() => {
+  const usage = result.value?.usage;
+  if (!usage) return null;
+  return {
+    total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
+    cached: usage.cachedInputTokens,
+    output: usage.outputTokens,
+    cost: usage.costUsd,
+    quality: usage.costQuality,
+  };
+});
+
+function formatCost(cost: number): string {
+  return cost > 0 && cost < 0.0001 ? "<$0.0001" : "$" + cost.toFixed(4);
+}
 
 const AUTH: Record<Auth, string> = {
   subscription: "saved login",
@@ -34,35 +164,120 @@ const AUTH: Record<Auth, string> = {
 <template>
   <main class="project">
     <header>
-      <button class="back" @click="$emit('close')">&larr;</button>
+      <button class="back" title="Back to projects" @click="$emit('close')">
+        &larr;
+      </button>
       <h1>{{ opened.project.name }}</h1>
-      <span class="mono git">
-        {{ opened.git.branch ?? "detached" }}
-        <template v-if="opened.git.dirty">
-          &middot; {{ opened.git.dirtyCount }} uncommitted
-        </template>
+      <span class="chip">{{ opened.git.branch ?? "detached" }}</span>
+      <span v-if="opened.git.dirty" class="chip warn">
+        {{ opened.git.dirtyCount }} uncommitted
       </span>
     </header>
 
-    <label class="ask" for="task">What do you want to build?</label>
-    <textarea id="task" v-model="task" rows="4" spellcheck="false"></textarea>
+    <!-- Prompt. The card is the input; the controls sit on its floor. -->
+    <section class="ask card">
+      <textarea
+        id="task"
+        v-model="task"
+        rows="4"
+        spellcheck="false"
+        placeholder="What do you want to build?"
+        :disabled="running"
+      ></textarea>
 
-    <div class="modes">
-      <button
-        v-for="m in modes"
-        :key="m"
-        class="mode"
-        :class="{ on: mode === m }"
-        @click="mode = m"
-      >
-        {{ m }}
-      </button>
-    </div>
+      <div class="controls">
+        <div v-if="installed.length" class="segments">
+          <button
+            v-for="p in installed"
+            :key="p.id"
+            class="seg"
+            :class="{ on: provider === p.id }"
+            :disabled="running"
+            @click="provider = p.id"
+          >
+            {{ p.program }}
+          </button>
+        </div>
+        <button class="btn primary run" :disabled="!canRun" @click="run">
+          {{ running ? "Running…" : "Run" }}
+        </button>
+      </div>
 
-    <section class="providers">
-      <h2>Providers</h2>
+      <div v-if="running" class="bar"><span></span></div>
+    </section>
+
+    <p v-if="runError" class="missing">{{ runError }}</p>
+    <p v-else-if="!installed.length && !providerError" class="missing">
+      Neither CLI is installed, so there is nothing to run yet.
+    </p>
+
+    <section v-if="lines.length" class="block">
+      <h2 class="label">Activity</h2>
+      <p class="note">Latest 500 entries; long messages shortened. Full events are saved in the task log.</p>
+      <ol class="card stream">
+        <li v-for="(line, i) in lines" :key="i" :class="line.kind">
+          {{ line.text }}
+        </li>
+      </ol>
+    </section>
+
+    <section v-if="result" class="block">
+      <h2 class="label">
+        {{ result.status === "done" ? "Finished" : "Failed" }}
+      </h2>
+      <div class="card outcome">
+        <p v-if="result.failure" class="missing">{{ result.failure }}</p>
+        <p v-else-if="result.summary" class="summary">{{ result.summary }}</p>
+
+        <!-- Three tiles. Every one labelled, none faked when unknown. -->
+        <div class="tiles">
+          <div class="tile">
+            <span class="figure">{{ tokens ? tokens.total : "—" }}</span>
+            <span class="note">
+              {{ tokens ? tokens.cached + " cached" : "tokens unavailable" }}
+            </span>
+          </div>
+          <div class="tile">
+            <span class="figure" :class="{ good: tokens && tokens.cost !== null }">
+              {{ tokens && tokens.cost !== null ? formatCost(tokens.cost) : "—" }}
+            </span>
+            <span class="note">
+              {{
+                tokens && tokens.cost !== null
+                  ? "cost, " + tokens.quality
+                  : "cost unavailable"
+              }}
+            </span>
+          </div>
+          <div class="tile">
+            <span class="figure">{{ result.diff.length }}</span>
+            <span class="note">Git-visible files changed</span>
+          </div>
+        </div>
+
+        <ul class="diff">
+          <li v-for="f in result.diff" :key="f.path">
+            <span class="mono path">{{ f.path }}</span>
+            <span v-if="f.added !== null" class="note">
+              +{{ f.added }} &minus;{{ f.deleted }}
+            </span>
+            <span v-else class="note">new or binary</span>
+          </li>
+          <li v-if="!result.diff.length && !result.failure" class="note">no Git-visible changes</li>
+        </ul>
+
+        <p class="note caveat">Git-ignored files are excluded from this diff.</p>
+        <p v-if="result.dirtyAtStart" class="note caveat">
+          This repository already had uncommitted changes, so some of the above
+          were not made by this run.
+        </p>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2 class="label">Providers</h2>
       <p v-if="providerError" class="missing">detection unavailable</p>
-      <ul v-else>
+      <ul v-else class="card providers">
         <li v-for="p in providers" :key="p.id">
           <span class="who">{{ p.program }}</span>
           <template v-if="p.path">
@@ -72,105 +287,272 @@ const AUTH: Record<Auth, string> = {
               tokens only, no cost
             </span>
           </template>
-          <span v-else class="missing">not installed</span>
+          <template v-else-if="installing === p.id">
+            <span class="note grow">{{ installLine }}</span>
+          </template>
+          <template v-else>
+            <span class="missing">not installed</span>
+            <button
+              class="link"
+              :disabled="installing !== null || running"
+              @click="install([p.id])"
+            >
+              install
+            </button>
+          </template>
         </li>
       </ul>
+      <p v-if="missing.length > 1 && !providerError" class="foot">
+        <button
+          class="btn"
+          :disabled="installing !== null || running"
+          @click="install(missing.map((p) => p.id))"
+        >
+          {{ installing ? "Installing…" : "Install both" }}
+        </button>
+        <span class="note">
+          runs <span class="mono">npm install --global</span> for
+          {{ missing.map((p) => p.program).join(" and ") }}
+        </span>
+      </p>
+      <p v-if="installError" class="missing">{{ installError }}</p>
     </section>
   </main>
 </template>
 
 <style scoped>
 .project {
-  max-width: 640px;
+  height: 100%;
+  overflow-y: auto;
+  max-width: 720px;
   margin: 0 auto;
-  padding: 72px var(--pad);
+  padding: 56px var(--pad) 72px;
 }
 
 header {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
-  margin-bottom: 56px;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
 }
 .back {
+  padding: 2px 8px 4px;
+  border-radius: var(--r-sm);
   color: var(--text-faint);
-  padding: 0 2px;
+  transition: color 120ms ease, background 120ms ease;
 }
 .back:hover {
   color: var(--text);
+  background: var(--surface-2);
 }
 h1 {
   margin: 0;
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.git {
-  color: var(--text-faint);
+  letter-spacing: -0.02em;
 }
 
-.ask {
-  display: block;
-  margin-bottom: 12px;
+.chip {
+  padding: 2px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11px;
   color: var(--text-dim);
 }
+.chip.warn {
+  color: var(--warn);
+  border-color: var(--border);
+}
 
+/* Prompt card */
+.ask {
+  position: relative;
+  overflow: hidden;
+  transition: border-color 120ms ease;
+}
+.ask:focus-within {
+  border-color: var(--border-strong);
+}
 textarea {
+  display: block;
   width: 100%;
-  background: var(--surface);
+  background: none;
   color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r);
-  padding: 12px 14px;
+  border: none;
+  padding: 16px 18px 4px;
   font: inherit;
   resize: vertical;
 }
+textarea::placeholder {
+  color: var(--text-faint);
+}
 textarea:focus {
   outline: none;
-  border-color: var(--accent-dim);
 }
-
-.modes {
-  display: flex;
-  gap: 4px;
-  margin-top: 16px;
-}
-.mode {
-  padding: 5px 12px;
-  border-radius: var(--r);
-  color: var(--text-faint);
-  text-transform: capitalize;
-  transition: color 90ms ease, background 90ms ease;
-}
-.mode:hover {
+textarea:disabled {
   color: var(--text-dim);
 }
-.mode.on {
-  background: var(--surface);
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+.segments {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.seg {
+  padding: 4px 11px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: capitalize;
+  transition: color 120ms ease, background 120ms ease;
+}
+.seg:hover:not(:disabled) {
+  color: var(--text-dim);
+}
+.seg.on {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.seg:disabled {
+  cursor: default;
+}
+.run {
+  margin-left: auto;
+  padding: 7px 20px;
+}
+
+/* Blue means in flight, and only that. */
+.bar {
+  position: absolute;
+  inset: auto 0 0;
+  height: 2px;
+  background: var(--border);
+}
+.bar span {
+  display: block;
+  width: 35%;
+  height: 100%;
+  background: var(--info);
+  animation: slide 1.4s ease-in-out infinite;
+}
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bar span {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
+.block {
+  margin-top: 32px;
+}
+
+.stream {
+  margin: 0;
+  padding: 12px 18px;
+  list-style: none;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.stream li {
+  padding: 3px 0;
+  color: var(--text-dim);
+}
+.stream li.toolUse,
+.stream li.started {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.stream li.failed {
+  color: var(--err);
+}
+
+.outcome {
+  padding: 18px;
+}
+.summary {
+  margin: 0 0 16px;
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+  padding: 14px 10px;
+  background: var(--surface-2);
+  text-align: center;
+}
+.figure {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.figure.good {
   color: var(--accent);
 }
 
-.providers {
-  margin-top: 56px;
-  border-top: 1px solid var(--border);
-  padding-top: 16px;
-}
-.providers h2 {
-  margin: 0 0 8px;
-  font-size: 14px;
-  font-weight: 400;
-  color: var(--text-dim);
-}
-.providers ul {
+.diff {
   margin: 0;
   padding: 0;
+  list-style: none;
+}
+.diff li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+}
+.path {
+  color: var(--text);
+}
+.caveat {
+  margin: 12px 0 0;
+}
+
+.providers {
+  margin: 0;
+  padding: 8px 18px;
   list-style: none;
 }
 .providers li {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  padding: 3px 0;
+  padding: 7px 0;
+}
+.providers li + li {
+  border-top: 1px solid var(--border);
 }
 .who {
   min-width: 64px;
@@ -181,6 +563,31 @@ textarea:focus {
 .note {
   font-size: 12px;
   color: var(--text-faint);
+}
+/* npm prints long lines; the row must not grow a horizontal scrollbar. */
+.grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.link {
+  padding: 0;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.link:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+.foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 0;
 }
 .missing {
   font-size: 12px;

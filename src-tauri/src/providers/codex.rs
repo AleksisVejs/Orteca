@@ -23,7 +23,7 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             let u = &v["usage"];
             vec![
                 ProviderEvent::Usage(Usage {
-                    input_tokens: n(&u["input_tokens"]),
+                    input_tokens: n(&u["input_tokens"]).saturating_sub(n(&u["cached_input_tokens"])),
                     cached_input_tokens: n(&u["cached_input_tokens"]),
                     output_tokens: n(&u["output_tokens"]),
                     reasoning_tokens: n(&u["reasoning_output_tokens"]),
@@ -88,4 +88,18 @@ fn message_of(v: &Value) -> String {
 
 fn n(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_reads_are_not_counted_twice() {
+        let events = parse_line(&serde_json::json!({"type":"turn.completed", "usage": {
+            "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20, "reasoning_output_tokens": 5
+        }}));
+        let ProviderEvent::Usage(u) = &events[0] else { panic!("missing usage") };
+        assert_eq!(u.input_tokens + u.cached_input_tokens + u.output_tokens, 120);
+    }
 }

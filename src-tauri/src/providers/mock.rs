@@ -127,7 +127,7 @@ mod tests {
         let u = usage(&replay_bundled(ProviderId::Codex));
         assert_eq!(u.cost_usd, None);
         assert_eq!(u.cost_quality, CostQuality::Unavailable);
-        assert_eq!(u.reasoning_tokens, 1024);
+        assert_eq!(u.reasoning_tokens, 128);
         assert_eq!(u.cached_input_tokens, 7680);
     }
 

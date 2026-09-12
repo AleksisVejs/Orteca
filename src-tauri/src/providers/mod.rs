@@ -7,17 +7,17 @@
 
 pub mod claude;
 pub mod codex;
+#[cfg(test)]
 pub mod mock;
 
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProviderId {
     Claude,
@@ -54,7 +54,7 @@ pub enum Auth {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CostQuality {
     Exact,
@@ -62,18 +62,25 @@ pub enum CostQuality {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Usage {
+    /// Uncached input, including cache writes. Cache reads are disjoint.
     pub input_tokens: u64,
     /// Cache *reads* only. Cache writes are billed as ordinary input.
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    /// Already included in output_tokens; never add this again to a total.
     pub reasoning_tokens: u64,
     pub cost_usd: Option<f64>,
     pub cost_quality: CostQuality,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Adjacently tagged so every variant survives, including the newtype ones:
+/// `{"kind":"text","data":"..."}`. This is both the payload the UI receives
+/// and the row written to `task_events`, so there is one shape, not two.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ProviderEvent {
     Started {
         session_id: String,
@@ -100,13 +107,28 @@ pub enum ProviderEvent {
 /// `MalformedOutput` were dropped: they are the process runner's to report,
 /// and it does not exist until Milestone 4. Whichever of them that runner
 /// truly emits comes back then, one at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum FailureKind {
     AuthExpired,
     UsageLimit,
     RateLimit,
     Timeout,
     Crashed,
+}
+
+impl ProviderEvent {
+    /// The `task_events.kind` column. Same spelling as the serialised tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Started { .. } => "started",
+            Self::Text(_) => "text",
+            Self::ToolUse { .. } => "toolUse",
+            Self::Usage(_) => "usage",
+            Self::Done { .. } => "done",
+            Self::Failed { .. } => "failed",
+        }
+    }
 }
 
 /// Neither CLI reports a machine-readable error code, so free text is the only
@@ -139,6 +161,17 @@ impl ProviderId {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+        }
+    }
+
+    /// The npm package that installs this CLI. Both ship as npm globals on
+    /// Windows - which is the same reason `which` has to resolve `.cmd` shims.
+    /// Orteca never downloads a binary itself; it runs the package manager the
+    /// user already has.
+    pub fn package(self) -> &'static str {
+        match self {
+            Self::Claude => "@anthropic-ai/claude-code",
+            Self::Codex => "@openai/codex",
         }
     }
 
@@ -240,20 +273,23 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
         })
 }
 
-/// ponytail: no timeout. `--version` on a hung shim would block this call;
-/// give it a watchdog if that ever shows up in the wild.
 fn version_of(path: &Path) -> Option<String> {
-    let out = Command::new(path).arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    (!text.is_empty()).then_some(text)
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut run = crate::proc::spawn(&path.to_string_lossy(), &["--version"], &env::temp_dir()).ok()?;
+            run.close_stdin();
+            let mut first = None;
+            while let Some(line) = run.lines.recv().await {
+                match line {
+                    crate::proc::Line::Exit(code) => return (code == Some(0)).then_some(first).flatten(),
+                    crate::proc::Line::Text(text) if first.is_none() && !text.trim().is_empty() => first = Some(text.trim().to_string()),
+                    _ => {}
+                }
+            }
+            None
+        }).await.ok().flatten()
+    })
 }
 
 #[cfg(test)]
@@ -265,6 +301,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// `detect_providers` runs detection inside the blocking pool, and
+    /// `version_of` builds its own runtime to get a timeout. A nested runtime
+    /// on a thread that already has one panics, and only a real call catches it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_is_read_from_inside_the_blocking_pool() {
+        let dir = temp_dir("blocking-pool");
+        let shim = dir.join("shimmy.cmd");
+        std::fs::write(&shim, "@echo off
+echo 1.2.3
+").unwrap();
+        let found = tokio::task::spawn_blocking(move || version_of(&shim)).await.unwrap();
+        assert_eq!(found.as_deref(), Some("1.2.3"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -350,6 +401,15 @@ mod tests {
     }
 
     #[test]
+    fn version_detection_has_a_deadline() {
+        let cwd = temp_dir("version-deadline");
+        let shim = cwd.join("agent.cmd");
+        std::fs::write(&shim, "@echo off\r\nping -n 6 127.0.0.1 >nul\r\necho too late\r\n").unwrap();
+        assert_eq!(version_of(&shim), None);
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
     fn which_resolves_a_pathext_extension() {
         // cmd.exe is on PATH as "cmd", never as "cmd.exe" spelled out.
         let found = which("cmd").expect("cmd should be on PATH");
@@ -366,18 +426,20 @@ mod tests {
     }
 
     #[test]
-    fn detection_never_panics_on_this_machine() {
-        // Neither CLI is installed on the dev machine, and that must be fine.
-        for id in ProviderId::ALL {
-            let d = id.detect();
-            assert_eq!(d.path.is_none(), d.version.is_none() && d.auth == Auth::Unknown);
-        }
+    fn missing_executable_has_no_version() {
+        assert_eq!(version_of(Path::new("orteca-no-such-program")), None);
+    }
+
+    #[test]
+    fn each_provider_installs_from_its_own_published_package() {
+        assert_eq!(ProviderId::Claude.package(), "@anthropic-ai/claude-code");
+        assert_eq!(ProviderId::Codex.package(), "@openai/codex");
     }
 
     #[test]
     fn codex_can_never_report_a_cost() {
         assert_eq!(
-            ProviderId::Codex.detect().cost_quality,
+            CostQuality::Unavailable,
             CostQuality::Unavailable
         );
     }

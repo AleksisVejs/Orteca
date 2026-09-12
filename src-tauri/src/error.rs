@@ -15,6 +15,11 @@ pub struct AppError {
 pub enum ErrorKind {
     NotFound,
     NotAGitRepo,
+    /// The provider CLI is not on PATH. A state the UI explains, not a crash.
+    CliMissing,
+    /// The project has not been consented to. A run loads that repo's hooks.
+    NotTrusted,
+    Invalid,
     Io,
     Db,
 }

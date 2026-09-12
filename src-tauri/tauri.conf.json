@@ -18,7 +18,7 @@
         "height": 720,
         "minWidth": 720,
         "minHeight": 520,
-        "backgroundColor": "#0F0F0E",
+        "backgroundColor": "#08090A",
         "decorations": true
       }
     ],
@@ -27,6 +27,11 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
   }
 }

@@ -1,6 +1,13 @@
 // Mirrors the serde shapes in src-tauri. Keep in step with src-tauri/src.
 
-export type ErrorKind = "notFound" | "notAGitRepo" | "io" | "db";
+export type ErrorKind =
+  | "notFound"
+  | "notAGitRepo"
+  | "cliMissing"
+  | "notTrusted"
+  | "invalid"
+  | "io"
+  | "db";
 
 export interface AppError {
   kind: ErrorKind;
@@ -35,8 +42,6 @@ export interface OpenedProject {
   trustFindings: TrustFinding[];
 }
 
-export type Mode = "efficient" | "balanced";
-
 export type ProviderId = "claude" | "codex";
 
 /** How the CLI authenticates. Orteca never reads a credential, only its presence. */
@@ -52,4 +57,49 @@ export interface Detected {
   version: string | null;
   auth: Auth;
   costQuality: CostQuality;
+}
+
+export type FailureKind =
+  | "authExpired"
+  | "usageLimit"
+  | "rateLimit"
+  | "timeout"
+  | "crashed";
+
+/** Token counts as the provider reported them. Codex never reports a cost. */
+export interface Usage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  costUsd: number | null;
+  costQuality: CostQuality;
+}
+
+/** Adjacently tagged in Rust, so every variant carries its payload in `data`. */
+export type ProviderEvent =
+  | { kind: "started"; data: { sessionId: string } }
+  | { kind: "text"; data: string }
+  | { kind: "toolUse"; data: { name: string; summary: string } }
+  | { kind: "usage"; data: Usage }
+  | { kind: "done"; data: { result: string; structured: unknown } }
+  | { kind: "failed"; data: { kind: FailureKind; message: string } };
+
+/** `added`/`deleted` are null for a binary or untracked file, never zero. */
+export interface FileStat {
+  path: string;
+  added: number | null;
+  deleted: number | null;
+}
+
+export interface TaskResult {
+  taskId: number;
+  status: "done" | "failed";
+  summary: string;
+  failure: string | null;
+  /** null when the run ended before the provider reported any numbers. */
+  usage: Usage | null;
+  diff: FileStat[];
+  /** The diff also contains edits that were already there when the run began. */
+  dirtyAtStart: boolean;
 }

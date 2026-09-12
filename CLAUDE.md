@@ -19,7 +19,7 @@ Rust lives in `src-tauri/`; run `cargo` from there. Everything else from the rep
 
 ```bash
 npm install
-node scripts/make-icon.mjs          # only if src-tauri/icons/icon.ico is missing
+node scripts/make-icon.mjs          # rebuild src-tauri/icons/ from src/assets/velo.png
 npm run build                       # vue-tsc --noEmit + vite build
 npm test                            # node --test scripts/*.test.mjs
 node --test scripts/app.test.mjs    # single JS test file
@@ -51,7 +51,8 @@ Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens an
   `src/api.ts` mirrors it with `isAppError`.
 
 Frontend: `src/api.ts` is the single `invoke` wrapper — add commands there, mirror types
-in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css`.
+in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css`, and
+`docs/ui.md` is the binding rulebook for anything visual — read it before touching UI.
 
 ## Rules this codebase runs on
 
@@ -73,8 +74,9 @@ in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css
 
 ## Gotchas already paid for
 
-- `tauri-build` needs `src-tauri/icons/icon.ico` even for `cargo test`. It is gitignored
-  in spirit — regenerate with `node scripts/make-icon.mjs`.
+- `tauri-build` needs `src-tauri/icons/icon.ico` even for `cargo test`. The whole icon
+  set is generated from `src/assets/velo.png` — regenerate with
+  `node scripts/make-icon.mjs`, never edit the files in `src-tauri/icons/` by hand.
 - `CreateJobObjectW` requires the `windows` crate's `Win32_Security` feature; the error
   looks like a plain missing import.
 - SQLite `datetime('now')` is second-resolution, so recents tie. Order by

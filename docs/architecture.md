@@ -6,8 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1, 2 and 3 are implemented. The acceptance checks for 1 and 2 are
-documented in `docs/m1-m2-verification.md`. Milestones 4-8 are not started.
+Milestones 1 to 4 are implemented. The acceptance checks for 1 and 2 are
+documented in `docs/m1-m2-verification.md`. Milestones 5-8 are not started.
 
 What exists and works:
 
@@ -18,6 +18,9 @@ What exists and works:
 - Open a project: git state, trust scan, recents
 - Provider detection (PATH resolution, version, auth mode), shown on the project
   screen; `mock` replays JSONL fixtures through the real event parsers
+- A single-stage run: prompt to one CLI, live stream, append-only event log,
+  working-tree diff, and a result labelled with its cost quality
+- Installing a missing CLI from the project screen, via the user's own npm
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -95,6 +98,12 @@ codex exec resume <SESSION_ID> "<follow-up>"
 | Resume | `codex exec resume <id>` / `--last` | exact |
 | Reproducible run | `--ignore-user-config`, `--ignore-rules` | exact |
 | **Mid-run instruction** | **not supported.** stdin is the prompt, consumed at start | exact |
+
+Install: `npm install --global @openai/codex`. Orteca shells out to the user's
+own npm and never fetches a binary itself, and it runs the install from a
+temporary directory so the opened repository's `.npmrc` cannot redirect the
+registry before that repository has been consented to. Claude Code installs the
+same way from `@anthropic-ai/claude-code`.
 
 Auth: `codex login` writes `~/.codex/auth.json` (ChatGPT subscription). Orteca never
 touches it, never asks for passwords — the CLI owns auth. `CODEX_API_KEY` is the
@@ -191,9 +200,9 @@ src-tauri/
       claude.rs    stream-json parser
       codex.rs     exec --json parser
       mock.rs      replays fixtures/*.jsonl through the real parsers
+    run.rs         one stage: argv, stream, event log, diff, result
     routing.rs *   deterministic classifier + route builder
     orchestrator.rs *  runs the route, owns the instruction queue
-    git.rs *       baseline snapshot, diff capture
 src/
   main.ts  App.vue  api.ts  types.ts
   views/      Launch.vue  Project.vue
@@ -201,6 +210,11 @@ src/
   styles/     tokens.css
 scripts/make-icon.mjs
 ```
+
+`git.rs` never happened: baseline snapshot and diff capture are four functions
+next to `git_state`, and `project.rs` already owns every git call. `run.rs` is
+the single-stage runner; the orchestrator that owns a multi-stage route and an
+instruction queue arrives with routing in Milestone 6.
 
 Merged away vs. spec: `optimization`, `execution`, `verification`, `metrics`,
 `safety`, `context` fold into the above. One store, not many. No Pinia — two
@@ -251,8 +265,9 @@ pub enum FailureKind {
 **As built (Milestone 3).** No `async_trait` and no `Provider` trait yet: a
 `ProviderId` enum with `detect()` and `parse_line()` covers detection and
 normalisation, and dynamic dispatch has nothing to dispatch on until the
-orchestrator picks a provider at runtime in Milestone 4. `Invocation`,
-`Handle`, `Steering` and `CancelToken` land with the first real run.
+orchestrator picks a provider at runtime. `Invocation`, `Handle`, `Steering`
+and `CancelToken` did not land with the first real run either — see the verdict
+below.
 
 `parse_line` takes one raw JSONL line and returns zero or more events: a Claude
 `result` is both a `Usage` and an outcome, and one assistant message can hold
@@ -260,9 +275,11 @@ text and a tool call together. `Done.result` is empty for Codex, which reports
 no final-answer field — the caller keeps the last `Text`.
 
 `FailureKind` lists only what a parser produces. `CliMissing`, `Cancelled` and
-`MalformedOutput` were dropped, because they are the process runner's to report
-and it does not exist yet; whichever the runner truly emits comes back in
-Milestone 4, one at a time. The other three are live: neither CLI reports a
+`MalformedOutput` were dropped, because they are the process runner's to report.
+Milestone 4 answered which of them the runner really needs: `CliMissing` became
+an `AppError` raised before a task row is even opened, and a process that exits
+without a result becomes a `failed` task carrying the exit code and the tail of
+its non-JSON output. Neither is a `FailureKind`, so the enum did not grow. The other three are live: neither CLI reports a
 machine-readable error code, so `classify_failure` matches the phrases both
 providers share in their free-text message and leaves anything unrecognised as
 `Crashed`. A wrong bucket sends the user to fix the wrong thing.
@@ -272,17 +289,16 @@ limit, not an oversight.** Per-message `usage` reports the output count the API
 had at `message_start`, and one API response can produce several assistant
 messages that all repeat that same placeholder — so summing them and keeping
 the last are both wrong. A run cancelled or crashed before `result` therefore
-has no honest token count at all. Milestone 4 must record that as
-`cost_quality: unavailable` with no number; it must never write a zero, which
-reads as "this was free".
+has no honest token count at all. That is recorded as `cost_quality:
+unavailable` with every token column NULL; nothing writes a zero, which would
+read as "this was free". The result screen says "token count unavailable".
 
-**Verdict on the trait, asked and answered.** The enum stands. Milestone 4 adds
-`Invocation` and a `start()` that returns a `Handle`, and at that point there
-are two concrete implementations plus the mock to choose between at runtime —
-that is when a trait earns its keep. Nothing written here has to move: the call
-sites are `ProviderId::detect()` and `ProviderId::parse_line()`, and a trait
-would wrap them rather than replace them. Adding it now would be an interface
-with nothing dispatching through it.
+**Verdict on the trait, asked and answered — again, after building the run.**
+The enum still stands, and `Invocation`/`Handle`/`Steering` were not needed
+either. A run is `run::args(id, prompt)` returning a `Vec<String>` plus the one
+`proc::spawn` every provider shares; the only per-provider difference is the
+argv, which is one `match`. A trait would dispatch a single method that returns
+data. Revisit when steering makes `start()` genuinely asymmetric in Milestone 5.
 
 Fixtures in `src-tauri/fixtures/*.jsonl` are written to the event shapes
 verified above, not captured from a live session, because neither CLI is
@@ -290,19 +306,17 @@ installed. Swap in a real capture when one exists; nothing else changes.
 
 Detection resolves the program against PATH x PATHEXT itself. `CreateProcess`
 only ever appends `.exe`, so `claude.cmd` — how both CLIs install on Windows —
-is invisible to a bare program name. The resolved path is what Milestone 4
-spawns.
+is invisible to a bare program name. The resolved path is what `run.rs` spawns.
 
 ## 7. SQLite schema — 6 tables
 
 Migration 0001 exists; the rest land with the milestone that needs them.
 
 ```sql
--- 0001, shipped
+-- 0001 and 0002, shipped
 projects(id, path, name, trusted, trust_scanned_at, last_opened_at, opened_seq)
   -- path is the git root and is UNIQUE. opened_seq orders recents.
 
--- not written yet
 tasks(id, project_id, prompt, mode, route_json, status, branch, base_commit,
       dirty_at_start, started_at, ended_at, summary, diff_stat_json)
 
@@ -312,8 +326,11 @@ task_events(id, task_id, ts, stage, kind, provider, payload_json)
 
 usage(id, task_id, event_id, provider, model, input_tokens, cached_input_tokens,
       output_tokens, reasoning_tokens, cost_usd, cost_quality)
-  -- cost_quality: 'exact' | 'estimated' | 'unavailable'
+  -- cost_quality: 'exact' | 'estimated' | 'unavailable'. Every token column is
+  -- nullable: a run that dies before its provider reports usage has no honest
+  -- number, and a zero would read as "this was free".
 
+-- not written yet
 file_cache(project_id, path, sha256, size, lang, indexed_at)
 
 baselines(project_id, task_class, n, median_tokens, median_calls, updated_at)
@@ -440,8 +457,8 @@ Review artifact:
 | 1 | Tauri 2 + Vue 3 shell, design tokens, **Job Object process runner + JSONL reader** | app opens, can spawn and kill a process tree | done |
 | 2 | Launch screen, open project, recents, git state, **trust scan** | can open a real repo | done |
 | 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
-| 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | next |
-| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | |
+| 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
+| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | next |
 | 6 | Classifier + multi-stage routes + structured artifacts + verify | Plan → Build → Review works | |
 | 7 | file_cache, path ranking, usage + baselines, route visual | metrics are honest and labelled | |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |

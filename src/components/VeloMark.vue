@@ -1,22 +1,25 @@
 <script setup lang="ts">
-// Velo. Flat fox mark, no personality, no animation.
+// Velo, the product mark. The PNG is the source of truth; it is white on
+// transparent, so it only ever sits on a dark surface.
+import velo from "../assets/velo.png";
 defineProps<{ size?: number }>();
 </script>
 
 <template>
-  <svg
+  <img
+    :src="velo"
     :width="size ?? 18"
     :height="size ?? 18"
-    viewBox="0 0 24 24"
-    fill="none"
+    alt=""
     aria-hidden="true"
-  >
-    <path
-      d="M3 4l4 3.2h10L21 4l-1.1 6.4A8 8 0 0 1 12 21a8 8 0 0 1-7.9-10.6L3 4Z"
-      stroke="currentColor"
-      stroke-width="1.4"
-      stroke-linejoin="round"
-    />
-    <path d="M9.2 12h.01M14.8 12h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
-  </svg>
+    draggable="false"
+  />
 </template>
+
+<style scoped>
+img {
+  display: block;
+  object-fit: contain;
+  user-select: none;
+}
+</style>

@@ -157,6 +157,63 @@ pub fn git_state(dir: &Path) -> GitState {
     }
 }
 
+/// One changed file. Line counts are `None` for a binary file or an untracked
+/// one, because git reports no numbers for either - and a zero would claim the
+/// file was touched and nothing changed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub path: String,
+    pub added: Option<u64>,
+    pub deleted: Option<u64>,
+}
+
+/// What the working tree looks like compared with `base`, plus whatever is
+/// untracked. If the repo was already dirty when the run started, this mixes
+/// the user's own edits in - the caller records `dirty_at_start` and says so.
+pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
+    let mut stats = Vec::new();
+    let empty_tree;
+    let base = match base {
+        Some(base) => base,
+        None => {
+            empty_tree = git_output(dir, &["hash-object", "-t", "tree", "--stdin"])?;
+            empty_tree.trim()
+        }
+    };
+    {
+        let numstat = git_output(dir, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", base, "--"])?;
+        let mut records = numstat.split('\0');
+        while let Some(line) = records.next() {
+            let mut parts = line.splitn(3, '\t');
+            let (Some(added), Some(deleted), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let path = if path.is_empty() {
+                // -z emits both names separately when Git detects a rename.
+                records.next();
+                records.next().unwrap_or_default()
+            } else { path };
+            stats.push(FileStat {
+                path: path.to_string(),
+                added: added.parse().ok(),
+                deleted: deleted.parse().ok(),
+            });
+        }
+    }
+    let untracked = git_output(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+        stats.push(FileStat {
+            path: path.to_string(),
+            added: None,
+            deleted: None,
+        });
+    }
+    Ok(stats)
+}
+
 /// Display name for a project directory: the folder name.
 pub fn display_name(path: &Path) -> String {
     path.file_name()
@@ -172,28 +229,72 @@ pub fn validate_dir(path: &str) -> Result<PathBuf> {
             format!("{path} is not a folder that exists"),
         ));
     }
-    Ok(p)
+    Ok(p.canonicalize()?)
 }
 
 /// Run git and return trimmed stdout, or `None` if git failed or isn't there.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let text = git_output(dir, args).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
     // Even `git status` can execute a repository's core.fsmonitor command.
     let out = Command::new("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(dir)
-        .output()
-        .ok()?;
+        .output()?;
     if !out.status.success() {
-        return None;
+        return Err(AppError::new(ErrorKind::Io, format!("Git could not inspect changes: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_in_an_unborn_repo_includes_staged_files() {
+        let dir = temp_dir("diff-unborn");
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap().success());
+        std::fs::write(dir.join("staged.txt"), "one\n").unwrap();
+        assert!(Command::new("git").args(["add", "."]).current_dir(&dir).status().unwrap().success());
+        let stats = diff_since(&dir, None).unwrap();
+        assert!(stats.iter().any(|s| s.path == "staged.txt"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diff_preserves_unicode_spaces_and_rename_destinations() {
+        let dir = temp_dir("diff-paths");
+        let command = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        command(&["init", "-q"]);
+        command(&["config", "user.name", "test"]);
+        command(&["config", "user.email", "test@example.com"]);
+        for name in ["old.txt", "é file.txt", "binary.dat"] {
+            std::fs::write(dir.join(name), if name == "binary.dat" { b"\0old" } else { b"old\n" }).unwrap();
+        }
+        command(&["add", "."]);
+        command(&["commit", "-qm", "initial"]);
+        let base = git_state(&dir).head.unwrap();
+        command(&["mv", "old.txt", "new name.txt"]);
+        std::fs::write(dir.join("é file.txt"), "old\nnew\n").unwrap();
+        std::fs::write(dir.join("binary.dat"), b"\0new").unwrap();
+        std::fs::write(dir.join("新 file.txt"), "untracked").unwrap();
+        let stats = diff_since(&dir, Some(&base)).unwrap();
+        for name in ["new name.txt", "é file.txt", "binary.dat", "新 file.txt"] {
+            assert!(stats.iter().any(|f| f.path == name), "missing {name}: {stats:?}");
+        }
+        let text = stats.iter().find(|f| f.path == "é file.txt").unwrap();
+        assert_eq!((text.added, text.deleted), (Some(1), Some(0)));
+        assert_eq!(stats.iter().find(|f| f.path == "binary.dat").unwrap().added, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("orteca-test-{tag}-{}", std::process::id()));

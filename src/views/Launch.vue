@@ -35,24 +35,22 @@ async function forget(path: string) {
 
 <template>
   <main class="launch">
-    <header class="brand">
-      <VeloMark :size="20" />
+    <div class="hero">
+      <div class="tile"><VeloMark :size="64" /></div>
       <h1>Orteca</h1>
-    </header>
+      <p class="tagline">The efficient way to run coding agents.</p>
 
-    <p class="tagline">The efficient way to run coding agents.</p>
-
-    <button class="btn" @click="choose">Open Project</button>
-
-    <p v-if="error" class="error">{{ error }}</p>
+      <button class="btn primary open" @click="choose">Open project</button>
+      <p v-if="error" class="error">{{ error }}</p>
+    </div>
 
     <section v-if="recents.length" class="recents">
-      <h2>Recent projects</h2>
-      <ul>
+      <h2 class="label">Recent</h2>
+      <ul class="card">
         <li v-for="p in recents" :key="p.path">
           <button class="entry" @click="emit('open', p.path)">
             <span class="name">{{ p.name }}</span>
-            <span class="mono">{{ p.path }}</span>
+            <span class="mono path">{{ p.path }}</span>
           </button>
           <button class="forget" title="Remove from list" @click="forget(p.path)">
             &times;
@@ -60,68 +58,81 @@ async function forget(path: string) {
         </li>
       </ul>
     </section>
+
+    <p class="foot">Better results. Less wasted context.</p>
   </main>
 </template>
 
 <style scoped>
 .launch {
   height: 100%;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  max-width: 520px;
+  max-width: 560px;
   margin: 0 auto;
-  padding: 40px var(--pad);
+  padding: 48px var(--pad);
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--accent);
+.hero {
+  text-align: center;
 }
-.brand h1 {
-  margin: 0;
-  font-size: 20px;
+
+/* The one place a glow is allowed: it is the product mark. */
+.tile {
+  display: inline-grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  border-radius: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px var(--mark-rim), 0 18px 40px var(--mark-shadow);
+}
+
+h1 {
+  margin: 20px 0 0;
+  font-size: 30px;
   font-weight: 600;
-  letter-spacing: -0.02em;
-  color: var(--text);
+  letter-spacing: -0.03em;
 }
 
 .tagline {
-  margin: 10px 0 36px;
+  margin: 6px 0 28px;
   color: var(--text-dim);
 }
 
-.btn {
-  align-self: flex-start;
+.open {
+  min-width: 180px;
 }
 
 .error {
-  margin-top: 18px;
+  margin: 16px 0 0;
   color: var(--err);
+  font-size: 12px;
 }
 
 .recents {
-  margin-top: 56px;
-}
-.recents h2 {
-  margin: 0 0 6px;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-faint);
+  margin-top: 48px;
 }
 .recents ul {
   list-style: none;
   margin: 0;
   padding: 0;
+  overflow: hidden;
 }
 .recents li {
   display: flex;
   align-items: center;
+  padding-right: 8px;
+  transition: background 120ms ease;
+}
+.recents li + li {
   border-top: 1px solid var(--border);
+}
+.recents li:hover {
+  background: var(--surface-2);
 }
 .recents li:hover .forget {
   opacity: 1;
@@ -129,26 +140,36 @@ async function forget(path: string) {
 
 .entry {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  padding: 11px 8px 11px 0;
+  gap: 1px;
+  padding: 12px 16px;
   text-align: left;
 }
-.entry:hover .name {
-  color: var(--accent);
-}
-.name {
-  transition: color 90ms ease;
+.path {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .forget {
   opacity: 0;
   padding: 4px 8px;
+  border-radius: var(--r-sm);
   color: var(--text-faint);
-  transition: opacity 90ms ease, color 90ms ease;
+  transition: opacity 120ms ease, color 120ms ease;
 }
 .forget:hover {
   color: var(--text);
+}
+
+.foot {
+  margin: 40px 0 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-faint);
 }
 </style>

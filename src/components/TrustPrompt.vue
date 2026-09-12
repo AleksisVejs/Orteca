@@ -24,7 +24,7 @@ defineEmits<{ trust: []; cancel: [] }>();
       <p v-if="error" role="alert">{{ error }}</p>
       <footer>
         <button class="btn" @click="$emit('cancel')">Cancel</button>
-        <button class="btn primary" @click="$emit('trust')">Trust and open</button>
+        <button class="btn consent" @click="$emit('trust')">Trust and open</button>
       </footer>
     </section>
   </div>
@@ -36,7 +36,7 @@ defineEmits<{ trust: []; cancel: [] }>();
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgb(0 0 0 / 0.55);
+  background: var(--overlay);
   padding: var(--pad);
 }
 
@@ -53,9 +53,9 @@ defineEmits<{ trust: []; cancel: [] }>();
 
 h2 {
   margin: 0 0 8px;
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
 }
 
 p {
@@ -67,18 +67,22 @@ ul {
   list-style: none;
   margin: 0 0 22px;
   padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
 }
 li {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 9px 0;
+  padding: 10px 14px;
+}
+li + li {
   border-top: 1px solid var(--border);
 }
 code {
   font-family: var(--mono);
   font-size: 12px;
-  color: var(--accent);
+  color: var(--text);
 }
 li span {
   color: var(--text-faint);
@@ -90,8 +94,13 @@ footer {
   justify-content: flex-end;
   gap: var(--gap);
 }
-.primary {
-  border-color: var(--accent-dim);
-  color: var(--accent);
+/* Consent is never the light primary button: opening is the risky move. */
+.consent {
+  color: var(--warn);
+  border-color: var(--border-strong);
+}
+.consent:hover {
+  border-color: var(--warn);
+  background: var(--surface-2);
 }
 </style>

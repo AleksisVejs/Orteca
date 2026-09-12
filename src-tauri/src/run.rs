@@ -155,10 +155,64 @@ pub struct Request {
     pub prompt: String,
     pub base_commit: Option<String>,
     pub dirty_at_start: bool,
+    /// Where to keep this run's raw JSONL. `None` records nothing.
+    pub recording: Option<PathBuf>,
+}
+
+/// The raw event stream of one run, kept so a paid run can be replayed free.
+///
+/// A live run spends the user's subscription; replaying one costs nothing. The
+/// bundled fixtures are hand-written guesses that have already been wrong once:
+/// they missed the item types Codex reports its own tool failures in, and only
+/// a recording fixes that for good.
+///
+/// Only JSON lines are kept, so the file stays loadable by `mock::replay`,
+/// which treats a malformed line as a broken fixture rather than as output.
+struct Recording {
+    path: Option<PathBuf>,
+    file: Option<std::fs::File>,
+}
+
+impl Recording {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self { path, file: None }
+    }
+
+    /// Opened on the first event, so a run that produced none leaves no file.
+    /// Nothing here may fail the run: the record that matters is `task_events`,
+    /// and a development aid must never cost the user a run they paid for. A
+    /// write that fails gives up for the rest of the run rather than retrying.
+    fn write(&mut self, value: &serde_json::Value) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.file.is_none() {
+            let opened = std::fs::create_dir_all(path.parent().unwrap_or(&path))
+                .and_then(|()| std::fs::File::create(&path));
+            match opened {
+                Ok(file) => self.file = Some(file),
+                Err(_) => {
+                    self.path = None;
+                    return;
+                }
+            }
+        }
+        // serde_json orders keys; the parsers read fields by name and do not
+        // care. What has to survive is the shape, not the byte order.
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if std::io::Write::write_all(file, format!("{value}
+").as_bytes()).is_err() {
+            self.path = None;
+            self.file = None;
+        }
+    }
 }
 
 pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
-    let Request { task_id, id, program, dir, prompt, base_commit, dirty_at_start } = request;
+    let Request { task_id, id, program, dir, prompt, base_commit, dirty_at_start, recording } = request;
+    let mut recording = Recording::new(recording);
     let mut outcome = Outcome::default();
     // Non-JSON output is the only clue a CLI leaves when it dies badly.
     let mut noise: Vec<String> = Vec::new();
@@ -176,6 +230,9 @@ pub async fn stream(store: &Store, request: Request, emit: impl Fn(&ProviderEven
             while let Some(line) = run.lines.recv().await {
                 match line {
                     Line::Json(value) => {
+                        // Before parsing: the recording is what the CLI said,
+                        // not what Orteca understood of it.
+                        recording.write(&value);
                         let events = id.parse_line(&value);
                         // Each parser understands a subset of its CLI's event
                         // types and silently drops the rest. Harmless for the
@@ -321,7 +378,7 @@ mod tests {
         Request {
             task_id: store.create_task(project.id, "test", "balanced", None, None, false).unwrap(),
             id: ProviderId::Codex, program: dir.join("fake.cmd"), dir,
-            prompt: "a\"b %PATH% & ^\n\\ --help".into(), base_commit: None, dirty_at_start: false,
+            prompt: "a\"b %PATH% & ^\n\\ --help".into(), base_commit: None, dirty_at_start: false, recording: None,
         }
     }
 
@@ -371,6 +428,49 @@ mod tests {
         assert_eq!(raw["item"]["error"], "sandbox setup failed", "the reason the run did nothing must survive");
         // Logged, not shown: the UI has no shape for an event nobody parsed.
         assert!(!emitted.borrow().contains(&"unknown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live run spends the user's subscription once. What the CLI said has to
+    /// come back for free afterwards, or every later test of this path bills
+    /// them again - and the hand-written fixtures have already been wrong once.
+    #[tokio::test]
+    async fn a_paid_run_is_recorded_so_it_can_be_replayed_for_free() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "recording");
+        let dir = request.dir.clone();
+        let recording = dir.join("recordings").join("task.jsonl");
+        request.recording = Some(recording.clone());
+        std::fs::write(
+            &request.program,
+            "@echo off
+             echo {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"an answer\"}}
+             echo warming up
+             echo {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":20}}
+             exit /b 0
+",
+        )
+        .unwrap();
+
+        let live = std::cell::RefCell::new(Vec::new());
+        let result = stream(&store, request, |e| {
+            live.borrow_mut().push(serde_json::to_string(e).unwrap());
+            Ok(())
+        })
+        .await;
+        assert_eq!(result.status, "done");
+
+        // Anything but JSONL makes the file a broken fixture, not a recording.
+        let written = std::fs::read_to_string(&recording).expect("nothing was recorded");
+        assert_eq!(written.lines().count(), 2, "non-JSON output leaked in: {written}");
+
+        let replayed: Vec<String> = crate::providers::mock::replay(ProviderId::Codex, &recording)
+            .expect("a recording must load as a fixture")
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        assert_eq!(replayed, live.into_inner(), "replay must reproduce the run it recorded");
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 

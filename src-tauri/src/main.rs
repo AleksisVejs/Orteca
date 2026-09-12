@@ -90,13 +90,16 @@ async fn start_task(
     events: tauri::ipc::Channel<providers::ProviderEvent>,
 ) -> Result<run::TaskResult> {
     let prepare_app = app.clone();
-    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), path, prompt, provider)).await
+    // Beside the database, because a recording belongs to the run it came from.
+    // Losing the directory costs a replay, never the run itself.
+    let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
+    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider)).await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     Ok(run::stream(&app.state::<Store>(), request, |event| events.send(event.clone())
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))).await)
 }
 
-fn prepare_run(store: &Store, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {
+fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
     };
@@ -130,6 +133,10 @@ fn prepare_run(store: &Store, path: String, prompt: String, provider: ProviderId
         prompt,
         base_commit: git.head,
         dirty_at_start: git.dirty,
+        // A real run costs the user's subscription. Keeping its JSONL is what
+        // makes the next one free, and is the only honest source of fixtures.
+        recording: recordings
+            .map(|dir| dir.join(format!("task-{task_id}-{}.jsonl", provider.program()))),
     })
 }
 

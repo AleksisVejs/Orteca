@@ -17,11 +17,33 @@ use crate::store::Store;
 /// One stage, so one name. Routing gives these real names in Milestone 6.
 const STAGE: &str = "run";
 
-// Scoped rules match command spelling, not every way of executing Git.
-const CLAUDE_DENY: &[&str] = &[
-    "Bash(git push:*)", "Bash(git reset:*)", "Bash(git clean:*)",
-    "PowerShell(git push:*)", "PowerShell(git reset:*)", "PowerShell(git clean:*)",
+// Commands the agent may never run, in either shell. Deny beats allow, so these
+// hold even though `--allowedTools` grants Bash and PowerShell outright.
+// Scoped rules match command spelling, not every way of executing Git: this is a
+// guardrail against an agent going wrong, not a sandbox against a hostile one.
+// Claude exposes no OS-level sandbox flag the way `codex --sandbox` does.
+const CLAUDE_DENY_COMMANDS: &[&str] = &[
+    // Rewriting or publishing the user's history. Orteca reads git, never rewrites it.
+    "git push:*", "git reset:*", "git clean:*", "git rebase:*",
+    "git restore:*", "git checkout --:*", "git filter-branch:*",
+    // Destroying files outside a normal edit.
+    "rm:*", "rmdir:*", "del:*", "rd:*", "Remove-Item:*",
+    // Publishing under the user's name.
+    "npm publish:*", "cargo publish:*", "gh release:*",
+    // Reaching the network, which is how a bad instruction exfiltrates a repo.
+    "curl:*", "wget:*", "Invoke-WebRequest:*", "Invoke-RestMethod:*", "scp:*", "ssh:*",
+    // Touching the machine rather than the project.
+    "shutdown:*", "reg:*", "schtasks:*", "net user:*", "Set-ExecutionPolicy:*",
 ];
+
+/// Every denied command in both shells Claude can reach, so a blocked command
+/// cannot simply be rerun through the other one.
+fn claude_deny() -> Vec<String> {
+    CLAUDE_DENY_COMMANDS
+        .iter()
+        .flat_map(|cmd| [format!("Bash({cmd})"), format!("PowerShell({cmd})")])
+        .collect()
+}
 
 /// What the UI gets when the run ends.
 #[derive(Debug, Clone, Serialize)]
@@ -65,8 +87,19 @@ pub fn args(id: ProviderId, _prompt: &str) -> Vec<String> {
             arg("--verbose"),
             arg("--permission-mode"),
             arg("acceptEdits"),
+            // Nothing is listening for a permission prompt. With the default
+            // `host` target a headless run hangs forever waiting for an answer
+            // no one can give; `none` denies instead, so the agent is told no
+            // and carries on.
+            arg("--permission-prompts"),
+            arg("none"),
+            // acceptEdits only auto-approves edits. Without this the agent can
+            // write code but never run the test that proves the code works.
+            arg("--allowedTools"),
+            arg("Bash"),
+            arg("PowerShell"),
             arg("--disallowedTools"),
-        ], CLAUDE_DENY.iter().map(|rule| arg(rule)).collect()].concat(),
+        ], claude_deny()].concat(),
     }
 }
 
@@ -354,7 +387,24 @@ mod tests {
         let claude = args(ProviderId::Claude, "do the thing").join(" ");
         assert!(!claude.contains("--bare"), "--bare would force an API key");
         assert!(claude.contains("--permission-mode acceptEdits"));
+        // A headless run has nobody to answer a prompt, so it must never wait
+        // for one. This is what made an agent stall instead of running a test.
+        assert!(claude.contains("--permission-prompts none"));
+        // The agent has to be able to verify its own work.
+        assert!(claude.contains("--allowedTools Bash PowerShell"));
+
+        // Deny beats allow, and every rule covers both shells.
+        for command in CLAUDE_DENY_COMMANDS {
+            assert!(claude.contains(&format!("Bash({command})")), "{command}");
+            assert!(claude.contains(&format!("PowerShell({command})")), "{command}");
+        }
         assert!(claude.contains("Bash(git push:*)"));
+        assert!(claude.contains("Bash(rm:*)"));
+        assert!(claude.contains("PowerShell(Remove-Item:*)"));
+        // Granting the shells must not silently outrank the denylist.
+        let allow = claude.find("--allowedTools").expect("allow");
+        let deny = claude.find("--disallowedTools").expect("deny");
+        assert!(allow < deny, "denylist must come after the grant it narrows");
 
         let codex = args(ProviderId::Codex, "do the thing").join(" ");
         assert!(codex.contains("--sandbox workspace-write"));

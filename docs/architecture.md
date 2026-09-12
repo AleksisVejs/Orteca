@@ -480,8 +480,21 @@ rides along with metrics. Each slice ends commit-ready with tests.
   `claude` is logged out and `codex` is out of credits. "CLI missing" stays a
   first-class state, and `mock` is still what tests run against.
 - The argv in `run::args` was checked against both CLIs' `--help` on 2026-09-12.
-  Every flag exists. The happy path is still unproven: no successful agent run
-  has ever gone end to end.
+  Every flag exists, and on the same day the first real runs went end to end
+  against a throwaway repo: a question answered with no edits, and a build that
+  edited a file and produced a diff.
+- **A headless run must never wait on a permission prompt.** `claude --print`
+  defaults to `--permission-prompts host`, and Orteca is not an SDK host, so the
+  first build run stalled: the agent asked four times to run a test and nothing
+  could answer. Orteca passes `--permission-prompts none`, which denies instead
+  of hanging. `acceptEdits` also only auto-approves *edits*, so `--allowedTools
+  Bash PowerShell` is what lets an agent verify its own work; `CLAUDE_DENY_COMMANDS`
+  narrows that back down, because deny beats allow.
+- `bypassPermissions` was considered and rejected. Whether a denylist still
+  applies under it is undocumented and could not be tested, and unlike
+  `codex --sandbox workspace-write` it is not an OS-level fence — Claude exposes
+  no sandbox flag at all. Allow-plus-deny gets the same power with documented
+  precedence. Do not swap it for the mode without evidence.
 - **Auth comes from the CLI, never from a credential file.** `claude auth status
   --json` and `codex login status` are the only sources. The old check - does
   `~/.claude/.credentials.json` exist - reported a saved login for a user who had

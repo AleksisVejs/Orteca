@@ -187,6 +187,11 @@ function formatCost(cost: number): string {
   return cost > 0 && cost < 0.0001 ? "<$0.0001" : "$" + cost.toFixed(4);
 }
 
+/** Six-figure token counts are unreadable run together; group them. */
+function formatTokens(count: number): string {
+  return count.toLocaleString("en-US");
+}
+
 const AUTH: Record<Auth, string> = {
   subscription: "saved login",
   apiKey: "API key",
@@ -266,9 +271,13 @@ const AUTH: Record<Auth, string> = {
         <!-- Three tiles. Every one labelled, none faked when unknown. -->
         <div class="tiles">
           <div class="tile">
-            <span class="figure">{{ tokens ? tokens.total : "—" }}</span>
+            <span class="figure">{{ tokens ? formatTokens(tokens.total) : "—" }}</span>
             <span class="note">
-              {{ tokens ? tokens.cached + " cached" : "tokens unavailable" }}
+              {{
+                tokens
+                  ? formatTokens(tokens.cached) + " cached"
+                  : "tokens unavailable"
+              }}
             </span>
           </div>
           <div class="tile">

@@ -113,6 +113,20 @@ fn cancel_task(task_id: i64, live: State<run::Live>) -> Result<()> {
     live.send(task_id, run::Control::Cancel)
 }
 
+/// Give a running agent something more to work with.
+///
+/// Where it goes is the provider's business: Claude takes it mid-turn on
+/// stdin, Codex has no channel and holds it. `apply_now` is the user choosing
+/// not to wait - the process ends and its session is resumed carrying the
+/// instruction, with the diff so far left exactly as it is.
+#[tauri::command]
+fn send_instruction(task_id: i64, text: String, apply_now: bool, live: State<run::Live>) -> Result<()> {
+    let Some(text) = run::clean_prompt(&text) else {
+        return Err(AppError::new(ErrorKind::Invalid, "Type the instruction first."));
+    };
+    live.send(task_id, run::Control::Instruct { text, apply_now })
+}
+
 fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId) -> Result<run::Request> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
@@ -328,6 +342,7 @@ fn main() {
             recent_projects,
             start_task,
             cancel_task,
+            send_instruction,
             trust_project,
             forget_project
         ])

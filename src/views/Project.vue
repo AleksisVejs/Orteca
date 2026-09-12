@@ -7,6 +7,7 @@ import {
   isAppError,
   onInstallEvent,
   onSignInEvent,
+  sendInstruction,
   signInProvider,
   startTask,
 } from "../api";
@@ -50,6 +51,9 @@ const rows = computed<Row[]>(() =>
         version: null,
         auth: "unknown",
         costQuality: "unavailable",
+        // Nothing reads this on a pending row - `selected` only ever finds a
+        // real answer - but the cautious value is the one to stand in with.
+        steering: "checkpoint",
         pending: true,
       },
   ),
@@ -129,6 +133,31 @@ const runError = ref<string | null>(null);
 const taskId = ref<number | null>(null);
 const stopping = ref(false);
 
+// A mid-task instruction. Where it lands is the provider's business, and the
+// card says which before the user types rather than after they have sent it.
+const instruction = ref("");
+const sending = ref(false);
+const instructionError = ref<string | null>(null);
+const steering = computed(() => selected.value?.steering ?? "checkpoint");
+
+async function instruct(applyNow: boolean) {
+  const text = instruction.value.trim();
+  if (!running.value || taskId.value === null || sending.value || !text) return;
+  sending.value = true;
+  instructionError.value = null;
+  try {
+    await sendInstruction(taskId.value, text, applyNow);
+    // Shown as the user's own words. Never pushed through `describe`, which
+    // would file them among the things the agent said.
+    stream.value.push({ kind: "instruction", text });
+    instruction.value = "";
+  } catch (e) {
+    instructionError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    sending.value = false;
+  }
+}
+
 async function stopRun() {
   if (!running.value || taskId.value === null || stopping.value) return;
   stopping.value = true;
@@ -175,6 +204,8 @@ async function run() {
   runError.value = null;
   taskId.value = null;
   stopping.value = false;
+  instruction.value = "";
+  instructionError.value = null;
   running.value = true;
   try {
     result.value = await startTask(
@@ -314,11 +345,58 @@ const AUTH: Record<Auth, string> = {
       Neither CLI is installed, so there is nothing to run yet.
     </p>
 
+    <section v-if="running" class="block">
+      <h2 class="label">While it works</h2>
+      <div class="card steer">
+        <input
+          v-model="instruction"
+          type="text"
+          spellcheck="false"
+          :placeholder="
+            steering === 'live'
+              ? 'Say something to it…'
+              : 'Something for the next step…'
+          "
+          :disabled="taskId === null || sending"
+          @keyup.enter="instruct(false)"
+        />
+        <div class="steer-row">
+          <button
+            class="btn"
+            :disabled="taskId === null || sending || !instruction.trim()"
+            @click="instruct(false)"
+          >
+            Send
+          </button>
+          <button
+            v-if="steering === 'checkpoint'"
+            class="btn"
+            :disabled="taskId === null || sending || !instruction.trim()"
+            @click="instruct(true)"
+          >
+            Apply now
+          </button>
+          <span class="note grow">
+            <template v-if="steering === 'live'">
+              {{ provider }} takes this while it works.
+            </template>
+            <template v-else>
+              {{ provider }} cannot be interrupted. Send holds it for the next
+              step; Apply now restarts its session with it, keeping every
+              change already made.
+            </template>
+          </span>
+        </div>
+        <p v-if="instructionError" class="missing">{{ instructionError }}</p>
+      </div>
+    </section>
+
     <section v-if="lines.length" class="block">
       <h2 class="label">Activity</h2>
       <p class="note">Latest 500 entries; long messages shortened. Full events are saved in the task log.</p>
       <ol class="card stream">
         <li v-for="(line, i) in lines" :key="i" :class="line.kind">
+          <span v-if="line.kind === 'instruction'" class="said">you</span>
           {{ line.text }}
         </li>
       </ol>
@@ -620,6 +698,45 @@ textarea:disabled {
 }
 .stream li.failed {
   color: var(--err);
+}
+/* The user's own words, marked as theirs rather than as something said back. */
+.stream li.instruction {
+  color: var(--text);
+}
+.said {
+  margin-right: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.steer input {
+  display: block;
+  width: 100%;
+  background: none;
+  color: var(--text);
+  border: none;
+  padding: 14px 18px 4px;
+  font: inherit;
+}
+.steer input::placeholder {
+  color: var(--text-faint);
+}
+.steer input:focus {
+  outline: none;
+}
+.steer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+.steer-row .btn {
+  padding: 6px 14px;
+  font-size: 12px;
+}
+.steer .missing {
+  padding: 0 18px 12px;
 }
 
 .outcome {

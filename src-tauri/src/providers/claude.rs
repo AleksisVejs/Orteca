@@ -7,6 +7,21 @@ use serde_json::Value;
 
 use super::{classify_failure, CostQuality, FailureKind, ProviderEvent, Usage};
 
+/// One user message in the shape `--input-format stream-json` accepts.
+///
+/// This shape was verified against the CLI, not taken from the spec: the
+/// architecture doc guessed `{"type":"user","text":"..."}`, which the CLI does
+/// not accept. A live run confirmed this one by echoing it back under
+/// `--replay-user-messages`. Serialised through serde so a prompt containing
+/// quotes, newlines or backslashes cannot break the line framing.
+pub fn user_message(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    })
+    .to_string()
+}
+
 pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
     match v["type"].as_str().unwrap_or_default() {
         "system" if v["subtype"] == "init" => v["session_id"]

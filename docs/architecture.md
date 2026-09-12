@@ -6,9 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 to 4 are implemented, and 5 is half done: a run can be stopped,
-but a mid-task instruction cannot be sent yet. The acceptance checks for 1 and 2
-are documented in `docs/m1-m2-verification.md`. Milestones 6-8 are not started.
+Milestones 1 to 5 are implemented. The acceptance checks for 1 and 2 are
+documented in `docs/m1-m2-verification.md`. Milestones 6-8 are not started.
 
 What exists and works:
 
@@ -23,6 +22,8 @@ What exists and works:
   working-tree diff, and a result labelled with its cost quality
 - Stopping a live run: the Job Object takes the whole tree, the stop is written
   to the event log, and the task ends `cancelled` rather than `failed`
+- Mid-task instructions: Claude takes one live on stdin mid-turn, Codex holds
+  one until asked to apply it and then resumes its own session with it
 - Installing a missing CLI from the project screen, via the user's own npm
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
@@ -384,29 +385,51 @@ User types an instruction while a task runs:
 
 | Running | Action |
 |---|---|
-| Claude (stdin open) | write `{"type":"user","text":"..."}` to its stdin. Live. |
+| Claude (stdin open) | write `{"type":"user","message":{"role":"user","content":"..."}}` to its stdin. Live. |
 | Codex | hold. Apply at next stage boundary. UI says "will apply at next step". |
 | Between stages | merge into the next stage's brief. |
-| User picks "apply now" on Codex | SIGTERM (Job Object close) → `codex exec resume <id>` with the instruction prepended. Diff so far is preserved; nothing is reverted. |
+| User picks "apply now" on Codex | Job Object close → `codex exec resume <id>` with the instruction prepended. Diff so far is preserved; nothing is reverted. |
 
 Every later stage brief includes the full accumulated constraint list. An instruction
 never silently expires.
 
-**Open before this is built.** `claude --input-format stream-json` exists and was
-checked against `--help`, but the exact JSON a user message has to be written in
-was *not* verified — `{"type":"user","text":"..."}` above is a guess, and the
-Claude Code streaming-input shape is closer to
-`{"type":"user","message":{"role":"user","content":"..."}}`. Verify it against a
-real run before trusting it, because getting it wrong breaks the prompt path that
-already works. Steering also means `run::stream` must stop calling
-`close_stdin()` straight after the prompt, and the argv must gain
-`--input-format stream-json`. Codex's side needs the session id from
-`ProviderEvent::Started` plus `codex exec resume <id> -` (both confirmed present
-in `codex exec resume --help`).
+### Verified against the CLIs, not assumed
 
-Cancel is built and is the model for the rest: `run::Live` holds one control
-sender per live task, `stream` selects over that channel alongside the CLI's
-output, and `Control` grows an `Instruction` variant when steering lands.
+The first draft of this section guessed `{"type":"user","text":"..."}`, which the
+CLI does not accept. These four facts came out of a live two-turn run and cost a
+few cents; `fixtures/claude-steered-run.jsonl` is that run, so they never need
+paying for again.
+
+1. **The message shape is the Messages-API one**, nested under `message`.
+   `--replay-user-messages` echoes an accepted message back, which is the cheap
+   way to check this without reading the answer.
+2. **`result` is per *turn*, not per run.** Under `--input-format stream-json`
+   Claude emits a full `result` and then waits for the next message
+   indefinitely. The run ends when Orteca closes stdin — so `stream` counts the
+   turns it is owed and closes only when every user message has been answered.
+   Closing at the first `result` throws away an instruction sent during it.
+3. **Usage is per turn but `total_cost_usd` is a session running total.** In the
+   recording the cost goes 0.0302 → 0.0405 while turn two's own output is six
+   tokens. So `Usage::absorb` adds the tokens and replaces the cost. Treating
+   both the same way in either direction reports a wrong number.
+4. **`codex exec resume` has no `--sandbox` flag** — only
+   `--dangerously-bypass-approvals-and-sandbox`, which this project forbids. The
+   sandbox travels as `-c sandbox_mode="workspace-write"`; a bogus value is
+   rejected with the three valid variants named, which is how the spelling was
+   confirmed without spending a run. Losing this would leave a resumed agent
+   read-only while still exiting 0 — the failure already documented in §16.
+
+**How it is built.** `run::Live` holds one control sender per live task, and
+`stream` selects over that channel alongside the CLI's output. `Control` is
+`Cancel` or `Instruct { text, apply_now }`. Every instruction is written to
+`task_events` with what became of it — `live`, `held`, `resumed` or `tooLate` —
+so one can never silently evaporate. A resume re-enters the same `stream` with
+new argv, keeping one event log, one token total and one diff baseline across
+both processes; the kill that hands over is not reported as a crash.
+
+A single-stage run has no stage boundary, so a held Codex instruction has
+nothing to apply itself to until Milestone 6. That is why "apply now" exists,
+and why the UI says plainly that Send will wait.
 
 ## 10. Command and process safety
 
@@ -479,7 +502,7 @@ Review artifact:
 | 2 | Launch screen, open project, recents, git state, **trust scan** | can open a real repo | done |
 | 3 | Provider detect (version + auth mode) + `mock` provider + fixtures | detection shown in UI, CI green | done |
 | 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
-| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | cancel done, steering next |
+| 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | done |
 | 6 | Classifier + multi-stage routes + structured artifacts + verify | Plan → Build → Review works | |
 | 7 | file_cache, path ranking, usage + baselines, route visual | metrics are honest and labelled | |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | |
@@ -496,10 +519,11 @@ rides along with metrics. Each slice ends commit-ready with tests.
 
 ## 16. Notes for whoever picks this up
 
-- Both CLIs are now installed on the dev machine (`@anthropic-ai/claude-code`
-  2.1.269, `@openai/codex` 0.154.0), but neither is usable for a full run:
-  `claude` is logged out and `codex` is out of credits. "CLI missing" stays a
-  first-class state, and `mock` is still what tests run against.
+- Both CLIs are installed on the dev machine (`@anthropic-ai/claude-code`
+  2.1.269, `@openai/codex` 0.154.0). `claude` is signed in on a claude.ai
+  subscription and can complete a real run; `codex` reports a login but its
+  credit state is unknown. "CLI missing" stays a first-class state, and `mock`
+  is still what tests run against — no test ever invokes a real CLI.
 - The argv in `run::args` was checked against both CLIs' `--help` on 2026-09-12.
   Every flag exists, and on the same day the first real runs went end to end
   against a throwaway repo: a question answered with no edits, and a build that

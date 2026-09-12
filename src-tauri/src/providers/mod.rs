@@ -39,6 +39,24 @@ pub struct Detected {
     /// The best cost figure this provider can ever give. Codex reports tokens
     /// and no cost, so its metrics are `unavailable` before a run even starts.
     pub cost_quality: CostQuality,
+    /// Whether a mid-task instruction reaches this CLI live or has to wait.
+    /// The UI says which before the user types, rather than after.
+    pub steering: Steering,
+}
+
+/// How a provider takes an instruction given to it mid-run.
+///
+/// Verified against both CLIs, not assumed: `claude -p --input-format
+/// stream-json` keeps reading stdin across turns, and `codex exec` has no
+/// stdin channel at all once its prompt is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Steering {
+    /// A new user message on stdin, taken while the turn is still running.
+    Live,
+    /// Nothing to speak to. The instruction waits, and applying it means
+    /// ending the process and resuming the session it recorded.
+    Checkpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -74,6 +92,28 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     pub cost_usd: Option<f64>,
     pub cost_quality: CostQuality,
+}
+
+impl Usage {
+    /// Fold another turn's numbers into this total.
+    ///
+    /// Claude reports `usage` per turn but `total_cost_usd` as a running total
+    /// for the whole session - checked against a live two-turn run, where the
+    /// cost went 0.0302 -> 0.0405 while the second turn's own output was six
+    /// tokens. So tokens add and cost replaces. Adding the costs would bill
+    /// the first turn twice; keeping only the last usage would throw every
+    /// turn but the last away.
+    pub fn absorb(&mut self, next: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(next.input_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.saturating_add(next.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(next.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(next.reasoning_tokens);
+        // A turn that reported no cost does not erase one that did.
+        if next.cost_usd.is_some() {
+            self.cost_usd = next.cost_usd;
+            self.cost_quality = next.cost_quality;
+        }
+    }
 }
 
 /// Adjacently tagged so every variant survives, including the newtype ones:
@@ -164,6 +204,38 @@ impl ProviderId {
         }
     }
 
+    /// Whether this CLI can be spoken to while it works.
+    pub fn steering(self) -> Steering {
+        match self {
+            Self::Claude => Steering::Live,
+            Self::Codex => Steering::Checkpoint,
+        }
+    }
+
+    /// Restart a recorded session with something new to say.
+    ///
+    /// `codex exec resume` has no `--sandbox` flag - only the bypass one this
+    /// project forbids - so the sandbox has to be set through config. The
+    /// override is validated: a bogus value is refused with the three variants
+    /// named, which is how this spelling was confirmed without spending a run.
+    pub fn resume_args(self, session: &str) -> Vec<String> {
+        let arg = str::to_string;
+        match self {
+            Self::Codex => vec![
+                arg("exec"),
+                arg("resume"),
+                session.to_string(),
+                arg("-"),
+                arg("--json"),
+                arg("-c"),
+                arg("sandbox_mode=\"workspace-write\""),
+            ],
+            // Claude never needs this: it takes instructions live, so there is
+            // no session to pick back up.
+            Self::Claude => Vec::new(),
+        }
+    }
+
     /// The npm package that installs this CLI. Both ship as npm globals on
     /// Windows - which is the same reason `which` has to resolve `.cmd` shims.
     /// Orteca never downloads a binary itself; it runs the package manager the
@@ -235,6 +307,7 @@ impl ProviderId {
                 Self::Claude => CostQuality::Estimated,
                 Self::Codex => CostQuality::Unavailable,
             },
+            steering: self.steering(),
         }
     }
 
@@ -377,6 +450,58 @@ fn version_of(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The numbers a steered run reports. Claude sends usage per turn and cost
+    /// as a session running total, so one of them adds and the other replaces.
+    /// Getting this uniform in either direction reports a wrong number.
+    #[test]
+    fn steered_turns_add_their_tokens_and_keep_the_latest_cost() {
+        let turn = |input, output, cost| Usage {
+            input_tokens: input,
+            cached_input_tokens: 10,
+            output_tokens: output,
+            reasoning_tokens: 1,
+            cost_usd: cost,
+            cost_quality: CostQuality::Estimated,
+        };
+        let mut total = turn(100, 4, Some(0.0302));
+        total.absorb(&turn(2, 6, Some(0.0405)));
+
+        assert_eq!(total.input_tokens, 102);
+        assert_eq!(total.output_tokens, 10);
+        assert_eq!(total.cached_input_tokens, 20);
+        assert_eq!(total.cost_usd, Some(0.0405), "the cost is already a session total");
+
+        // Codex reports no cost at all, and that must not erase Claude's.
+        let mut kept = turn(1, 1, Some(0.5));
+        kept.absorb(&Usage { cost_usd: None, cost_quality: CostQuality::Unavailable, ..turn(1, 1, None) });
+        assert_eq!(kept.cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn a_user_message_survives_quotes_and_newlines() {
+        let line = claude::user_message("say \"hi\"
+then stop");
+        assert_eq!(line.lines().count(), 1, "a newline would split the JSONL frame");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "say \"hi\"
+then stop");
+    }
+
+    /// Resume has no --sandbox flag, so the mode travels as a config override.
+    /// Losing it would leave a resumed agent read-only while still exiting 0.
+    #[test]
+    fn a_resumed_codex_session_keeps_its_write_sandbox() {
+        let argv = ProviderId::Codex.resume_args("abc-123").join(" ");
+        assert!(argv.contains("exec resume abc-123"));
+        assert!(argv.contains("sandbox_mode=\"workspace-write\""));
+        assert!(!argv.contains("danger"));
+        assert!(argv.contains("--json"));
+        // The prompt arrives on stdin, never as an argument.
+        assert!(ProviderId::Codex.resume_args("abc-123").contains(&"-".to_string()));
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("orteca-provider-{label}-{}", std::process::id()));

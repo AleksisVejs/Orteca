@@ -50,6 +50,9 @@ export type Auth = "subscription" | "apiKey" | "signedOut" | "unknown";
 
 export type CostQuality = "exact" | "estimated" | "unavailable";
 
+/** How a mid-task instruction reaches a CLI that is already running. */
+export type Steering = "live" | "checkpoint";
+
 /** A live detection. `path: null` means not installed — a state, not an error. */
 export interface Detected {
   id: ProviderId;
@@ -58,6 +61,8 @@ export interface Detected {
   version: string | null;
   auth: Auth;
   costQuality: CostQuality;
+  /** `live` takes an instruction mid-turn; `checkpoint` has to be restarted. */
+  steering: Steering;
 }
 
 export type FailureKind =

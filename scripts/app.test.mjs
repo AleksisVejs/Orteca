@@ -25,7 +25,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -35,6 +35,7 @@ async function projectView(api = {}) {
     onInstallEvent: async () => () => {},
     onSignInEvent: async () => () => {},
     cancelTask: async () => {},
+    sendInstruction: async () => {},
     isAppError: e => !!e?.message,
     ...api,
   });
@@ -206,6 +207,66 @@ test('a stop that lands after the run ended never becomes a run error', async ()
   release({ ...finished, status: 'done', failure: null, summary: 'finished anyway' });
   await running;
   assert.equal(state.result.value.status, 'done', 'a late stop must not rewrite the real outcome');
+});
+
+test('an instruction is shown as the user’s own words and clears the box', async () => {
+  let sent = null;
+  let release;
+  const { state } = await projectView({
+    detectProviders: async () => [{ id: 'claude', path: 'fake.exe', steering: 'live' }],
+    sendInstruction: async (taskId, text, applyNow) => { sent = { taskId, text, applyNow }; },
+    startTask: async (...args) => {
+      const [onEvent, onTask] = args.filter(arg => typeof arg === 'function');
+      onTask(4);
+      onEvent({ kind: 'text', data: 'working on it' });
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+
+  const running = state.run();
+  assert.equal(state.steering.value, 'live', 'the card must say how this CLI takes it');
+  state.instruction.value = '  use tabs  ';
+  await state.instruct(false);
+
+  assert.deepEqual(sent, { taskId: 4, text: 'use tabs', applyNow: false });
+  assert.equal(state.instruction.value, '', 'a sent instruction must not sit in the box');
+  const mine = state.lines.value.filter(l => l.kind === 'instruction');
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].text, 'use tabs');
+
+  release({ ...finished, status: 'done', failure: null, summary: 'done' });
+  await running;
+});
+
+test('a checkpoint provider can apply now, and a refused instruction is not shown as sent', async () => {
+  let applyNow = null;
+  let release;
+  const { state } = await projectView({
+    detectProviders: async () => [{ id: 'codex', path: 'fake.exe', steering: 'checkpoint' }],
+    sendInstruction: async (_id, _text, now) => {
+      applyNow = now;
+      throw Error('That run has already finished.');
+    },
+    startTask: async (...args) => {
+      args.filter(arg => typeof arg === 'function')[1](5);
+      return new Promise(resolve => { release = resolve; });
+    },
+  });
+
+  const running = state.run();
+  assert.equal(state.steering.value, 'checkpoint');
+  state.instruction.value = 'make it faster';
+  await state.instruct(true);
+
+  assert.equal(applyNow, true);
+  assert.match(state.instructionError.value, /already finished/);
+  assert.equal(state.lines.value.filter(l => l.kind === 'instruction').length, 0,
+    'a refused instruction must not appear as if it landed');
+  assert.equal(state.instruction.value, 'make it faster', 'the words must not be thrown away');
+  assert.equal(state.sending.value, false);
+
+  release({ ...finished, status: 'done', failure: null });
+  await running;
 });
 
 test('a signed-out CLI blocks the run and offers sign-in instead', async () => {

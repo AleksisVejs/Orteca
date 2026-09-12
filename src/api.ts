@@ -64,6 +64,14 @@ export const startTask = (
 export const cancelTask = (taskId: number) =>
   invoke<void>("cancel_task", { taskId });
 
+/**
+ * Sends a mid-task instruction. A live provider takes it straight away; a
+ * checkpoint one holds it unless `applyNow`, which restarts its session with
+ * the instruction rather than waiting for a boundary that may never come.
+ */
+export const sendInstruction = (taskId: number, text: string, applyNow: boolean) =>
+  invoke<void>("send_instruction", { taskId, text, applyNow });
+
 /** Installs the CLI with npm. Resolves with the fresh detection, or throws. */
 export const installProvider = (provider: ProviderId) =>
   invoke<Detected>("install_provider", { provider });

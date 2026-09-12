@@ -23,6 +23,8 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             let u = &v["usage"];
             vec![
                 ProviderEvent::Usage(Usage {
+                    // `exec --json` 0.154.0 names no model in any event.
+                    model: None,
                     input_tokens: n(&u["input_tokens"]).saturating_sub(n(&u["cached_input_tokens"])),
                     cached_input_tokens: n(&u["cached_input_tokens"]),
                     output_tokens: n(&u["output_tokens"]),
@@ -133,6 +135,7 @@ mod tests {
         }}));
         let ProviderEvent::Usage(u) = &events[0] else { panic!("missing usage") };
         assert_eq!(u.input_tokens + u.cached_input_tokens + u.output_tokens, 120);
+        assert_eq!(u.model, None, "codex names no model, so none is invented");
     }
 
     #[test]

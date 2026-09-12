@@ -6,12 +6,14 @@ import type {
   Detected,
   Mode,
   OpenedProject,
+  Preflight,
   Project,
   ProviderEvent,
   ProviderId,
   InstructionReceipt,
   TaskResult,
   TaskSummary,
+  TaskDetail,
 } from "./types";
 
 export function isAppError(e: unknown): e is AppError {
@@ -45,6 +47,10 @@ export const forgetProject = (path: string) =>
 /** This project's past runs, newest first. */
 export const recentTasks = (path: string) =>
   invoke<TaskSummary[]>("recent_tasks", { path });
+export const getTaskDetail = (path: string, taskId: number) =>
+  invoke<TaskDetail>("task_detail", { path, taskId });
+export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode) =>
+  invoke<Preflight>("preview_task", { path, prompt, provider, mode });
 
 /**
  * The channel exists before invocation; completion uses the invoke response.
@@ -89,6 +95,8 @@ export const sendInstruction = (taskId: number, text: string, applyNow: boolean)
 /** Installs the CLI with npm. Resolves with the fresh detection, or throws. */
 export const installProvider = (provider: ProviderId) =>
   invoke<Detected>("install_provider", { provider });
+export const cancelProviderOperation = (provider: ProviderId) =>
+  invoke<void>("cancel_provider_operation", { provider });
 
 export const onInstallEvent = (fn: (provider: ProviderId, line: string) => void) =>
   listen<[ProviderId, string]>("install-event", (e) => fn(e.payload[0], e.payload[1]));

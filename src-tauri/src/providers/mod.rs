@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProviderId {
     Claude,
@@ -83,6 +83,9 @@ pub enum CostQuality {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
+    /// Provider-reported model id, when the CLI includes one.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Uncached input, including cache writes. Cache reads are disjoint.
     pub input_tokens: u64,
     /// Cache *reads* only. Cache writes are billed as ordinary input.
@@ -104,6 +107,9 @@ impl Usage {
     /// the first turn twice; keeping only the last usage would throw every
     /// turn but the last away.
     pub fn absorb(&mut self, next: &Usage) {
+        if next.model.is_some() {
+            self.model = next.model.clone();
+        }
         self.input_tokens = self.input_tokens.saturating_add(next.input_tokens);
         self.cached_input_tokens = self.cached_input_tokens.saturating_add(next.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(next.output_tokens);
@@ -492,6 +498,7 @@ mod tests {
     #[test]
     fn steered_turns_add_their_tokens_and_keep_the_latest_cost() {
         let turn = |input, output, cost| Usage {
+            model: Some("test-model".into()),
             input_tokens: input,
             cached_input_tokens: 10,
             output_tokens: output,

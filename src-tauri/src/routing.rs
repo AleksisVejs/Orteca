@@ -683,9 +683,11 @@ pub fn brief(
     if stage.writes() {
         if route.is_single_call() {
             out.push_str(
-                "This is the only agent call for this task. Make the change, then run one \
-                 focused check that proves it works. Stop as soon as it passes; do not \
-                 broaden the task, refactor around it, or run the whole suite.\n",
+                "This is the only agent call for this task. Make the change. If it changes \
+                 behaviour, run one focused check that proves it works and stop as soon as \
+                 it passes. A change with nothing to run - a comment, docs, wording - needs \
+                 no check: stop once the edit is made. Do not broaden the task, refactor \
+                 around it, or run the whole suite.\n",
             );
         } else {
             out.push_str(

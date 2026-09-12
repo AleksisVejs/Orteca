@@ -1,17 +1,54 @@
 <script setup lang="ts">
+import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import type { TrustFinding } from "../types";
 
 defineProps<{ name: string; findings: TrustFinding[]; error?: string | null }>();
-defineEmits<{ trust: []; cancel: [] }>();
+const emit = defineEmits<{ trust: []; cancel: [] }>();
+const panel = ref<HTMLElement | null>(null);
+let previouslyFocused: HTMLElement | null = null;
+
+function keydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    emit("cancel");
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const buttons = panel.value?.querySelectorAll<HTMLElement>("button");
+  if (!buttons?.length) return;
+  const first = buttons.item(0);
+  const last = buttons.item(buttons.length - 1);
+  if (!first || !last) return;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+onMounted(() => {
+  previouslyFocused = document.activeElement as HTMLElement | null;
+  void nextTick(() => panel.value?.querySelector<HTMLElement>("button")?.focus());
+});
+onUnmounted(() => previouslyFocused?.focus());
 </script>
 
 <template>
-  <div class="scrim">
-    <section class="panel">
-      <h2>Trust {{ name }}?</h2>
+  <div class="scrim" @keydown="keydown">
+    <section
+      ref="panel"
+      class="panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="trust-title"
+      tabindex="-1"
+    >
+      <h2 id="trust-title">Trust {{ name }}?</h2>
       <p>
-        Agent CLIs can load instructions and run configuration from this project
-        and its parent folders. Open it only if you trust where the code came from.
+        Orteca may read setup instructions from this project and its parent
+        folders. Only open it if you trust where the code came from.
       </p>
 
       <ul>
@@ -21,10 +58,10 @@ defineEmits<{ trust: []; cancel: [] }>();
         </li>
       </ul>
 
-      <p v-if="error" role="alert">{{ error }}</p>
+      <p v-if="error" role="alert" aria-live="assertive">{{ error }}</p>
       <footer>
-        <button class="btn" @click="$emit('cancel')">Cancel</button>
-        <button class="btn consent" @click="$emit('trust')">Trust and open</button>
+        <button class="btn" @click="emit('cancel')">Cancel</button>
+        <button class="btn consent" @click="emit('trust')">Trust and open</button>
       </footer>
     </section>
   </div>

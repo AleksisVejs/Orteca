@@ -11,10 +11,15 @@ export interface TaskSummary {
   routeKind: RouteKind | null;
   callsUsed: number | null;
   provider: ProviderId | null;
+  model: string | null;
   tokens: number | null;
+  uncachedTokens: number | null;
   cachedTokens: number | null;
   costUsd: number | null;
   costQuality: CostQuality | null;
+  unknownEvents: number;
+  durationMs: number | null;
+  patchAvailable: boolean;
 }
 
 export type ErrorKind =
@@ -57,6 +62,11 @@ export interface OpenedProject {
   project: Project;
   git: GitState;
   trustFindings: TrustFinding[];
+}
+export interface Preflight {
+  provider: ProviderId;
+  git: GitState;
+  route: Route;
 }
 
 export type ProviderId = "claude" | "codex";
@@ -181,6 +191,7 @@ export interface BudgetStop {
 
 /** Token counts as the provider reported them. Codex never reports a cost. */
 export interface Usage {
+  model: string | null;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
@@ -231,6 +242,9 @@ export interface TaskResult {
   /** null when the run ended before the provider reported any numbers. */
   usage: Usage | null;
   diff: FileStat[];
+  patchText: string | null;
+  unknownEvents: number;
+  durationMs: number;
   /** The diff also contains edits that were already there when the run began. */
   dirtyAtStart: boolean;
   /** Decided before any provider started, ceilings included. */
@@ -245,4 +259,35 @@ export interface TaskResult {
   budgetStop: BudgetStop | null;
   /** null until the project has enough comparable runs to compare against. */
   baseline: Baseline | null;
+}
+export interface TaskEvent {
+  id: number;
+  ts: string;
+  stage: string | null;
+  kind: string;
+  provider: string;
+  payload: unknown;
+}
+export interface TaskDetail {
+  id: number;
+  prompt: string;
+  status: TaskSummary["status"];
+  startedAt: string;
+  endedAt: string | null;
+  summary: string | null;
+  route: unknown | null;
+  diff: FileStat[];
+  patchText: string | null;
+  dirtyAtStart: boolean;
+  callsUsed: number | null;
+  provider: ProviderId | null;
+  model: string | null;
+  tokens: number | null;
+  uncachedTokens: number | null;
+  cachedTokens: number | null;
+  costUsd: number | null;
+  costQuality: CostQuality | null;
+  unknownEvents: number;
+  durationMs: number | null;
+  events: TaskEvent[];
 }

@@ -96,6 +96,14 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
     let u = &v["usage"];
     let cost = v["total_cost_usd"].as_f64().filter(|cost| *cost > 0.0);
     let usage = Usage {
+        // `result` has no `model` field; `modelUsage` is keyed by model id and
+        // can hold a helper model too, so name the one that wrote the most.
+        model: v["modelUsage"].as_object().and_then(|models| {
+            models
+                .iter()
+                .max_by_key(|(_, m)| n(&m["outputTokens"]))
+                .map(|(id, _)| id.clone())
+        }),
         input_tokens: n(&u["input_tokens"])
             .saturating_add(n(&u["cache_creation_input_tokens"])),
         cached_input_tokens: n(&u["cache_read_input_tokens"]),
@@ -178,5 +186,19 @@ mod tests {
     fn a_long_summary_is_cut_without_splitting_a_character() {
         let long = "é".repeat(200);
         assert_eq!(summary(serde_json::json!({"file_path": long})).chars().count(), 120);
+    }
+
+    /// Recorded 2.1.269 shape: no `model` on `result`, and `modelUsage` may
+    /// list a helper model beside the one that did the work.
+    #[test]
+    fn the_model_is_the_one_that_wrote_the_most() {
+        let events = parse_line(&serde_json::json!({"type":"result", "subtype":"success", "result":"ok",
+            "usage": {"input_tokens": 2, "output_tokens": 640},
+            "modelUsage": {
+                "claude-haiku-4-5": {"outputTokens": 30},
+                "claude-sonnet-5": {"outputTokens": 610}
+            }}));
+        let usage = events.iter().find_map(|e| match e { ProviderEvent::Usage(u) => Some(u), _ => None });
+        assert_eq!(usage.and_then(|u| u.model.as_deref()), Some("claude-sonnet-5"));
     }
 }

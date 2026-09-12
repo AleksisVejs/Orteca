@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, ErrorKind, Result};
 
@@ -160,7 +160,7 @@ pub fn git_state(dir: &Path) -> GitState {
 /// One changed file. Line counts are `None` for a binary file or an untracked
 /// one, because git reports no numbers for either - and a zero would claim the
 /// file was touched and nothing changed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStat {
     pub path: String,
@@ -172,7 +172,7 @@ pub struct FileStat {
 }
 
 /// Whether a changed file is this run's work, the user's, or both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Origin {
     /// Clean when the run started.
@@ -281,6 +281,88 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
         });
     }
     Ok(stats)
+}
+
+/// The reviewable patch for the same comparison as `diff_since`.
+///
+/// Git does not include untracked files in `git diff`, so small text files are
+/// rendered as new-file hunks here. Large and binary untracked files remain in
+/// the file-stat list but are called out instead of loading unbounded data.
+pub fn patch_since(dir: &Path, base: Option<&str>) -> Result<String> {
+    const MAX_PATCH_BYTES: usize = 512 * 1024;
+    const MAX_UNTRACKED_BYTES: usize = 64 * 1024;
+    let empty_tree;
+    let base = match base {
+        Some(base) => base,
+        None => {
+            empty_tree = git_output(dir, &["hash-object", "-t", "tree", "--stdin"])?;
+            empty_tree.trim()
+        }
+    };
+    let mut patch = git_output(
+        dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            base,
+            "--",
+        ],
+    )?;
+    let untracked = git_output(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+        if patch.len() >= MAX_PATCH_BYTES {
+            break;
+        }
+        let full = dir.join(path);
+        let remaining = MAX_PATCH_BYTES - patch.len();
+        let addition = match std::fs::read(&full) {
+            Ok(bytes) if bytes.len() <= MAX_UNTRACKED_BYTES => match String::from_utf8(bytes) {
+                Ok(text) => new_file_patch(path, &text),
+                Err(_) => format!("\n# binary untracked file: {path}\n"),
+            },
+            Ok(_) => format!("\n# untracked file too large to display: {path}\n"),
+            Err(_) => format!("\n# untracked file could not be read: {path}\n"),
+        };
+        append_limited(&mut patch, &addition, remaining);
+    }
+    if patch.len() > MAX_PATCH_BYTES {
+        truncate_utf8(&mut patch, MAX_PATCH_BYTES);
+        patch.push_str("\n# patch truncated at 512 KiB\n");
+    }
+    Ok(patch)
+}
+
+fn append_limited(target: &mut String, text: &str, limit: usize) {
+    let end = text
+        .char_indices()
+        .find(|(index, character)| *index + character.len_utf8() > limit)
+        .map_or_else(|| limit.min(text.len()), |(index, _)| index);
+    target.push_str(&text[..end]);
+}
+
+fn truncate_utf8(text: &mut String, limit: usize) {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn new_file_patch(path: &str, text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let count = lines.len();
+    let mut patch = format!(
+        "\ndiff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +{count} @@\n"
+    );
+    for line in lines {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    patch
 }
 
 /// Every tracked path in the repository, as forward-slash relative paths.
@@ -401,6 +483,30 @@ mod tests {
         let text = stats.iter().find(|f| f.path == "é file.txt").unwrap();
         assert_eq!((text.added, text.deleted), (Some(1), Some(0)));
         assert_eq!(stats.iter().find(|f| f.path == "binary.dat").unwrap().added, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn patch_contains_tracked_hunks_and_small_untracked_files() {
+        let dir = temp_dir("patch");
+        let command = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        command(&["init", "-q"]);
+        command(&["config", "user.name", "test"]);
+        command(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+        command(&["add", "."]);
+        command(&["commit", "-qm", "initial"]);
+        let base = git_state(&dir).head.unwrap();
+        std::fs::write(dir.join("tracked.txt"), "before\nafter\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new content\n").unwrap();
+
+        let patch = patch_since(&dir, Some(&base)).unwrap();
+        assert!(patch.contains("+after"), "tracked hunk missing: {patch}");
+        assert!(patch.contains("diff --git a/new.txt b/new.txt"), "untracked hunk missing: {patch}");
+        assert!(patch.contains("+new content"), "untracked content missing: {patch}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

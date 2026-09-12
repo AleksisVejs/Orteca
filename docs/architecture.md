@@ -38,7 +38,10 @@ What exists and works:
   checked on cumulative usage after every turn; a finished run is compared to
   the median of comparable runs once five exist; the result shows the route
 - The project screen lists recent runs with their outcome, route, calls and
-  labelled usage
+  labelled usage; each run opens its patch and append-only event log
+- A preflight preview shows the selected route, ceilings and existing working
+  tree changes before a provider starts; provider install and sign-in can be
+  cancelled and are bounded to five minutes
 - Codex is refused up front on a repository whose folder ACL the user cannot
   change, instead of "finishing" with no tools (see §16)
 - CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
@@ -173,7 +176,7 @@ embeddings. Not an AST index. It also gives every route an `ExecutionBudget`:
 ```text
 max_agent_calls     maximum provider processes/stages
 max_turns           provider turn ceiling where the CLI supports one
-max_reported_tokens cumulative reported usage; checked after each completed turn
+max_reported_tokens cumulative uncached usage (input + output, not cache reads); checked after each completed turn
 preferred_tier      cheapest capable provider/model tier for this task class
 ```
 
@@ -266,7 +269,9 @@ Found by the measurement: the token guard counts cache reads, so this ~190k
 cached context crosses the 150k `implementOnce` ceiling on its own. The guard
 also fires after the final stage's result with nothing left to stop, so a
 finished, correct run reads `budgetReached`. The baseline excludes cache reads,
-so the two disagree. Fix that before trusting a baseline.
+so the two disagree. Fixed 2026-09-13: the guard now counts uncached input and
+output only, the same tokens the baseline compares. It still fires after a final
+result, but only once a run has genuinely spent past the ceiling.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -307,7 +312,7 @@ A module is a folder only once it outgrows one file. Actual layout today,
 
 ```
 src-tauri/
-  migrations/0001_init.sql  0002_tasks.sql
+  migrations/0001_init.sql  0002_tasks.sql  0003_calls.sql  0004_task_details.sql
   src/
     main.rs        Tauri commands + app setup
     error.rs       AppError { kind, message }, serialized to the frontend

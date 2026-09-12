@@ -9,12 +9,14 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::error::{AppError, ErrorKind, Result};
+use crate::project::FileStat;
 use crate::providers::{CostQuality, Usage};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_tasks.sql"),
     include_str!("../migrations/0003_calls.sql"),
+    include_str!("../migrations/0004_task_details.sql"),
 ];
 
 /// What comparable finished runs in a project have cost. Always an estimate:
@@ -198,8 +200,8 @@ impl Store {
         tx.execute(
             "INSERT INTO usage
                 (task_id, event_id, provider, input_tokens, cached_input_tokens,
-                 output_tokens, reasoning_tokens, cost_usd, cost_quality)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 output_tokens, reasoning_tokens, cost_usd, cost_quality, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 task_id,
                 event_id,
@@ -210,12 +212,14 @@ impl Store {
                 usage.map(|u| u.reasoning_tokens),
                 usage.and_then(|u| u.cost_usd),
                 quality_name(quality),
+                usage.and_then(|u| u.model.as_deref()),
             ],
         )?;
         tx.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn finish_task(
         &self,
         task_id: i64,
@@ -224,13 +228,38 @@ impl Store {
         diff_stat_json: &str,
         calls_used: u32,
     ) -> Result<()> {
+        self.finish_task_details(task_id, status, summary, diff_stat_json, None, 0, None, calls_used)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_task_details(
+        &self,
+        task_id: i64,
+        status: &str,
+        summary: &str,
+        diff_stat_json: &str,
+        patch_text: Option<&str>,
+        unknown_events: u32,
+        duration_ms: Option<u64>,
+        calls_used: u32,
+    ) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
         let changed = conn.execute(
             "UPDATE tasks
                 SET status = ?2, summary = ?3, diff_stat_json = ?4, calls_used = ?5,
+                    patch_text = ?6, unknown_events = ?7, duration_ms = ?8,
                     ended_at = datetime('now')
               WHERE id = ?1",
-            params![task_id, status, summary, diff_stat_json, calls_used],
+            params![
+                task_id,
+                status,
+                summary,
+                diff_stat_json,
+                calls_used,
+                patch_text,
+                unknown_events,
+                duration_ms.map(|ms| ms.min(i64::MAX as u64) as i64),
+            ],
         )?;
         if changed == 0 {
             return Err(AppError::new(ErrorKind::NotFound, "task record no longer exists"));
@@ -302,9 +331,11 @@ impl Store {
         let conn = self.0.lock().expect("store poisoned");
         let mut stmt = conn.prepare(
             "SELECT t.id, t.prompt, t.status, t.started_at, t.summary,
-                    json_extract(t.route_json, '$.kind'), t.calls_used, u.provider,
+                    json_extract(t.route_json, '$.kind'), t.calls_used, u.provider, u.model,
                     u.input_tokens + u.cached_input_tokens + u.output_tokens,
-                    u.cached_input_tokens, u.cost_usd, u.cost_quality
+                    u.input_tokens + u.output_tokens, u.cached_input_tokens, u.cost_usd,
+                    u.cost_quality, t.unknown_events, t.duration_ms,
+                    (t.patch_text IS NOT NULL AND length(t.patch_text) > 0)
                FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
               WHERE t.project_id = ?1
               ORDER BY t.id DESC LIMIT ?2",
@@ -319,13 +350,88 @@ impl Store {
                 route_kind: r.get(5)?,
                 calls_used: r.get(6)?,
                 provider: r.get(7)?,
-                tokens: r.get(8)?,
-                cached_tokens: r.get(9)?,
-                cost_usd: r.get(10)?,
-                cost_quality: r.get(11)?,
+                model: r.get(8)?,
+                tokens: r.get(9)?,
+                uncached_tokens: r.get(10)?,
+                cached_tokens: r.get(11)?,
+                cost_usd: r.get(12)?,
+                cost_quality: r.get(13)?,
+                unknown_events: r.get(14)?,
+                duration_ms: r.get(15)?,
+                patch_available: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn task_detail(&self, project_id: i64, task_id: i64) -> Result<TaskDetail> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut detail = conn.query_row(
+            "SELECT t.id, t.prompt, t.status, t.started_at, t.ended_at, t.summary,
+                    t.route_json, t.diff_stat_json, t.patch_text, t.dirty_at_start,
+                    t.calls_used, u.provider, u.model,
+                    u.input_tokens + u.cached_input_tokens + u.output_tokens,
+                    u.input_tokens + u.output_tokens, u.cached_input_tokens,
+                    u.cost_usd, u.cost_quality, t.unknown_events, t.duration_ms
+               FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
+              WHERE t.project_id = ?1 AND t.id = ?2",
+            params![project_id, task_id],
+            |r| {
+                let route_json: Option<String> = r.get(6)?;
+                let diff_json: Option<String> = r.get(7)?;
+                Ok(TaskDetail {
+                    id: r.get(0)?,
+                    prompt: r.get(1)?,
+                    status: r.get(2)?,
+                    started_at: r.get(3)?,
+                    ended_at: r.get(4)?,
+                    summary: r.get(5)?,
+                    route: route_json.and_then(|json| serde_json::from_str(&json).ok()),
+                    diff: diff_json
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default(),
+                    patch_text: r.get(8)?,
+                    dirty_at_start: r.get::<_, i64>(9)? != 0,
+                    calls_used: r.get(10)?,
+                    provider: r.get(11)?,
+                    model: r.get(12)?,
+                    tokens: r.get(13)?,
+                    uncached_tokens: r.get(14)?,
+                    cached_tokens: r.get(15)?,
+                    cost_usd: r.get(16)?,
+                    cost_quality: r.get(17)?,
+                    unknown_events: r.get(18)?,
+                    duration_ms: r.get(19)?,
+                    events: Vec::new(),
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                AppError::new(ErrorKind::NotFound, "that task is not in this project")
+            }
+            other => other.into(),
+        })?;
+
+        let mut events = conn.prepare(
+            "SELECT id, ts, stage, kind, provider, payload_json
+               FROM task_events WHERE task_id = ?1 ORDER BY id",
+        )?;
+        detail.events = events
+            .query_map([task_id], |r| {
+                let payload: String = r.get(5)?;
+                Ok(TaskEvent {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    stage: r.get(2)?,
+                    kind: r.get(3)?,
+                    provider: r.get(4)?,
+                    payload: serde_json::from_str(&payload)
+                        .unwrap_or(serde_json::Value::String(payload)),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(detail)
     }
 }
 
@@ -342,10 +448,52 @@ pub struct TaskSummary {
     pub route_kind: Option<String>,
     pub calls_used: Option<u32>,
     pub provider: Option<String>,
+    pub model: Option<String>,
     pub tokens: Option<u64>,
+    pub uncached_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub cost_quality: Option<String>,
+    pub unknown_events: u32,
+    pub duration_ms: Option<u64>,
+    pub patch_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvent {
+    pub id: i64,
+    pub ts: String,
+    pub stage: Option<String>,
+    pub kind: String,
+    pub provider: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDetail {
+    pub id: i64,
+    pub prompt: String,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub summary: Option<String>,
+    pub route: Option<serde_json::Value>,
+    pub diff: Vec<FileStat>,
+    pub patch_text: Option<String>,
+    pub dirty_at_start: bool,
+    pub calls_used: Option<u32>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub tokens: Option<u64>,
+    pub uncached_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub cost_quality: Option<String>,
+    pub unknown_events: u32,
+    pub duration_ms: Option<u64>,
+    pub events: Vec<TaskEvent>,
 }
 
 fn read_project(conn: &Connection, path: &str) -> Result<Project> {
@@ -436,7 +584,7 @@ mod tests {
         let silent = store.create_task(new_task(project.id, "first", "balanced")).unwrap();
         store.record_usage(silent, None, "codex", None).unwrap();
         let measured = store.create_task(new_task(project.id, "second", "balanced")).unwrap();
-        let usage = Usage { input_tokens: 10, cached_input_tokens: 100, output_tokens: 5, reasoning_tokens: 0, cost_usd: Some(0.01), cost_quality: CostQuality::Estimated };
+        let usage = Usage { model: None, input_tokens: 10, cached_input_tokens: 100, output_tokens: 5, reasoning_tokens: 0, cost_usd: Some(0.01), cost_quality: CostQuality::Estimated };
         store.record_usage(measured, None, "claude", Some(&usage)).unwrap();
         store.finish_task(measured, "done", "ok", "[]", 1).unwrap();
 
@@ -444,6 +592,41 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [measured, silent]);
         assert_eq!((rows[0].tokens, rows[0].calls_used, rows[0].cost_quality.as_deref()), (Some(115), Some(1), Some("estimated")));
         assert_eq!((rows[1].tokens, rows[1].status.as_str()), (None, "running"));
+    }
+
+    #[test]
+    fn task_detail_returns_patch_metrics_and_event_log_for_its_project() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let route = r#"{"kind":"implementOnce"}"#;
+        let task = store
+            .create_task(NewTask {
+                route_json: Some(route),
+                ..new_task(project.id, "inspect it", "balanced")
+            })
+            .unwrap();
+        let usage = Usage {
+            model: Some("test-model".into()),
+            input_tokens: 10,
+            cached_input_tokens: 3,
+            output_tokens: 5,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            cost_quality: CostQuality::Unavailable,
+        };
+        store.record_usage(task, None, "codex", Some(&usage)).unwrap();
+        store.append_event(task, "implement", "unknown", "codex", r#"{"type":"new.event"}"#).unwrap();
+        store
+            .finish_task_details(task, "done", "finished", "[]", Some("diff --git"), 1, Some(1250), 1)
+            .unwrap();
+
+        let detail = store.task_detail(project.id, task).unwrap();
+        assert_eq!(detail.patch_text.as_deref(), Some("diff --git"));
+        assert_eq!(detail.unknown_events, 1);
+        assert_eq!(detail.duration_ms, Some(1250));
+        assert_eq!(detail.model.as_deref(), Some("test-model"));
+        assert_eq!(detail.events[0].kind, "unknown");
+        assert!(store.task_detail(project.id + 1, task).is_err());
     }
 
     #[test]
@@ -604,7 +787,7 @@ mod tests {
         let run_in = |mode: &str, project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
             let route = format!(r#"{{"kind":"{kind}"}}"#);
             let task = store.create_task(NewTask { route_json: Some(&route), ..new_task(project_id, "p", mode) }).unwrap();
-            let usage = Usage { input_tokens: tokens, cached_input_tokens: tokens * 10, output_tokens: 0, reasoning_tokens: 0, cost_usd: None, cost_quality: CostQuality::Unavailable };
+            let usage = Usage { model: None, input_tokens: tokens, cached_input_tokens: tokens * 10, output_tokens: 0, reasoning_tokens: 0, cost_usd: None, cost_quality: CostQuality::Unavailable };
             store.record_usage(task, None, provider, Some(&usage)).unwrap();
             store.finish_task(task, status, "", "[]", 1).unwrap();
             task

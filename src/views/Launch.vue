@@ -38,9 +38,9 @@ async function forget(path: string) {
     <div class="hero">
       <div class="tile"><VeloMark :size="64" /></div>
       <h1>Orteca</h1>
-      <p class="tagline">The efficient way to run coding agents.</p>
+      <p class="tagline">Tell it what you need. Orteca handles the steps.</p>
 
-      <button class="btn primary open" @click="choose">Open project</button>
+      <button class="btn primary open" @click="choose">Choose a project</button>
       <p v-if="error" class="error">{{ error }}</p>
     </div>
 
@@ -59,7 +59,7 @@ async function forget(path: string) {
       </ul>
     </section>
 
-    <p class="foot">Better results. Less wasted context.</p>
+    <p class="foot">One prompt in. Finished work out.</p>
   </main>
 </template>
 

@@ -239,6 +239,11 @@ pub struct TaskResult {
     /// The UI must say "unavailable" and never print a zero.
     pub usage: Option<Usage>,
     pub diff: Vec<FileStat>,
+    /// Reviewable Git patch, if Git could produce one.
+    pub patch_text: Option<String>,
+    /// JSONL records that the provider parser did not recognise.
+    pub unknown_events: u32,
+    pub duration_ms: u64,
     /// The diff includes edits that were already in the working tree.
     pub dirty_at_start: bool,
     /// The route this run was given before any provider started, ceilings and
@@ -620,6 +625,8 @@ struct State {
     halt: bool,
     /// Non-JSON output - the only clue a CLI leaves when it dies badly.
     noise: Vec<String>,
+    /// JSONL records that had no known provider event shape.
+    unknown_events: u32,
     /// Instructions the provider has not taken yet. A checkpoint provider
     /// accumulates these; a live one never holds anything.
     held: Vec<String>,
@@ -631,15 +638,16 @@ struct State {
 }
 
 impl State {
-    /// Cumulative reported tokens: what the inter-turn guard is measured
-    /// against. A run whose provider reported nothing has no honest number and
-    /// therefore cannot have crossed a ceiling.
+    /// Cumulative uncached tokens: what the inter-turn guard is measured
+    /// against. Cache reads are left out, as the baseline leaves them out: the
+    /// CLI re-reads its own ~40-55k context every turn, so counting it put a
+    /// finished trivial run past its ceiling. A run whose provider reported
+    /// nothing has no honest number and therefore cannot have crossed a ceiling.
     fn reported_tokens(&self) -> u64 {
-        self.outcome.usage.as_ref().map_or(0, |u| {
-            u.input_tokens
-                .saturating_add(u.cached_input_tokens)
-                .saturating_add(u.output_tokens)
-        })
+        self.outcome
+            .usage
+            .as_ref()
+            .map_or(0, |u| u.input_tokens.saturating_add(u.output_tokens))
     }
 }
 
@@ -653,6 +661,7 @@ enum Next {
 }
 
 pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
+    let started_at = std::time::Instant::now();
     let Request { task_id, id, program, dir, prompt, route, base_commit, dirty_at_start, before_run, recordings } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -679,6 +688,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         budget_stop: None,
         halt: false,
         noise: Vec::new(),
+        unknown_events: 0,
         held: Vec::new(),
         session: None,
         apply_now_pending: false,
@@ -767,6 +777,15 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             Vec::new()
         }
     };
+    let patch_text = match project::patch_since(&dir, base_commit.as_deref()) {
+        Ok(patch) if patch.is_empty() => None,
+        Ok(patch) => Some(patch),
+        Err(e) => {
+            outcome.failure.get_or_insert(e.message);
+            None
+        }
+    };
+    let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
     if let Some(message) = &outcome.failure {
         let event = ProviderEvent::Failed { kind: crate::providers::classify_failure(message), message: message.clone() };
         if let Err(e) = record(store, task_id, "run", id, &event) {
@@ -799,11 +818,14 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     let baseline = serde_json::to_value(route.kind)
         .ok()
         .and_then(|kind| store.baseline(task_id, kind.as_str()?, id.program()).ok().flatten());
-    if let Err(e) = store.finish_task(
+    if let Err(e) = store.finish_task_details(
         task_id,
         status,
         &summary,
         &serde_json::to_string(&diff).unwrap_or_else(|_| "[]".into()),
+        patch_text.as_deref(),
+        state.unknown_events,
+        Some(duration_ms),
         state.calls_used,
     ) {
         status = "failed";
@@ -817,6 +839,9 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         failure: outcome.failure,
         usage: outcome.usage,
         diff,
+        patch_text,
+        unknown_events: state.unknown_events,
+        duration_ms,
         dirty_at_start,
         route,
         stages: state.notes,
@@ -1029,6 +1054,7 @@ async fn attempt(
                 // emitted - the UI has no shape for it - so the log stays
                 // complete while the stream stays readable.
                 if events.is_empty() {
+                    state.unknown_events = state.unknown_events.saturating_add(1);
                     if let Err(e) = store.append_event(ctx.task_id, ctx.stage(), "unknown", ctx.id.program(), &value.to_string()) {
                         state.outcome.failure = Some(format!("could not record run event: {}", e.message));
                         break;

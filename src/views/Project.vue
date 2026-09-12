@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
+  cancelProviderOperation,
   cancelTask,
   detectProviders,
+  getTaskDetail,
   installProvider,
   isAppError,
   onInstallEvent,
   onSignInEvent,
+  previewTask,
   recentTasks,
   sendInstruction,
   signInProvider,
@@ -19,6 +22,8 @@ import type {
   OpenedProject,
   ProviderEvent,
   ProviderId,
+  Preflight,
+  TaskDetail,
   TaskResult,
   TaskSummary,
 } from "../types";
@@ -38,8 +43,8 @@ const provider = ref<ProviderId>("codex");
 // The route itself is decided in Rust before any CLI starts and costs nothing.
 const mode = ref<Mode>("balanced");
 const MODES: Array<{ id: Mode; label: string; hint: string }> = [
-  { id: "balanced", label: "Balanced", hint: "Plan and review where the work calls for it" },
-  { id: "efficient", label: "Efficient", hint: "Prefer the shortest route that still verifies" },
+  { id: "balanced", label: "Careful", hint: "Let Orteca plan, build, and check the work" },
+  { id: "efficient", label: "Quick", hint: "Take the shortest safe path" },
 ];
 
 const installed = computed(() => providers.value.filter((p) => p.path));
@@ -94,6 +99,15 @@ async function install(ids: ProviderId[]) {
   installing.value = null;
   installLine.value = "";
 }
+
+async function cancelProvider(id: ProviderId) {
+  try {
+    await cancelProviderOperation(id);
+  } catch {
+    // The operation may have completed between rendering and the click.
+  }
+}
+
 // Sign-in is the CLI's own browser flow. Orteca starts it and shows its output;
 // it never renders a login form and never handles a credential.
 const signingIn = ref<ProviderId | null>(null);
@@ -137,6 +151,7 @@ const running = ref(false);
 const stream = ref<Array<{ kind: string; text: string }>>([]);
 const result = ref<TaskResult | null>(null);
 const runError = ref<string | null>(null);
+const currentActivity = ref("Getting ready");
 
 // The backend sends this the moment the task row exists, which is what Stop
 // names. Until it arrives there is a run on screen that cannot yet be stopped,
@@ -190,6 +205,10 @@ let stop: Array<() => void> = [];
 // so; it never blocks a run.
 const history = ref<TaskSummary[]>([]);
 const historyError = ref(false);
+const historyDetail = ref<TaskDetail | null>(null);
+const historyDetailLoading = ref(false);
+const historyDetailError = ref(false);
+let historyRequest = 0;
 
 async function loadHistory() {
   try {
@@ -197,6 +216,57 @@ async function loadHistory() {
     historyError.value = false;
   } catch {
     historyError.value = true;
+  }
+}
+
+async function openHistory(run: TaskSummary) {
+  if (historyDetail.value?.id === run.id) {
+    historyDetail.value = null;
+    return;
+  }
+  const request = ++historyRequest;
+  historyDetailLoading.value = true;
+  historyDetailError.value = false;
+  try {
+    const detail = await getTaskDetail(props.opened.project.path, run.id);
+    if (request === historyRequest) historyDetail.value = detail;
+  } catch {
+    if (request === historyRequest) historyDetailError.value = true;
+  } finally {
+    if (request === historyRequest) historyDetailLoading.value = false;
+  }
+}
+
+const preview = ref<Preflight | null>(null);
+const previewing = ref(false);
+const previewError = ref<string | null>(null);
+let previewTimer: ReturnType<typeof setTimeout> | null = null;
+let previewRequest = 0;
+
+function schedulePreview() {
+  previewRequest += 1;
+  if (previewTimer !== null) clearTimeout(previewTimer);
+  if (!task.value.trim() || !selected.value?.path || running.value) {
+    preview.value = null;
+    previewError.value = null;
+    return;
+  }
+  previewTimer = setTimeout(refreshPreview, 250);
+}
+
+async function refreshPreview() {
+  const request = ++previewRequest;
+  const chosen = selected.value;
+  if (!chosen?.path || !task.value.trim()) return;
+  previewing.value = true;
+  previewError.value = null;
+  try {
+    const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value);
+    if (request === previewRequest) preview.value = planned;
+  } catch (e) {
+    if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    if (request === previewRequest) previewing.value = false;
   }
 }
 
@@ -225,7 +295,10 @@ onMounted(async () => {
   ]);
 });
 
-onUnmounted(() => stop.forEach((off) => off()));
+onUnmounted(() => {
+  if (previewTimer !== null) clearTimeout(previewTimer);
+  stop.forEach((off) => off());
+});
 
 async function run() {
   if (!canRun.value) return;
@@ -236,6 +309,7 @@ async function run() {
   stopping.value = false;
   instruction.value = "";
   instructionError.value = null;
+  currentActivity.value = "Getting ready";
   running.value = true;
   try {
     result.value = await startTask(
@@ -244,6 +318,8 @@ async function run() {
       provider.value,
       mode.value,
       (event) => {
+        const activity = activityFor(event);
+        if (activity !== null) currentActivity.value = activity;
         const text = describe(event);
         if (text === null) return;
         stream.value.push({ kind: event.kind, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text });
@@ -264,15 +340,55 @@ async function run() {
   }
 }
 
+/** Short, human words for the things a provider does behind the scenes. */
+function actionTarget(summary: string): string {
+  const target = summary.replace(/\s+/g, " ").trim();
+  return target.length > 64 ? target.slice(0, 61) + "…" : target;
+}
+
+function friendlyToolUse(name: string, summary: string): string {
+  const kind = `${name} ${summary}`.toLowerCase();
+  const target = actionTarget(summary);
+  if (/edit|write|patch|create|delete|move|rename|file_change/.test(kind)) {
+    return target ? `Editing ${target}` : "Editing files";
+  }
+  if (/read|cat|head|tail|grep|rg|find|list|search|inspect/.test(kind)) {
+    return target ? `Reading ${target}` : "Reading the project";
+  }
+  if (/test|check|lint|build|compile|typecheck|cargo|npm/.test(kind)) {
+    return "Checking that it works";
+  }
+  if (/git diff|git status/.test(kind)) return "Checking what changed";
+  if (/shell|command|execute|bash|powershell/.test(kind)) return "Running a command";
+  return target ? `Working on ${target}` : "Working on it";
+}
+
+function activityFor(event: ProviderEvent): string | null {
+  switch (event.kind) {
+    case "started":
+      return "Getting ready";
+    case "text":
+      return "Thinking through the request";
+    case "toolUse":
+      return friendlyToolUse(event.data.name, event.data.summary);
+    case "done":
+      return "Putting on the finishing touches";
+    case "failed":
+      return `Couldn’t finish: ${event.data.message}`;
+    default:
+      return null;
+  }
+}
+
 /** One line per event. Usage and the final result have their own panel. */
 function describe(event: ProviderEvent): string | null {
   switch (event.kind) {
     case "started":
-      return `session ${event.data.sessionId}`;
+      return "Getting ready";
     case "text":
       return event.data;
     case "toolUse":
-      return `${event.data.name} ${event.data.summary}`.trim();
+      return friendlyToolUse(event.data.name, event.data.summary);
     case "failed":
       return event.data.message;
     default:
@@ -288,10 +404,12 @@ const tokens = computed(() => {
   if (!usage) return null;
   return {
     total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
+    uncached: usage.inputTokens + usage.outputTokens,
     cached: usage.cachedInputTokens,
     output: usage.outputTokens,
     cost: usage.costUsd,
     quality: usage.costQuality,
+    model: usage.model,
   };
 });
 
@@ -304,15 +422,43 @@ function formatTokens(count: number): string {
   return count.toLocaleString("en-US");
 }
 
+function formatDuration(milliseconds: number | null | undefined): string {
+  if (milliseconds === null || milliseconds === undefined) return "duration unavailable";
+  const seconds = Math.round(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function formatPayload(payload: unknown): string {
+  if (typeof payload === "string") return payload;
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return "unreadable event";
+  }
+}
+
 /** A stopped run is its own outcome, not a quieter kind of failure. Nor is a
  *  run that reached the budget its route declared. */
 const OUTCOME: Record<TaskResult["status"], string> = {
-  done: "Finished",
+  done: "Done",
   cancelled: "Stopped",
-  failed: "Failed",
-  budgetReached: "Budget reached",
-  reviewRejected: "Review requested changes",
+  failed: "Couldn’t finish",
+  budgetReached: "Stopped safely",
+  reviewRejected: "Needs another look",
 };
+
+const STAGE_LABELS: Record<string, string> = {
+  plan: "Making a plan",
+  implement: "Making changes",
+  review: "Reviewing the work",
+  verify: "Checking that it works",
+};
+
+function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage] ?? stage;
+}
 
 /** What the route spent against what it was allowed. Both numbers are exact:
  *  Orteca chose the route, so it knows the ceiling as well as the spend. */
@@ -362,11 +508,19 @@ const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, runn
 
 /** A past run's metrics, each labelled, unknown spelled out rather than zeroed. */
 function historyLine(t: TaskSummary): string {
+  // Keep old local rows readable while newer rows distinguish uncached work.
+  const legacy = t.uncachedTokens === undefined;
+  const measured = legacy ? t.tokens : t.uncachedTokens;
   return [
     t.routeKind,
     t.callsUsed === null ? null : `${t.callsUsed} ${t.callsUsed === 1 ? "call" : "calls"}`,
-    t.tokens === null ? "tokens unavailable" : `${formatTokens(t.tokens)} tokens`,
+    measured == null
+      ? "tokens unavailable"
+      : `${formatTokens(measured)} ${legacy ? "tokens" : "uncached"}`,
+    t.model,
     t.costUsd === null ? null : `${formatCost(t.costUsd)} ${t.costQuality}`,
+    t.durationMs == null ? null : formatDuration(t.durationMs),
+    t.unknownEvents ? `${t.unknownEvents} unknown event${t.unknownEvents === 1 ? "" : "s"}` : null,
     `${t.startedAt.slice(0, 16)} UTC`,
   ]
     .filter(Boolean)
@@ -384,7 +538,7 @@ const AUTH: Record<Auth, string> = {
 <template>
   <main class="project">
     <header>
-      <button class="back" title="Back to projects" @click="$emit('close')">
+      <button class="back" title="Back to projects" aria-label="Back to projects" @click="$emit('close')">
         &larr;
       </button>
       <h1>{{ opened.project.name }}</h1>
@@ -394,43 +548,20 @@ const AUTH: Record<Auth, string> = {
       </span>
     </header>
 
-    <!-- Prompt. The card is the input; the controls sit on its floor. -->
+    <!-- One prompt, one clear action. Details stay available without crowding the first step. -->
     <section class="ask card">
+      <label class="ask-heading" for="task">What do you want done?</label>
       <textarea
         id="task"
         v-model="task"
         rows="4"
         spellcheck="false"
-        placeholder="What do you want to build?"
+        placeholder="Example: Add dark mode and make sure it works."
         :disabled="running"
+        @input="schedulePreview"
       ></textarea>
 
       <div class="controls">
-        <div class="segments">
-          <button
-            v-for="m in MODES"
-            :key="m.id"
-            class="seg"
-            :class="{ on: mode === m.id }"
-            :title="m.hint"
-            :disabled="running"
-            @click="mode = m.id"
-          >
-            {{ m.label }}
-          </button>
-        </div>
-        <div v-if="installed.length" class="segments">
-          <button
-            v-for="p in installed"
-            :key="p.id"
-            class="seg"
-            :class="{ on: provider === p.id }"
-            :disabled="running"
-            @click="provider = p.id"
-          >
-            {{ p.program }}
-          </button>
-        </div>
         <button
           v-if="running"
           class="btn stop"
@@ -440,9 +571,71 @@ const AUTH: Record<Auth, string> = {
           {{ stopping ? "Stopping…" : "Stop" }}
         </button>
         <button class="btn primary run" :disabled="!canRun" @click="run">
-          {{ running ? "Running…" : "Run" }}
+          {{ running ? "Working…" : "Do it" }}
         </button>
       </div>
+
+      <details class="advanced-controls">
+        <summary>More control</summary>
+        <div class="advanced-options">
+          <div>
+            <span class="option-label">How careful should I be?</span>
+            <div class="segments">
+              <button
+                v-for="m in MODES"
+                :key="m.id"
+                class="seg"
+                :class="{ on: mode === m.id }"
+                :aria-pressed="mode === m.id"
+                :title="m.hint"
+                :disabled="running"
+                @click="mode = m.id; schedulePreview()"
+              >
+                {{ m.label }}
+              </button>
+            </div>
+          </div>
+          <div v-if="installed.length">
+            <span class="option-label">Which AI should help?</span>
+            <div class="segments">
+              <button
+                v-for="p in installed"
+                :key="p.id"
+                class="seg"
+                :class="{ on: provider === p.id }"
+                :aria-pressed="provider === p.id"
+                :disabled="running"
+                @click="provider = p.id; schedulePreview()"
+              >
+                {{ p.program }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div v-if="previewing" class="preview note" aria-live="polite">
+        Figuring out the best way to do it…
+      </div>
+      <div v-else-if="preview" class="preview" aria-live="polite">
+        <span class="preview-title">Orteca will handle the rest</span>
+        <span class="route compact">{{ preview.route.stages.map(stageLabel).join(" → ") }}</span>
+        <span class="note">I’ll plan, make the changes, and check the result.</span>
+        <span v-if="preview.git.dirty" class="note caveat">
+          I’ll keep your {{ preview.git.dirtyCount }} existing change{{ preview.git.dirtyCount === 1 ? "" : "s" }} safe.
+        </span>
+        <details class="preview-details">
+          <summary>Show the plan</summary>
+          <p class="note">{{ preview.route.reason }}</p>
+          <p class="note budget-line">
+            Up to {{ preview.route.budget.maxTurns ?? "the provider’s limit" }} steps ·
+            {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }}
+          </p>
+        </details>
+      </div>
+      <p v-else-if="previewError" class="preview-error missing" role="status">
+        Preview unavailable: {{ previewError }}
+      </p>
 
       <div v-if="running" class="bar"><span></span></div>
     </section>
@@ -453,7 +646,15 @@ const AUTH: Record<Auth, string> = {
     </p>
 
     <section v-if="running" class="block">
-      <h2 class="label">While it works</h2>
+      <h2 class="label">Right now</h2>
+      <div class="card working" role="status" aria-live="polite">
+        <span class="activity-dot" aria-hidden="true"></span>
+        <div>
+          <strong>{{ currentActivity }}</strong>
+          <p class="note">Orteca is taking care of the details.</p>
+        </div>
+      </div>
+      <h2 class="label follow-up-label">Want to add something?</h2>
       <div class="card steer">
         <input
           v-model="instruction"
@@ -485,12 +686,11 @@ const AUTH: Record<Auth, string> = {
           </button>
           <span class="note grow">
             <template v-if="steering === 'live'">
-              {{ provider }} takes this while it works.
+              I’ll use this for the next step.
             </template>
             <template v-else>
-              {{ provider }} cannot be interrupted. Send holds it for the next
-              step; Apply now restarts its session with it, keeping every
-              change already made.
+              Orteca will use this on the next step. “Apply now” restarts that
+              step and keeps anything already changed.
             </template>
           </span>
         </div>
@@ -499,9 +699,9 @@ const AUTH: Record<Auth, string> = {
     </section>
 
     <section v-if="lines.length" class="block">
-      <h2 class="label">Activity</h2>
-      <p class="note">Latest 500 entries; long messages shortened. Full events are saved in the task log.</p>
-      <ol class="card stream">
+      <h2 class="label">What Orteca is doing</h2>
+      <p class="note">A simple live view. The full technical log is saved with the task.</p>
+      <ol class="card stream" role="log" aria-live="polite" aria-relevant="additions">
         <li v-for="(line, i) in lines" :key="i" :class="line.kind">
           <span v-if="line.kind === 'instruction'" class="said">you</span>
           {{ line.text }}
@@ -521,19 +721,25 @@ const AUTH: Record<Auth, string> = {
         <!-- A budget stop hands the decision back rather than spending more.
              Nothing here continues the run: that is a fresh Run, deliberately. -->
         <p v-if="result.budgetStop" class="note caveat stopped">
-          {{ result.budgetStop.message }}
+          Orteca stopped safely after using the planned limit. Run again if you
+          want it to keep going.
         </p>
         <p v-if="result.budgetStop?.remaining.length" class="note caveat stopped">
-          Not started: {{ result.budgetStop.remaining.join(" → ") }}. Run again
-          if you want to spend more on this.
+          Still to do: {{ result.budgetStop.remaining.map(stageLabel).join(" → ") }}. Run again
+          if you want Orteca to keep going.
+        </p>
+        <p v-if="result.unknownEvents" class="note caveat unknown-events" role="status">
+          {{ result.unknownEvents }} provider event{{ result.unknownEvents === 1 ? "" : "s" }} were not recognized and remain available in the task log below.
         </p>
 
-        <!-- The route as decided before anything ran: what ran, what did not. -->
+        <details class="result-details">
+          <summary>Show details</summary>
+          <!-- The route as decided before anything ran: what ran, what did not. -->
         <ol class="route">
           <template v-for="(step, i) in routeSteps" :key="step.stage">
             <li v-if="i" class="arrow" aria-hidden="true">→</li>
             <li :class="{ ran: step.ran }">
-              {{ step.stage }}<span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
+              {{ stageLabel(step.stage) }}<span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
             </li>
           </template>
         </ol>
@@ -550,7 +756,8 @@ const AUTH: Record<Auth, string> = {
           <div v-if="calls" class="tile">
             <span class="figure">{{ calls.used }} / {{ calls.allowed }}</span>
             <span class="note">
-              agent {{ calls.allowed === 1 ? "call" : "calls" }} used —
+              agent {{ calls.allowed === 1 ? "call" : "calls" }} used ·
+              {{ result.turnsUsed }} / {{ result.route.budget.maxTurns ?? "provider-defined" }} turns —
               {{ calls.ran.join(" → ") || "none" }}
             </span>
           </div>
@@ -559,7 +766,7 @@ const AUTH: Record<Auth, string> = {
             <span class="note">
               {{
                 tokens
-                  ? formatTokens(tokens.cached) + " cached"
+                  ? formatTokens(tokens.uncached) + " uncached · " + formatTokens(tokens.cached) + " cached"
                   : "tokens unavailable"
               }}
             </span>
@@ -575,6 +782,14 @@ const AUTH: Record<Auth, string> = {
                   : "cost unavailable"
               }}
             </span>
+          </div>
+          <div class="tile">
+            <span class="figure">{{ formatDuration(result.durationMs) }}</span>
+            <span class="note">elapsed</span>
+          </div>
+          <div class="tile">
+            <span class="figure model">{{ tokens?.model ?? "—" }}</span>
+            <span class="note">model reported by provider</span>
           </div>
           <div class="tile">
             <span class="figure">{{ changed.byRun.length }}</span>
@@ -594,6 +809,7 @@ const AUTH: Record<Auth, string> = {
           No savings figure yet: that needs five finished runs of this route here
           to compare against.
         </p>
+        </details>
 
         <ul class="diff">
           <li v-for="f in changed.byRun" :key="f.path">
@@ -606,10 +822,10 @@ const AUTH: Record<Auth, string> = {
               already changed before this run; counts include both
             </span>
           </li>
-          <li v-if="!changed.byRun.length && !result.failure" class="note">no Git-visible changes</li>
+          <li v-if="!changed.byRun.length && !result.failure" class="note">no files changed</li>
         </ul>
 
-        <p class="note caveat">Git-ignored files are excluded from this diff.</p>
+        <p class="note caveat">Some hidden files are not shown here.</p>
         <!-- Only when git could not snapshot the tree first. Otherwise the list
              above is exact about whose change is whose. -->
         <p v-if="changed.unknown" class="note caveat">
@@ -620,24 +836,74 @@ const AUTH: Record<Auth, string> = {
           Already changed before this run, and left as they were:
           <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(", ") }}</span>
         </p>
+        <details v-if="result.patchText" class="patch-view">
+          <summary>View patch</summary>
+          <pre>{{ result.patchText }}</pre>
+        </details>
       </div>
     </section>
 
     <section v-if="history.length || historyError" class="block">
-      <h2 class="label">Recent runs</h2>
+      <h2 class="label">Past work</h2>
       <p v-if="historyError" class="missing">history unavailable</p>
       <ul v-else class="card history">
         <li v-for="t in history" :key="t.id">
-          <span class="status">{{ HISTORY_STATUS[t.status] ?? t.status }}</span>
-          <span class="grow" :title="t.prompt">{{ t.prompt }}</span>
-          <span class="note">{{ historyLine(t) }}</span>
+          <button
+            class="history-entry"
+            :aria-expanded="historyDetail?.id === t.id"
+            :title="`Open details for ${t.prompt}`"
+            @click="openHistory(t)"
+          >
+            <span class="status">{{ HISTORY_STATUS[t.status] ?? t.status }}</span>
+            <span class="grow" :title="t.prompt">{{ t.prompt }}</span>
+            <span class="note">{{ historyLine(t) }}</span>
+            <span class="chevron" aria-hidden="true">{{ historyDetail?.id === t.id ? "−" : "+" }}</span>
+          </button>
         </li>
       </ul>
+      <p v-if="historyDetailLoading" class="note detail-state" aria-live="polite">Loading task details…</p>
+      <p v-if="historyDetailError" class="missing detail-state" role="alert">Task details unavailable.</p>
+      <div v-if="historyDetail" class="card history-detail">
+        <div class="detail-heading">
+          <span class="status">{{ HISTORY_STATUS[historyDetail.status] ?? historyDetail.status }}</span>
+          <span class="note">{{ historyDetail.startedAt.slice(0, 16) }} UTC</span>
+        </div>
+        <p class="detail-prompt">{{ historyDetail.prompt }}</p>
+        <p v-if="historyDetail.summary" class="summary">{{ historyDetail.summary }}</p>
+        <div class="detail-metrics">
+          <span>{{ historyDetail.uncachedTokens === null ? "uncached tokens unavailable" : formatTokens(historyDetail.uncachedTokens) + " uncached tokens" }}</span>
+          <span>{{ historyDetail.model ?? "model unavailable" }}</span>
+          <span>{{ formatDuration(historyDetail.durationMs) }}</span>
+          <span v-if="historyDetail.callsUsed !== null">{{ historyDetail.callsUsed }} calls</span>
+          <span v-if="historyDetail.unknownEvents">{{ historyDetail.unknownEvents }} unknown events</span>
+        </div>
+        <ul class="diff">
+          <li v-for="f in historyDetail.diff" :key="f.path">
+            <span class="mono path">{{ f.path }}</span>
+            <span v-if="f.added !== null" class="note">+{{ f.added }} −{{ f.deleted }}</span>
+            <span v-else class="note">new or binary</span>
+          </li>
+          <li v-if="!historyDetail.diff.length" class="note">no Git-visible changes</li>
+        </ul>
+        <details v-if="historyDetail.patchText" class="patch-view">
+          <summary>View patch</summary>
+          <pre>{{ historyDetail.patchText }}</pre>
+        </details>
+        <details class="event-log">
+          <summary>View task log · {{ historyDetail.events.length }} events</summary>
+          <ol>
+            <li v-for="event in historyDetail.events" :key="event.id">
+              <span class="mono">{{ event.stage ?? "run" }} · {{ event.kind }}</span>
+              <pre>{{ formatPayload(event.payload) }}</pre>
+            </li>
+          </ol>
+        </details>
+      </div>
     </section>
 
     <section class="block">
-      <h2 class="label">Providers</h2>
-      <p v-if="providerError" class="missing">detection unavailable</p>
+      <h2 class="label">AI helpers</h2>
+      <p v-if="providerError" class="missing">Could not check the AI helpers.</p>
       <ul v-else class="card providers">
         <li v-for="p in rows" :key="p.id">
           <span class="who">{{ p.program }}</span>
@@ -646,6 +912,7 @@ const AUTH: Record<Auth, string> = {
           </template>
           <template v-else-if="p.path && signingIn === p.id">
             <span class="note grow">{{ signInLine }}</span>
+            <button class="link" @click="cancelProvider(p.id)">cancel</button>
           </template>
           <template v-else-if="p.path">
             <span class="mono">{{ p.version ?? "version unknown" }}</span>
@@ -666,15 +933,16 @@ const AUTH: Record<Auth, string> = {
           </template>
           <template v-else-if="installing === p.id">
             <span class="note grow">{{ installLine }}</span>
+            <button class="link" @click="cancelProvider(p.id)">cancel</button>
           </template>
           <template v-else>
-            <span class="missing">not installed</span>
+            <span class="missing">not ready</span>
             <button
               class="link"
               :disabled="installing !== null || running"
               @click="install([p.id])"
             >
-              install
+              set up
             </button>
           </template>
         </li>
@@ -685,7 +953,7 @@ const AUTH: Record<Auth, string> = {
           :disabled="installing !== null || running"
           @click="install(missing.map((p) => p.id))"
         >
-          {{ installing ? "Installing…" : "Install both" }}
+          {{ installing ? "Setting up…" : "Set up both" }}
         </button>
         <span class="note">
           runs <span class="mono">npm install --global</span> for
@@ -762,6 +1030,11 @@ h1 {
 .ask:focus-within {
   border-color: var(--border-strong);
 }
+.ask-heading {
+  display: block;
+  padding: 16px 18px 0;
+  font-weight: 600;
+}
 textarea {
   display: block;
   width: 100%;
@@ -818,6 +1091,67 @@ textarea:disabled {
   margin-left: auto;
   padding: 7px 20px;
 }
+.advanced-controls {
+  border-top: 1px solid var(--border);
+  padding: 0 12px;
+}
+.advanced-controls summary,
+.preview-details summary,
+.result-details summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.advanced-controls summary {
+  padding: 10px 0;
+}
+.advanced-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  padding: 0 0 12px;
+}
+.option-label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 0 12px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.preview-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.preview .route {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.preview .note {
+  width: 100%;
+}
+.preview-details {
+  width: 100%;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.preview-details p {
+  margin: 8px 0 0;
+}
+.preview-error {
+  margin: 0 18px 12px;
+}
 /* Never the primary button: stopping a run is not the obvious next step. */
 .stop {
   margin-left: auto;
@@ -850,8 +1184,11 @@ textarea:disabled {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .bar span {
+  .bar span,
+  .activity-dot {
     animation: none;
+  }
+  .bar span {
     width: 100%;
     opacity: 0.5;
   }
@@ -859,6 +1196,41 @@ textarea:disabled {
 
 .block {
   margin-top: 32px;
+}
+
+.working {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+}
+.working strong {
+  display: block;
+  font-weight: 600;
+}
+.working p {
+  margin: 2px 0 0;
+}
+.activity-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--info);
+  animation: activity-pulse 1.6s ease-in-out infinite;
+}
+@keyframes activity-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.follow-up-label {
+  margin-top: 24px;
 }
 
 .stream {
@@ -930,7 +1302,7 @@ textarea:disabled {
 
 .tiles {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 1px;
   background: var(--border);
   border: 1px solid var(--border);
@@ -952,6 +1324,14 @@ textarea:disabled {
   font-weight: 600;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
+}
+.figure.model {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
 }
 .good {
   color: var(--accent);
@@ -983,6 +1363,17 @@ textarea:disabled {
 }
 .reason {
   margin: 6px 0 16px;
+}
+.result-details {
+  margin: 16px 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.result-details .route {
+  margin-top: 12px;
+}
+.result-details .tiles {
+  margin-top: 16px;
 }
 .compare {
   margin: 0 0 12px;
@@ -1034,6 +1425,81 @@ textarea:disabled {
 .history .grow {
   color: var(--text);
 }
+.history-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+}
+.history-entry:hover .grow,
+.history-entry:hover .chevron {
+  color: var(--text);
+}
+.chevron {
+  color: var(--text-faint);
+}
+.detail-state {
+  margin: 10px 0 0;
+}
+.history-detail {
+  margin-top: 10px;
+  padding: 16px 18px;
+}
+.detail-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.detail-prompt {
+  margin: 10px 0 12px;
+  color: var(--text);
+}
+.detail-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.patch-view,
+.event-log {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.patch-view summary,
+.event-log summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.patch-view pre,
+.event-log pre {
+  max-height: 360px;
+  margin: 10px 0 0;
+  padding: 12px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+}
+.event-log ol {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.event-log li + li {
+  margin-top: 10px;
+}
 .who {
   min-width: 64px;
   font-family: var(--mono);
@@ -1072,5 +1538,36 @@ textarea:disabled {
 .missing {
   font-size: 12px;
   color: var(--warn);
+}
+
+@media (max-width: 600px) {
+  .project {
+    padding-top: 32px;
+  }
+  header {
+    flex-wrap: wrap;
+  }
+  .controls,
+  .steer-row,
+  .history-entry {
+    flex-wrap: wrap;
+  }
+  .controls .segments {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .run,
+  .stop {
+    margin-left: 0;
+  }
+  .run {
+    margin-left: auto;
+  }
+  .tiles {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .status {
+    min-width: 0;
+  }
 }
 </style>

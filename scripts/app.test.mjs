@@ -43,7 +43,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -95,6 +95,14 @@ test('activity is bounded even when a provider emits long messages', async () =>
   await state.run();
   assert.ok(state.lines.value.length > 0 && state.lines.value.length <= 500);
   assert.ok(state.lines.value.every(line => line.text.length <= 4001));
+});
+
+test('provider actions become plain-English live updates', async () => {
+  const { state } = await projectView();
+  assert.equal(state.friendlyToolUse('Read', 'src/App.vue'), 'Reading src/App.vue');
+  assert.equal(state.friendlyToolUse('Edit', 'src/App.vue'), 'Editing src/App.vue');
+  assert.equal(state.friendlyToolUse('Shell', 'npm test'), 'Checking that it works');
+  assert.equal(state.activityFor({ kind: 'text', data: 'I found the issue.' }), 'Thinking through the request');
 });
 
 test('detection errors and invoke failures are exposed', async () => {
@@ -384,7 +392,7 @@ test('a budget stop reads as its own outcome and never as a failure', async () =
   await state.run();
 
   assert.equal(state.result.value.status, 'budgetReached');
-  assert.equal(state.OUTCOME.budgetReached, 'Budget reached', 'a budget stop must not be labelled a failure');
+  assert.equal(state.OUTCOME.budgetReached, 'Stopped safely', 'a budget stop must not be labelled a failure');
   assert.equal(state.result.value.failure, null);
   // The work survives the stop, and is what the screen has to show.
   assert.equal(state.result.value.summary, 'got as far as the edit');

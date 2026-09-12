@@ -16,7 +16,9 @@ use serde_json::Value;
 use super::{ProviderEvent, ProviderId};
 
 /// Read `fixture` as JSONL and normalise it exactly as a live run would be.
-/// Lines that are not JSON are dropped, the same way `proc` hands them off.
+/// Unlike `proc`, which passes a non-JSON line through as text, a malformed
+/// line here is an error: a fixture is checked in, so a typo in one is a
+/// broken test rather than something a provider did.
 pub fn replay(id: ProviderId, fixture: &Path) -> io::Result<Vec<ProviderEvent>> {
     let input = std::fs::read_to_string(fixture)?;
     let mut events = Vec::new();

@@ -147,6 +147,7 @@ async fn detect_providers(found: tauri::ipc::Channel<Detected>) -> Result<Vec<De
 /// which is what `cancel_task` needs and what makes a run stoppable long
 /// before it resolves.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn start_task(
     app: AppHandle,
     path: String,

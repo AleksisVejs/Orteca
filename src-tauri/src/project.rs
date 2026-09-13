@@ -365,6 +365,22 @@ fn new_file_patch(path: &str, text: &str) -> String {
     patch
 }
 
+/// The test command the repository declares at its root, if Orteca can run it
+/// without a model finding it: `npm test` for a real `scripts.test` (not `npm
+/// init`'s placeholder), else `cargo test` for a `Cargo.toml`.
+pub fn check_command(dir: &Path) -> Option<Vec<&'static str>> {
+    let npm = std::fs::read_to_string(dir.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|manifest| manifest["scripts"]["test"].as_str().map(|s| !s.contains("no test specified")))
+        .unwrap_or(false);
+    if npm {
+        Some(vec!["npm", "test"])
+    } else {
+        dir.join("Cargo.toml").is_file().then(|| vec!["cargo", "test"])
+    }
+}
+
 /// Every tracked path in the repository, as forward-slash relative paths.
 ///
 /// One `git ls-files` and no file is opened: this is the cheap repository

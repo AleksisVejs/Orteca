@@ -497,6 +497,29 @@ Found by the benchmark and fixed:
   CLI stopped at. Claude's `num_turns` is not the `--max-turns` unit (11 at a
   ceiling of 10; a successful stage under 10 reported 13).
 
+What the multi-stage rows cost: the Claude refactor's Verify was a $0.14 call
+that re-read the diff to run `npm test`; the Codex refactor's Verify ran `npm
+test` through PowerShell, hit the execution policy, reported a fail and bought a
+Fix call; the security row was four Opus calls at ~$0.25 each for a one-function
+fix. Orteca now runs a declared test command itself (§8), and small guarded work
+skips Plan and runs on `standard` with only its Review on `deep`. Re-measured,
+same tasks, one run each (new = uncached in + out):
+
+| Task | Arm | Before | Now | Plain CLI |
+|---|---|---|---|---|
+| refactor | Claude | 2 calls · 65k new · $0.35 · 107s | 1 call · 39k · $0.24 · 64s | 26k · $0.20 · 77s |
+| refactor | Codex | 3 calls · 55k new · 203s | 1 call · 17k · 104s | 17k · 170s |
+| security | Claude | 4 calls · 81k new · $1.06 · 222s | 2 calls · 40k · $0.41 · 110s | 22k · $0.16 · 71s |
+| security | Codex | 4 calls · 75k new · 234s | 3 calls · 78k · 255s | 33k · 94s |
+
+All passed every check. Every local Verify ran and passed, the Codex refactor's
+inside `codex sandbox`. The Codex security run is the exception: its `deep`
+Review found a real regression in the implement stage (`//css/site.css`
+refused, a normal path the acceptance checks did not cover) and bought the Fix,
+which repaired it. That run cost more than before and bought a caught bug; no
+plain-CLI result had the regression. Claude still costs more per guarded task
+than the plain CLI: an Opus review of a finished diff is ~$0.25 of it.
+
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
 - Claude stage running → instruction is injected live via stdin.
@@ -728,7 +751,7 @@ signals: complexity 0-10, risk 0-10,
 |---|---|
 | complexity <= 3, risk <= 3, blast <= 5, and blast >= 1 or a small-edit word | **Implement once** — inspect named paths, edit, run one focused verification inside that call; no Plan or Review |
 | architecture OR complexity >= 7 | Understand → **Plan** → Implement → Verify |
-| security OR authz OR schema_change | Understand → **Plan** → Implement → **Review** → Verify |
+| security OR authz OR schema_change | Implement → **Review** → Verify; **Plan** first when also architectural or complexity >= 7 |
 | implement failed twice | escalate: Plan → Implement → Review |
 
 `Efficient` shifts thresholds up by 2 (fewer stages) and chooses the cheapest
@@ -762,7 +785,19 @@ route that just failed it. The table also had no default row; there is now a
 | `Standard` | Implement → Verify | 2 |
 | `Planned` | Plan → Implement → Verify | 3 |
 | `Escalated` | Plan → Implement → Review | 3 |
-| `Guarded` | Plan → Implement → Review → Verify | 4 |
+| `Guarded` | Implement → Review → Verify, Plan first when large | 3 or 4 |
+
+`maxAgentCalls` is the number of stages. **Orteca runs a Verify itself when
+the repository declares its test command at the root** (`project::check_command`:
+a real `scripts.test`, else `Cargo.toml`), so on most repos a Verify is no agent
+call. A pass or a fail comes from the exit code, and the last 60 lines of output
+become the Verify artifact, so a failure still buys the Fix call with the
+output in its brief. Orteca picks the fence rather than building one: on Codex
+the command runs in `codex sandbox` (read-only, like a Codex Verify; a sandbox
+that fails to start hands the stage to the agent instead of failing it), on
+Claude it runs as Claude's Verify allowlist would have. With no declared
+command, or none on PATH, the agent verifies as before. Guarded work runs on
+`standard` with its Review on `deep` (`budget.reviewTier`), shown in the preview.
 
 Two rules the spec did not write down, both of which exist to stop Orteca
 spending on its own initiative:

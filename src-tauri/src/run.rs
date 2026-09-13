@@ -814,8 +814,9 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             stage,
             max_turns: route.budget.max_turns,
             schema: write_schema(task_id, stage),
-            tier: match (stage, route.budget.escalation) {
-                (Stage::Fix, Some(up)) => up,
+            tier: match (stage, route.budget.escalation, route.budget.review_tier) {
+                (Stage::Fix, Some(up), _) => up,
+                (Stage::Review, _, Some(review)) => review,
                 _ => route.budget.preferred_tier,
             },
         };
@@ -827,20 +828,27 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         state.turns_this_call = 0;
         state.recording = Recording::new(recordings.as_deref(), task_id, stage, id);
 
-        let brief = routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
-        if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), ctx.plan.tier, id)) {
-            state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
-            break;
-        }
+        // A Verify is a test command and a pass or a fail. When the repository
+        // names its command Orteca runs it: no model call, no false failure
+        // from an agent's shell, and a failure still buys the Fix call.
+        let checked_locally = stage == Stage::Verify
+            && verify_locally(store, &ctx, &mut state, &mut control, &emit, index, stages.len()).await;
+        if !checked_locally {
+            let brief = routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
+            if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), ctx.plan.tier, id)) {
+                state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
+                break;
+            }
 
-        // Usually one pass. A checkpoint provider told to apply an instruction
-        // now ends its process and comes back through here resuming its own
-        // session.
-        let mut launch = Launch::first(id, &brief, &ctx.plan);
-        loop {
-            match attempt(store, &ctx, &mut state, &mut control, &emit, launch).await {
-                Next::Ended => break,
-                Next::Restart(again) => launch = again,
+            // Usually one pass. A checkpoint provider told to apply an instruction
+            // now ends its process and comes back through here resuming its own
+            // session.
+            let mut launch = Launch::first(id, &brief, &ctx.plan);
+            loop {
+                match attempt(store, &ctx, &mut state, &mut control, &emit, launch).await {
+                    Next::Ended => break,
+                    Next::Restart(again) => launch = again,
+                }
             }
         }
 
@@ -981,6 +989,98 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         baseline,
         worktree,
     }
+}
+
+/// Run the repository's own test command as the Verify stage, with no model.
+///
+/// False, with nothing counted, when there is no command or no way to run it:
+/// the stage then goes to the agent as before. Orteca picks the fence and never
+/// builds one. Codex runs the command inside `codex sandbox`, read-only like a
+/// Codex Verify; Claude has no sandbox on Windows, so it runs as Claude's own
+/// Verify allowlist would have run it.
+async fn verify_locally(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    index: usize,
+    of: usize,
+) -> bool {
+    // ponytail: ten minutes is a guess at a slow suite; make it per project when one needs longer.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    let Some(command) = project::check_command(&ctx.dir) else { return false };
+    let Some(tool) = crate::providers::which(command[0]) else { return false };
+    let tool = tool.to_string_lossy().into_owned();
+    let shown = command.join(" ");
+    let (program, mut args) = match ctx.id {
+        ProviderId::Codex => (
+            ctx.program.to_string_lossy().into_owned(),
+            vec!["sandbox", "-c", "windows.sandbox=\"elevated\"", "--", tool.as_str()],
+        ),
+        ProviderId::Claude => (tool.clone(), Vec::new()),
+    };
+    args.extend(&command[1..]);
+    let Ok(mut run) = proc::spawn(&program, &args, &ctx.dir) else { return false };
+
+    let stage = serde_json::json!({
+        "kind": "stage",
+        "data": { "stage": Stage::Verify, "index": index, "of": of, "writes": false, "schema": true, "runner": "orteca", "command": shown },
+    });
+    let _ = note(store, ctx, "stage", &stage.to_string());
+    let started = ProviderEvent::ToolUse { name: "orteca".into(), summary: shown.clone() };
+    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &started).and_then(|()| emit(&started));
+
+    let mut tail = std::collections::VecDeque::new();
+    let mut code = None;
+    let mut timed_out = false;
+    let deadline = tokio::time::sleep(TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            line = run.lines.recv() => match line {
+                Some(Line::Exit(exit)) => { code = exit; break; }
+                Some(Line::Text(text)) => tail.push_back(text),
+                Some(Line::Json(value)) => tail.push_back(value.to_string()),
+                None => break,
+            },
+            Some(action) = control.recv() => match action {
+                Control::Cancel => { answer(Control::Cancel, store, ctx, state, &mut run).await; }
+                // No agent is running to take it; the next brief carries it, as
+                // it carries any instruction that arrived between stages.
+                Control::Instruct { text, reply, .. } => {
+                    state.constraints.push(text.clone());
+                    let _ = note(store, ctx, "instruction", &instruction(&text, InstructionDisposition::Held));
+                    let _ = reply.send(InstructionReceipt { disposition: InstructionDisposition::Held });
+                }
+            },
+            () = &mut deadline, if !timed_out => { timed_out = true; run.cancel(); }
+        }
+        // The end of a suite's output is where it says what failed.
+        while tail.len() > 60 {
+            tail.pop_front();
+        }
+    }
+    if state.outcome.cancelled {
+        return true;
+    }
+    let mut output = Vec::from(tail).join("\n");
+    // The sandbox failing to start is not the suite failing, and must not buy
+    // a Fix call.
+    if ctx.id == ProviderId::Codex && output.contains("windows sandbox failed") {
+        return false;
+    }
+    if timed_out {
+        output.push_str("\nStopped by Orteca after 10 minutes.");
+    }
+    let passed = code == Some(0) && !timed_out;
+    let finished = ProviderEvent::Text(format!("{shown} {}", if passed { "passed" } else { "did not pass" }));
+    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &finished).and_then(|()| emit(&finished));
+    state.structured = Some(serde_json::json!({
+        "checks": [{ "command": shown, "passed": passed, "output": output }],
+        "verdict": if passed { "pass" } else { "fail" },
+    }));
+    true
 }
 
 fn commit_message(task_id: i64, prompt: &str) -> String {
@@ -2404,13 +2504,13 @@ ping -n 60 127.0.0.1 >nul
     async fn a_longer_route_runs_its_stages_in_order() {
         let store = Store::in_memory().unwrap();
         let route = routing::route(
-            "add an authorization check before the delete endpoint",
+            "redesign the authorization subsystem so every endpoint checks it",
             Mode::Balanced,
             &RepoSignals::default(),
         );
         assert_eq!(route.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
         let mut request = routed(&store, "stages", route);
-        let dir = request.dir.clone();
+        let (dir, task) = (request.dir.clone(), request.task_id);
         // One answer that is both a passing Review and a passing Verify, since
         // the shim gives every stage the same one.
         claude_shim(
@@ -2434,6 +2534,47 @@ ping -n 60 127.0.0.1 >nul
         assert!(calls[0].contains("Do not edit any file"), "the plan stage was allowed to edit");
         assert!(calls[1].contains("Make the change"));
         assert!(calls[3].contains("Verify"));
+        // Built a tier below, reviewed on deep.
+        let payloads = store.event_payloads(task);
+        let model = |stage: &str| payloads.iter().find(|v| v["kind"] == "stage" && v["data"]["stage"] == stage).map(|v| v["data"]["model"].clone());
+        assert_eq!(model("implement"), Some("sonnet".into()));
+        assert_eq!(model("review"), Some("opus".into()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A repository that names its test command is verified by Orteca running
+    /// it: no Verify call. A failure still buys the Fix, which is told what the
+    /// suite printed.
+    #[tokio::test]
+    async fn a_declared_test_command_is_verified_without_an_agent_call() {
+        let store = Store::in_memory().unwrap();
+        let script = |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"console.log('header is not bold');process.exit({code})\""}}}}"#);
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+
+        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let mut request = routed(&store, "local-verify-pass", route.clone());
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), script(0)).unwrap();
+        claude_shim(&mut request, &passing);
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+        assert_eq!(result.calls_used, 1, "an agent was asked to run the tests");
+        let verify = result.stages.last().unwrap();
+        assert_eq!((verify.stage, verify.artifact.as_ref().map(|a| a["checks"][0]["command"].clone())), (Stage::Verify, Some("npm test".into())));
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
+        assert_eq!(project::check_command(&dir), None, "npm init's placeholder is not a test command");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut request = routed(&store, "local-verify-fail", route);
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), script(1)).unwrap();
+        claude_shim(&mut request, &passing);
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        assert_eq!(result.status, "done");
+        assert_eq!(result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(), [Stage::Implement, Stage::Verify, Stage::Fix]);
+        assert_eq!(result.calls_used, 2, "only Implement and Fix are agent calls");
+        let calls = briefs(&dir);
+        assert!(calls[1].contains("header is not bold"), "the fix was not told what failed: {}", calls[1]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2724,11 +2865,13 @@ exit /b 0
     #[tokio::test]
     async fn a_review_that_asks_for_changes_does_not_buy_another_call() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let mut route = routing::route(
             "add an authorization check before the delete endpoint",
             Mode::Balanced,
             &RepoSignals::default(),
         );
+        // A route with no Fix call to buy, such as one already on deep.
+        route.budget.escalation = None;
         let mut request = routed(&store, "review", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         // Every call reports a Review artifact asking for changes. Only the
@@ -2745,8 +2888,8 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "reviewRejected");
-        assert_eq!(result.calls_used, 3, "a call was spent after the review rejected the work");
-        assert_eq!(result.stages.len(), 3, "Verify ran after a review that rejected the work");
+        assert_eq!(result.calls_used, 2, "a call was spent after the review rejected the work");
+        assert_eq!(result.stages.len(), 2, "Verify ran after a review that rejected the work");
         assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
         let artifact = result.stages.last().unwrap().artifact.as_ref().expect("the review artifact was dropped");
         assert_eq!(artifact["verdict"], "changes_requested");
@@ -2842,27 +2985,28 @@ exit /b 0
             "verdict": "changes_requested"
         });
         let passing = serde_json::json!({"checks": [{"command": "cargo test auth", "passed": true, "output": "ok"}], "verdict": "pass"});
-        claude_shim_answers(&mut request, &[rejected.clone(), rejected.clone(), rejected, passing]);
+        claude_shim_answers(&mut request, &[rejected.clone(), rejected, passing]);
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "done");
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
-            [Stage::Plan, Stage::Implement, Stage::Review, Stage::Fix]
+            [Stage::Implement, Stage::Review, Stage::Fix]
         );
-        assert_eq!(result.calls_used, 4);
+        assert_eq!(result.calls_used, 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn a_missing_review_artifact_rejects_the_route_without_verify() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let mut route = routing::route(
             "add an authorization check before the delete endpoint",
             Mode::Balanced,
             &RepoSignals::default(),
         );
+        route.budget.escalation = None;
         let mut request = routed(&store, "missing-review", route);
         let dir = request.dir.clone();
         claude_shim(&mut request, &serde_json::json!({"objective": "not a review"}));
@@ -2870,7 +3014,7 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "reviewRejected");
-        assert_eq!(result.stages.len(), 3);
+        assert_eq!(result.stages.len(), 2);
         assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
         assert!(result.stages.last().unwrap().artifact.is_none());
         assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("review"));

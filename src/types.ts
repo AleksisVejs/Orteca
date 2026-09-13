@@ -70,6 +70,8 @@ export interface Preflight {
   model: ModelChoice;
   /** What the route's one Fix call would run on; null when it declares none. */
   escalation: ModelChoice | null;
+  /** What the Review runs on when it is not the route's tier; null otherwise. */
+  review: ModelChoice | null;
 }
 
 export type ProviderId = "claude" | "codex";
@@ -195,6 +197,8 @@ export interface ExecutionBudget {
   /** The tier of the one Fix call a failed Review or Verify may buy. Null
    *  when the route has no such stage or is already on `deep`. */
   escalation: Tier | null;
+  /** Guarded work is reviewed on this tier rather than `preferredTier`. */
+  reviewTier: Tier | null;
 }
 
 export interface Route {

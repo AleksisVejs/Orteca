@@ -40,6 +40,8 @@ struct Preflight {
     model: routing::ModelChoice,
     /// What the one Fix call would run on, if the route declares one.
     escalation: Option<routing::ModelChoice>,
+    /// What the Review runs on, when that is not the route's tier.
+    review: Option<routing::ModelChoice>,
 }
 
 struct PlannedRun {
@@ -252,7 +254,8 @@ fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, 
     let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
     let model = planned.route.budget.preferred_tier.model(provider);
     let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
-    Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation })
+    let review = planned.route.budget.review_tier.map(|tier| tier.model(provider));
+    Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation, review })
 }
 
 /// How much of each plan's rolling limit is used, from each CLI's own answer.

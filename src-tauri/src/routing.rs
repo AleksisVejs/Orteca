@@ -295,6 +295,10 @@ pub struct ExecutionBudget {
     /// buy. `None` when the route has no such stage or is already on `Deep`.
     /// The cap is structural: one call, never a second.
     pub escalation: Option<Tier>,
+    /// The tier a Review runs on when it is not `preferred_tier`. Guarded work
+    /// is built a tier below and reviewed on `deep`: a read-only look at a
+    /// finished diff is where the stronger model earns its price.
+    pub review_tier: Option<Tier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,11 +599,21 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             "this prompt has already failed twice, so it is planned and reviewed",
         )
     } else if signals.security || signals.authz || signals.schema_change {
-        (
-            RouteKind::Guarded,
-            vec![Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify],
-            "security, authorisation or schema work is planned, reviewed and verified",
-        )
+        // A plan earns its call when the work is big enough to go wrong in its
+        // shape. A one-function fix is not, and its Review still runs (§4.3.6).
+        if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
+            (
+                RouteKind::Guarded,
+                vec![Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify],
+                "security, authorisation or schema work this large is planned, reviewed and verified",
+            )
+        } else {
+            (
+                RouteKind::Guarded,
+                vec![Stage::Implement, Stage::Review, Stage::Verify],
+                "security, authorisation or schema work is reviewed and verified; it is small enough to need no plan",
+            )
+        }
     } else if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
         (
             RouteKind::Planned,
@@ -626,7 +640,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         )
     };
 
-    let mut budget = budget_for(kind, mode);
+    let mut budget = budget_for(kind, mode, stages.len());
     let mut tier_reason = "the tier this route is trusted with";
     let mut raised = false;
     if signals.prior_failures >= 1 {
@@ -700,31 +714,35 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
 /// 90k and 257k reported tokens. They are set to stop a run that has clearly
 /// lost the plot, not to trim one that is working. Milestone 7's baselines are
 /// what replace guesses with measurements.
-fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
+fn budget_for(kind: RouteKind, mode: Mode, calls: usize) -> ExecutionBudget {
     // A runaway guard, not a budget: Claude reports tokens only when a call
     // ends, so this is the one thing that stops a looping call mid-run. Tokens
     // do the budgeting. Per-route turn counts cut correct runs short at 10, and
     // gave a big route's stages fewer turns than a small route's one call (§4.3.6).
     const RUNAWAY_TURNS: u32 = 50;
-    let (calls, tokens) = match kind {
-        RouteKind::ImplementOnce => (1, 150_000),
-        RouteKind::Standard => (2, 300_000),
-        RouteKind::Planned | RouteKind::Escalated => (3, 600_000),
-        RouteKind::Guarded => (4, 800_000),
+    let tokens = match kind {
+        RouteKind::ImplementOnce => 150_000,
+        RouteKind::Standard => 300_000,
+        RouteKind::Planned | RouteKind::Escalated => 600_000,
+        RouteKind::Guarded => 800_000,
     };
     let efficient = mode == Mode::Efficient;
     ExecutionBudget {
-        max_agent_calls: calls,
+        max_agent_calls: calls as u32,
         max_turns: Some(RUNAWAY_TURNS),
         max_reported_tokens: Some(if efficient { tokens / 4 * 3 } else { tokens }),
         preferred_tier: match (kind, efficient) {
             (RouteKind::ImplementOnce, _) | (RouteKind::Standard, true) => Tier::Cheapest,
+            // Guarded builds on standard and reviews on deep: four deep calls
+            // cost 6x the plain CLI for a one-function fix (§4.3.6).
             (RouteKind::Standard, false)
             | (RouteKind::Planned, true)
-            | (RouteKind::Escalated, true) => Tier::Standard,
+            | (RouteKind::Escalated, true)
+            | (RouteKind::Guarded, _) => Tier::Standard,
             _ => Tier::Deep,
         },
         escalation: None,
+        review_tier: (kind == RouteKind::Guarded).then_some(Tier::Deep),
     }
 }
 
@@ -934,7 +952,7 @@ mod tests {
         assert_eq!(route("make the header bold", Mode::Balanced, &stalled).budget.preferred_tier, Tier::Standard, "never onto a tier that stalled");
 
         let guarded = route("fix the password check", Mode::Balanced, &low(1.0));
-        assert_eq!((guarded.kind, guarded.budget.preferred_tier), (RouteKind::Guarded, Tier::Deep), "guarded work keeps its tier");
+        assert_eq!((guarded.kind, guarded.budget.preferred_tier, guarded.budget.review_tier), (RouteKind::Guarded, Tier::Standard, Some(Tier::Deep)), "guarded work keeps its tiers");
         assert_eq!(route("fix the typo", Mode::Balanced, &low(1.0)).budget.preferred_tier, Tier::Cheapest, "one call has no check to catch a miss");
     }
 
@@ -981,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn security_authz_and_schema_work_is_planned_reviewed_and_verified() {
+    fn security_authz_and_schema_work_is_reviewed_on_deep_and_verified() {
         for prompt in [
             "sanitize the user input to close the injection vulnerability",
             "add an authorization check before the delete endpoint",
@@ -989,9 +1007,12 @@ mod tests {
         ] {
             let r = balanced(prompt, REPO);
             assert_eq!(r.kind, RouteKind::Guarded, "`{prompt}` was not guarded");
-            assert_eq!(r.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
+            assert_eq!(r.stages, [Stage::Implement, Stage::Review, Stage::Verify], "`{prompt}` is small and needs no plan");
+            assert_eq!((r.budget.preferred_tier, r.budget.review_tier), (Tier::Standard, Some(Tier::Deep)));
             assert!(r.signals.risk >= 5, "`{prompt}` scored risk {}", r.signals.risk);
         }
+        let large = balanced("redesign the authorization subsystem so every endpoint checks it", REPO);
+        assert_eq!(large.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
     }
 
     /// A prompt can read as small and still be dangerous. The gate wins.

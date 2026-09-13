@@ -122,6 +122,28 @@ impl Usage {
     }
 }
 
+/// What keeps a Codex run to what Orteca and the repository supply (§4.3.3).
+/// An empty `CODEX_HOME` would be cleaner but signs the user out, so the
+/// user's `config.toml` - plugins, MCP servers, notify, proxy - is skipped
+/// while auth still comes from `CODEX_HOME`, and what loads without any config
+/// is switched off by name. The global `AGENTS.md` has no switch and still loads.
+pub const CODEX_ISOLATION: &[&str] = &[
+    "--ignore-user-config",
+    "-c",
+    "features.plugins=false",
+    "-c",
+    "features.apps=false",
+    "-c",
+    "features.recommended_plugins=false",
+    "-c",
+    "skills.include_instructions=false",
+    // Skipping config.toml also skips this, and without it Codex on Windows
+    // quietly turns `--sandbox workspace-write` into read-only and still exits
+    // 0. Both values write; `elevated` is the stronger fence.
+    "-c",
+    "windows.sandbox=\"elevated\"",
+];
+
 /// Adjacently tagged so every variant survives, including the newtype ones:
 /// `{"kind":"text","data":"..."}`. This is both the payload the UI receives
 /// and the row written to `task_events`, so there is one shape, not two.
@@ -230,6 +252,7 @@ impl ProviderId {
     }
 
     /// Restart a recorded session with something new to say.
+    /// It is isolated the same way as a fresh `codex exec`.
     ///
     /// `codex exec resume` has no `--sandbox` flag - only the bypass one this
     /// project forbids - so the sandbox has to be set through config. The
@@ -252,6 +275,7 @@ impl ProviderId {
                     arg("-c"),
                     arg("sandbox_mode=\"workspace-write\""),
                 ],
+                CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
                 schema.map_or_else(Vec::new, |path| {
                     vec![arg("--output-schema"), path.display().to_string()]
                 }),
@@ -541,6 +565,8 @@ then stop");
         assert!(argv.contains("sandbox_mode=\"workspace-write\""));
         assert!(!argv.contains("danger"));
         assert!(argv.contains("--json"));
+        // A resume must not bring the user's plugins and skills back.
+        assert!(argv.contains(&CODEX_ISOLATION.join(" ")));
         // The prompt arrives on stdin, never as an argument.
         assert!(ProviderId::Codex.resume_args("abc-123", None).contains(&"-".to_string()));
         // A resumed stage keeps the artifact contract its route asked for.

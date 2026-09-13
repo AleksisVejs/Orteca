@@ -273,6 +273,62 @@ so the two disagree. Fixed 2026-09-13: the guard now counts uncached input and
 output only, the same tokens the baseline compares. It still fires after a final
 result, but only once a run has genuinely spent past the ceiling.
 
+### 4.3.3 Runs load only what Orteca and the repo supply — 2026-09-13
+
+A run used to start inside the user's own setup: Claude re-read ~16k of plugins,
+skills, tools and a proxy MCP server every turn, and Codex opened a global skill
+file and ran `rtk` before reading any code. Flags were checked the §4.2 way (a
+real value-taking flag answers "argument missing"; a boolean one gets past the
+parser to "Input must be provided"; an invented one answers "unknown option"),
+then each was tried in a one-turn run whose `init` event or rollout was read.
+
+| CLI | Flag | Exists | What a real run showed |
+|---|---|---|---|
+| claude 2.1.269 | `--setting-sources project,local` | yes | drops user settings: 3 plugins → 0, user hooks, `~/.claude/CLAUDE.md`, and its `env` (`ENABLE_TOOL_SEARCH`, the proxy `ANTHROPIC_BASE_URL`). **Leaves** claude.ai MCP connectors and 18 skills. Repo `.claude/settings.json` hooks still run. |
+| claude | `--strict-mcp-config` (no `--mcp-config`) | yes | MCP servers → 0: user, claude.ai connectors **and the repo's `.mcp.json`** |
+| claude | `--mcp-config` | yes | not used |
+| claude | `--disable-slash-commands` | yes | skills → 0 |
+| claude | `--tools Bash,PowerShell,Read,Edit,Write,Glob,Grep` | yes | built-in tools 28 → 7. Needed: with user settings gone tool search is off, so every schema loads in full — the three flags above alone gave a 46.2k first turn, with `--tools` 21.4k |
+| claude | `--no-plugins` | **no** | "unknown option" |
+| codex 0.154.0 | `CODEX_HOME=<empty dir>` | — | **breaks sign-in** ("Not logged in"). Not used. |
+| codex | `--ignore-user-config` | yes | skips `config.toml`: plugins, MCP servers, `notify`, the proxy provider, and the user's `model` / `windows.sandbox`. Auth still from `CODEX_HOME`. Still loaded host skills and recommended plugins. |
+| codex | `-c features.recommended_plugins=false` | yes | recommended-plugins message gone |
+| codex | `-c skills.include_instructions=false` | yes | skills block (`~/.agents/skills`, `~/.codex/skills/.system`) gone |
+| codex | `-c features.plugins=false`, `-c features.apps=false` | yes | passed for certainty; nothing further visible in the rollout |
+| codex | `-c windows.sandbox="elevated"` | yes (`elevated` \| `unelevated`) | **required.** Without it `--ignore-user-config` leaves no Windows sandbox mode, and Codex silently runs `--sandbox workspace-write` as `read-only`: the first measured run could not read or edit anything yet exited 0 as `done`. Both values wrote in a probe. |
+| codex | `-c project_doc_max_bytes=0` | yes | does **not** drop the global `AGENTS.md`, and would drop the repo's. Not used. |
+
+Claude's `--bare` stays forbidden; nothing here needed it. Codex's global
+`~/.codex/AGENTS.md` has no switch short of `CODEX_HOME`, so it still loads: here
+that is one line, `@…\RTK.md`, which Codex does not expand but may choose to open.
+Repo hooks still load for Claude, so consent stays unconditional.
+
+One-turn "reply ok" context, same machine: Claude 54.1k → 21.4k; Codex 16.4k
+(`--ignore-user-config` alone) → 12.6k.
+
+Measured through `start_task` over CDP (open → trust → start), `balanced`, fresh
+clones of `orteca-sandbox` @ `081c1ff` (typo) and `orteca-measure` @ `fb4de85`
+(slug); Claude runs one after the other, Codex alongside. "Before" is the
+post-guard-fix re-run from the same day.
+
+| Run | Before | Tokens | Cached | Uncached (in + out) | Turns | First-turn context | Status | Tests |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| Claude typo ("titel") | 163.3k / 3 turns | 65,152 | 57,948 | 7,204 | 3 | 21.4k | `done` | pass |
+| Claude slug | 220.7k / 5 turns | 90,126 | 81,610 | 8,516 | 5 | 21.8k | `done` | 3/3 pass |
+| Codex slug | 98.7k | 40,971 | 37,632 | 3,339 | 1 | — | `done` | 3/3 pass |
+
+Codex fell 58%, but not like for like: skipping `config.toml` also drops the
+user's `model = "gpt-5.6-luna"` at `xhigh` and the headroom proxy, so this ran
+Codex's default model (`gpt-6-astra`) direct. The first attempt, before
+`windows.sandbox` was set, ran read-only and was reported `done` with no diff;
+that row is not counted. Codex's first command still read the global
+`~/.codex/RTK.md` that `~/.codex/AGENTS.md` points at; it opened no plugin or
+skill file and ran no `rtk`.
+
+Claude: total tokens fell 60% (typo) and 59% (slug) at the same turn count; every
+turn's context stayed 21-23k. Its transcripts mention no plugin, skill, `rtk`,
+headroom or `.codex` path.
+
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
 - Claude stage running → instruction is injected live via stdin.

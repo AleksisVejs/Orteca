@@ -297,6 +297,9 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("exec"),
                 arg("-"),
                 arg("--json"),
+            ],
+            crate::providers::CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
+            vec![
                 arg("--sandbox"),
                 // A stage with no business editing cannot edit. Codex has an
                 // OS-level fence for this; using it is cheaper and more certain
@@ -314,6 +317,21 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("--output-format"),
                 arg("stream-json"),
                 arg("--verbose"),
+                // Only what Orteca and the repository supply (§4.3.3). User
+                // settings carry the user's plugins, hooks and CLAUDE.md; the
+                // repo's project settings, hooks included, still load, which
+                // is why consent stays unconditional.
+                arg("--setting-sources"),
+                arg("project,local"),
+                // No MCP server at all: the user's, the claude.ai connectors,
+                // and the repository's `.mcp.json` alike.
+                arg("--strict-mcp-config"),
+                // Skills load as slash commands; this is what drops them.
+                arg("--disable-slash-commands"),
+                // Without the user's settings every built-in tool schema loads
+                // in full. No stage uses the rest; the grants below narrow these.
+                arg("--tools"),
+                arg("Bash,PowerShell,Read,Edit,Write,Glob,Grep"),
                 arg("--permission-mode"),
                 arg("acceptEdits"),
                 // Streaming input is what makes a mid-task instruction possible:
@@ -1921,6 +1939,12 @@ ping -n 60 127.0.0.1 >nul
         let claude = args(ProviderId::Claude, &plan_for(Stage::Implement)).join(" ");
         assert!(!claude.contains("--bare"), "--bare would force an API key");
         assert!(claude.contains("--permission-mode acceptEdits"));
+        // The user's plugins, skills, MCP servers and CLAUDE.md stay out of the
+        // run; the repository's own settings still load (§4.3.3).
+        assert!(claude.contains("--setting-sources project,local"));
+        assert!(claude.contains("--strict-mcp-config"));
+        assert!(claude.contains("--disable-slash-commands"));
+        assert!(claude.contains("--tools Bash,PowerShell,Read,Edit,Write,Glob,Grep"));
         // A headless run has nobody to answer a prompt, so it must never wait
         // for one. This is what made an agent stall instead of running a test.
         assert!(claude.contains("--permission-prompts none"));
@@ -1943,6 +1967,9 @@ ping -n 60 127.0.0.1 >nul
         let codex = args(ProviderId::Codex, &plan_for(Stage::Implement)).join(" ");
         assert!(codex.contains("--sandbox workspace-write"));
         assert!(!codex.contains("danger-full-access"));
+        assert!(codex.contains(&crate::providers::CODEX_ISOLATION.join(" ")));
+        // Without it, ignoring the user's config leaves Codex read-only on Windows.
+        assert!(codex.contains("windows.sandbox=\"elevated\""));
         // The prompt is one argument, never spliced into a shell string.
         assert!(args(ProviderId::Codex, &plan_for(Stage::Implement)).contains(&"-".to_string()));
     }

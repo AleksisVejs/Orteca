@@ -67,6 +67,25 @@ mod tests {
             .expect("a finished run reports usage")
     }
 
+    /// Recorded from a real isolated run with the flags `run::args` passes: its
+    /// init names no plugin, MCP server or skill, and it still parses to a
+    /// finished run.
+    #[test]
+    fn an_isolated_claude_run_loads_none_of_the_users_setup() {
+        let path = fixture(ProviderId::Claude).with_file_name("claude-isolated-run.jsonl");
+        let init: Value = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["subtype"] == "init")
+            .expect("init event");
+        assert_eq!(init["plugins"], serde_json::json!([]));
+        assert_eq!(init["mcp_servers"], serde_json::json!([]));
+        assert_eq!(init["skills"], serde_json::json!([]));
+
+        let events = replay(ProviderId::Claude, &path).expect("fixture");
+        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::Done { turns: 4, .. })));
+    }
+
     #[test]
     fn claude_run_normalises_to_events() {
         let events = replay_bundled(ProviderId::Claude);

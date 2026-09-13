@@ -38,6 +38,23 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             .map(|blocks| blocks.iter().filter_map(block).collect())
             .unwrap_or_default(),
         "result" => result(v),
+        // Sent before the answer on every call; `allowed` and `allowed_warning`
+        // are recorded. `rejected` is the plan's limit being used up. The result
+        // that follows may word it in a way `classify_failure` does not know,
+        // so the kind is set here. Not yet seen in a recording.
+        "rate_limit_event"
+            if v["rate_limit_info"]["status"] == "rejected" && v["rate_limit_info"]["isUsingOverage"] != true =>
+        {
+            let window = match v["rate_limit_info"]["rateLimitType"].as_str() {
+                Some("five_hour") => "session",
+                Some("seven_day") => "weekly",
+                _ => "plan",
+            };
+            vec![ProviderEvent::Failed {
+                kind: FailureKind::UsageLimit,
+                message: format!("Claude's {window} usage limit is used up."),
+            }]
+        }
         _ => Vec::new(),
     }
 }
@@ -200,5 +217,19 @@ mod tests {
             }}));
         let usage = events.iter().find_map(|e| match e { ProviderEvent::Usage(u) => Some(u), _ => None });
         assert_eq!(usage.and_then(|u| u.model.as_deref()), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn a_rejected_rate_limit_is_a_usage_limit_and_a_warning_is_not() {
+        let rejected = parse_line(&serde_json::json!({"type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour", "isUsingOverage": false}}));
+        assert!(
+            matches!(rejected.as_slice(), [ProviderEvent::Failed { kind: FailureKind::UsageLimit, message }] if message.contains("session")),
+            "{rejected:?}"
+        );
+        let warned = parse_line(&serde_json::json!({"type": "rate_limit_event",
+            "rate_limit_info": {"status": "allowed_warning", "rateLimitType": "seven_day"}}));
+        assert!(warned.is_empty(), "a warning is not a stop");
+        assert_eq!(classify_failure("You've hit your session limit · resets 4pm"), FailureKind::UsageLimit);
     }
 }

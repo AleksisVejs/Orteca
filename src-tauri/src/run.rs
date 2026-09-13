@@ -236,6 +236,8 @@ pub struct TaskResult {
     /// field. Empty is possible and is not an error.
     pub summary: String,
     pub failure: Option<String>,
+    /// Why it failed, when it did. `usageLimit` is what offers the other CLI.
+    pub failure_kind: Option<FailureKind>,
     /// `None` when the run ended before the provider reported any numbers.
     /// The UI must say "unavailable" and never print a zero.
     pub usage: Option<Usage>,
@@ -425,6 +427,10 @@ struct Outcome {
     /// What earlier provider processes cost, added up. See `begin_process`.
     banked_cost: Option<f64>,
     failure: Option<String>,
+    /// The kind a provider reported with its failure. A specific kind outlives
+    /// a later generic one: Claude's spent plan arrives as a rate-limit event,
+    /// and the result after it may be worded as nothing in particular.
+    reported_kind: Option<FailureKind>,
     /// A provider reported a result at least once. With a live provider that
     /// is once per turn, so it does not mean the run is over.
     done: bool,
@@ -486,9 +492,21 @@ impl Outcome {
                 self.done = true;
                 self.result = result.clone();
             }
-            ProviderEvent::Failed { message, .. } => self.failure = Some(message.clone()),
+            ProviderEvent::Failed { kind, message } => {
+                self.failure = Some(message.clone());
+                if *kind != FailureKind::Crashed || self.reported_kind.is_none() {
+                    self.reported_kind = Some(*kind);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Why the run failed: the kind a provider reported, else read from the message.
+    fn failure_kind(&self) -> Option<FailureKind> {
+        self.failure
+            .as_deref()
+            .map(|message| self.reported_kind.unwrap_or_else(|| crate::providers::classify_failure(message)))
     }
 
     /// What the task row and the result screen both call this run. A stop that
@@ -881,8 +899,8 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         );
     }
     let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    if let Some(message) = &outcome.failure {
-        let event = ProviderEvent::Failed { kind: crate::providers::classify_failure(message), message: message.clone() };
+    if let (Some(message), Some(kind)) = (&outcome.failure, outcome.failure_kind()) {
+        let event = ProviderEvent::Failed { kind, message: message.clone() };
         if let Err(e) = record(store, task_id, "run", id, &event) {
             outcome.failure = Some(format!("{message}; could not log failure: {}", e.message));
         }
@@ -931,6 +949,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         task_id,
         status,
         summary,
+        failure_kind: outcome.failure_kind(),
         failure: outcome.failure,
         usage: outcome.usage,
         diff,
@@ -1207,6 +1226,7 @@ async fn attempt(
                     // stopped before it can enter another stage.
                     if provider_budget_reached {
                         state.outcome.failure = None;
+                        state.outcome.reported_kind = None;
                         if state.budget_stop.is_none() {
                             let stop = turn_stop(ctx, state);
                             let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
@@ -1746,6 +1766,22 @@ ping -n 60 127.0.0.1 >nul
         free.absorb(&usage(None));
         free.settle_cost();
         assert_eq!(free.usage.unwrap().cost_usd, None, "no reported cost stays unavailable, never 0");
+    }
+
+    /// A spent plan must reach the screen as `usageLimit`, which is what offers
+    /// the other CLI, even when the result after it says nothing specific.
+    #[test]
+    fn a_reported_usage_limit_is_not_overwritten_by_a_vaguer_failure() {
+        let mut outcome = Outcome::default();
+        outcome.absorb(&ProviderEvent::Failed { kind: FailureKind::UsageLimit, message: "Claude's session usage limit is used up.".into() });
+        outcome.absorb(&ProviderEvent::Failed { kind: FailureKind::Crashed, message: "something went wrong".into() });
+        assert_eq!(outcome.failure_kind(), Some(FailureKind::UsageLimit));
+        assert_eq!(outcome.failure.as_deref(), Some("something went wrong"), "the last words are still shown");
+
+        let mut unreported = Outcome { failure: Some("codex exited with code 1".into()), ..Outcome::default() };
+        assert_eq!(unreported.failure_kind(), Some(FailureKind::Crashed), "read from the message when no provider said");
+        unreported.failure = None;
+        assert_eq!(unreported.failure_kind(), None, "no failure, no kind");
     }
 
     #[test]

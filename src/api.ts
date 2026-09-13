@@ -50,8 +50,10 @@ export const recentTasks = (path: string) =>
   invoke<TaskSummary[]>("recent_tasks", { path });
 export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
-export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode) =>
-  invoke<Preflight>("preview_task", { path, prompt, provider, mode });
+/** `headroom` is the room left in the provider's tightest plan window, or null
+ *  when unread. The router may run a checked route a tier down when it is low. */
+export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode, headroom: number | null) =>
+  invoke<Preflight>("preview_task", { path, prompt, provider, mode, headroom });
 
 /** Plan limits from each CLI's own answer. Costs no tokens; takes seconds. */
 export const providerLimits = () => invoke<Limits[]>("provider_limits");
@@ -68,6 +70,7 @@ export const startTask = (
   prompt: string,
   provider: ProviderId,
   mode: Mode,
+  headroom: number | null,
   onEvent: (event: ProviderEvent) => void,
   onTask: (taskId: number) => void,
 ) => {
@@ -77,7 +80,7 @@ export const startTask = (
   // Without it there is nothing for Stop to name.
   const task = new Channel<number>();
   task.onmessage = onTask;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, events, task });
+  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, events, task });
 };
 
 /**

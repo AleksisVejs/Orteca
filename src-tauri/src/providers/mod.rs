@@ -220,7 +220,14 @@ pub fn classify_failure(message: &str) -> FailureKind {
     // "rate limit" first: a usage-limit message often mentions both.
     if m.contains("rate limit") || m.contains("too many requests") {
         FailureKind::RateLimit
-    } else if m.contains("usage limit") || m.contains("quota") || m.contains("credit balance") {
+    } else if m.contains("usage limit")
+        || m.contains("quota")
+        || m.contains("credit balance")
+        // How Claude words a spent plan window. Unverified against a recording.
+        || m.contains("hit your limit")
+        || m.contains("session limit")
+        || m.contains("weekly limit")
+    {
         FailureKind::UsageLimit
     } else if m.contains("oauth")
         || m.contains("api key")

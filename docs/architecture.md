@@ -380,7 +380,8 @@ How it was chosen:
    event records the model and effort Orteca asked for, which is the only record
    of it for Codex.
 
-**Adaptation: up on evidence, never down.**
+**Adaptation: up on evidence, never down** — except the one step down a low
+plan limit allows on a checked route, which evidence always outranks (§4.3.5).
 
 - The same prompt already failed once (`prior_failures >= 1`): one tier up.
   After two failures the route itself escalates (§8).
@@ -436,9 +437,26 @@ What Orteca does with it, in `Project.vue`:
   call the route may make, its Fix call included. The warning names only
   reported figures. **The 5% is a guess, not a measurement:** replace it with
   each route's measured draw once runs read limits before and after.
-- Nothing is blocked: a warning is not a refusal, and a run that does hit a
-  limit already ends `failed` with `usageLimit`. The tier is not stepped down to
-  save allowance; §4.3.4 moves up on evidence and never down.
+- Nothing is blocked: a warning is not a refusal. It offers "use codex
+  instead" when the other CLI is known to have more room.
+- **A low limit steps the tier down once, where the run still finishes**
+  (`routing::route`). The frontend passes its headroom reading to
+  `preview_task` and `start_task`, the same number for both. The tier drops one
+  step when headroom is under 10% per call the route may make, Fix call
+  included, and only on a `standard` or `planned` route: its Verify catches a
+  miss, and the Fix call it buys runs on the tier the route would have used. It
+  never drops a tier that evidence raised (a prior failure or a stall), never on
+  `guarded` or `escalated` work, never onto a tier that stalled here, and never
+  below `cheapest`. An unread limit is not a low one. The 10% is a guess too.
+- **A run that spends the plan offers the other CLI.** Claude's stream sends
+  `rate_limit_event` with `status: "rejected"` when a window is used up (not yet
+  seen in a recording) and the parser reports it as `usageLimit`, a kind that
+  outlives a vaguer result after it. `TaskResult.failureKind` carries it. When it
+  is `usageLimit` and the other CLI is signed in and not known to be empty, the
+  result offers "Continue with codex": a fresh run of the same request, started
+  by the user, on a tree that keeps whatever the stopped run changed.
+- A run that failed on `usageLimit`, `rateLimit` or `authExpired` is not a prior
+  failure of its prompt, so continuing it does not send it a tier up (§8).
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -721,7 +739,9 @@ spending on its own initiative:
   the same thing twice.
 
 "Failed twice" is matched on the exact prompt text in the same project, and
-counts a `budgetReached` run as not having finished. Exact text is the only
+counts a `budgetReached` run as not having finished. A run that failed on a
+spent plan, a rate limit or an expired sign-in does not count: that says
+nothing about the prompt. Exact text is the only
 honest definition available without a model call; a re-worded retry counts as a
 fresh task, which errs towards the cheaper route.
 

@@ -103,6 +103,14 @@ impl Tier {
         }
     }
 
+    fn down(self) -> Option<Tier> {
+        match self {
+            Self::Cheapest => None,
+            Self::Standard => Some(Self::Cheapest),
+            Self::Deep => Some(Self::Standard),
+        }
+    }
+
     // ponytail: pinned Codex slugs go stale when OpenAI retires a model; read
     // `~/.codex/models_cache.json` if that starts happening between releases.
     pub fn model(self, id: ProviderId) -> ModelChoice {
@@ -410,6 +418,10 @@ pub struct RepoSignals {
     /// Route kinds and tiers that stalled in this project's recent runs on the
     /// selected provider. See `Store::stalled_tiers`.
     pub stalled_tiers: Vec<(RouteKind, Tier)>,
+    /// Room left in the selected provider's tightest plan window, 0-100, as its
+    /// CLI reported it before the run. `None` when it could not be read, which
+    /// never counts as low.
+    pub headroom: Option<f64>,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -616,9 +628,11 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
 
     let mut budget = budget_for(kind, mode);
     let mut tier_reason = "the tier this route is trusted with";
+    let mut raised = false;
     if signals.prior_failures >= 1 {
         if let Some(up) = budget.preferred_tier.up() {
             budget.preferred_tier = up;
+            raised = true;
             tier_reason = "this prompt did not finish before, so it runs one tier up";
         }
     }
@@ -629,7 +643,29 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     while repo.stalled_tiers.contains(&(kind, budget.preferred_tier)) {
         let Some(up) = budget.preferred_tier.up() else { break };
         budget.preferred_tier = up;
+        raised = true;
         tier_reason = "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
+    }
+    // Short on plan allowance, the one step down, and only where the run still
+    // finishes: a Review or Verify catches a miss, and the Fix call it buys
+    // runs on the tier this route would have used. Never on a tier evidence
+    // raised, never on guarded or twice-failed work, never onto a tier that
+    // stalled here.
+    // ponytail: 10% of a plan window per call is a guess, not a measurement;
+    // replace it with each route's measured draw once runs read limits before and after.
+    const LOW_ROOM_PER_CALL: f64 = 10.0;
+    let checked = stages.iter().any(|s| matches!(s, Stage::Review | Stage::Verify));
+    if let (Some(room), Some(down)) = (repo.headroom, budget.preferred_tier.down()) {
+        let calls = budget.max_agent_calls + u32::from(checked);
+        if checked
+            && !raised
+            && matches!(kind, RouteKind::Standard | RouteKind::Planned)
+            && !repo.stalled_tiers.contains(&(kind, down))
+            && room < LOW_ROOM_PER_CALL * f64::from(calls)
+        {
+            budget.preferred_tier = down;
+            tier_reason = "the plan limit is low, so it runs one tier down; its checks, and a Fix call on the usual tier, catch a miss";
+        }
     }
     // Only a stage with a pass/fail contract can show that the tier was not
     // enough, so only a route with one declares the Fix call.
@@ -868,6 +904,33 @@ mod tests {
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {
         route(prompt, Mode::Balanced, &repo(paths))
+    }
+
+    /// Short on allowance, a checked route runs one tier down and keeps its Fix
+    /// call on the usual tier. Never where evidence raised the tier, never on
+    /// guarded work, never onto a tier that stalled, never without a check.
+    #[test]
+    fn a_low_plan_limit_drops_a_checked_route_one_tier() {
+        let low = |room: f64| RepoSignals { headroom: Some(room), ..repo(REPO) };
+        let r = route("make the header bold", Mode::Balanced, &low(20.0));
+        assert_eq!(r.kind, RouteKind::Standard);
+        assert_eq!((r.budget.preferred_tier, r.budget.escalation), (Tier::Cheapest, Some(Tier::Standard)));
+        assert!(r.tier_reason.contains("one tier down"), "{}", r.tier_reason);
+
+        assert_eq!(route("make the header bold", Mode::Balanced, &low(60.0)).budget.preferred_tier, Tier::Standard, "enough room");
+        assert_eq!(balanced("make the header bold", REPO).budget.preferred_tier, Tier::Standard, "an unread limit is not a low one");
+
+        let mut raised = low(5.0);
+        raised.prior_failures = 1;
+        assert_eq!(route("make the header bold", Mode::Balanced, &raised).budget.preferred_tier, Tier::Deep, "evidence outranks allowance");
+
+        let mut stalled = low(5.0);
+        stalled.stalled_tiers = vec![(RouteKind::Standard, Tier::Cheapest)];
+        assert_eq!(route("make the header bold", Mode::Balanced, &stalled).budget.preferred_tier, Tier::Standard, "never onto a tier that stalled");
+
+        let guarded = route("fix the password check", Mode::Balanced, &low(1.0));
+        assert_eq!((guarded.kind, guarded.budget.preferred_tier), (RouteKind::Guarded, Tier::Deep), "guarded work keeps its tier");
+        assert_eq!(route("fix the typo", Mode::Balanced, &low(1.0)).budget.preferred_tier, Tier::Cheapest, "one call has no check to catch a miss");
     }
 
     /// The headline of the milestone: a small, low-risk, narrow task costs one

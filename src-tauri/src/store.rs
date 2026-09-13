@@ -160,9 +160,15 @@ impl Store {
     pub fn prior_failures(&self, project_id: i64, prompt: &str) -> Result<u32> {
         let conn = self.0.lock().expect("store poisoned");
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-              WHERE project_id = ?1 AND prompt = ?2
-                AND status IN ('failed', 'budgetReached', 'reviewRejected', 'verifyFailed')",
+            // A spent plan, a rate limit or an expired sign-in says nothing
+            // about whether the prompt is hard. Counting one would send the
+            // same prompt, continued on the other CLI, a tier up.
+            "SELECT COUNT(*) FROM tasks t
+              WHERE t.project_id = ?1 AND t.prompt = ?2
+                AND t.status IN ('failed', 'budgetReached', 'reviewRejected', 'verifyFailed')
+                AND NOT EXISTS (SELECT 1 FROM task_events e
+                                 WHERE e.task_id = t.id AND e.kind = 'failed'
+                                   AND json_extract(e.payload_json, '$.data.kind') IN ('usageLimit', 'rateLimit', 'authExpired'))",
             params![project_id, prompt],
             |r| r.get(0),
         )?)
@@ -811,6 +817,10 @@ mod tests {
         // A different prompt, and the same prompt in a different project.
         close(project.id, "do something else", "failed");
         close(other.id, "do it", "failed");
+        // Ran out of plan usage: says nothing about the prompt, so not counted.
+        let spent = store.create_task(new_task(project.id, "do it", "balanced")).unwrap();
+        store.append_event(spent, "run", "failed", "claude", r#"{"kind":"failed","data":{"kind":"usageLimit","message":"limit"}}"#).unwrap();
+        store.finish_task(spent, "failed", "", "[]", 1).unwrap();
 
         assert_eq!(store.prior_failures(project.id, "do it").unwrap(), 3);
         assert_eq!(store.prior_failures(project.id, "never asked").unwrap(), 0);

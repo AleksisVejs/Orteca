@@ -153,6 +153,7 @@ async fn start_task(
     prompt: String,
     provider: ProviderId,
     mode: Mode,
+    headroom: Option<f64>,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
 ) -> Result<run::TaskResult> {
@@ -160,7 +161,7 @@ async fn start_task(
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
-    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode)).await
+    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode, headroom)).await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
@@ -196,7 +197,7 @@ async fn send_instruction(
     live.instruct(task_id, text, apply_now).await
 }
 
-fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, mode: Mode) -> Result<PlannedRun> {
+fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>) -> Result<PlannedRun> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
     };
@@ -224,6 +225,9 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
             recent_paths: project::recent_paths(&dir),
             prior_failures: store.prior_failures(project.id, &prompt)?,
             stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
+            // The frontend's reading, not a fresh one: the preview and the run
+            // must be routed on the same number.
+            headroom: headroom.filter(|room| room.is_finite()),
         },
     );
     Ok(PlannedRun { dir, project, program, git, prompt, route })
@@ -231,8 +235,8 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
 
 /// Show the exact route and ceilings before a provider is started.
 #[tauri::command]
-fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, store: State<Store>) -> Result<Preflight> {
-    let planned = plan_run(&store, path, prompt, provider, mode)?;
+fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, store: State<Store>) -> Result<Preflight> {
+    let planned = plan_run(&store, path, prompt, provider, mode, headroom)?;
     let model = planned.route.budget.preferred_tier.model(provider);
     let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
     Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation })
@@ -256,8 +260,8 @@ async fn provider_limits() -> Vec<providers::limits::Limits> {
 /// Everything that has to be true, and decided, before a provider starts: the
 /// project is trusted, the CLI exists, the baseline is taken, and the route and
 /// its ceilings are chosen and written down.
-fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode) -> Result<run::Request> {
-    let PlannedRun { dir, project: record, program, git, prompt, route } = plan_run(store, path, prompt, provider, mode)?;
+fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>) -> Result<run::Request> {
+    let PlannedRun { dir, project: record, program, git, prompt, route } = plan_run(store, path, prompt, provider, mode, headroom)?;
 
     // The baseline is taken before the agent runs, so the diff afterwards has
     // something honest to compare against.

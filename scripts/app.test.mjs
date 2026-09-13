@@ -43,8 +43,8 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
-    ref, computed,
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, alternative, fallback, continueWith, switchTo, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+    ref, computed, setTimeout, clearTimeout,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
     detectProviders: async () => [{ id: 'codex', path: 'fake.exe' }],
@@ -507,4 +507,37 @@ test('a route that may not fit in the fullest window warns before it starts', as
   assert.equal(state.limitWarning.value, null, '80% left covers two calls');
   state.preview.value = { provider: 'codex', route: oneCall, escalation: null };
   assert.equal(state.limitWarning.value, null, '12% left covers one call');
+
+  state.preview.value = { provider: 'codex', route: twoCalls, escalation: { model: 'gpt-5.6-sol', effort: 'high' } };
+  assert.equal(state.alternative.value, 'claude', 'claude has 80% left against codex 12%');
+  state.switchTo('claude');
+  assert.equal(state.provider.value, 'claude');
+  assert.equal(state.providerPicked.value, true, 'switching is the user choosing');
+});
+
+test('a run that ran out of plan usage offers the other CLI, and continuing is a fresh run there', async () => {
+  const sent = [];
+  const { state } = await projectView({
+    detectProviders: bothInstalled,
+    providerLimits: reading(100, 30),
+    startTask: async (path, prompt, provider, mode, headroom) => {
+      sent.push({ provider, headroom });
+      return sent.length === 1
+        ? { ...finished, status: 'failed', failure: "Claude's session usage limit is used up.", failureKind: 'usageLimit' }
+        : { ...finished, status: 'done', failure: null, failureKind: null };
+    },
+  });
+  await settle();
+  state.providerPicked.value = true;
+  state.provider.value = 'claude';
+  await state.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(state.fallback.value)), { id: 'codex', room: 70 });
+  assert.equal(sent.length, 1, 'offered, never taken on the user’s behalf');
+
+  await state.continueWith('codex');
+  assert.deepEqual(sent, [{ provider: 'claude', headroom: 0 }, { provider: 'codex', headroom: 70 }]);
+  assert.equal(state.fallback.value, null);
+
+  state.result.value = { ...finished, status: 'failed', failureKind: 'crashed' };
+  assert.equal(state.fallback.value, null, 'a crash is not a reason to switch');
 });

@@ -208,6 +208,45 @@ const limitWarning = computed(() => {
   return tight ? { window: tight, calls, resets: resetWhen(tight) } : null;
 });
 
+/** The other runnable CLI, and its room left (null when unread). */
+function otherThan(id: ProviderId): { id: ProviderId; room: number | null } | null {
+  const other = installed.value.find((p) => p.id !== id && p.auth !== "signedOut");
+  return other ? { id: other.id, room: headroom(other.id) } : null;
+}
+
+/** Before a run: the other CLI, when it is known to have more room than this one. */
+const alternative = computed(() => {
+  const p = preview.value;
+  if (!p || !limitWarning.value) return null;
+  const other = otherThan(p.provider);
+  const mine = headroom(p.provider);
+  return other && other.room !== null && (mine === null || other.room > mine) ? other.id : null;
+});
+
+/** After a run that stopped because its plan ran out: the CLI that could take over.
+ *  Offered, never taken: continuing is a fresh run the user starts. */
+const fallback = computed(() => {
+  const r = result.value;
+  if (r?.status !== "failed" || r.failureKind !== "usageLimit") return null;
+  const other = otherThan(provider.value);
+  return other && (other.room === null || other.room > 0) ? other : null;
+});
+
+function switchTo(id: ProviderId) {
+  provider.value = id;
+  providerPicked.value = true;
+  pickedFor.value = null;
+  schedulePreview();
+}
+
+/** The same request on the other CLI. What the stopped run changed is still on disk. */
+async function continueWith(id: ProviderId) {
+  provider.value = id;
+  providerPicked.value = true;
+  pickedFor.value = null;
+  await run();
+}
+
 /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
 /// and refusing to run on a guess would be the same mistake in the other
 /// direction. The run itself reports an auth failure honestly either way.
@@ -337,7 +376,7 @@ async function refreshPreview() {
   previewing.value = true;
   previewError.value = null;
   try {
-    const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value);
+    const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id));
     if (request === previewRequest) preview.value = planned;
   } catch (e) {
     if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
@@ -396,6 +435,8 @@ async function run() {
       task.value,
       provider.value,
       mode.value,
+      // The same reading the preview was routed on, so the run matches it.
+      headroom(provider.value),
       (event) => {
         const activity = activityFor(event);
         if (activity !== null) currentActivity.value = activity;
@@ -715,6 +756,7 @@ const AUTH: Record<Auth, string> = {
         <span v-if="limitWarning" class="missing limit-warning" role="status">
           {{ preview.provider }}’s {{ limitWarning.window.label }} limit is {{ Math.round(limitWarning.window.usedPercent) }}% used<template v-if="limitWarning.resets">, resets {{ limitWarning.resets }}</template>.
           This can take up to {{ limitWarning.calls }} AI {{ limitWarning.calls === 1 ? "call" : "calls" }}, so it might not finish.
+          <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
         </span>
         <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
         <details class="preview-details">
@@ -725,7 +767,7 @@ const AUTH: Record<Auth, string> = {
             {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }} ·
             {{ preview.model.model }}, {{ preview.model.effort }} effort
             <template v-if="preview.escalation">
-              · one more call on {{ preview.escalation.model }} if a check or review doesn’t pass
+              · one more call on {{ preview.escalation.model }}, {{ preview.escalation.effort }} effort, if a check or review doesn’t pass
             </template>
           </p>
           <p class="note">{{ preview.route.tierReason }}</p>
@@ -811,6 +853,16 @@ const AUTH: Record<Auth, string> = {
       <h2 class="label">{{ OUTCOME[result.status] }}</h2>
       <div class="card outcome">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
+        <div v-if="fallback" class="fallback" role="status">
+          <p class="note">
+            {{ provider }} is out of plan usage. {{ fallback.id }} can carry on with the same
+            request<template v-if="fallback.room !== null">, with {{ Math.round(fallback.room) }}% of its tightest limit left</template>.
+            Anything already changed stays on disk.
+          </p>
+          <button class="btn" :disabled="running" @click="continueWith(fallback.id)">
+            Continue with {{ fallback.id }}
+          </button>
+        </div>
         <p v-else-if="result.summary" class="summary">{{ result.summary }}</p>
         <p v-if="result.status === 'cancelled'" class="note caveat stopped">
           Stopped part-way. Anything the agent had already written is still on
@@ -1253,6 +1305,17 @@ textarea:disabled {
 }
 .limit-warning {
   width: 100%;
+}
+.fallback {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 0 16px;
+}
+.fallback .note {
+  flex: 1;
+  margin: 0;
 }
 /* Never the primary button: stopping a run is not the obvious next step. */
 .stop {

@@ -271,6 +271,8 @@ export interface TaskResult {
   status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed";
   summary: string;
   failure: string | null;
+  /** Why it failed, when it did. `usageLimit` is what offers the other CLI. */
+  failureKind: FailureKind | null;
   /** null when the run ended before the provider reported any numbers. */
   usage: Usage | null;
   diff: FileStat[];

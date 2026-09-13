@@ -422,6 +422,8 @@ struct Outcome {
     /// keeping only the last would count one turn and throw the rest away.
     /// `Usage::absorb` knows which fields add and which replace.
     usage: Option<Usage>,
+    /// What earlier provider processes cost, added up. See `begin_process`.
+    banked_cost: Option<f64>,
     failure: Option<String>,
     /// A provider reported a result at least once. With a live provider that
     /// is once per turn, so it does not mean the run is over.
@@ -442,6 +444,24 @@ impl Outcome {
         self.result.clear();
         self.done = false;
         self.finished = false;
+    }
+
+    /// Claude's `total_cost_usd` is a running total for one process, so within
+    /// a process the latest report replaces the last (`Usage::absorb`). A new
+    /// process counts from zero again. Whatever the previous one reached is
+    /// banked first, or a three-stage run would report one stage's cost.
+    fn begin_process(&mut self) {
+        if let Some(cost) = self.usage.as_mut().and_then(|u| u.cost_usd.take()) {
+            *self.banked_cost.get_or_insert(0.0) += cost;
+        }
+    }
+
+    /// Put every process's cost, added up, on the task's usage.
+    fn settle_cost(&mut self) {
+        self.begin_process();
+        if let Some(usage) = self.usage.as_mut() {
+            usage.cost_usd = self.banked_cost;
+        }
     }
 
     fn exited(&mut self, id: ProviderId, code: Option<i32>, noise: &[String]) {
@@ -815,6 +835,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
 
     let dir = ctx.dir;
     let mut outcome = state.outcome;
+    outcome.settle_cost();
 
     live.close(task_id);
 
@@ -1094,6 +1115,7 @@ async fn attempt(
     // call it spent, and hiding the failures would flatter the metric.
     state.calls_used = state.calls_used.saturating_add(1);
     state.turns_this_call = 0;
+    state.outcome.begin_process();
     let mut run = match proc::spawn(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir) {
         Ok(run) => run,
         Err(e) => {
@@ -1691,6 +1713,41 @@ ping -n 60 127.0.0.1 >nul
     /// A result is not the same thing as an ending. A live provider reports one
     /// per turn, so a stop during turn two must still read as a stop even
     /// though turn one already answered - only `finished` means the run is over.
+    /// The bug this guards: a three-call run on Claude reported the last call's
+    /// cost as the whole run's, while its tokens were summed correctly.
+    #[test]
+    fn cost_adds_across_processes_and_replaces_within_one() {
+        let usage = |cost_usd: Option<f64>| ProviderEvent::Usage(Usage {
+            model: None,
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            cost_usd,
+            cost_quality: if cost_usd.is_some() { crate::providers::CostQuality::Estimated } else { crate::providers::CostQuality::Unavailable },
+        });
+        let mut outcome = Outcome::default();
+        outcome.begin_process();
+        outcome.absorb(&usage(Some(0.01)));
+        outcome.absorb(&usage(Some(0.03))); // the same session, now at 0.03 in all
+        outcome.begin_process();
+        outcome.absorb(&usage(Some(0.02)));
+        outcome.begin_process();
+        outcome.absorb(&usage(None)); // a process that reported no cost adds nothing
+        outcome.settle_cost();
+
+        let total = outcome.usage.expect("usage was lost");
+        assert!((total.cost_usd.expect("cost was lost") - 0.05).abs() < 1e-9, "{:?}", total.cost_usd);
+        assert_eq!(total.input_tokens, 4, "tokens still add per report");
+        assert_eq!(total.cost_quality, crate::providers::CostQuality::Estimated);
+
+        let mut free = Outcome::default();
+        free.begin_process();
+        free.absorb(&usage(None));
+        free.settle_cost();
+        assert_eq!(free.usage.unwrap().cost_usd, None, "no reported cost stays unavailable, never 0");
+    }
+
     #[test]
     fn a_stop_is_rewritten_by_the_run_ending_but_not_by_a_single_turn() {
         let mut answered = Outcome::default();

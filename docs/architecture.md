@@ -768,7 +768,11 @@ fixtures and regression tests so they do not need paying for again.
 3. **Usage is per turn but `total_cost_usd` is a session running total.** In the
    recording the cost goes 0.0302 → 0.0405 while turn two's own output is six
    tokens. So `Usage::absorb` adds the tokens and replaces the cost. Treating
-   both the same way in either direction reports a wrong number.
+   both the same way in either direction reports a wrong number. A session is
+   one process, though: every stage and every resume starts a new one that
+   counts from zero, so `run::Outcome` banks each process's last cost before the
+   next starts and adds them up when the run ends. Until 2026-09-13 it did not,
+   and a three-call run reported one call's cost as the whole run's.
 4. **`codex exec resume` has no `--sandbox` flag** — only
    `--dangerously-bypass-approvals-and-sandbox`, which this project forbids. The
    sandbox travels as `-c sandbox_mode="workspace-write"`; a bogus value is

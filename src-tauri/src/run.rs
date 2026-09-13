@@ -785,6 +785,23 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             None
         }
     };
+    // Codex on Windows can run `workspace-write` as read-only and still end its
+    // turn cleanly. Every command is rejected inside the CLI, and `--json`
+    // carries none of it - the rejections exist only in Codex's own rollout.
+    // What the stream cannot hide is the repository: a writing stage that left
+    // no change of its own did not do what `done` would claim. Prose is not read.
+    if id == ProviderId::Codex
+        && outcome.failure.is_none()
+        && !outcome.cancelled
+        && state.budget_stop.is_none()
+        && state.notes.iter().any(|n| n.stage.writes())
+        && diff.iter().all(|f| f.origin == Some(project::Origin::BeforeRun))
+    {
+        outcome.failure = Some(
+            "Codex ended its implement stage without changing any file. A sandbox that fell back to read-only looks exactly like this."
+                .into(),
+        );
+    }
     let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
     if let Some(message) = &outcome.failure {
         let event = ProviderEvent::Failed { kind: crate::providers::classify_failure(message), message: message.clone() };
@@ -1462,6 +1479,32 @@ mod tests {
         assert_eq!(raw["item"]["error"], "sandbox setup failed", "the reason the run did nothing must survive");
         // Logged, not shown: the UI has no shape for an event nobody parsed.
         assert!(!emitted.borrow().contains(&"unknown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Real capture, 2026-09-13: Codex ran `workspace-write` as read-only, every
+    /// command was rejected where `--json` never shows it, and the turn ended
+    /// cleanly with an apology. Nothing in the stream is a failure; the
+    /// untouched repository is.
+    #[tokio::test]
+    async fn a_codex_implement_stage_that_changed_nothing_is_not_done() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "read-only");
+        let dir = request.dir.clone();
+        // Outside the repository, or the shim itself would be the run's diff.
+        let program = std::env::temp_dir().join(format!("orteca-read-only-{}.cmd", std::process::id()));
+        let fixture = mock::named("codex-read-only-run.jsonl");
+        std::fs::write(&program, format!("@echo off\r\ntype \"{}\"\r\n", fixture.display())).unwrap();
+        request.program = program.clone();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert!(result.diff.is_empty());
+        assert_eq!(result.status, "failed");
+        assert!(result.failure.unwrap().contains("without changing any file"));
+        // The agent's own words stay the summary; they were never the signal.
+        assert!(result.summary.contains("read-only"));
+        std::fs::remove_file(program).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

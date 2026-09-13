@@ -229,7 +229,8 @@ pub struct BudgetStop {
 #[serde(rename_all = "camelCase")]
 pub struct TaskResult {
     pub task_id: i64,
-    /// `done`, `cancelled`, `failed`, `budgetReached` or `reviewRejected`.
+    /// `done`, `cancelled`, `failed`, `budgetReached`, `reviewRejected` or
+    /// `verifyFailed`.
     pub status: &'static str,
     /// The provider's final answer, or its last message if it reports no final
     /// field. Empty is possible and is not an error.
@@ -274,6 +275,8 @@ pub struct StagePlan {
     /// The artifact contract, already written to a file. Claude takes the
     /// schema text inline, Codex takes the path.
     pub schema: Option<PathBuf>,
+    /// The route's tier, which names the model and effort on the command line.
+    pub tier: routing::Tier,
 }
 
 /// The argv for one stage.
@@ -299,6 +302,7 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("--json"),
             ],
             crate::providers::CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
+            model_args(id, plan.tier),
             vec![
                 arg("--sandbox"),
                 // A stage with no business editing cannot edit. Codex has an
@@ -356,8 +360,25 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             args.extend(claude_deny(writes));
             args.extend(turn_limit(plan));
             args.extend(schema_arg(plan));
+            args.extend(model_args(id, plan.tier));
             args
         }
+    }
+}
+
+/// The model and effort a tier asks for. All four flags answer "argument
+/// missing" when given no value (§4.3.4). Codex has no effort flag; the config
+/// key is the one its own `config.toml` uses.
+fn model_args(id: ProviderId, tier: routing::Tier) -> Vec<String> {
+    let choice = tier.model(id);
+    match id {
+        ProviderId::Claude => vec!["--model".into(), choice.model.into(), "--effort".into(), choice.effort.into()],
+        ProviderId::Codex => vec![
+            "--model".into(),
+            choice.model.into(),
+            "-c".into(),
+            format!("model_reasoning_effort=\"{}\"", choice.effort),
+        ],
     }
 }
 
@@ -579,10 +600,12 @@ impl Launch {
     /// Pick a recorded session back up with everything the user has said since.
     /// The session already holds the history, so only the new words are sent.
     fn resume(id: ProviderId, session: &str, held: &[String], plan: &StagePlan) -> Self {
-        Launch {
-            argv: id.resume_args(session, plan.schema.as_deref()),
-            opening: held.join("\n"),
+        let mut argv = id.resume_args(session, plan.schema.as_deref());
+        // Without it a resumed session runs on the account's default model.
+        if id == ProviderId::Codex {
+            argv.extend(model_args(id, plan.tier));
         }
+        Launch { argv, opening: held.join("\n") }
     }
 }
 
@@ -641,6 +664,8 @@ struct State {
     /// review asked for changes, so the remaining stages have nothing useful
     /// left to do. What happens next is the user's call.
     halt: bool,
+    /// The route's one Fix call has been bought. Never reset: there is no second.
+    escalated: bool,
     /// Non-JSON output - the only clue a CLI leaves when it dies badly.
     noise: Vec<String>,
     /// JSONL records that had no known provider event shape.
@@ -689,7 +714,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         id,
         program,
         dir,
-        plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None },
+        plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None, tier: route.budget.preferred_tier },
         final_stage: true,
         remaining: Vec::new(),
         max_reported_tokens: route.budget.max_reported_tokens,
@@ -705,6 +730,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         structured: None,
         budget_stop: None,
         halt: false,
+        escalated: false,
         noise: Vec::new(),
         unknown_events: 0,
         held: Vec::new(),
@@ -719,8 +745,12 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         state.outcome.failure = Some(format!("could not record the route: {}", e.message));
     }
 
-    let stages = route.stages.clone();
-    for (index, stage) in stages.iter().copied().enumerate() {
+    // Mutable because a stage that does not pass may be followed by the one Fix
+    // call the route declared, in place of whatever stages were left.
+    let mut stages = route.stages.clone();
+    let mut index = 0;
+    while index < stages.len() {
+        let stage = stages[index];
         if state.outcome.failure.is_some()
             || state.outcome.cancelled
             || state.halt
@@ -741,6 +771,10 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             stage,
             max_turns: route.budget.max_turns,
             schema: write_schema(task_id, stage),
+            tier: match (stage, route.budget.escalation) {
+                (Stage::Fix, Some(up)) => up,
+                _ => route.budget.preferred_tier,
+            },
         };
         ctx.final_stage = index + 1 == stages.len();
         ctx.remaining = stages[index..].to_vec();
@@ -751,7 +785,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         state.recording = Recording::new(recordings.as_deref(), task_id, stage, id);
 
         let brief = routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
-        if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, &route)) {
+        if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), ctx.plan.tier, id)) {
             state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
             break;
         }
@@ -770,8 +804,13 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         // A stage that ended in an instruction still waiting is not a stage
         // that lost it: the constraint list carries it into the next brief.
         state.held.clear();
-        let note_for_stage = finish_stage(store, &ctx, &mut state, stage);
+        let note_for_stage = finish_stage(store, &ctx, &mut state, stage, route.budget.escalation);
         state.notes.push(note_for_stage);
+        if state.escalated && !stages.contains(&Stage::Fix) {
+            stages.truncate(index + 1);
+            stages.push(Stage::Fix);
+        }
+        index += 1;
     }
 
     let dir = ctx.dir;
@@ -831,10 +870,10 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     // wrong - and not a success, because the route did not finish. The work,
     // the diff and the usage are all kept exactly as they are.
     let mut status = if state.budget_stop.is_some() && outcome.failure.is_none() && !outcome.cancelled {
-        if state.budget_stop.as_ref().is_some_and(|stop| stop.limit == "review") {
-            "reviewRejected"
-        } else {
-            "budgetReached"
+        match state.budget_stop.as_ref().map(|stop| stop.limit) {
+            Some("review") => "reviewRejected",
+            Some("verify") => "verifyFailed",
+            _ => "budgetReached",
         }
     } else {
         outcome.status()
@@ -900,10 +939,12 @@ fn gate(route: &Route, state: &State, index: usize, stages: &[Stage]) -> Option<
         Some(BudgetStop { limit, allowed, observed, remaining: remaining.clone(), message })
     };
 
-    if state.calls_used >= budget.max_agent_calls {
+    // The Fix call, once bought, is the one call the route declared on top.
+    let allowed = budget.max_agent_calls + u32::from(state.escalated);
+    if state.calls_used >= allowed {
         return stop(
             "calls",
-            budget.max_agent_calls.into(),
+            allowed.into(),
             state.calls_used.into(),
             format!(
                 "This route was given {} agent call{}, and they are used up.                  The work so far is kept; running the rest is up to you.",
@@ -937,7 +978,7 @@ fn token_stop(limit: Option<u64>, used: u64, remaining: Vec<Stage>) -> Option<Bu
 
 /// Close out one stage: validate whatever artifact came back, log it, and hand
 /// the next stage what it is entitled to.
-fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -> StageNote {
+fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, escalation: Option<routing::Tier>) -> StageNote {
     // An artifact counts only if it arrived as structured output and matches
     // the shape the stage contracted for. The alternative - reading the closing
     // prose and filling the fields from it - is exactly the guesswork the
@@ -949,23 +990,39 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
     if stage.schema().is_some() {
         let _ = note(store, ctx, "artifact", &artifact_payload(stage, artifact.as_ref()));
     }
-    // A review that asks for changes ends the route here. Verifying a change
-    // the review just rejected spends a call to confirm something already
-    // known, and adding a fix call would be Orteca deciding to spend more on
-    // the user's behalf. The findings are the result; what to do about them is
-    // the user's to choose.
-    // A review that hit a budget stop did not complete; that stop is the result.
-    if stage == Stage::Review
+    // A review that asks for changes, or checks that did not pass, end the
+    // route here - unless the route declared its one Fix call a tier up, which
+    // then runs in place of whatever was left. Verifying a change the review
+    // just rejected spends a call to confirm something already known, and a
+    // second fix would be Orteca spending past what the route declared. The
+    // findings are the result; what to do about them is the user's to choose.
+    // A stage that hit a budget stop did not complete; that stop is the result.
+    if matches!(stage, Stage::Review | Stage::Verify | Stage::Fix)
         && state.budget_stop.is_none()
-        && !artifact.as_ref().is_some_and(routing::review_passed)
+        && !artifact.as_ref().is_some_and(|a| routing::stage_passed(stage, a))
     {
+        if let Some(tier) = escalation.filter(|_| !state.escalated) {
+            state.escalated = true;
+            let choice = tier.model(ctx.id);
+            let payload = serde_json::json!({
+                "kind": "escalation",
+                "data": { "after": stage, "tier": tier, "model": choice.model, "effort": choice.effort }
+            });
+            let _ = note(store, ctx, "escalation", &payload.to_string());
+            return StageNote { stage, summary: state.outcome.summary(), artifact };
+        }
         let remaining = ctx.remaining.iter().skip(1).copied().collect();
         let stop = BudgetStop {
-            limit: "review",
+            limit: if stage == Stage::Review { "review" } else { "verify" },
             allowed: 0,
             observed: 0,
             remaining,
-            message: "The review did not return a valid pass. Its findings are kept; deciding whether to change the work is up to you.".into(),
+            message: if stage == Stage::Review {
+                "The review did not return a valid pass. Its findings are kept; deciding whether to change the work is up to you."
+            } else {
+                "The checks did not report a pass. What they printed is kept; deciding whether to change the work is up to you."
+            }
+            .into(),
         };
         state.halt = true;
         state.budget_stop = Some(stop.clone());
@@ -979,15 +1036,20 @@ fn routing_payload(route: &Route) -> String {
     serde_json::json!({ "kind": "routing", "data": route }).to_string()
 }
 
-fn stage_payload(stage: Stage, index: usize, route: &Route) -> String {
+fn stage_payload(stage: Stage, index: usize, of: usize, tier: routing::Tier, id: ProviderId) -> String {
+    let choice = tier.model(id);
     serde_json::json!({
         "kind": "stage",
         "data": {
             "stage": stage,
             "index": index,
-            "of": route.stages.len(),
+            "of": of,
             "writes": stage.writes(),
             "schema": stage.schema().is_some(),
+            // What Orteca asked for. Codex names no model in its events, so
+            // for Codex this is the only record of it.
+            "model": choice.model,
+            "effort": choice.effort,
         }
     })
     .to_string()
@@ -1396,7 +1458,7 @@ mod tests {
     }
 
     fn plan_for(stage: Stage) -> StagePlan {
-        StagePlan { stage, max_turns: Some(6), schema: write_schema(0, stage) }
+        StagePlan { stage, max_turns: Some(6), schema: write_schema(0, stage), tier: routing::Tier::Cheapest }
     }
 
     #[test]
@@ -2009,7 +2071,7 @@ ping -n 60 127.0.0.1 >nul
     /// an inline schema, and takes a file.
     #[test]
     fn only_verified_ceiling_flags_reach_a_command_line() {
-        let plan = StagePlan { stage: Stage::Plan, max_turns: Some(7), schema: write_schema(0, Stage::Plan) };
+        let plan = StagePlan { stage: Stage::Plan, max_turns: Some(7), schema: write_schema(0, Stage::Plan), tier: routing::Tier::Deep };
         let claude = args(ProviderId::Claude, &plan);
         assert!(claude.windows(2).any(|w| w == ["--max-turns", "7"]));
         assert!(claude.contains(&"--json-schema".to_string()));
@@ -2028,6 +2090,13 @@ ping -n 60 127.0.0.1 >nul
         // A stage with no artifact contract asks for none.
         let implement = args(ProviderId::Claude, &plan_for(Stage::Implement));
         assert!(!implement.contains(&"--json-schema".to_string()));
+
+        // The tier reaches both command lines as a model and an effort, and a
+        // resumed Codex session keeps them instead of the account default.
+        assert!(claude.windows(4).any(|w| w == ["--model", "opus", "--effort", "high"]));
+        assert!(codex.windows(4).any(|w| w == ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\""]));
+        let resumed = Launch::resume(ProviderId::Codex, "abc-123", &[], &plan).argv;
+        assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-5.6-sol"]));
     }
 
     /// A shim that answers every call, logs the brief it was given, and exits.
@@ -2070,18 +2139,26 @@ ping -n 60 127.0.0.1 >nul
     /// for stdin to end, because a live provider's stdin is only closed once it
     /// has answered - waiting for the end would deadlock both sides.
     fn claude_shim(request: &mut Request, structured: &serde_json::Value) {
+        claude_shim_answers(request, std::slice::from_ref(structured));
+    }
+
+    /// The same, answering the Nth call with the Nth value and every call after
+    /// the last value with that one.
+    fn claude_shim_answers(request: &mut Request, answers: &[serde_json::Value]) {
         request.id = ProviderId::Claude;
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
         let log = request.dir.join("briefs.log").to_string_lossy().replace('\\', "/");
+        let answers = serde_json::to_string(answers).unwrap();
         std::fs::write(
             request.dir.join("fake.js"),
             format!(
-                "const fs=require('fs');let buf='',answered=false;process.stdin.setEncoding('utf8');\
+                "const fs=require('fs');const answers={answers};let buf='',answered=false;process.stdin.setEncoding('utf8');\
                  process.stdin.on('data',d=>{{buf+=d;const ls=buf.split('\\n');buf=ls.pop();\
                  for(const l of ls){{if(!l.trim()||answered)continue;answered=true;\
+                 const n=fs.existsSync('{log}')?fs.readFileSync('{log}','utf8').split('=== CALL ===').length-1:0;\
                  fs.appendFileSync('{log}','=== CALL ===' + JSON.parse(l).message.content);\
                  console.log(JSON.stringify({{type:'result',subtype:'success',result:'stage answered',\
-                 structured_output:{structured},usage:{{input_tokens:10,output_tokens:1}},total_cost_usd:0.01}}));}}}});\
+                 structured_output:answers[Math.min(n,answers.length-1)],usage:{{input_tokens:10,output_tokens:1}},total_cost_usd:0.01}}));}}}});\
                  process.stdin.on('end',()=>process.exit(0));"
             ),
         )
@@ -2157,8 +2234,11 @@ ping -n 60 127.0.0.1 >nul
         assert!(routing["data"]["budget"]["maxTurns"].is_number());
         assert!(routing["data"]["signals"]["complexity"].is_number());
         assert!(routing["data"]["reason"].as_str().is_some_and(|r| !r.is_empty()));
-        // The tier is recorded and, deliberately, reaches no command line.
+        // The tier is recorded with why, and each stage names the model it asked for.
         assert!(routing["data"]["budget"]["preferredTier"].is_string());
+        assert!(routing["data"]["tierReason"].as_str().is_some_and(|r| !r.is_empty()));
+        let stage = payloads.iter().find(|v| v["kind"] == "stage").expect("no stage was recorded");
+        assert!(stage["data"]["model"].as_str().is_some_and(|m| !m.is_empty()));
         // Before the first provider event, not after.
         let first_provider = payloads.iter().position(|v| v["kind"] == "started" || v["kind"] == "text");
         let at = payloads.iter().position(|v| v["kind"] == "routing").unwrap();
@@ -2179,10 +2259,13 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(route.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
         let mut request = routed(&store, "stages", route);
         let dir = request.dir.clone();
+        // One answer that is both a passing Review and a passing Verify, since
+        // the shim gives every stage the same one.
         claude_shim(
             &mut request,
             &serde_json::json!({
                 "findings": [],
+                "checks": [{"command": "cargo test auth", "passed": true, "output": "ok"}],
                 "verdict": "pass"
             }),
         );
@@ -2460,7 +2543,9 @@ exit /b 0
             }
         );
 
-        assert_eq!(result.status, "done");
+        // The shim echoes its brief, which is no Verify artifact, so the route
+        // ends there - after every stage ran, which is what this test is about.
+        assert_eq!(result.status, "verifyFailed");
         // Three stages, three calls: the instruction did not buy an extra
         // process to say the same thing twice.
         assert_eq!(result.calls_used, 3);
@@ -2516,6 +2601,102 @@ exit /b 0
         // Recorded, so the findings are not only on screen.
         let logged = store.event_payloads(task).into_iter().find(|v| v["kind"] == "artifact" && v["data"]["stage"] == "review");
         assert_eq!(logged.expect("no artifact row")["data"]["valid"], true);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Verify that ends cleanly while one of its checks failed is not `done`,
+    /// whatever verdict it gave itself. It buys the one Fix call a tier up, and
+    /// when that fails too the route ends there: the cap is one call.
+    #[tokio::test]
+    async fn checks_that_did_not_pass_end_the_route_as_verify_failed() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        assert_eq!(route.stages, [Stage::Implement, Stage::Verify]);
+        assert_eq!(route.budget.escalation, Some(routing::Tier::Deep));
+        let mut request = routed(&store, "verify-failed", route);
+        let (dir, task) = (request.dir.clone(), request.task_id);
+        claude_shim(
+            &mut request,
+            &serde_json::json!({
+                "checks": [{"command": "npm test", "passed": false, "output": "1 failing"}],
+                "verdict": "pass"
+            }),
+        );
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "verifyFailed");
+        assert_eq!(result.calls_used, 3);
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify, Stage::Fix]
+        );
+        assert_eq!(result.failure, None, "failing checks are a stop, not a provider fault");
+        let stop = result.budget_stop.as_ref().expect("verify stop was not returned");
+        assert_eq!(stop.limit, "verify");
+        assert!(stop.remaining.is_empty());
+        let payloads = store.event_payloads(task);
+        assert_eq!(payloads.iter().filter(|v| v["kind"] == "escalation").count(), 1);
+        let fix = payloads.iter().find(|v| v["kind"] == "stage" && v["data"]["stage"] == "fix").expect("no fix stage recorded");
+        assert_eq!(fix["data"]["model"], "opus", "the fix did not run a tier up");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The Fix call can rescue the task: checks that failed on the route's tier
+    /// pass after a fix a tier up, and the run is done.
+    #[tokio::test]
+    async fn a_fix_a_tier_up_that_passes_finishes_the_task() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let mut request = routed(&store, "escalated-pass", route);
+        let dir = request.dir.clone();
+        let failing = serde_json::json!({"checks": [{"command": "npm test", "passed": false, "output": "header is not bold"}], "verdict": "fail"});
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim_answers(&mut request, &[failing.clone(), failing, passing]);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done");
+        assert_eq!(result.calls_used, 3);
+        assert!(result.budget_stop.is_none());
+        let calls = briefs(&dir);
+        assert!(
+            calls[2].contains("did not pass") && calls[2].contains("header is not bold"),
+            "the fix was not told what failed: {}",
+            calls[2]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A review that asks for changes buys the same one call, and the Fix takes
+    /// the place of the Verify that was left.
+    #[tokio::test]
+    async fn a_rejected_review_buys_one_fix_in_place_of_what_was_left() {
+        let store = Store::in_memory().unwrap();
+        let mut route = routing::route(
+            "add an authorization check before the delete endpoint",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        route.budget.preferred_tier = routing::Tier::Standard;
+        route.budget.escalation = Some(routing::Tier::Deep);
+        let mut request = routed(&store, "escalated-review", route);
+        let dir = request.dir.clone();
+        let rejected = serde_json::json!({
+            "findings": [{"severity": "high", "file": "a.rs", "line": 1, "issue": "unchecked", "fix": "check it"}],
+            "verdict": "changes_requested"
+        });
+        let passing = serde_json::json!({"checks": [{"command": "cargo test auth", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim_answers(&mut request, &[rejected.clone(), rejected.clone(), rejected, passing]);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done");
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Plan, Stage::Implement, Stage::Review, Stage::Fix]
+        );
+        assert_eq!(result.calls_used, 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

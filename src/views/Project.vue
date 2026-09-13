@@ -447,6 +447,7 @@ const OUTCOME: Record<TaskResult["status"], string> = {
   failed: "Couldn’t finish",
   budgetReached: "Stopped safely",
   reviewRejected: "Needs another look",
+  verifyFailed: "Checks didn’t pass",
 };
 
 const STAGE_LABELS: Record<string, string> = {
@@ -454,6 +455,7 @@ const STAGE_LABELS: Record<string, string> = {
   implement: "Making changes",
   review: "Reviewing the work",
   verify: "Checking that it works",
+  fix: "Fixing it with a stronger model",
 };
 
 function stageLabel(stage: string): string {
@@ -467,18 +469,22 @@ const calls = computed(() => {
   if (!r) return null;
   return {
     used: r.callsUsed,
-    allowed: r.route.budget.maxAgentCalls,
+    // The Fix call, once bought, is the one call the route declared on top.
+    allowed: r.route.budget.maxAgentCalls + (r.stages.some((s) => s.stage === "fix") ? 1 : 0),
     stages: r.route.stages,
     ran: r.stages.map((s) => s.stage),
   };
 });
 
-/** Every stage the route declared, and whether it ran. Stages run in order,
- *  so the ones that ran are always the front of the route. */
+/** Every stage that ran, then the route's stages that did not. Stages run in
+ *  order, so the ones that ran are the front of the route — unless a Fix call
+ *  was bought, which takes the place of whatever was left. */
 const routeSteps = computed(() => {
   const r = result.value;
   if (!r) return [];
-  return r.route.stages.map((stage, i) => ({ stage, ran: i < r.stages.length }));
+  const ran = r.stages.map((s) => ({ stage: s.stage, ran: true }));
+  if (ran.some((s) => s.stage === "fix")) return ran;
+  return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false }))];
 });
 
 /** This run against the median of comparable finished runs here. Only for a
@@ -629,8 +635,13 @@ const AUTH: Record<Auth, string> = {
           <p class="note">{{ preview.route.reason }}</p>
           <p class="note budget-line">
             Up to {{ preview.route.budget.maxTurns ?? "the provider’s limit" }} steps ·
-            {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }}
+            {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }} ·
+            {{ preview.model.model }}, {{ preview.model.effort }} effort
+            <template v-if="preview.escalation">
+              · one more call on {{ preview.escalation.model }} if a check or review doesn’t pass
+            </template>
           </p>
+          <p class="note">{{ preview.route.tierReason }}</p>
         </details>
       </div>
       <p v-else-if="previewError" class="preview-error missing" role="status">

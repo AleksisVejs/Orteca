@@ -67,6 +67,9 @@ export interface Preflight {
   provider: ProviderId;
   git: GitState;
   route: Route;
+  model: ModelChoice;
+  /** What the route's one Fix call would run on; null when it declares none. */
+  escalation: ModelChoice | null;
 }
 
 export type ProviderId = "claude" | "codex";
@@ -113,7 +116,7 @@ export type FailureKind =
 export type Mode = "efficient" | "balanced";
 
 /** A stage of a route. A trivial task's route is `["implement"]` and nothing else. */
-export type Stage = "plan" | "implement" | "review" | "verify";
+export type Stage = "plan" | "implement" | "review" | "verify" | "fix";
 
 export type RouteKind =
   | "implementOnce"
@@ -122,10 +125,15 @@ export type RouteKind =
   | "guarded"
   | "escalated";
 
-/** Cheapest capable tier for this task class. Policy data: Orteca records it
- *  and passes no model flag, because naming a tier is not knowing which model
- *  id is cheapest-capable on this account today. */
+/** Cheapest capable tier for this task class. It names a model and an effort
+ *  on the provider's command line; see architecture §4.3.4. */
 export type Tier = "cheapest" | "standard" | "deep";
+
+/** What a tier asks one provider for. */
+export interface ModelChoice {
+  model: string;
+  effort: string;
+}
 
 /** What the deterministic classifier read out of the prompt and the repo. No
  *  model was called to produce any of it. */
@@ -153,6 +161,9 @@ export interface ExecutionBudget {
    *  stops is the next stage. */
   maxReportedTokens: number | null;
   preferredTier: Tier;
+  /** The tier of the one Fix call a failed Review or Verify may buy. Null
+   *  when the route has no such stage or is already on `deep`. */
+  escalation: Tier | null;
 }
 
 export interface Route {
@@ -163,6 +174,8 @@ export interface Route {
   signals: Signals;
   /** Why this route, in the words of the rule that chose it. */
   reason: string;
+  /** Why `budget.preferredTier`, the same way. */
+  tierReason: string;
   /** Paths named in the brief. Names only — never file contents. */
   candidatePaths: string[];
   /** What each stage would have preferred to run on. Recorded, not acted on. */
@@ -181,7 +194,7 @@ export interface StageNote {
 /** Why a run stopped short of its route. Neither a win nor a fault: the work,
  *  the diff and the usage are all kept, and going further is the user's call. */
 export interface BudgetStop {
-  limit: "calls" | "turns" | "tokens" | "review";
+  limit: "calls" | "turns" | "tokens" | "review" | "verify";
   allowed: number;
   observed: number;
   /** Stages the route still had. Nothing starts them automatically. */
@@ -234,9 +247,10 @@ export interface Baseline {
 export interface TaskResult {
   taskId: number;
   /** `cancelled` is the user stopping the run, `budgetReached` a ceiling the
-   *  route declared, and `reviewRejected` an explicit review stop: none is a
-   *  win, and none is a provider fault. */
-  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected";
+   *  route declared, `reviewRejected` an explicit review stop and
+   *  `verifyFailed` checks that did not report a pass: none is a win, and none
+   *  is a provider fault. */
+  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed";
   summary: string;
   failure: string | null;
   /** null when the run ended before the provider reported any numbers. */

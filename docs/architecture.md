@@ -29,10 +29,12 @@ What exists and works:
 - Routing with no model call: a keyword classifier picks one of five routes,
   each with call, turn and token ceilings declared before a provider starts; a
   trivial task is one Implement call that verifies itself
-- Plan and Review return schema-checked artifacts and cannot edit; a Review
-  that is missing, invalid, or asks for changes ends the route with
-  `reviewRejected`; a budget stop ends `budgetReached` and never escalates on
-  its own
+- Plan, Review and Verify return schema-checked artifacts and cannot edit; a
+  Review that is missing, invalid, or asks for changes ends the route with
+  `reviewRejected`; a Verify that is missing, invalid, ran no check, or lists a
+  failing one ends it with `verifyFailed` — unless the route declared its one
+  Fix call a tier up, which runs first; a budget stop ends `budgetReached` and
+  never escalates on its own
 - A diff that tells the run's changes from files already dirty before it
 - Briefs name ranked candidate paths, never contents; the token ceiling is
   checked on cumulative usage after every turn; a finished run is compared to
@@ -45,6 +47,8 @@ What exists and works:
 - Codex is refused up front on a repository whose folder ACL the user cannot
   change, instead of "finishing" with no tools (see §16)
 - CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
+- A route's tier picks a real model and effort on both CLIs, and moves up a tier
+  when that tier has stalled in the project's own history (§4.3.4)
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -197,7 +201,7 @@ it proves nothing on its own.
 | `max_turns` | `--max-turns <turns>` — **exists**, though it is absent from `--help` | **none at all** |
 | artifact schema | `--json-schema <schema>`, inline JSON | `--output-schema <FILE>`, a path |
 | `max_reported_tokens` | none (`--max-budget-usd` is dollars, and only on API-key billing) | none |
-| `preferred_tier` | `--model <name>`, but see below | `--model <name>`, but see below |
+| `preferred_tier` | `--model <model>` + `--effort <level>` (§4.3.4) | `--model <MODEL>` + `-c model_reasoning_effort=` (§4.3.4) |
 
 So: `max_turns` is passed straight to Claude, and for Codex **Orteca counts
 completed turns itself and ends the process at the ceiling.** The number is real
@@ -206,11 +210,8 @@ either way; only who enforces it differs, and the UI is not told otherwise.
 per turn for Codex, but only per `result` for Claude, which can cover several turns
 (`num_turns`, counted in full towards the turn ceiling).
 
-`preferred_tier` reaches **no command line at all**. Both CLIs take a `--model`,
-but naming a tier is not the same as knowing which model id is cheapest-capable
-on this account today, and a guess would be billed to the user. The tier is
-recorded with the route so the decision stays auditable, and Milestone 7 can act
-on it once there is evidence about what each tier really costs here.
+`preferred_tier` names a model and an effort on both command lines since
+2026-09-13. What each tier maps to, why, and how it adapts is §4.3.4.
 
 A stage that has no business editing is **stopped** from editing rather than
 asked not to: `codex exec --sandbox read-only`, and for Claude — which has no
@@ -328,6 +329,81 @@ skill file and ran no `rtk`.
 Claude: total tokens fell 60% (typo) and 59% (slug) at the same turn count; every
 turn's context stayed 21-23k. Its transcripts mention no plugin, skill, `rtk`,
 headroom or `.codex` path.
+
+### 4.3.4 Which model a tier runs on — researched 2026-09-13
+
+Flags checked the §4.2 way, with no value: `claude --model <model>`, `claude
+--effort <level>` (`low`…`max`), `codex exec --model <MODEL>` and `codex exec
+resume --model` all answer "argument missing". Codex has no effort flag; it
+takes `-c model_reasoning_effort="…"`, the key its own `config.toml` uses. A bogus
+value there is not rejected before the prompt is read, so the levels come from
+the account's `~/.codex/models_cache.json` (`supported_reasoning_levels`), not
+from the CLI refusing a wrong one.
+
+| Tier | Claude | $/M in · out | Codex | $/M in · out |
+|---|---|---:|---|---:|
+| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-5.6-luna`, `medium` | 0.20 · 1.20 |
+| `standard` | `sonnet`, `high` | 2 · 10 | `gpt-5.6-terra`, `medium` | 2 · 12 |
+| `deep` | `opus` (Opus 5), `high` | 5 · 25 | `gpt-5.6-sol`, `high` | 5 · 30 |
+
+Considered and not chosen: Haiku 4.5 ($1 · $5, 200k, no effort control), Fable
+5.1 ($10 · $50), GPT-6 Astra ($10 · $50, out 2026-09-03, Codex's default and the
+model this account could not verify access to in §4.3.2), GPT-5.5 (retired for
+ChatGPT sign-in on 2026-08-31).
+
+How it was chosen:
+
+1. **Cost per finished task, not per token.** A retry pays for the whole
+   context again. The cheapest tier is used only where failure is cheap to see
+   (`implementOnce`: narrow brief, one focused check).
+2. **Public benchmarks only separate tiers coarsely.** SWE-bench Verified is
+   saturated (Opus 5 96%, GPT-5.6 Sol 96.2%). SWE-bench Pro spreads further
+   (Fable 5.1 81.2%, Sol 64.6%) but has no score for Astra, Terra, Luna or
+   Sonnet 5, and vendor harnesses differ. That is enough to order models inside
+   one family, and not enough to promise a success rate here.
+3. **Context doesn't separate these models.** Every candidate has at least 200k,
+   and §4.3.3 measured Orteca's turns at 21-23k (Claude) and a 12.6k first turn
+   (Codex).
+4. **Lower effort before a smaller model.** The stronger model at lower effort
+   usually matches the weaker one at higher effort, so Claude's cheapest tier is
+   Sonnet at `low`, not Haiku. The whole route runs on one tier, because caches
+   are per model.
+5. **A subscription isn't billed per token, but its allowance scales with
+   price**, so the ordering holds either way. None of these prices is turned
+   into a cost for Codex: it still reports tokens only, `unavailable`.
+6. **Claude aliases follow the account**, and the id that ran comes back in
+   `modelUsage`. Codex has no aliases, so its slugs are pinned in
+   `routing::Tier::model` and must be updated when one is retired. Each `stage`
+   event records the model and effort Orteca asked for, which is the only record
+   of it for Codex.
+
+**Adaptation: up on evidence, never down.**
+
+- The same prompt already failed once (`prior_failures >= 1`): one tier up.
+  After two failures the route itself escalates (§8).
+- A route kind and tier with at least five finished runs (`done`,
+  `budgetReached`, `reviewRejected`, `verifyFailed`) among the project's last
+  50 on this provider and mode, two in five of them stalled: one tier up, again
+  if that tier has stalled too, never past `deep`. `failed` is left out, because
+  a rate limit or sign-in failure says nothing about the model. Modes are kept
+  apart because Efficient's tighter ceilings stop runs Balanced would finish.
+  A run that needed its Fix call counts as a stall of the tier it started on,
+  however it ended.
+- Orteca never tries a cheaper tier to see what happens: that is spending on its
+  own initiative on a worse chance of success. Evidence ages out with the
+  project's last 50 runs, and only then is a skipped tier tried again.
+- The reason is in `route.tierReason`. The preview shows the model, effort and
+  reason before anything starts.
+
+**Not measured yet.** No real run has used these flags. The next measurement
+repeats the §4.3.3 exercises on the `cheapest` tier with both CLIs and compares
+them to the rows above.
+
+Sources: Claude Code model config (code.claude.com/docs/en/model-config),
+Anthropic API prices (claude-api reference, cached 2026-06-24), OpenAI prices
+(cloudzero.com/blog/openai-pricing), Codex models
+(learn.chatgpt.com/docs/models), SWE-bench Verified (benchlm.ai) and Pro
+(codingfleet.com) leaderboards as of 2026-09-10.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -507,7 +583,7 @@ projects(id, path, name, trusted, trust_scanned_at, last_opened_at, opened_seq)
 tasks(id, project_id, prompt, mode, route_json, status, branch, base_commit,
       dirty_at_start, started_at, ended_at, summary, diff_stat_json)
   -- status: 'running' | 'done' | 'cancelled' | 'failed' |
-  -- 'budgetReached' | 'reviewRejected'. A stop is its own outcome: the work
+  -- 'budgetReached' | 'reviewRejected' | 'verifyFailed'. A stop is its own outcome: the work
   -- so far is real and nothing was reverted.
 
 task_events(id, task_id, ts, stage, kind, provider, payload_json)
@@ -549,7 +625,7 @@ signals: complexity 0-10, risk 0-10,
 
 | Condition | Route |
 |---|---|
-| complexity <= 3, risk <= 3, blast <= 5 | **Implement once** — inspect named paths, edit, run one focused verification inside that call; no Plan or Review |
+| complexity <= 3, risk <= 3, blast <= 5, and blast >= 1 or a small-edit word | **Implement once** — inspect named paths, edit, run one focused verification inside that call; no Plan or Review |
 | architecture OR complexity >= 7 | Understand → **Plan** → Implement → Verify |
 | security OR authz OR schema_change | Understand → **Plan** → Implement → **Review** → Verify |
 | implement failed twice | escalate: Plan → Implement → Review |
@@ -591,10 +667,19 @@ Two rules the spec did not write down, both of which exist to stop Orteca
 spending on its own initiative:
 
 - **A Review that is missing, invalid, or returns `changes_requested` ends the
-  route there with `reviewRejected`.** No fix call is added — that would be
-  Orteca deciding to spend more — and no Verify call is spent confirming what
-  the review has already rejected. The findings are the result; what to do
-  about them is the user's to choose.
+  route there with `reviewRejected`; a Verify that does not report a pass
+  backed by at least one check, none failing, ends it with `verifyFailed`.** A
+  stage that ends cleanly while printing failures is not `done`, and no Verify
+  call is spent confirming what a review has already rejected. The findings are
+  the result; what to do about them is the user's to choose.
+- **Bounded escalation: one Fix call, declared before the run.** A route with a
+  Review or Verify stage whose tier is not `deep` carries `budget.escalation`,
+  the next tier up. The first Review or Verify that does not pass is followed by
+  one `fix` stage on that tier, in place of whatever stages were left: it is
+  handed the failing artifact, may edit, and returns the Verify artifact. A
+  passing Fix makes the task `done`; anything else is `verifyFailed`. There is
+  never a second Fix, `deep` and `implementOnce` routes have none, the call
+  ceiling grows by exactly that one call, and a budget stop never escalates.
 - **A held instruction is delivered by the next stage's brief, not by resuming
   the stage it arrived in** — unless that stage is the last one, where M5's
   behaviour is unchanged. Resuming as well would pay for a second process to say
@@ -608,8 +693,8 @@ fresh task, which errs towards the cheaper route.
 Every stage runs on **the provider the user selected**. The capability map is
 recorded per stage and not acted on: routing a stage to a CLI the user has not
 signed into fails the run for a reason the screen never mentioned, and the
-router cannot see per-stage auth state yet. That waits for Milestone 7 with the
-tier.
+router cannot see per-stage auth state yet. The tier does act: it picks the
+model on the selected provider (§4.3.4).
 
 ## 9. Mid-task instructions — exact mechanics
 
@@ -769,10 +854,10 @@ Review artifact:
 
 **As built (Milestone 6).** Both flags exist and both are used: Claude takes the
 schema inline, Codex takes a file, written into the temp directory Orteca owns
-and never into the user's repository. Only Plan and Review contract for an
-artifact; Implement and Verify are judged by the diff and by what their own
-verification command printed, and wrapping a code change in a JSON envelope buys
-nothing.
+and never into the user's repository. Plan, Review and Verify contract for an
+artifact. Verify's is `{checks: [{command, passed, output}], verdict: pass |
+fail}`, and a pass needs at least one check with none failing. Implement is
+judged by the diff, and wrapping a code change in a JSON envelope buys nothing.
 
 What an artifact is worth is decided *after* the stage, by a shallow check of
 required keys against the shape that stage contracted for. It is not a second
@@ -813,13 +898,14 @@ rides along with metrics. Each slice ends commit-ready with tests.
    merely because most input was cached. The run must have a declared budget,
    a small-task single-call path, and an honest budget-reached outcome before
    Orteca can make that claim.
-4. **`budgetReached` is a fifth task status, and `reviewRejected` is a sixth
-   explicit stop outcome.** Neither is a failure when the provider completed
+4. **`budgetReached` is a fifth task status, and `reviewRejected` and
+   `verifyFailed` are explicit stop outcomes beside it.** Neither is a failure when the provider completed
    normally; neither is a success because the route did not finish. The work,
    diff, findings, and reported usage are kept exactly as they are, and the
    remaining stages are named so the user knows what they are being asked to
    decide about. Continuing is a fresh Run — a deliberate act — and Orteca never
-   takes it on their behalf.
+   takes it on their behalf. The single exception is the one Fix call a route
+   declares in its budget before it starts.
 5. **The one exemption from the call ceiling is an instruction the user gave.**
    A resume that carries a mid-task instruction is allowed past `max_agent_calls`
    and is still counted and logged. The rule the budget enforces is that Orteca

@@ -9,7 +9,9 @@
 //! The route is fixed *before* a provider starts, and it carries its own
 //! ceilings. A trivial task gets exactly one agent call and verifies itself
 //! inside it. A task that crosses a ceiling stops and says so; it never quietly
-//! promotes itself to a longer route.
+//! promotes itself to a longer route. The one exception is declared with the
+//! route: a Review or Verify that does not pass may buy a single Fix call on
+//! the next tier up (`budget.escalation`), and never a second.
 
 use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
@@ -70,18 +72,57 @@ impl Capability {
     }
 }
 
-/// A cheapest-capable tier for a task class. **Policy data only**, never argv.
+/// A cheapest-capable tier for a task class, and the model each CLI runs it on.
 ///
-/// Both CLIs do take a `--model`, but naming a tier is not the same as knowing
-/// which model id is cheapest-capable on this account today, and inventing one
-/// would bill the user for a guess. The tier is recorded with the route so the
-/// decision stays auditable, and it reaches no command line.
+/// The catalogue is research, not measurement: list prices, public coding
+/// benchmarks and the Codex account's own model list as of 2026-09-13, written
+/// up in architecture §4.3.4. Claude takes aliases, which follow the newest
+/// model the account can use, and the id that actually ran is read back from
+/// `modelUsage`. Codex has no aliases, so its slugs are pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Tier {
     Cheapest,
     Standard,
     Deep,
+}
+
+/// What a tier asks one CLI for: a model and a reasoning effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ModelChoice {
+    pub model: &'static str,
+    pub effort: &'static str,
+}
+
+impl Tier {
+    fn up(self) -> Option<Tier> {
+        match self {
+            Self::Cheapest => Some(Self::Standard),
+            Self::Standard => Some(Self::Deep),
+            Self::Deep => None,
+        }
+    }
+
+    // ponytail: pinned Codex slugs go stale when OpenAI retires a model; read
+    // `~/.codex/models_cache.json` if that starts happening between releases.
+    pub fn model(self, id: ProviderId) -> ModelChoice {
+        let (model, effort) = match (id, self) {
+            // Sonnet 5 at low effort, not Haiku 4.5: Haiku is half the price but
+            // a generation older with no effort control, and one retry costs
+            // more than the difference.
+            (ProviderId::Claude, Self::Cheapest) => ("sonnet", "low"),
+            (ProviderId::Claude, Self::Standard) => ("sonnet", "high"),
+            // Opus 5, not Fable 5.1: twice the price for a lead that only shows
+            // on the hardest benchmarks.
+            (ProviderId::Claude, Self::Deep) => ("opus", "high"),
+            (ProviderId::Codex, Self::Cheapest) => ("gpt-5.6-luna", "medium"),
+            (ProviderId::Codex, Self::Standard) => ("gpt-5.6-terra", "medium"),
+            // Sol, not Astra: half the price, and Astra has no SWE-bench Pro
+            // score yet.
+            (ProviderId::Codex, Self::Deep) => ("gpt-5.6-sol", "high"),
+        };
+        ModelChoice { model, effort }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +132,9 @@ pub enum Stage {
     Implement,
     Review,
     Verify,
+    /// The one call a Review or Verify that did not pass may buy, a tier up:
+    /// it fixes what was found and checks the fix in the same call.
+    Fix,
 }
 
 impl Stage {
@@ -101,34 +145,36 @@ impl Stage {
             Self::Implement => "implement",
             Self::Review => "review",
             Self::Verify => "verify",
+            Self::Fix => "fix",
         }
     }
 
     pub fn capability(self) -> Capability {
         match self {
             Self::Plan => Capability::Deep,
-            Self::Implement | Self::Verify => Capability::Implement,
+            Self::Implement | Self::Verify | Self::Fix => Capability::Implement,
             Self::Review => Capability::Review,
         }
     }
 
     /// The artifact shape this stage is contracted to return, if any.
     ///
-    /// Only Plan and Review have one. Implement and Verify are judged by the
-    /// diff and by what their own verification command printed, and asking a
-    /// CLI to wrap a code change in a JSON envelope buys nothing.
+    /// Implement has none: it is judged by the diff, and asking a CLI to wrap a
+    /// code change in a JSON envelope buys nothing. Verify and Fix do, because
+    /// a stage that ends cleanly while reporting failing checks is not a pass.
     pub fn schema(self) -> Option<&'static str> {
         match self {
             Self::Plan => Some(PLAN_SCHEMA),
             Self::Review => Some(REVIEW_SCHEMA),
-            Self::Implement | Self::Verify => None,
+            Self::Verify | Self::Fix => Some(VERIFY_SCHEMA),
+            Self::Implement => None,
         }
     }
 
     /// Whether this stage is allowed to change files. A plan that edits code
     /// has skipped the review the route put after it.
     pub fn writes(self) -> bool {
-        matches!(self, Self::Implement)
+        matches!(self, Self::Implement | Self::Fix)
     }
 }
 
@@ -140,6 +186,9 @@ pub const PLAN_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"
 /// The Review artifact. `verdict: "pass"` is what lets the route end without a
 /// fix call - which is where "calls avoided" is actually earned.
 pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["findings","verdict"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","line","issue","fix"],"properties":{"severity":{"type":"string","enum":["low","medium","high"]},"file":{"type":"string"},"line":{"type":"integer"},"issue":{"type":"string"},"fix":{"type":"string"}}}},"verdict":{"type":"string","enum":["pass","changes_requested"]}}}"#;
+
+/// The Verify artifact: each check that ran and whether it passed.
+pub const VERIFY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["checks","verdict"],"properties":{"checks":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["command","passed","output"],"properties":{"command":{"type":"string"},"passed":{"type":"boolean"},"output":{"type":"string"}}}},"verdict":{"type":"string","enum":["pass","fail"]}}}"#;
 
 /// Check a structured artifact against the shape its stage contracted for.
 ///
@@ -166,14 +215,27 @@ pub fn artifact_is_valid(stage: Stage, value: &serde_json::Value) -> bool {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|v| v == "pass" || v == "changes_requested")
         }
-        Stage::Implement | Stage::Verify => false,
+        Stage::Verify | Stage::Fix => {
+            object.get("checks").is_some_and(serde_json::Value::is_array)
+                && object
+                    .get("verdict")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| v == "pass" || v == "fail")
+        }
+        Stage::Implement => false,
     }
 }
 
-/// `true` when a Review artifact says the work is finished. Anything that is
-/// not a valid artifact saying `pass` is not a pass.
-pub fn review_passed(value: &serde_json::Value) -> bool {
-    artifact_is_valid(Stage::Review, value) && value["verdict"] == "pass"
+/// `true` when a Review or Verify artifact says the work is finished. Anything
+/// that is not a valid artifact saying `pass` is not a pass, and neither is a
+/// Verify or Fix pass with no check behind it or with a check that failed.
+pub fn stage_passed(stage: Stage, value: &serde_json::Value) -> bool {
+    artifact_is_valid(stage, value)
+        && value["verdict"] == "pass"
+        && (stage == Stage::Review
+            || value["checks"].as_array().is_some_and(|checks| {
+                !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
+            }))
 }
 
 /// What the classifier read out of the prompt and the repository. Serialised
@@ -217,8 +279,14 @@ pub struct ExecutionBudget {
     /// interrupt a turn that is already running, so this is checked once a turn
     /// has completed, and what it stops is the *next* stage.
     pub max_reported_tokens: Option<u64>,
-    /// Cheapest capable tier for this task class. Policy data; see `Tier`.
+    /// Cheapest capable tier for this task class, after adaptation. Every
+    /// stage of the route runs on it: caches are per model, so switching
+    /// between stages would pay for the same context twice.
     pub preferred_tier: Tier,
+    /// The tier of the one Fix call a Review or Verify that does not pass may
+    /// buy. `None` when the route has no such stage or is already on `Deep`.
+    /// The cap is structural: one call, never a second.
+    pub escalation: Option<Tier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +313,8 @@ pub struct Route {
     pub signals: Signals,
     /// Why this route, in the words of the rule that chose it.
     pub reason: &'static str,
+    /// Why `budget.preferred_tier`, in the same way.
+    pub tier_reason: &'static str,
     /// Tracked paths the prompt appears to be about. Names only - never
     /// contents, which the agent can read for itself more cheaply than Orteca
     /// can pay to paste them in.
@@ -269,6 +339,10 @@ const COMPLEXITY: &[(&str, u8)] = &[
     ("design", 2), ("implement", 2), ("introduce", 2), ("integrate", 2),
     ("concurren", 2), ("async", 2), ("performance", 2), ("multiple", 2),
     ("add support", 2), ("new module", 2), ("protocol", 2), ("state machine", 3),
+    // A cause nobody has found yet. The fix may be one line; finding it is not.
+    ("intermittent", 3), ("flaky", 3), ("deadlock", 3), ("race condition", 3),
+    (" hang", 3), ("memory leak", 3), ("nondetermin", 3), ("sometimes", 2),
+    ("randomly", 2),
 ];
 
 /// Words that say a prompt is small. Subtracted, never below zero.
@@ -333,6 +407,9 @@ pub struct RepoSignals {
     /// on its own.
     pub recent_paths: Vec<String>,
     pub prior_failures: u32,
+    /// Route kinds and tiers that stalled in this project's recent runs on the
+    /// selected provider. See `Store::stalled_tiers`.
+    pub stalled_tiers: Vec<(RouteKind, Tier)>,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -520,6 +597,9 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     } else if signals.complexity <= 3u8.saturating_add(shift)
         && signals.risk <= 3u8.saturating_add(shift)
         && signals.blast_radius <= 5usize.saturating_add(shift as usize)
+        // Narrow has to be shown, not assumed: a prompt that names no tracked
+        // file and no small-edit word is of unknown scope, not a small one.
+        && (signals.blast_radius > 0 || score(&prompt.to_ascii_lowercase(), TRIVIAL) > 0)
     {
         (
             RouteKind::ImplementOnce,
@@ -534,7 +614,30 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         )
     };
 
-    let budget = budget_for(kind, mode);
+    let mut budget = budget_for(kind, mode);
+    let mut tier_reason = "the tier this route is trusted with";
+    if signals.prior_failures >= 1 {
+        if let Some(up) = budget.preferred_tier.up() {
+            budget.preferred_tier = up;
+            tier_reason = "this prompt did not finish before, so it runs one tier up";
+        }
+    }
+    // Evidence only, never exploration: a tier that stalled here is stepped
+    // over, and a cheaper one is never tried on Orteca's own initiative. The
+    // evidence ages out with the project's last 50 runs, which is what lets a
+    // stepped-over tier be tried again.
+    while repo.stalled_tiers.contains(&(kind, budget.preferred_tier)) {
+        let Some(up) = budget.preferred_tier.up() else { break };
+        budget.preferred_tier = up;
+        tier_reason = "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
+    }
+    // Only a stage with a pass/fail contract can show that the tier was not
+    // enough, so only a route with one declares the Fix call.
+    budget.escalation = stages
+        .iter()
+        .any(|s| matches!(s, Stage::Review | Stage::Verify))
+        .then(|| budget.preferred_tier.up())
+        .flatten();
     let preferred_providers = stages
         .iter()
         .map(|s| s.capability().preferred_provider())
@@ -547,6 +650,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         budget,
         signals,
         reason,
+        tier_reason,
         // A brief names a handful of paths, not a directory listing.
         candidate_paths: candidate_paths.into_iter().take(10).collect(),
         preferred_providers,
@@ -579,6 +683,7 @@ fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
             | (RouteKind::Escalated, true) => Tier::Standard,
             _ => Tier::Deep,
         },
+        escalation: None,
     }
 }
 
@@ -618,7 +723,16 @@ pub fn brief(
         ),
         Stage::Verify => out.push_str(
             "Verify the change that is already in the working tree. Run the focused checks \
-             that prove it, report what they printed, and change nothing else.\n\n",
+             that prove it and change nothing else. Return only the structured result: every \
+             check you ran, whether it passed, and what it printed. `pass` means at least one \
+             check ran and every check passed.\n\n",
+        ),
+        Stage::Fix => out.push_str(
+            "An earlier stage of this task did not pass; what it found is below. Fix that and \
+             nothing beyond it, then run the focused checks that prove the fix. Return only \
+             the structured result: every check you ran, whether it passed, and what it \
+             printed. `pass` means at least one check ran and every check passed. This is the \
+             last call this task gets.\n\n",
         ),
         Stage::Implement => {}
     }
@@ -677,10 +791,10 @@ pub fn brief(
     }
 
     out.push_str("\nBudget: ");
-    out.push_str(&describe_budget(route));
+    out.push_str(&describe_budget(route, stage));
     out.push('\n');
 
-    if stage.writes() {
+    if stage == Stage::Implement {
         if route.is_single_call() {
             out.push_str(
                 "This is the only agent call for this task. Make the change. If it changes \
@@ -699,8 +813,9 @@ pub fn brief(
     out
 }
 
-fn describe_budget(route: &Route) -> String {
-    let calls = route.budget.max_agent_calls;
+fn describe_budget(route: &Route, stage: Stage) -> String {
+    // A Fix runs on the one call the route declared on top of its own.
+    let calls = route.budget.max_agent_calls + u32::from(stage == Stage::Fix);
     let mut text = format!(
         "{calls} agent call{} for the whole task",
         if calls == 1 { "" } else { "s" }
@@ -738,7 +853,7 @@ mod tests {
                 .map(String::from)
                 .to_vec(),
             recent_paths: vec!["docs/slug-notes.md".into()],
-            prior_failures: 0,
+            ..Default::default()
         };
         let r = route("tidy the slug code", Mode::Balanced, &signals);
         assert_eq!(r.candidate_paths, ["docs/slug-notes.md", "src/deep/slug.rs", "slugs.txt", "slugify.rs"]);
@@ -869,6 +984,36 @@ mod tests {
         assert!(r.stages.contains(&Stage::Review));
     }
 
+    /// The tier moves up on evidence - this prompt failing, or this tier
+    /// stalling on this route here - and never down, and never past Deep.
+    #[test]
+    fn a_tier_only_steps_up_on_evidence_and_deep_is_the_ceiling() {
+        assert_eq!(balanced("fix the typo", REPO).budget.preferred_tier, Tier::Cheapest);
+        // One Fix call a tier up, only where a check can fail and a tier is left.
+        assert_eq!(balanced("fix the typo", REPO).budget.escalation, None, "one call has no check to fail");
+        let standard = balanced("make the header bold", REPO);
+        assert_eq!((standard.budget.preferred_tier, standard.budget.escalation), (Tier::Standard, Some(Tier::Deep)));
+        assert_eq!(balanced("redesign the storage subsystem", REPO).budget.escalation, None, "nothing above deep");
+        let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[]);
+        assert!(fix.contains("did not pass") && !fix.contains("A later stage checks"));
+        assert!(fix.contains("3 agent calls for the whole task"), "the Fix brief did not count its own call: {fix}");
+
+        let mut signals = repo(REPO);
+        signals.prior_failures = 1;
+        assert_eq!(route("fix the typo", Mode::Balanced, &signals).budget.preferred_tier, Tier::Standard);
+
+        let mut signals = repo(REPO);
+        signals.stalled_tiers = vec![(RouteKind::ImplementOnce, Tier::Cheapest), (RouteKind::ImplementOnce, Tier::Standard)];
+        let r = route("fix the typo", Mode::Balanced, &signals);
+        assert_eq!(r.budget.preferred_tier, Tier::Deep);
+        assert!(r.tier_reason.contains("stalled"));
+        // Evidence about another route kind says nothing about this one.
+        signals.stalled_tiers = vec![(RouteKind::Standard, Tier::Cheapest)];
+        assert_eq!(route("fix the typo", Mode::Balanced, &signals).budget.preferred_tier, Tier::Cheapest);
+        signals.stalled_tiers = vec![(RouteKind::Planned, Tier::Deep)];
+        assert_eq!(route("redesign the storage subsystem", Mode::Balanced, &signals).budget.preferred_tier, Tier::Deep);
+    }
+
     #[test]
     fn a_wide_prompt_leaves_the_one_call_route_even_when_it_scores_low() {
         let narrow = repo(&["src/widget/one_widget.rs", "docs/architecture.md"]);
@@ -945,25 +1090,55 @@ mod tests {
         // A Plan artifact is not a Review artifact, however well-formed.
         assert!(!artifact_is_valid(Stage::Review, &good));
 
-        assert!(review_passed(&serde_json::json!({"findings": [], "verdict": "pass"})));
-        assert!(!review_passed(&serde_json::json!({"findings": [], "verdict": "changes_requested"})));
+        let review = |v: serde_json::Value| stage_passed(Stage::Review, &v);
+        assert!(review(serde_json::json!({"findings": [], "verdict": "pass"})));
+        assert!(!review(serde_json::json!({"findings": [], "verdict": "changes_requested"})));
         // Not an artifact at all, so not a pass: a missing review is not a
         // clean one.
-        assert!(!review_passed(&serde_json::json!({"verdict": "pass"})));
+        assert!(!review(serde_json::json!({"verdict": "pass"})));
+    }
+
+    /// A Verify pass is only a pass with evidence behind it: at least one check,
+    /// and none of them failed, whatever the verdict says.
+    #[test]
+    fn a_verify_pass_needs_a_check_and_no_failing_one() {
+        let verify = |v: serde_json::Value| stage_passed(Stage::Verify, &v);
+        let ok = serde_json::json!({"command": "cargo test slug", "passed": true, "output": "1 passed"});
+        let bad = serde_json::json!({"command": "cargo test", "passed": false, "output": "1 failed"});
+        assert!(verify(serde_json::json!({"checks": [ok], "verdict": "pass"})));
+        assert!(!verify(serde_json::json!({"checks": [], "verdict": "pass"})), "a pass with nothing run");
+        assert!(!verify(serde_json::json!({"checks": [ok, bad], "verdict": "pass"})), "a pass over a failing check");
+        assert!(!verify(serde_json::json!({"checks": [ok], "verdict": "fail"})));
+        assert!(!verify(serde_json::json!({"verdict": "pass"})));
+    }
+
+    /// Scope that was never shown to be small does not get the one-call route,
+    /// and a cause nobody has found yet is not trivial because the words are few.
+    #[test]
+    fn unknown_scope_and_unfound_causes_leave_the_one_call_route() {
+        assert_eq!(balanced("make the header bold", REPO).kind, RouteKind::Standard);
+        assert_eq!(balanced("fix the typo", REPO).kind, RouteKind::ImplementOnce);
+        assert_eq!(balanced("tidy run.rs", REPO).kind, RouteKind::ImplementOnce);
+        assert_ne!(balanced("fix the intermittent hang in run.rs", REPO).kind, RouteKind::ImplementOnce);
+        assert_ne!(balanced("the watcher is flaky", REPO).kind, RouteKind::ImplementOnce);
+        // " hang" is not a substring of "change".
+        assert_eq!(balanced("change the typo in run.rs", REPO).kind, RouteKind::ImplementOnce);
     }
 
     #[test]
-    fn only_plan_and_review_contract_for_an_artifact_and_only_implement_writes() {
+    fn only_implement_goes_without_an_artifact_and_only_implement_writes() {
         assert!(Stage::Plan.schema().is_some());
         assert!(Stage::Review.schema().is_some());
+        assert!(Stage::Verify.schema().is_some());
+        assert_eq!(Stage::Fix.schema(), Some(VERIFY_SCHEMA));
         assert!(Stage::Implement.schema().is_none());
-        assert!(Stage::Verify.schema().is_none());
         assert!(Stage::Implement.writes());
+        assert!(Stage::Fix.writes());
         for stage in [Stage::Plan, Stage::Review, Stage::Verify] {
             assert!(!stage.writes(), "{} must not be allowed to edit", stage.name());
         }
-        // Both schemas have to be JSON a CLI will accept.
-        for schema in [PLAN_SCHEMA, REVIEW_SCHEMA] {
+        // Every schema has to be JSON a CLI will accept.
+        for schema in [PLAN_SCHEMA, REVIEW_SCHEMA, VERIFY_SCHEMA] {
             serde_json::from_str::<serde_json::Value>(schema).expect("schema must be valid JSON");
         }
     }

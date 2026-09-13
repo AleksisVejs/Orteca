@@ -36,6 +36,10 @@ struct Preflight {
     provider: ProviderId,
     git: GitState,
     route: Route,
+    /// What the route's tier asks this provider for.
+    model: routing::ModelChoice,
+    /// What the one Fix call would run on, if the route declares one.
+    escalation: Option<routing::ModelChoice>,
 }
 
 struct PlannedRun {
@@ -219,6 +223,7 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
             tracked_paths: project::tracked_paths(&dir),
             recent_paths: project::recent_paths(&dir),
             prior_failures: store.prior_failures(project.id, &prompt)?,
+            stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
         },
     );
     Ok(PlannedRun { dir, project, program, git, prompt, route })
@@ -228,7 +233,9 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
 #[tauri::command]
 fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, store: State<Store>) -> Result<Preflight> {
     let planned = plan_run(&store, path, prompt, provider, mode)?;
-    Ok(Preflight { provider, git: planned.git, route: planned.route })
+    let model = planned.route.budget.preferred_tier.model(provider);
+    let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
+    Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation })
 }
 
 /// Everything that has to be true, and decided, before a provider starts: the

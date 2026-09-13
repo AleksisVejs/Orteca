@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::error::{AppError, ErrorKind, Result};
 use crate::project::FileStat;
 use crate::providers::{CostQuality, Usage};
+use crate::routing::{RouteKind, Tier};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -152,15 +153,16 @@ impl Store {
     /// did not need. A re-worded retry counts as a fresh task, which errs
     /// towards the cheaper route.
     ///
-    /// `budgetReached` and `reviewRejected` count. A run that ran out of budget
-    /// or was rejected by review did not finish its work, and pretending
-    /// otherwise would leave a task looping on a route that could not finish.
+    /// `budgetReached`, `reviewRejected` and `verifyFailed` count. A run that ran
+    /// out of budget, was rejected by review or failed its checks did not finish
+    /// its work, and pretending otherwise would leave a task looping on a route
+    /// that could not finish.
     pub fn prior_failures(&self, project_id: i64, prompt: &str) -> Result<u32> {
         let conn = self.0.lock().expect("store poisoned");
         Ok(conn.query_row(
             "SELECT COUNT(*) FROM tasks
               WHERE project_id = ?1 AND prompt = ?2
-                AND status IN ('failed', 'budgetReached', 'reviewRejected')",
+                AND status IN ('failed', 'budgetReached', 'reviewRejected', 'verifyFailed')",
             params![project_id, prompt],
             |r| r.get(0),
         )?)
@@ -296,6 +298,44 @@ impl Store {
             median_tokens: median(&mut tokens) as u64,
             median_calls: median(&mut calls) as u32,
         }))
+    }
+
+    /// Route kinds and tiers that stalled in this project on this provider and
+    /// mode: at least five finished runs among the project's last 50, two in
+    /// five of them `budgetReached`, `reviewRejected` or `verifyFailed`.
+    /// `failed` is left out, because a rate limit or an expired sign-in says
+    /// nothing about the model. Mode is kept apart because Efficient's tighter
+    /// ceilings stop runs that Balanced would have let finish. A run that needed
+    /// its Fix call a tier up is a stall of the tier it started on, however it
+    /// ended.
+    // ponytail: a Codex implement that changed nothing is `failed` and so not
+    // counted; split failure kinds into their own column if that hides stalls.
+    pub fn stalled_tiers(&self, project_id: i64, provider: &str, mode: &str) -> Result<Vec<(RouteKind, Tier)>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(t.route_json, '$.kind'), json_extract(t.route_json, '$.budget.preferredTier')
+               FROM tasks t JOIN usage u ON u.task_id = t.id
+              WHERE t.id IN (SELECT id FROM tasks WHERE project_id = ?1 ORDER BY id DESC LIMIT 50)
+                AND u.provider = ?2
+                AND t.mode = ?3
+                AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed')
+              GROUP BY 1, 2
+             HAVING COUNT(*) >= 5
+                AND 5 * SUM(t.status != 'done'
+                            OR EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = 'escalation'))
+                    >= 2 * COUNT(*)",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id, provider, mode], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // A row from before tiers were recorded names none, and is skipped.
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, tier)| {
+                let parse = |s: Option<String>| s.map(serde_json::Value::String);
+                Some((serde_json::from_value(parse(kind)?).ok()?, serde_json::from_value(parse(tier)?).ok()?))
+            })
+            .collect())
     }
 
     pub fn set_trusted(&self, path: &str, trusted: bool) -> Result<()> {
@@ -811,6 +851,46 @@ mod tests {
             store.baseline(current, "implementOnce", "codex").unwrap(),
             Some(Baseline { runs: 5, median_tokens: 300, median_calls: 1 })
         );
+    }
+
+    /// Two stalls in five finished runs of one route kind, tier and provider.
+    /// Failures and other providers do not count, and old evidence ages out.
+    #[test]
+    fn a_tier_stalls_on_two_in_five_recent_finished_runs() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let run = |kind: &str, tier: &str, provider: &str, status: &str| {
+            let route = format!(r#"{{"kind":"{kind}","budget":{{"preferredTier":"{tier}"}}}}"#);
+            let task = store.create_task(NewTask { route_json: Some(&route), ..new_task(project.id, "p", "balanced") }).unwrap();
+            store.record_usage(task, None, provider, None).unwrap();
+            store.finish_task(task, status, "", "[]", 1).unwrap();
+            task
+        };
+        let stalled = || store.stalled_tiers(project.id, "codex", "balanced").unwrap();
+        for status in ["done", "done", "done", "budgetReached", "failed", "failed"] {
+            run("implementOnce", "cheapest", "codex", status);
+        }
+        run("implementOnce", "cheapest", "claude", "reviewRejected");
+        run("implementOnce", "standard", "codex", "budgetReached");
+        assert_eq!(stalled(), Vec::new(), "one stall in four finished runs is not a pattern");
+
+        run("implementOnce", "cheapest", "codex", "reviewRejected");
+        assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest)]);
+
+        // A run that needed its Fix call is a stall of the tier it started on,
+        // even when the Fix made it done.
+        for escalated in [false, false, false, true, true] {
+            let task = run("planned", "standard", "codex", "done");
+            if escalated {
+                store.append_event(task, "fix", "escalation", "codex", "{}").unwrap();
+            }
+        }
+        assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest), (RouteKind::Planned, Tier::Standard)]);
+
+        for _ in 0..50 {
+            run("standard", "standard", "codex", "done");
+        }
+        assert_eq!(stalled(), Vec::new(), "evidence older than the last 50 runs ages out");
     }
 
     #[test]

@@ -461,6 +461,42 @@ What Orteca does with it, in `Project.vue`:
 - A run that failed on `usageLimit`, `rateLimit` or `authExpired` is not a prior
   failure of its prompt, so continuing it does not send it a tier up (§8).
 
+### 4.3.6 Orteca against the plain CLIs — 2026-09-13
+
+Five tasks in a fresh no-dependency Node repo, one run each, four arms: Orteca
+(`balanced`, through `prepare_run` + `run::stream`) and the plain CLI on the
+user's own setup (`claude -p --permission-mode acceptEdits`, `codex exec
+--sandbox workspace-write`, Codex on the user's `gpt-6-astra` at `low`). Graded
+by acceptance checks the agents never saw. All 20 runs passed every check.
+
+| Task | Orteca route | Orteca+Claude | Claude | Orteca+Codex | Codex |
+|---|---|---:|---:|---:|---:|
+| typo | implementOnce | 113k · $0.12 | 164k · $0.25 | 45k | 96k |
+| bug + regression test | implementOnce | 237k · $0.10 | 618k · $0.22 | 71k | 149k |
+| feature + tests | implementOnce | 240k · $0.11 | 511k · $0.20 | 77k | 123k |
+| refactor across 3 files | standard | 283k · $0.35 | 353k · $0.20 | 264k | 152k |
+| path-traversal fix | guarded (deep) | 249k · $1.06 | 339k · $0.17 | 256k | 177k |
+| **uncached in + out, all five** | | 195k | 147k | 175k | 100k |
+
+Totals are reported tokens, cache reads included; costs are Claude's estimates.
+**One-call routes beat the plain CLI at the same quality. Multi-stage routes do
+not:** each stage re-reads the repo, and `guarded` runs on Opus, so the same
+passing fix cost 6x. One run per cell on a toy repo: a direction, not a rate.
+
+Found by the benchmark and fixed:
+
+- Claude's `bug` and `feature` runs ended `error_max_turns` at the 10-turn
+  `implementOnce` ceiling with correct code, reading `budgetReached`. The plain
+  CLI needed 10-12 `num_turns` for the same tasks. Per-route turn ceilings
+  (10 / 10 / 8 / 8) also gave each stage of a big route fewer turns than a
+  small route's one call. Every stage now gets 50 in both modes: a runaway
+  guard, since Claude reports tokens only when a call ends and nothing else
+  stops a looping call mid-run. The token ceilings do the budgeting.
+- That stop reported `turnsUsed: 0` and `observed: 0`: `error_max_turns` is a
+  failed result, and only `Done` counted turns. It now counts the ceiling the
+  CLI stopped at. Claude's `num_turns` is not the `--max-turns` unit (11 at a
+  ceiling of 10; a successful stage under 10 reported 13).
+
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
 - Claude stage running → instruction is injected live via stdin.

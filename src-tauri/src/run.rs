@@ -1247,6 +1247,14 @@ async fn attempt(
                     // must remain a budget outcome, and the process must be
                     // stopped before it can enter another stage.
                     if provider_budget_reached {
+                        // `error_max_turns` is a failed result, so no `Done`
+                        // counted its turns. The CLI stopped at the ceiling it
+                        // was given, which makes the ceiling the exact count;
+                        // its `num_turns` uses a different unit (11 at 10).
+                        if let Some(max) = ctx.plan.max_turns {
+                            state.turns_used = state.turns_used.saturating_add(max.saturating_sub(state.turns_this_call));
+                            state.turns_this_call = state.turns_this_call.max(max);
+                        }
                         state.outcome.failure = None;
                         state.outcome.reported_kind = None;
                         if state.budget_stop.is_none() {
@@ -2584,7 +2592,10 @@ exit /b 0
 
         assert_eq!(result.status, "budgetReached");
         assert_eq!(result.failure, None);
-        assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("turns"));
+        let stop = result.budget_stop.expect("no budget stop was reported");
+        assert_eq!(stop.limit, "turns");
+        assert_eq!(stop.observed, stop.allowed, "the stop said fewer turns than the ceiling Claude hit");
+        assert_eq!(u64::from(result.turns_used), stop.allowed);
         assert!(result.usage.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }

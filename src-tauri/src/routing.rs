@@ -701,16 +701,21 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
 /// lost the plot, not to trim one that is working. Milestone 7's baselines are
 /// what replace guesses with measurements.
 fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
-    let (calls, turns, tokens) = match kind {
-        RouteKind::ImplementOnce => (1, 10, 150_000),
-        RouteKind::Standard => (2, 10, 300_000),
-        RouteKind::Planned | RouteKind::Escalated => (3, 8, 600_000),
-        RouteKind::Guarded => (4, 8, 800_000),
+    // A runaway guard, not a budget: Claude reports tokens only when a call
+    // ends, so this is the one thing that stops a looping call mid-run. Tokens
+    // do the budgeting. Per-route turn counts cut correct runs short at 10, and
+    // gave a big route's stages fewer turns than a small route's one call (§4.3.6).
+    const RUNAWAY_TURNS: u32 = 50;
+    let (calls, tokens) = match kind {
+        RouteKind::ImplementOnce => (1, 150_000),
+        RouteKind::Standard => (2, 300_000),
+        RouteKind::Planned | RouteKind::Escalated => (3, 600_000),
+        RouteKind::Guarded => (4, 800_000),
     };
     let efficient = mode == Mode::Efficient;
     ExecutionBudget {
         max_agent_calls: calls,
-        max_turns: Some(if efficient { turns - 2 } else { turns }),
+        max_turns: Some(RUNAWAY_TURNS),
         max_reported_tokens: Some(if efficient { tokens / 4 * 3 } else { tokens }),
         preferred_tier: match (kind, efficient) {
             (RouteKind::ImplementOnce, _) | (RouteKind::Standard, true) => Tier::Cheapest,

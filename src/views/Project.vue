@@ -12,6 +12,7 @@ import {
   previewTask,
   providerLimits,
   recentTasks,
+  removeWorktree,
   sendInstruction,
   signInProvider,
   startTask,
@@ -19,6 +20,7 @@ import {
 import type {
   Auth,
   Detected,
+  Isolation,
   LimitWindow,
   Limits,
   Mode,
@@ -48,6 +50,14 @@ const mode = ref<Mode>("balanced");
 const MODES: Array<{ id: Mode; label: string; hint: string }> = [
   { id: "balanced", label: "Careful", hint: "Let Orteca plan, build, and check the work" },
   { id: "efficient", label: "Quick", hint: "Take the shortest safe path" },
+];
+
+// Where the agent works. A copy is a git worktree beside the repository on a
+// branch of its own; this folder is not touched until the user merges it.
+const isolation = ref<Isolation>("currentTree");
+const ISOLATIONS: Array<{ id: Isolation; label: string; hint: string }> = [
+  { id: "currentTree", label: "This folder", hint: "Change the files you have open" },
+  { id: "worktree", label: "Separate copy", hint: "Work in a copy on a new branch and leave this folder alone" },
 ];
 
 const installed = computed(() => providers.value.filter((p) => p.path));
@@ -227,7 +237,8 @@ const alternative = computed(() => {
  *  Offered, never taken: continuing is a fresh run the user starts. */
 const fallback = computed(() => {
   const r = result.value;
-  if (r?.status !== "failed" || r.failureKind !== "usageLimit") return null;
+  // A copy's work is on its branch; a fresh run would start from the commit without it.
+  if (r?.status !== "failed" || r.failureKind !== "usageLimit" || r.worktree) return null;
   const other = otherThan(provider.value);
   return other && (other.room === null || other.room > 0) ? other : null;
 });
@@ -352,6 +363,27 @@ async function openHistory(run: TaskSummary) {
   }
 }
 
+// Removing a copy deletes a folder, so it takes a second click. The branch stays.
+const confirmRemove = ref<number | null>(null);
+const removedCopies = ref<number[]>([]);
+const removeError = ref<string | null>(null);
+
+async function removeCopy(id: number) {
+  if (confirmRemove.value !== id) {
+    confirmRemove.value = id;
+    removeError.value = null;
+    return;
+  }
+  try {
+    await removeWorktree(props.opened.project.path, id);
+    removedCopies.value = [...removedCopies.value, id];
+  } catch (e) {
+    removeError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    confirmRemove.value = null;
+  }
+}
+
 const preview = ref<Preflight | null>(null);
 const previewing = ref(false);
 const previewError = ref<string | null>(null);
@@ -376,7 +408,7 @@ async function refreshPreview() {
   previewing.value = true;
   previewError.value = null;
   try {
-    const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id));
+    const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value);
     if (request === previewRequest) preview.value = planned;
   } catch (e) {
     if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
@@ -437,6 +469,7 @@ async function run() {
       mode.value,
       // The same reading the preview was routed on, so the run matches it.
       headroom(provider.value),
+      isolation.value,
       (event) => {
         const activity = activityFor(event);
         if (activity !== null) currentActivity.value = activity;
@@ -723,6 +756,23 @@ const AUTH: Record<Auth, string> = {
               </button>
             </div>
           </div>
+          <div>
+            <span class="option-label">Where should it work?</span>
+            <div class="segments">
+              <button
+                v-for="w in ISOLATIONS"
+                :key="w.id"
+                class="seg"
+                :class="{ on: isolation === w.id }"
+                :aria-pressed="isolation === w.id"
+                :title="w.hint"
+                :disabled="running"
+                @click="isolation = w.id; schedulePreview()"
+              >
+                {{ w.label }}
+              </button>
+            </div>
+          </div>
           <div v-if="installed.length">
             <span class="option-label">Which AI should help?</span>
             <div class="segments">
@@ -749,7 +799,14 @@ const AUTH: Record<Auth, string> = {
         <span class="preview-title">Orteca will handle the rest</span>
         <span class="route compact">{{ preview.route.stages.map(stageLabel).join(" → ") }}</span>
         <span class="note">I’ll plan, make the changes, and check the result.</span>
-        <span v-if="preview.git.dirty" class="note caveat">
+        <span v-if="isolation === 'worktree'" class="note caveat">
+          I’ll work in a separate copy on a new branch and leave this folder alone.
+          <template v-if="preview.git.dirty">
+            Your {{ preview.git.dirtyCount }} uncommitted change{{ preview.git.dirtyCount === 1 ? "" : "s" }} won’t be in it.
+          </template>
+          Files Git ignores, like node_modules, aren’t copied.
+        </span>
+        <span v-else-if="preview.git.dirty" class="note caveat">
           I’ll keep your {{ preview.git.dirtyCount }} existing change{{ preview.git.dirtyCount === 1 ? "" : "s" }} safe.
         </span>
         <!-- Only reported figures reach the words; the per-call threshold is a guess and is not shown as a number. -->
@@ -878,6 +935,28 @@ const AUTH: Record<Auth, string> = {
           Still to do: {{ result.budgetStop.remaining.map(stageLabel).join(" → ") }}. Run again
           if you want Orteca to keep going.
         </p>
+        <div v-if="result.worktree" class="copy" role="status">
+          <p class="note">
+            Worked in a separate copy on branch <span class="mono">{{ result.worktree.branch }}</span>.
+            <template v-if="result.worktree.commit">
+              Its changes are committed there as <span class="mono">{{ result.worktree.commit.slice(0, 7) }}</span>.
+              Merge the branch when you’re happy with it.
+            </template>
+            <template v-else-if="result.worktree.commitError">
+              The changes are in the copy but not committed: {{ result.worktree.commitError }}
+            </template>
+            <template v-else>Nothing changed, so there is nothing to merge.</template>
+          </p>
+          <template v-if="!removedCopies.includes(result.taskId)">
+            <p class="note mono">{{ result.worktree.path }}</p>
+            <button class="btn" :class="{ confirming: confirmRemove === result.taskId }" :disabled="running" @click="removeCopy(result.taskId)">
+              {{ confirmRemove === result.taskId ? "Yes, delete the copy folder" : "Remove copy" }}
+            </button>
+            <button v-if="confirmRemove === result.taskId" class="link" @click="confirmRemove = null">Keep it</button>
+          </template>
+          <p v-else class="note">Copy removed. The branch is still there.</p>
+          <p v-if="removeError" class="missing">{{ removeError }}</p>
+        </div>
         <p v-if="result.unknownEvents" class="note caveat unknown-events" role="status">
           {{ result.unknownEvents }} provider event{{ result.unknownEvents === 1 ? "" : "s" }} were not recognized and remain available in the task log below.
         </p>
@@ -1026,6 +1105,17 @@ const AUTH: Record<Auth, string> = {
           <span>{{ formatDuration(historyDetail.durationMs) }}</span>
           <span v-if="historyDetail.callsUsed !== null">{{ historyDetail.callsUsed }} calls</span>
           <span v-if="historyDetail.unknownEvents">{{ historyDetail.unknownEvents }} unknown events</span>
+        </div>
+        <div v-if="historyDetail.worktreePath && !removedCopies.includes(historyDetail.id)" class="copy">
+          <p class="note">
+            Worked in a separate copy on branch <span class="mono">{{ historyDetail.branch }}</span> at
+            <span class="mono">{{ historyDetail.worktreePath }}</span>.
+          </p>
+          <button class="btn" :class="{ confirming: confirmRemove === historyDetail.id }" :disabled="running" @click="removeCopy(historyDetail.id)">
+            {{ confirmRemove === historyDetail.id ? "Yes, delete the copy folder" : "Remove copy" }}
+          </button>
+          <button v-if="confirmRemove === historyDetail.id" class="link" @click="confirmRemove = null">Keep it</button>
+          <p v-if="removeError" class="missing">{{ removeError }}</p>
         </div>
         <ul class="diff">
           <li v-for="f in historyDetail.diff" :key="f.path">
@@ -1316,6 +1406,20 @@ textarea:disabled {
 .fallback .note {
   flex: 1;
   margin: 0;
+}
+.copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.copy .note {
+  flex-basis: 100%;
+  margin: 0;
+}
+/* Deleting a folder is never the primary button; the second click says so in --warn. */
+.copy .btn.confirming {
+  color: var(--warn);
 }
 /* Never the primary button: stopping a run is not the obvious next step. */
 .stop {

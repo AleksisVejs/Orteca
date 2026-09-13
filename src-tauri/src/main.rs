@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use error::{AppError, ErrorKind, Result};
 use proc::Line;
-use project::{GitState, TrustFinding};
+use project::{GitState, Isolation, TrustFinding};
 use providers::{Detected, ProviderId};
 use routing::{Mode, Route};
 use store::{NewTask, Project, Store};
@@ -155,6 +155,7 @@ async fn start_task(
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
+    isolation: Isolation,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
 ) -> Result<run::TaskResult> {
@@ -162,7 +163,7 @@ async fn start_task(
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
-    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode, headroom)).await
+    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode, headroom, isolation)).await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
@@ -198,16 +199,28 @@ async fn send_instruction(
     live.instruct(task_id, text, apply_now).await
 }
 
-fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>) -> Result<PlannedRun> {
+fn codex_acl_refusal() -> AppError {
+    AppError::new(
+        ErrorKind::Invalid,
+        "Codex cannot sandbox this repository: Windows does not let your account change permissions on its folder, so every tool would fail while the run looked finished. Move the repository into a folder you own, such as your user folder, or run it with claude.",
+    )
+}
+
+fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation) -> Result<PlannedRun> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
     };
     let (dir, project) = trusted_dir(store, &path)?;
+    let git = project::git_state(&dir);
 
-    if provider == ProviderId::Codex && !proc::can_change_acl(&dir) {
+    // A copy's folder does not exist yet; it is checked once it does.
+    if provider == ProviderId::Codex && isolation == Isolation::CurrentTree && !proc::can_change_acl(&dir) {
+        return Err(codex_acl_refusal());
+    }
+    if isolation == Isolation::Worktree && git.head.is_none() {
         return Err(AppError::new(
             ErrorKind::Invalid,
-            "Codex cannot sandbox this repository: Windows does not let your account change permissions on its folder, so every tool would fail while the run looked finished. Move the repository into a folder you own, such as your user folder, or run it with claude.",
+            "This repository has no commits yet, so there is nothing to copy. Commit once, or run it in this folder.",
         ));
     }
 
@@ -217,7 +230,6 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
             format!("{} is not installed or not on PATH.", provider.program()),
         )
     })?;
-    let git = project::git_state(&dir);
     let route = routing::route(
         &prompt,
         mode,
@@ -236,8 +248,8 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
 
 /// Show the exact route and ceilings before a provider is started.
 #[tauri::command]
-fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, store: State<Store>) -> Result<Preflight> {
-    let planned = plan_run(&store, path, prompt, provider, mode, headroom)?;
+fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation, store: State<Store>) -> Result<Preflight> {
+    let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
     let model = planned.route.budget.preferred_tier.model(provider);
     let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
     Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation })
@@ -261,13 +273,16 @@ async fn provider_limits() -> Vec<providers::limits::Limits> {
 /// Everything that has to be true, and decided, before a provider starts: the
 /// project is trusted, the CLI exists, the baseline is taken, and the route and
 /// its ceilings are chosen and written down.
-fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>) -> Result<run::Request> {
-    let PlannedRun { dir, project: record, program, git, prompt, route } = plan_run(store, path, prompt, provider, mode, headroom)?;
+#[allow(clippy::too_many_arguments)]
+fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation) -> Result<run::Request> {
+    let PlannedRun { dir, project: record, program, git, prompt, route } = plan_run(store, path, prompt, provider, mode, headroom, isolation)?;
 
+    // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
+    let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
     // The baseline is taken before the agent runs, so the diff afterwards has
     // something honest to compare against.
     // A clean tree needs no snapshot: everything in the diff is the run's.
-    let before_run = if git.dirty { project::snapshot(&dir, git.head.as_deref()) } else { Some(Default::default()) };
+    let before_run = if dirty_at_start { project::snapshot(&dir, git.head.as_deref()) } else { Some(Default::default()) };
 
     // Stored before anything runs, so a run that dies in its first second still
     // says what it was allowed to do.
@@ -280,23 +295,65 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
         route_json: route_json.as_deref(),
         branch: git.branch.as_deref(),
         base_commit: git.head.as_deref(),
-        dirty_at_start: git.dirty,
+        dirty_at_start,
     })?;
+
+    let worktree = match isolation {
+        Isolation::CurrentTree => None,
+        Isolation::Worktree => match make_worktree(store, &dir, &git, provider, task_id) {
+            Ok(copy) => Some(copy),
+            Err(e) => {
+                // The row is already open; it closes as what happened rather
+                // than as a run left running.
+                let _ = store.finish_task_details(task_id, "failed", &e.message, "[]", None, 0, None, 0);
+                return Err(e);
+            }
+        },
+    };
 
     Ok(run::Request {
         task_id,
         id: provider,
         program,
-        dir,
+        dir: worktree.as_ref().map_or(dir, |copy| copy.path.clone().into()),
         prompt,
         route,
         base_commit: git.head,
-        dirty_at_start: git.dirty,
+        dirty_at_start,
         before_run,
         // A real run costs the user's subscription. Keeping its JSONL is what
         // makes the next one free, and is the only honest source of fixtures.
         recordings,
+        worktree,
     })
+}
+
+/// Make the copy a run works in, on a branch named for its task.
+fn make_worktree(store: &Store, repo: &std::path::Path, git: &GitState, provider: ProviderId, task_id: i64) -> Result<project::Worktree> {
+    let copy = git.root.as_deref().and_then(|root| project::worktree_dir(root, task_id)).ok_or_else(|| {
+        AppError::new(ErrorKind::Invalid, "A repository at the top of a drive has no folder beside it for a copy. Run it in this folder instead.")
+    })?;
+    let branch = format!("orteca/task-{task_id}");
+    project::add_worktree(repo, &copy, &branch)?;
+    let worktree = project::Worktree { path: copy.to_string_lossy().into_owned(), branch, commit: None, commit_error: None };
+    // Recorded before anything else can fail, so the copy can always be removed.
+    store.set_worktree(task_id, &worktree.branch, &worktree.path)?;
+    if provider == ProviderId::Codex && !proc::can_change_acl(&copy) {
+        return Err(codex_acl_refusal());
+    }
+    Ok(worktree)
+}
+
+/// Delete a finished run's copy. Git refuses while it holds uncommitted work,
+/// and the branch stays either way.
+#[tauri::command]
+fn remove_worktree(path: String, task_id: i64, store: State<Store>) -> Result<()> {
+    let (dir, record) = trusted_dir(&store, &path)?;
+    let Some(copy) = store.worktree_path(record.id, task_id)? else {
+        return Err(AppError::new(ErrorKind::NotFound, "That run has no copy to remove."));
+    };
+    project::remove_worktree(&dir, std::path::Path::new(&copy))?;
+    store.clear_worktree(record.id, task_id)
 }
 
 fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
@@ -543,6 +600,7 @@ fn main() {
             task_detail,
             preview_task,
             provider_limits,
+            remove_worktree,
             cancel_provider_operation
         ])
         .run(tauri::generate_context!())

@@ -416,6 +416,75 @@ pub fn validate_dir(path: &str) -> Result<PathBuf> {
     Ok(p.canonicalize()?)
 }
 
+/// Where a run works: the user's own folder, or a copy of the last commit on a
+/// branch of its own that the user merges when they are happy with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Isolation {
+    #[default]
+    CurrentTree,
+    Worktree,
+}
+
+/// The separate copy a run worked in.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Worktree {
+    pub path: String,
+    pub branch: String,
+    /// The commit holding the run's changes. `None` when it changed nothing or
+    /// git refused, which `commit_error` then says.
+    pub commit: Option<String>,
+    pub commit_error: Option<String>,
+}
+
+/// Beside the repository, not in app data: the folders above a copy are then
+/// the ones the trust scan already read, plus one Orteca made. `None` for a
+/// repository at the top of a drive, which has nowhere beside it.
+pub fn worktree_dir(root: &str, task_id: i64) -> Option<PathBuf> {
+    let root = PathBuf::from(root.replace('/', std::path::MAIN_SEPARATOR_STR));
+    Some(root.parent()?.join(".orteca-worktrees").join(format!("{}-{task_id}", display_name(&root))))
+}
+
+/// A hooks folder that never exists, so git runs none of the repository's
+/// hooks: `--no-verify` alone still runs post-checkout and post-commit.
+fn no_hooks(copy: &Path) -> String {
+    format!("core.hooksPath={}", copy.parent().unwrap_or(copy).join(".no-hooks").display())
+}
+
+pub fn add_worktree(repo: &Path, copy: &Path, branch: &str) -> Result<()> {
+    if let Some(parent) = copy.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let hooks = no_hooks(copy);
+    let path = copy.to_string_lossy();
+    git_run(repo, &["-c", &hooks, "worktree", "add", "-q", "-b", branch, &path, "HEAD"], "Git could not make a separate copy")?;
+    Ok(())
+}
+
+/// Commit everything in a copy to its branch, as Orteca rather than the user:
+/// the agent wrote it, and a missing identity or a signing prompt must not
+/// leave the work uncommitted.
+pub fn commit_worktree(copy: &Path, message: &str) -> Result<String> {
+    let hooks = no_hooks(copy);
+    let quiet = ["-c", &hooks, "-c", "commit.gpgsign=false", "-c", "user.name=Orteca", "-c", "user.email=orteca@localhost"];
+    git_run(copy, &[&quiet[..], &["add", "-A"]].concat(), "Git could not stage the run's changes")?;
+    git_run(copy, &[&quiet[..], &["commit", "-q", "--no-verify", "-m", message]].concat(), "Git could not commit the run's changes")?;
+    git(copy, &["rev-parse", "HEAD"]).ok_or_else(|| AppError::new(ErrorKind::Io, "Git committed but could not name the commit"))
+}
+
+/// Never forced: a copy with uncommitted work stays, and git says why. The
+/// branch is left alone, because deleting it would be a destructive command.
+pub fn remove_worktree(repo: &Path, copy: &Path) -> Result<()> {
+    if !copy.exists() {
+        // Already deleted by hand: only git's record of it is left.
+        git_run(repo, &["worktree", "prune"], "Git could not forget the missing copy")?;
+        return Ok(());
+    }
+    git_run(repo, &["worktree", "remove", &copy.to_string_lossy()], "Git would not remove the copy")?;
+    Ok(())
+}
+
 /// A fresh machine may have no git at all, and every folder would then look
 /// like "not a repository".
 pub fn git_installed() -> bool {
@@ -429,6 +498,10 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
+    git_run(dir, args, "Git could not inspect changes")
+}
+
+fn git_run(dir: &Path, args: &[&str], failure: &str) -> Result<String> {
     // Even `git status` can execute a repository's core.fsmonitor command.
     let out = Command::new("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
@@ -436,7 +509,7 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
         .current_dir(dir)
         .output()?;
     if !out.status.success() {
-        return Err(AppError::new(ErrorKind::Io, format!("Git could not inspect changes: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        return Err(AppError::new(ErrorKind::Io, format!("{failure}: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -554,6 +627,50 @@ mod tests {
         attribute(&dir, &mut unknown, None);
         assert!(unknown.iter().all(|f| f.origin.is_none()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A copy is its own folder on its own branch: the run's work is committed
+    /// there, the user's folder and uncommitted edits stay as they were, no
+    /// repository hook runs, and removing the copy keeps the branch.
+    #[test]
+    fn a_worktree_keeps_the_run_away_from_the_users_folder() {
+        let base = temp_dir("worktree");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git_in(&repo, &["init", "-q"]);
+        git_in(&repo, &["config", "user.name", "test"]);
+        git_in(&repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("a.txt"), "old\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-qm", "initial"]);
+        for hook in ["post-checkout", "post-commit"] {
+            std::fs::write(repo.join(".git/hooks").join(hook), "#!/bin/sh\ntouch hook-ran\n").unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "mine\n").unwrap();
+
+        let copy = worktree_dir(&git_state(&repo).root.unwrap(), 7).unwrap();
+        assert!(copy.ends_with(Path::new(".orteca-worktrees").join("repo-7")), "{}", copy.display());
+        add_worktree(&repo, &copy, "orteca/task-7").unwrap();
+        assert_eq!(std::fs::read_to_string(copy.join("a.txt")).unwrap().replace("\r\n", "\n"), "old\n", "the copy took the user's uncommitted edit");
+
+        std::fs::write(copy.join("a.txt"), "agent\n").unwrap();
+        std::fs::write(copy.join("new.txt"), "agent\n").unwrap();
+        let sha = commit_worktree(&copy, "Orteca task 7: test").unwrap();
+        assert_eq!(git_in(&repo, &["rev-parse", "orteca/task-7"]), sha);
+        assert_eq!(git_in(&repo, &["log", "-1", "--format=%an", "orteca/task-7"]), "Orteca");
+        assert!(!copy.join("hook-ran").exists() && !repo.join("hook-ran").exists(), "a repository hook ran");
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "mine\n", "the user's folder changed");
+        assert!(!repo.join("new.txt").exists());
+
+        remove_worktree(&repo, &copy).unwrap();
+        assert!(!copy.exists());
+        git_in(&repo, &["rev-parse", "--verify", "orteca/task-7"]);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

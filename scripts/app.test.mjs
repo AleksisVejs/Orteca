@@ -43,7 +43,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, alternative, fallback, continueWith, switchTo, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, alternative, fallback, continueWith, switchTo, isolation, removeCopy, confirmRemove, removedCopies, removeError, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed, setTimeout, clearTimeout,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -540,4 +540,33 @@ test('a run that ran out of plan usage offers the other CLI, and continuing is a
 
   state.result.value = { ...finished, status: 'failed', failureKind: 'crashed' };
   assert.equal(state.fallback.value, null, 'a crash is not a reason to switch');
+});
+
+test('a run in a separate copy asks for one, and removing the copy takes a second click', async () => {
+  const sent = [];
+  const removed = [];
+  const worktree = { path: 'C:/.orteca-worktrees/repo-1', branch: 'orteca/task-1', commit: 'abcdef123', commitError: null };
+  const { state } = await projectView({
+    detectProviders: bothInstalled,
+    providerLimits: reading(100, 30),
+    startTask: async (path, prompt, provider, mode, headroom, isolation) => {
+      sent.push(isolation);
+      return { ...finished, status: 'failed', failure: 'used up', failureKind: 'usageLimit', worktree };
+    },
+    removeWorktree: async (path, taskId) => { removed.push(taskId); },
+  });
+  await settle();
+  state.providerPicked.value = true;
+  state.provider.value = 'claude';
+  state.isolation.value = 'worktree';
+  await state.run();
+  assert.deepEqual(sent, ['worktree']);
+  assert.equal(state.fallback.value, null, 'a fresh run would start from the commit without the copy’s work');
+
+  await state.removeCopy(1);
+  assert.deepEqual(removed, [], 'the first click only asks');
+  await state.removeCopy(1);
+  assert.deepEqual(removed, [1]);
+  assert.deepEqual([...state.removedCopies.value], [1]);
+  assert.equal(state.confirmRemove.value, null);
 });

@@ -265,6 +265,8 @@ pub struct TaskResult {
     /// Comparable finished runs in this project, once there are five. The UI
     /// shows no savings figure without it.
     pub baseline: Option<Baseline>,
+    /// The separate copy the run worked in, if the user asked for one.
+    pub worktree: Option<project::Worktree>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -556,6 +558,9 @@ pub struct Request {
     /// Directory for this run's raw JSONL, one file per stage. `None` records
     /// nothing.
     pub recordings: Option<PathBuf>,
+    /// The separate copy `dir` points into, when the user asked for one. Its
+    /// changes are committed to the copy's branch when the run ends.
+    pub worktree: Option<project::Worktree>,
 }
 
 /// The raw event stream of one run, kept so a paid run can be replayed free.
@@ -743,7 +748,7 @@ enum Next {
 
 pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
     let started_at = std::time::Instant::now();
-    let Request { task_id, id, program, dir, prompt, route, base_commit, dirty_at_start, before_run, recordings } = request;
+    let Request { task_id, id, program, dir, prompt, route, base_commit, dirty_at_start, before_run, recordings, worktree } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
     let mut control = live.open(task_id);
@@ -881,6 +886,17 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             None
         }
     };
+    // Committed whatever the outcome: a stopped run's work is still work, and on
+    // its own branch it is one merge away instead of loose in a folder.
+    let worktree = worktree.map(|mut copy| {
+        if !diff.is_empty() {
+            match project::commit_worktree(&dir, &commit_message(task_id, &prompt)) {
+                Ok(sha) => copy.commit = Some(sha),
+                Err(e) => copy.commit_error = Some(e.message),
+            }
+        }
+        copy
+    });
     // Codex on Windows can run `workspace-write` as read-only and still end its
     // turn cleanly. Every command is rejected inside the CLI, and `--json`
     // carries none of it - the rejections exist only in Codex's own rollout.
@@ -963,7 +979,13 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         turns_used: state.turns_used,
         budget_stop: state.budget_stop,
         baseline,
+        worktree,
     }
+}
+
+fn commit_message(task_id: i64, prompt: &str) -> String {
+    let line: String = prompt.lines().next().unwrap_or_default().chars().take(60).collect();
+    format!("Orteca task {task_id}: {line}")
 }
 
 /// Whether the next stage may start.
@@ -1531,7 +1553,7 @@ mod tests {
             }).unwrap(),
             id: ProviderId::Codex, program: dir.join("fake.cmd"), dir,
             prompt: "a\"b %PATH% & ^\n\\ --help".into(), route: one_call("fix the typo"),
-            base_commit: None, dirty_at_start: false, before_run: Some(Default::default()), recordings: None,
+            base_commit: None, dirty_at_start: false, before_run: Some(Default::default()), recordings: None, worktree: None,
         }
     }
 
@@ -2272,6 +2294,35 @@ ping -n 60 127.0.0.1 >nul
         let mut request = task_request(store, label);
         request.route = route;
         request
+    }
+
+    /// A run in a separate copy commits its work to the copy's branch and
+    /// writes nothing in the user's folder.
+    #[tokio::test]
+    async fn a_run_in_a_copy_commits_there_and_not_in_the_users_folder() {
+        let store = Store::in_memory().unwrap();
+        let mut request = routed(&store, "worktree", one_call("fix the typo in the readme"));
+        let repo = request.dir.clone();
+        assert!(std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "initial"])
+            .current_dir(&repo).status().unwrap().success());
+        let copy = project::worktree_dir(&project::git_state(&repo).root.unwrap(), request.task_id).unwrap();
+        let _ = std::fs::remove_dir_all(&copy);
+        project::add_worktree(&repo, &copy, &format!("orteca/test-{}", std::process::id())).unwrap();
+        request.program = copy.join("fake.cmd");
+        request.dir = copy.clone();
+        request.worktree = Some(project::Worktree { path: copy.to_string_lossy().into_owned(), branch: "test".into(), commit: None, commit_error: None });
+        answering_shim(&request, 1);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        let tree = result.worktree.expect("the copy was not reported");
+        assert!(tree.commit.is_some(), "not committed: {:?}", tree.commit_error);
+        assert!(copy.join("briefs.log").exists());
+        assert!(!repo.join("briefs.log").exists(), "the run wrote in the user's folder");
+        let _ = std::fs::remove_dir_all(&copy);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// The headline of Milestone 6, end to end: a trivial task starts exactly

@@ -6,7 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 to 6 are implemented, and 7 is in progress (see §14). The
+Milestones 1 to 6 are implemented, and 7 is built except the deferred file
+cache (see §14). The
 acceptance checks for 1 and 2 are documented in `docs/m1-m2-verification.md`.
 Milestone 8 is in progress: the NSIS installer builds unsigned (see §16).
 
@@ -52,6 +53,8 @@ What exists and works:
 - Each plan's rolling limits are read from its CLI at no token cost; the
   provider with the most left is picked until the user picks one, and the
   preview warns when a route may not fit in what is left (§4.3.5)
+- A run can work in a separate copy: a git worktree beside the repository on
+  its own branch, committed when the run ends, removable afterwards (§11)
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -497,19 +500,20 @@ A module is a folder only once it outgrows one file. Actual layout today,
 
 ```
 src-tauri/
-  migrations/0001_init.sql  0002_tasks.sql  0003_calls.sql  0004_task_details.sql
+  migrations/0001_init.sql … 0005_worktree.sql
   src/
     main.rs        Tauri commands + app setup
     error.rs       AppError { kind, message }, serialized to the frontend
     proc/          spawn, Job Object, cancel, JSONL reader
       mod.rs
       job.rs
-    project.rs     git state, trust scan, path validation
+    project.rs     git state, trust scan, path validation, diff, worktrees
     store.rs       SQLite, migrations, projects
     providers/     detect + event normalisation + mock fixture replay
       mod.rs       ProviderId, Detected, ProviderEvent, `which`
       claude.rs    stream-json parser
       codex.rs     exec --json parser
+      limits.rs    plan limits read from each CLI (§4.3.5)
       mock.rs      replays fixtures/*.jsonl through the real parsers
     run.rs         route runner: stages, argv, stream, budgets, event log, diff, result
     routing.rs     deterministic classifier + route builder + stage briefs
@@ -519,7 +523,7 @@ src/
   views/      Launch.vue  Project.vue
   components/ VeloMark.vue  TrustPrompt.vue
   styles/     tokens.css
-scripts/make-icon.mjs
+scripts/make-icon.mjs  make-sandbox.mjs  app.test.mjs  ui.test.mjs
 ```
 
 `git.rs` never happened: baseline snapshot and diff capture are four functions
@@ -616,9 +620,10 @@ either. A run is `run::args(id, prompt)` returning a `Vec<String>` plus the one
 argv, which is one `match`. A trait would dispatch a single method that returns
 data. Revisit when steering makes `start()` genuinely asymmetric in Milestone 5.
 
-Fixtures in `src-tauri/fixtures/*.jsonl` are written to the event shapes
-verified above, not captured from a live session, because neither CLI is
-installed. Swap in a real capture when one exists; nothing else changes.
+The first fixtures in `src-tauri/fixtures/*.jsonl` were written to the event
+shapes verified above before either CLI was installed. Both are installed now
+(§16), and a real run's JSONL is kept under the app data `recordings` folder;
+swap a capture in for a hand-written fixture and nothing else changes.
 
 Detection resolves the program against PATH x PATHEXT itself. `CreateProcess`
 only ever appends `.exe`, so `claude.cmd` — how both CLIs install on Windows —
@@ -626,7 +631,7 @@ is invisible to a bare program name. The resolved path is what `run.rs` spawns.
 
 ## 7. SQLite schema — 6 tables
 
-Migration 0001 exists; the rest land with the milestone that needs them.
+Migrations 0001 to 0005 are shipped; `file_cache` is deferred.
 
 ```sql
 -- 0001 and 0002, shipped
@@ -651,6 +656,13 @@ usage(id, task_id, event_id, provider, model, input_tokens, cached_input_tokens,
 
 -- 0003, shipped
 tasks.calls_used   -- exact provider processes started; NULL on older rows
+
+-- 0004, shipped
+tasks.patch_text, tasks.unknown_events, tasks.duration_ms
+
+-- 0005, shipped
+tasks.worktree_path  -- the separate copy a run worked in; NULL once removed.
+                     -- tasks.branch then holds the copy's branch.
 
 -- deferred
 file_cache(project_id, path, sha256, size, lang, indexed_at)
@@ -859,6 +871,30 @@ before, byte-identical after — the user's, not counted as the run's work) or
 include both). If git cannot produce the snapshot the origin is `null` and the
 screen falls back to saying it cannot tell. A file the run restored to the
 commit drops out of the diff and is not reported.
+
+**Separate copy — built 2026-09-13.** Two choices, not three: `This folder`
+(default) and `Separate copy`. `New branch` in the user's own folder was
+dropped: switching branches under uncommitted edits is the risky part, and a
+worktree gives a branch without it.
+
+- A copy is `git worktree add -b orteca/task-<id>
+  <parent>/.orteca-worktrees/<repo>-<id> HEAD`. It sits **beside the
+  repository, not in app data**, so the folders above it are the ones the
+  trust scan already read, plus one Orteca made.
+- It starts from HEAD. The user's uncommitted changes and ignored files
+  (`node_modules`) are not in it, and the preview says so. The diff needs no
+  snapshot: everything in it is the run's.
+- When the run ends, whatever the outcome, its changes are committed to that
+  branch as `Orteca`, with `core.hooksPath` pointed at a folder that does not
+  exist and signing off. `--no-verify` alone still runs post-checkout and
+  post-commit hooks the user never consented to. The user merges the branch.
+- **Remove copy** runs `git worktree remove` without `--force` and keeps the
+  branch: deleting a branch is the user's call. A copy deleted by hand is
+  cleared with `git worktree prune`. A running task's copy is never offered.
+- Refused before any CLI starts: a repository with no commits, one at the top
+  of a drive, and Codex on a copy whose ACL cannot be changed.
+- "Continue with the other CLI" is not offered after a copy's run: a fresh copy
+  would start from HEAD without the stopped run's work.
 
 ## 12. Project intelligence
 

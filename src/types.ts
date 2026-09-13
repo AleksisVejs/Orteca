@@ -133,6 +133,19 @@ export type FailureKind =
  *  threshold up by two, so more work takes the shorter route. */
 export type Mode = "efficient" | "balanced";
 
+/** Where a run works: the user's folder, or a git worktree beside the
+ *  repository on a branch of its own. */
+export type Isolation = "currentTree" | "worktree";
+
+/** The separate copy a run worked in. */
+export interface Worktree {
+  path: string;
+  branch: string;
+  /** The commit holding the run's changes; null when nothing changed or git refused. */
+  commit: string | null;
+  commitError: string | null;
+}
+
 /** A stage of a route. A trivial task's route is `["implement"]` and nothing else. */
 export type Stage = "plan" | "implement" | "review" | "verify" | "fix";
 
@@ -293,6 +306,8 @@ export interface TaskResult {
   budgetStop: BudgetStop | null;
   /** null until the project has enough comparable runs to compare against. */
   baseline: Baseline | null;
+  /** Set when the run worked in a separate copy. */
+  worktree: Worktree | null;
 }
 export interface TaskEvent {
   id: number;
@@ -323,5 +338,8 @@ export interface TaskDetail {
   costQuality: CostQuality | null;
   unknownEvents: number;
   durationMs: number | null;
+  branch: string | null;
+  /** The separate copy the run worked in, until it is removed. */
+  worktreePath: string | null;
   events: TaskEvent[];
 }

@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_tasks.sql"),
     include_str!("../migrations/0003_calls.sql"),
     include_str!("../migrations/0004_task_details.sql"),
+    include_str!("../migrations/0005_worktree.sql"),
 ];
 
 /// What comparable finished runs in a project have cost. Always an estimate:
@@ -142,6 +143,34 @@ impl Store {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// The copy a run works in, recorded the moment it exists, so a run that
+    /// fails straight after can still have it removed.
+    pub fn set_worktree(&self, task_id: i64, branch: &str, path: &str) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        conn.execute("UPDATE tasks SET branch = ?2, worktree_path = ?3 WHERE id = ?1", params![task_id, branch, path])?;
+        Ok(())
+    }
+
+    /// A finished task's copy. A running task's is never offered for removal:
+    /// the agent is still working in it.
+    pub fn worktree_path(&self, project_id: i64, task_id: i64) -> Result<Option<String>> {
+        let conn = self.0.lock().expect("store poisoned");
+        match conn.query_row(
+            "SELECT worktree_path FROM tasks WHERE project_id = ?1 AND id = ?2 AND status != 'running'",
+            params![project_id, task_id],
+            |r| r.get(0),
+        ) {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            other => Ok(other?),
+        }
+    }
+
+    pub fn clear_worktree(&self, project_id: i64, task_id: i64) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        conn.execute("UPDATE tasks SET worktree_path = NULL WHERE project_id = ?1 AND id = ?2", params![project_id, task_id])?;
+        Ok(())
     }
 
     /// How many earlier runs of this exact prompt in this project ended without
@@ -418,7 +447,8 @@ impl Store {
                     t.calls_used, u.provider, u.model,
                     u.input_tokens + u.cached_input_tokens + u.output_tokens,
                     u.input_tokens + u.output_tokens, u.cached_input_tokens,
-                    u.cost_usd, u.cost_quality, t.unknown_events, t.duration_ms
+                    u.cost_usd, u.cost_quality, t.unknown_events, t.duration_ms,
+                    t.branch, t.worktree_path
                FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
               WHERE t.project_id = ?1 AND t.id = ?2",
             params![project_id, task_id],
@@ -448,6 +478,8 @@ impl Store {
                     cost_quality: r.get(17)?,
                     unknown_events: r.get(18)?,
                     duration_ms: r.get(19)?,
+                    branch: r.get(20)?,
+                    worktree_path: r.get(21)?,
                     events: Vec::new(),
                 })
             },
@@ -539,6 +571,9 @@ pub struct TaskDetail {
     pub cost_quality: Option<String>,
     pub unknown_events: u32,
     pub duration_ms: Option<u64>,
+    pub branch: Option<String>,
+    /// The separate copy the run worked in, until it is removed.
+    pub worktree_path: Option<String>,
     pub events: Vec<TaskEvent>,
 }
 

@@ -39,7 +39,7 @@ Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens an
 
 - `main.rs` — Tauri commands (projects: `open_project`, `recent_projects`,
   `trust_project`, `forget_project`; providers: `detect_providers`,
-  `install_provider`, `sign_in_provider`; runs: `start_task`, `cancel_task`,
+  `install_provider`, `sign_in_provider`, `provider_limits`; runs: `start_task`, `cancel_task`,
   `send_instruction`, `recent_tasks`) and app setup. `start_task` routes the
   prompt, snapshots a dirty tree, and refuses Codex on a folder whose ACL the user
   cannot change, all before any CLI starts. The `Store` is Tauri managed state.

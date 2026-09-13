@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
   Detected,
+  Limits,
   Mode,
   OpenedProject,
   Preflight,
@@ -51,6 +52,9 @@ export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
 export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode) =>
   invoke<Preflight>("preview_task", { path, prompt, provider, mode });
+
+/** Plan limits from each CLI's own answer. Costs no tokens; takes seconds. */
+export const providerLimits = () => invoke<Limits[]>("provider_limits");
 
 /**
  * The channel exists before invocation; completion uses the invoke response.

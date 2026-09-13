@@ -10,6 +10,7 @@ import {
   onInstallEvent,
   onSignInEvent,
   previewTask,
+  providerLimits,
   recentTasks,
   sendInstruction,
   signInProvider,
@@ -18,6 +19,8 @@ import {
 import type {
   Auth,
   Detected,
+  LimitWindow,
+  Limits,
   Mode,
   OpenedProject,
   ProviderEvent,
@@ -131,6 +134,79 @@ async function signIn(id: ProviderId) {
 }
 
 const selected = computed(() => providers.value.find((p) => p.id === provider.value));
+
+// What each plan has used, as its CLI reports it. Read on open and after every
+// run; a reading costs no tokens but takes a few seconds.
+const limits = ref<Limits[]>([]);
+// Once the user picks a provider, headroom stops choosing for them.
+const providerPicked = ref(false);
+const pickedFor = ref<string | null>(null);
+
+async function loadLimits() {
+  try {
+    limits.value = await providerLimits();
+  } catch {
+    limits.value = [];
+  }
+  pickByHeadroom();
+}
+
+/** The room left in this provider's tightest window, or null with no reading. */
+function headroom(id: ProviderId): number | null {
+  const windows = limits.value.find((l) => l.id === id)?.windows ?? [];
+  return windows.length ? Math.min(...windows.map((w) => 100 - w.usedPercent)) : null;
+}
+
+/** Move to the runnable provider with the most room left. Only when every
+ *  runnable one has a reading: an unread limit is not an empty one. */
+function pickByHeadroom() {
+  if (providerPicked.value) return;
+  const runnable = installed.value
+    .filter((p) => p.auth !== "signedOut")
+    .map((p) => ({ id: p.id, room: headroom(p.id) }));
+  if (runnable.length < 2 || runnable.some((r) => r.room === null)) return;
+  // A tie keeps the provider already selected.
+  const best = runnable.reduce((a, b) =>
+    b.room! > a.room! || (b.room === a.room && b.id === provider.value) ? b : a,
+  );
+  pickedFor.value = `Using ${best.id}: it has the most limit left (${runnable
+    .map((r) => `${r.id} ${Math.round(r.room!)}%`)
+    .join(", ")}).`;
+  if (best.id !== provider.value) {
+    provider.value = best.id;
+    schedulePreview();
+  }
+}
+
+function resetWhen(w: LimitWindow): string | null {
+  if (w.resetsText) return w.resetsText;
+  if (w.resetsAt === null) return null;
+  return new Date(w.resetsAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+/** A helper row's reading: every window with its label, or why there is none. */
+function limitLine(id: ProviderId): string | null {
+  const reading = limits.value.find((l) => l.id === id);
+  if (!reading) return null;
+  if (!reading.windows.length) return `limits unavailable: ${reading.unavailable ?? "no reading"}`;
+  return reading.windows.map((w) => `${w.label} ${Math.round(w.usedPercent)}% used`).join(" · ");
+}
+
+// ponytail: a flat 5% of a window per agent call is a guess, not a measurement.
+// Replace it with each route's measured draw once runs read limits before and after.
+const PERCENT_PER_CALL = 5;
+
+/** The fullest window that may not cover every call this route can make. */
+const limitWarning = computed(() => {
+  const p = preview.value;
+  if (!p) return null;
+  const calls = p.route.budget.maxAgentCalls + (p.escalation ? 1 : 0);
+  const windows = limits.value.find((l) => l.id === p.provider)?.windows ?? [];
+  const tight = windows
+    .filter((w) => 100 - w.usedPercent < calls * PERCENT_PER_CALL)
+    .sort((a, b) => b.usedPercent - a.usedPercent)[0];
+  return tight ? { window: tight, calls, resets: resetWhen(tight) } : null;
+});
 
 /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
 /// and refusing to run on a guess would be the same mistake in the other
@@ -272,6 +348,7 @@ async function refreshPreview() {
 
 onMounted(async () => {
   void loadHistory();
+  void loadLimits();
   try {
     providers.value = await detectProviders((one) => {
       providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
@@ -281,6 +358,8 @@ onMounted(async () => {
     if (first && !installed.value.some((p) => p.id === provider.value)) {
       provider.value = first.id;
     }
+    // Limits may have landed first; both halves are needed to choose.
+    pickByHeadroom();
   } catch {
     providerError.value = true;
   }
@@ -337,6 +416,8 @@ async function run() {
     stopping.value = false;
     taskId.value = null;
     await loadHistory();
+    // The run just spent some of a limit; the next pick should know.
+    void loadLimits();
   }
 }
 
@@ -611,7 +692,7 @@ const AUTH: Record<Auth, string> = {
                 :class="{ on: provider === p.id }"
                 :aria-pressed="provider === p.id"
                 :disabled="running"
-                @click="provider = p.id; schedulePreview()"
+                @click="provider = p.id; providerPicked = true; pickedFor = null; schedulePreview()"
               >
                 {{ p.program }}
               </button>
@@ -630,6 +711,12 @@ const AUTH: Record<Auth, string> = {
         <span v-if="preview.git.dirty" class="note caveat">
           I’ll keep your {{ preview.git.dirtyCount }} existing change{{ preview.git.dirtyCount === 1 ? "" : "s" }} safe.
         </span>
+        <!-- Only reported figures reach the words; the per-call threshold is a guess and is not shown as a number. -->
+        <span v-if="limitWarning" class="missing limit-warning" role="status">
+          {{ preview.provider }}’s {{ limitWarning.window.label }} limit is {{ Math.round(limitWarning.window.usedPercent) }}% used<template v-if="limitWarning.resets">, resets {{ limitWarning.resets }}</template>.
+          This can take up to {{ limitWarning.calls }} AI {{ limitWarning.calls === 1 ? "call" : "calls" }}, so it might not finish.
+        </span>
+        <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
         <details class="preview-details">
           <summary>Show the plan</summary>
           <p class="note">{{ preview.route.reason }}</p>
@@ -941,6 +1028,7 @@ const AUTH: Record<Auth, string> = {
             <span v-if="p.costQuality === 'unavailable'" class="note">
               tokens only, no cost
             </span>
+            <span v-if="limitLine(p.id)" class="note">{{ limitLine(p.id) }}</span>
           </template>
           <template v-else-if="installing === p.id">
             <span class="note grow">{{ installLine }}</span>
@@ -1162,6 +1250,9 @@ textarea:disabled {
 }
 .preview-error {
   margin: 0 18px 12px;
+}
+.limit-warning {
+  width: 100%;
 }
 /* Never the primary button: stopping a run is not the obvious next step. */
 .stop {

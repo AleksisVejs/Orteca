@@ -238,6 +238,21 @@ fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, 
     Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation })
 }
 
+/// How much of each plan's rolling limit is used, from each CLI's own answer.
+/// Costs no tokens and never runs inside a project. Never an error: a provider
+/// that cannot be read comes back with the reason.
+#[tauri::command]
+async fn provider_limits() -> Vec<providers::limits::Limits> {
+    let probes = ProviderId::ALL.map(|id| tauri::async_runtime::spawn(providers::limits::read(id)));
+    let mut limits = Vec::with_capacity(probes.len());
+    for probe in probes {
+        if let Ok(one) = probe.await {
+            limits.push(one);
+        }
+    }
+    limits
+}
+
 /// Everything that has to be true, and decided, before a provider starts: the
 /// project is trusted, the CLI exists, the baseline is taken, and the route and
 /// its ceilings are chosen and written down.
@@ -522,6 +537,7 @@ fn main() {
             recent_tasks,
             task_detail,
             preview_task,
+            provider_limits,
             cancel_provider_operation
         ])
         .run(tauri::generate_context!())

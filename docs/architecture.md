@@ -49,6 +49,9 @@ What exists and works:
 - CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
 - A route's tier picks a real model and effort on both CLIs, and moves up a tier
   when that tier has stalled in the project's own history (§4.3.4)
+- Each plan's rolling limits are read from its CLI at no token cost; the
+  provider with the most left is picked until the user picks one, and the
+  preview warns when a route may not fit in what is left (§4.3.5)
 
 Build (Rust lives in `src-tauri/`, run from there for cargo):
 
@@ -404,6 +407,38 @@ Anthropic API prices (claude-api reference, cached 2026-06-24), OpenAI prices
 (cloudzero.com/blog/openai-pricing), Codex models
 (learn.chatgpt.com/docs/models), SWE-bench Verified (benchlm.ai) and Pro
 (codingfleet.com) leaderboards as of 2026-09-10.
+
+### 4.3.5 How much of a plan is left — verified 2026-09-13
+
+Both CLIs answer this without spending anything, and Orteca asks them rather
+than reading a credential or a session log (`providers::limits`).
+
+| CLI | Asked with | Answer | Cost |
+|---|---|---|---|
+| claude 2.1.269 | `claude -p /usage --output-format stream-json --verbose --setting-sources project,local --strict-mcp-config --max-turns 1`, from temp | a synthetic assistant message (`model: "<synthetic>"`), text lines `Current session: 66% used · resets Sep 13, 3:50pm (Europe/Kyiv)` and `Current week (all models): …` | 0 tokens, `total_cost_usd: 0` |
+| codex-cli 0.154.0 | `codex app-server` on stdio: `initialize`, `initialized`, `account/rateLimits/read`, sent back to back | `rateLimits.primary` / `secondary`: `usedPercent`, `windowDurationMins` (300, 10080), `resetsAt` (Unix seconds) | no thread started |
+
+`/usage` is the one `claude` call without `--disable-slash-commands`, because it
+is a slash command. Its reset time is the CLI's own words and is shown
+verbatim. On an API key it prints no windows, and the reading says so. Claude's
+run stream also carries `rate_limit_event` with the same utilizations, but only
+once a run has started; the fixtures keep two.
+
+What Orteca does with it, in `Project.vue`:
+
+- **Every window is shown on the helper row** with the CLI's label; an unread
+  one says `limits unavailable:` and why. It is never shown as 0%.
+- **The provider is picked by headroom**, the room left in its tightest window,
+  among installed, signed-in CLIs, and only when every one of them has a
+  reading. A tie keeps the current choice. Once the user picks, headroom stops
+  choosing. Limits are read again after every run.
+- **The preview warns** when the fullest window has less room left than 5% per
+  call the route may make, its Fix call included. The warning names only
+  reported figures. **The 5% is a guess, not a measurement:** replace it with
+  each route's measured draw once runs read limits before and after.
+- Nothing is blocked: a warning is not a refusal, and a run that does hit a
+  limit already ends `failed` with `usageLimit`. The tier is not stepped down to
+  save allowance; §4.3.4 moves up on evidence and never down.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 

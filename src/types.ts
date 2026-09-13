@@ -102,6 +102,24 @@ export interface Detected {
   steering: Steering;
 }
 
+/** One rolling allowance window, as the CLI reported it. */
+export interface LimitWindow {
+  /** The CLI's own name: "session", "week (all models)", "5-hour", "week". */
+  label: string;
+  usedPercent: number;
+  /** Unix seconds (Codex). */
+  resetsAt: number | null;
+  /** The CLI's own words, in the user's time zone (Claude). */
+  resetsText: string | null;
+}
+
+/** How much of a plan is used. No windows means no reading, and `unavailable` says why. */
+export interface Limits {
+  id: ProviderId;
+  windows: LimitWindow[];
+  unavailable: string | null;
+}
+
 export type FailureKind =
   | "authExpired"
   | "usageLimit"

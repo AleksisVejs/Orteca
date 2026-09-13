@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod limits;
 #[cfg(test)]
 pub mod mock;
 

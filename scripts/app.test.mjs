@@ -43,7 +43,7 @@ async function projectView(api = {}) {
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
     ref, computed,
     defineProps: () => ({ opened: project }), defineEmits: () => () => {},
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -464,4 +464,47 @@ test('the route shows what ran, and a saving is only claimed against a baseline'
   const stopped = await projectView({ startTask: async () => ({ ...done, status: 'budgetReached', baseline: { runs: 5, medianTokens: 100, medianCalls: 3 } }) });
   await stopped.state.run();
   assert.equal(stopped.state.comparison.value, null, 'an unfinished run is not a saving');
+});
+
+const bothInstalled = async () => [{ id: 'claude', path: 'c.exe', auth: 'subscription' }, { id: 'codex', path: 'x.exe', auth: 'subscription' }];
+const reading = (claude, codex) => async () => [
+  { id: 'claude', windows: [{ label: 'session', usedPercent: claude, resetsAt: null, resetsText: 'Sep 13, 3:50pm' }], unavailable: null },
+  codex === null
+    ? { id: 'codex', windows: [], unavailable: 'codex app-server exited' }
+    : { id: 'codex', windows: [{ label: '5-hour', usedPercent: codex, resetsAt: 1789304323, resetsText: null }], unavailable: null },
+];
+const settle = () => new Promise(r => setTimeout(r));
+
+test('the provider with the most limit left is picked, until the user picks one', async () => {
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(35, 90) });
+  await settle();
+  assert.equal(state.provider.value, 'claude', 'codex has 10% left, claude 65%');
+  assert.match(state.pickedFor.value, /claude 65%, codex 10%/);
+
+  state.providerPicked.value = true;
+  state.provider.value = 'codex';
+  state.limits.value = await reading(95, 10)();
+  state.pickByHeadroom();
+  assert.equal(state.provider.value, 'codex', 'a choice the user made is never overridden');
+});
+
+test('an unread limit is not an empty one, and says why', async () => {
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(95, null) });
+  await settle();
+  assert.equal(state.provider.value, 'codex', 'no switch on a missing reading');
+  assert.equal(state.limitLine('codex'), 'limits unavailable: codex app-server exited');
+  assert.equal(state.limitLine('claude'), 'session 95% used');
+});
+
+test('a route that may not fit in the fullest window warns before it starts', async () => {
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(20, 88) });
+  await settle();
+  const twoCalls = { ...oneCall, budget: { ...oneCall.budget, maxAgentCalls: 2 } };
+  state.preview.value = { provider: 'codex', route: twoCalls, escalation: { model: 'gpt-5.6-sol', effort: 'high' } };
+  assert.equal(state.limitWarning.value.calls, 3, 'the declared Fix call counts');
+  assert.equal(state.limitWarning.value.window.label, '5-hour');
+  state.preview.value = { provider: 'claude', route: twoCalls, escalation: null };
+  assert.equal(state.limitWarning.value, null, '80% left covers two calls');
+  state.preview.value = { provider: 'codex', route: oneCall, escalation: null };
+  assert.equal(state.limitWarning.value, null, '12% left covers one call');
 });

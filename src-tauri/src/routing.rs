@@ -340,7 +340,30 @@ impl Route {
     pub fn is_single_call(&self) -> bool {
         self.kind == RouteKind::ImplementOnce
     }
+
+    /// `true` when the checks run before the Review, so a failed check is fixed
+    /// first and the Review reads the fix.
+    pub fn verifies_before_review(&self) -> bool {
+        let at = |stage| self.stages.iter().position(|s| *s == stage);
+        matches!((at(Stage::Verify), at(Stage::Review)), (Some(v), Some(r)) if v < r)
+    }
+
+    /// What the Review runs on when that is not the route's tier.
+    pub fn review_model(&self, id: ProviderId) -> Option<ModelChoice> {
+        let mut choice = self.budget.review_tier?.model(id);
+        if let (Mode::Efficient, Some(effort)) = (self.mode, EFFICIENT_REVIEW_EFFORT) {
+            choice.effort = effort;
+        }
+        Some(choice)
+    }
 }
+
+/// The effort a guarded Review asks for in Efficient mode; `None` keeps `deep`'s.
+/// `medium` caught every seeded defect `high` did, for ~20% less (§4.3.6).
+/// Balanced never changes.
+// ponytail: 5 cases x 2 runs on a toy repo; re-run the seeded benchmark when the
+// Review brief or the Opus model changes.
+const EFFICIENT_REVIEW_EFFORT: Option<&str> = Some("medium");
 
 /// Words that make a prompt complex, and what each is worth.
 const COMPLEXITY: &[(&str, u8)] = &[
@@ -426,6 +449,9 @@ pub struct RepoSignals {
     /// CLI reported it before the run. `None` when it could not be read, which
     /// never counts as low.
     pub headroom: Option<f64>,
+    /// The repository declares a test command Orteca can run itself, so a
+    /// Verify costs no agent call.
+    pub checks_locally: bool,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -601,19 +627,28 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     } else if signals.security || signals.authz || signals.schema_change {
         // A plan earns its call when the work is big enough to go wrong in its
         // shape. A one-function fix is not, and its Review still runs (§4.3.6).
-        if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
-            (
-                RouteKind::Guarded,
-                vec![Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify],
-                "security, authorisation or schema work this large is planned, reviewed and verified",
-            )
+        let large = signals.architecture || signals.complexity >= 7u8.saturating_add(shift);
+        let mut stages = if large {
+            vec![Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]
         } else {
-            (
-                RouteKind::Guarded,
-                vec![Stage::Implement, Stage::Review, Stage::Verify],
-                "security, authorisation or schema work is reviewed and verified; it is small enough to need no plan",
-            )
+            vec![Stage::Implement, Stage::Review, Stage::Verify]
+        };
+        // Tests Orteca runs itself cost no call, so they go first: a failure is
+        // fixed before the deep Review reads it, and a Review of passing work
+        // can spend itself on what the tests do not cover.
+        if repo.checks_locally {
+            let n = stages.len();
+            stages.swap(n - 2, n - 1);
         }
+        (
+            RouteKind::Guarded,
+            stages,
+            if large {
+                "security, authorisation or schema work this large is planned, reviewed and verified"
+            } else {
+                "security, authorisation or schema work is reviewed and verified; it is small enough to need no plan"
+            },
+        )
     } else if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
         (
             RouteKind::Planned,
@@ -775,24 +810,43 @@ pub fn brief(
 
     match stage {
         Stage::Plan => out.push_str("Plan this work. Do not edit any file. Return only the structured plan.\n\n"),
-        Stage::Review => out.push_str(
-            "Review the change that is already in the working tree against the task below. \
-             Do not edit any file. Return only the structured review; `pass` means the work \
-             is finished and needs no further call.\n\n",
-        ),
+        Stage::Review => {
+            out.push_str(
+                "Review the change that is already in the working tree against the task below. \
+                 Do not edit any file. Return only the structured review; `pass` means the work \
+                 is finished and needs no further call.",
+            );
+            let tested = carried
+                .iter()
+                .any(|n| n.stage == Stage::Verify && n.artifact.as_ref().is_some_and(|a| stage_passed(Stage::Verify, a)));
+            if tested {
+                out.push_str(
+                    " The repository's tests already pass on it; spend the review on the \
+                     inputs and paths they do not cover.",
+                );
+            }
+            out.push_str("\n\n");
+        }
         Stage::Verify => out.push_str(
             "Verify the change that is already in the working tree. Run the focused checks \
              that prove it and change nothing else. Return only the structured result: every \
              check you ran, whether it passed, and what it printed. `pass` means at least one \
              check ran and every check passed.\n\n",
         ),
-        Stage::Fix => out.push_str(
-            "An earlier stage of this task did not pass; what it found is below. Fix that and \
-             nothing beyond it, then run the focused checks that prove the fix. Return only \
-             the structured result: every check you ran, whether it passed, and what it \
-             printed. `pass` means at least one check ran and every check passed. This is the \
-             last call this task gets.\n\n",
-        ),
+        Stage::Fix => {
+            out.push_str(
+                "An earlier stage of this task did not pass; what it found is below. Fix that and \
+                 nothing beyond it, then run the focused checks that prove the fix. Return only \
+                 the structured result: every check you ran, whether it passed, and what it \
+                 printed. `pass` means at least one check ran and every check passed. ",
+            );
+            let reviewed = route.verifies_before_review() && carried.last().is_some_and(|n| n.stage == Stage::Verify);
+            out.push_str(if reviewed {
+                "A review reads the fix after this call.\n\n"
+            } else {
+                "This is the last call this task gets.\n\n"
+            });
+        }
         Stage::Implement => {}
     }
 
@@ -1013,6 +1067,20 @@ mod tests {
         }
         let large = balanced("redesign the authorization subsystem so every endpoint checks it", REPO);
         assert_eq!(large.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
+
+        // Tests Orteca runs itself go before the Review.
+        let local = RepoSignals { checks_locally: true, ..repo(REPO) };
+        let r = route("add an authorization check before the delete endpoint", Mode::Balanced, &local);
+        assert_eq!(r.stages, [Stage::Implement, Stage::Verify, Stage::Review]);
+        assert!(r.verifies_before_review() && !balanced("add an authorization check before the delete endpoint", REPO).verifies_before_review());
+        let r = route("redesign the authorization subsystem so every endpoint checks it", Mode::Balanced, &local);
+        assert_eq!(r.stages, [Stage::Plan, Stage::Implement, Stage::Verify, Stage::Review]);
+
+        // Balanced reviews on deep's own effort; Efficient only moves it once benchmarked.
+        let claude = ProviderId::Claude;
+        assert_eq!(r.review_model(claude), Some(Tier::Deep.model(claude)));
+        let lean = route("add an authorization check before the delete endpoint", Mode::Efficient, &local);
+        assert_eq!(lean.review_model(claude).map(|c| c.effort), Some(EFFICIENT_REVIEW_EFFORT.unwrap_or("high")));
     }
 
     /// A prompt can read as small and still be dangerous. The gate wins.

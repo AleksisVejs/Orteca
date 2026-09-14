@@ -243,6 +243,7 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
             // The frontend's reading, not a fresh one: the preview and the run
             // must be routed on the same number.
             headroom: headroom.filter(|room| room.is_finite()),
+            checks_locally: project::check_command(&dir).is_some_and(|command| providers::which(command[0]).is_some()),
         },
     );
     Ok(PlannedRun { dir, project, program, git, prompt, route })
@@ -254,7 +255,7 @@ fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, 
     let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
     let model = planned.route.budget.preferred_tier.model(provider);
     let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
-    let review = planned.route.budget.review_tier.map(|tier| tier.model(provider));
+    let review = planned.route.review_model(provider);
     Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation, review })
 }
 

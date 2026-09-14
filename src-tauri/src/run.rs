@@ -281,6 +281,18 @@ pub struct StagePlan {
     pub schema: Option<PathBuf>,
     /// The route's tier, which names the model and effort on the command line.
     pub tier: routing::Tier,
+    /// Replaces the tier's effort. Only a guarded Review in Efficient mode sets it.
+    pub effort: Option<&'static str>,
+}
+
+impl StagePlan {
+    fn model(&self, id: ProviderId) -> routing::ModelChoice {
+        let mut choice = self.tier.model(id);
+        if let Some(effort) = self.effort {
+            choice.effort = effort;
+        }
+        choice
+    }
 }
 
 /// The argv for one stage.
@@ -306,7 +318,7 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("--json"),
             ],
             crate::providers::CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
-            model_args(id, plan.tier),
+            model_args(id, plan),
             vec![
                 arg("--sandbox"),
                 // A stage with no business editing cannot edit. Codex has an
@@ -364,7 +376,7 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             args.extend(claude_deny(writes));
             args.extend(turn_limit(plan));
             args.extend(schema_arg(plan));
-            args.extend(model_args(id, plan.tier));
+            args.extend(model_args(id, plan));
             args
         }
     }
@@ -373,8 +385,8 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
 /// The model and effort a tier asks for. All four flags answer "argument
 /// missing" when given no value (§4.3.4). Codex has no effort flag; the config
 /// key is the one its own `config.toml` uses.
-fn model_args(id: ProviderId, tier: routing::Tier) -> Vec<String> {
-    let choice = tier.model(id);
+fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
+    let choice = plan.model(id);
     match id {
         ProviderId::Claude => vec!["--model".into(), choice.model.into(), "--effort".into(), choice.effort.into()],
         ProviderId::Codex => vec![
@@ -646,7 +658,7 @@ impl Launch {
         let mut argv = id.resume_args(session, plan.schema.as_deref());
         // Without it a resumed session runs on the account's default model.
         if id == ProviderId::Codex {
-            argv.extend(model_args(id, plan.tier));
+            argv.extend(model_args(id, plan));
         }
         Launch { argv, opening: held.join("\n") }
     }
@@ -757,7 +769,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         id,
         program,
         dir,
-        plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None, tier: route.budget.preferred_tier },
+        plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None, tier: route.budget.preferred_tier, effort: None },
         final_stage: true,
         remaining: Vec::new(),
         max_reported_tokens: route.budget.max_reported_tokens,
@@ -819,6 +831,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
                 (Stage::Review, _, Some(review)) => review,
                 _ => route.budget.preferred_tier,
             },
+            effort: route.review_model(id).filter(|_| stage == Stage::Review).map(|choice| choice.effort),
         };
         ctx.final_stage = index + 1 == stages.len();
         ctx.remaining = stages[index..].to_vec();
@@ -835,7 +848,7 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             && verify_locally(store, &ctx, &mut state, &mut control, &emit, index, stages.len()).await;
         if !checked_locally {
             let brief = routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
-            if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), ctx.plan.tier, id)) {
+            if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), &ctx.plan, id)) {
                 state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
                 break;
             }
@@ -860,6 +873,10 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         if state.escalated && !stages.contains(&Stage::Fix) {
             stages.truncate(index + 1);
             stages.push(Stage::Fix);
+            // A failed check does not cancel the Review still to come: it reads the fix.
+            if stage == Stage::Verify && route.verifies_before_review() {
+                stages.push(Stage::Review);
+            }
         }
         index += 1;
     }
@@ -1198,8 +1215,8 @@ fn routing_payload(route: &Route) -> String {
     serde_json::json!({ "kind": "routing", "data": route }).to_string()
 }
 
-fn stage_payload(stage: Stage, index: usize, of: usize, tier: routing::Tier, id: ProviderId) -> String {
-    let choice = tier.model(id);
+fn stage_payload(stage: Stage, index: usize, of: usize, plan: &StagePlan, id: ProviderId) -> String {
+    let choice = plan.model(id);
     serde_json::json!({
         "kind": "stage",
         "data": {
@@ -1630,7 +1647,7 @@ mod tests {
     }
 
     fn plan_for(stage: Stage) -> StagePlan {
-        StagePlan { stage, max_turns: Some(6), schema: write_schema(0, stage), tier: routing::Tier::Cheapest }
+        StagePlan { stage, max_turns: Some(6), schema: write_schema(0, stage), tier: routing::Tier::Cheapest, effort: None }
     }
 
     #[test]
@@ -2294,7 +2311,7 @@ ping -n 60 127.0.0.1 >nul
     /// an inline schema, and takes a file.
     #[test]
     fn only_verified_ceiling_flags_reach_a_command_line() {
-        let plan = StagePlan { stage: Stage::Plan, max_turns: Some(7), schema: write_schema(0, Stage::Plan), tier: routing::Tier::Deep };
+        let plan = StagePlan { stage: Stage::Plan, max_turns: Some(7), schema: write_schema(0, Stage::Plan), tier: routing::Tier::Deep, effort: None };
         let claude = args(ProviderId::Claude, &plan);
         assert!(claude.windows(2).any(|w| w == ["--max-turns", "7"]));
         assert!(claude.contains(&"--json-schema".to_string()));
@@ -2575,6 +2592,44 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(result.calls_used, 2, "only Implement and Fix are agent calls");
         let calls = briefs(&dir);
         assert!(calls[1].contains("header is not bold"), "the fix was not told what failed: {}", calls[1]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Guarded work in a repository with a test command runs the tests before
+    /// the deep Review. Passing work is reviewed knowing the tests pass; a
+    /// failure buys the Fix, and the Review still reads the fix.
+    #[tokio::test]
+    async fn guarded_work_runs_its_tests_before_the_review() {
+        let store = Store::in_memory().unwrap();
+        let script = |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"process.exit({code})\""}}}}"#);
+        let review = serde_json::json!({"findings": [], "verdict": "pass"});
+        let fixed = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        let signals = RepoSignals { checks_locally: true, ..RepoSignals::default() };
+        let route = routing::route("add an authorization check before the delete endpoint", Mode::Balanced, &signals);
+        let stages = |result: &TaskResult| result.stages.iter().map(|n| n.stage).collect::<Vec<_>>();
+
+        let mut request = routed(&store, "guarded-tests-pass", route.clone());
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), script(0)).unwrap();
+        claude_shim(&mut request, &review);
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+        assert_eq!(stages(&result), [Stage::Implement, Stage::Verify, Stage::Review]);
+        assert_eq!(result.calls_used, 2);
+        assert!(briefs(&dir)[1].contains("tests already pass"), "the review was not told the tests pass");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut request = routed(&store, "guarded-tests-fail", route);
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), script(1)).unwrap();
+        claude_shim_answers(&mut request, &[review.clone(), fixed, review]);
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+        assert_eq!(stages(&result), [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Review]);
+        assert_eq!(result.calls_used, 3);
+        let calls = briefs(&dir);
+        assert!(calls[1].contains("A review reads the fix"), "the fix was told it is the last call");
+        assert!(!calls[2].contains("tests already pass"), "the review was told failing tests pass");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

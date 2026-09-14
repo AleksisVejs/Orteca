@@ -520,6 +520,34 @@ which repaired it. That run cost more than before and bought a caught bug; no
 plain-CLI result had the regression. Claude still costs more per guarded task
 than the plain CLI: an Opus review of a finished diff is ~$0.25 of it.
 
+Next, cheaper without a weaker review. When the repository declares a test
+command, guarded work runs it *before* the Review: a failure buys the Fix and
+the Review then reads the fix; passing work is reviewed with the brief saying
+the tests pass, so Opus spends on what they miss. The Review's effort in
+Efficient mode is `EFFICIENT_REVIEW_EFFORT` in `routing.rs`; Balanced stays on
+`high`.
+
+That effort was chosen by a review-only benchmark: Orteca's exact Review argv
+and brief, on five seeded changes to a Node file server whose tests all pass,
+two runs per arm (2026-09-14). Graded by reading every finding.
+
+| Seeded change | Opus high | Opus medium | Sonnet high |
+|---|---|---|---|
+| `startsWith(ROOT)` with no separator (sibling bypass) | 2/2 high | 2/2 high | 2/2 (1 medium) |
+| `..` checked before decoding (`..%2f` bypass) | 2/2 high | 2/2 high | 2/2 high |
+| 403 with no `return`, delete still runs | 2/2 high | 2/2 high | 2/2 high |
+| `//css/site.css` refused (the Codex-caught regression) | 2/2 low | 2/2 medium | **0/2** |
+| correct fix (control) | 0/2 pass | 0/2 pass | 2/2 pass |
+| **avg per review** | $0.150 · 53s | **$0.121 · 38s** | $0.156 · 104s |
+
+Opus `medium` found everything `high` found, rated the regression higher, and
+cost 19% less and ran 28% faster, so Efficient uses it. Sonnet missed the
+regression both times and was not cheaper - it took more turns - so it is not a
+reviewer. Both Opus efforts asked for changes on the correct fix because its
+regression test cannot fail (the URL parser strips `..` first). That is true,
+and it buys a Fix call; it does not depend on effort. Ten runs per arm on a toy
+repo: a direction, not a rate.
+
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
 - Claude stage running → instruction is injected live via stdin.

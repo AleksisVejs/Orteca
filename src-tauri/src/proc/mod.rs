@@ -429,7 +429,10 @@ mod tests {
         let expected = owned_temp().expect("LOCALAPPDATA");
         let mut run = spawn(
             "node",
-            &["-e", "console.log(JSON.stringify({temp:process.env.TEMP,tmp:process.env.TMP}))"],
+            &[
+                "-e",
+                "console.log(JSON.stringify({temp:process.env.TEMP,tmp:process.env.TMP}))",
+            ],
             &std::env::temp_dir(),
         )
         .unwrap();
@@ -444,8 +447,16 @@ mod tests {
             }
         }
         let (temp, tmp) = reported.expect("child reported no temp");
-        assert_eq!(std::path::Path::new(&temp), expected, "child inherited a TEMP Orteca does not own");
-        assert_eq!(std::path::Path::new(&tmp), expected, "TMP and TEMP must agree");
+        assert_eq!(
+            std::path::Path::new(&temp),
+            expected,
+            "child inherited a TEMP Orteca does not own"
+        );
+        assert_eq!(
+            std::path::Path::new(&tmp),
+            expected,
+            "TMP and TEMP must agree"
+        );
 
         // The whole point: this directory has to accept a write.
         let probe = expected.join("write-probe");

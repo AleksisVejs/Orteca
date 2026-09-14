@@ -26,7 +26,10 @@ pub enum ErrorKind {
 
 impl AppError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        AppError { kind, message: message.into() }
+        AppError {
+            kind,
+            message: message.into(),
+        }
     }
 }
 

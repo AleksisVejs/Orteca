@@ -1,8 +1,8 @@
 //! SQLite. Migrations are numbered SQL files applied in order, tracked with
 //! `PRAGMA user_version`. No ORM, no query builder.
 
-use std::path::Path;
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
@@ -19,7 +19,16 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_calls.sql"),
     include_str!("../migrations/0004_task_details.sql"),
     include_str!("../migrations/0005_worktree.sql"),
+    include_str!("../migrations/0006_model_prices.sql"),
 ];
+
+/// A published API rate, in USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+}
 
 /// What comparable finished runs in a project have cost. Always an estimate:
 /// "comparable" means the same route kind on the same provider, which is not
@@ -67,15 +76,27 @@ impl Store {
     #[cfg(test)]
     pub fn event_kinds(&self, task: i64) -> Vec<String> {
         let conn = self.0.lock().unwrap();
-        let mut statement = conn.prepare("SELECT kind FROM task_events WHERE task_id=?1 ORDER BY id").unwrap();
-        statement.query_map([task], |r| r.get::<_, String>(0)).unwrap().map(|k| k.unwrap()).collect()
+        let mut statement = conn
+            .prepare("SELECT kind FROM task_events WHERE task_id=?1 ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([task], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|k| k.unwrap())
+            .collect()
     }
 
     #[cfg(test)]
     pub fn event_payloads(&self, task: i64) -> Vec<serde_json::Value> {
         let conn = self.0.lock().unwrap();
-        let mut statement = conn.prepare("SELECT payload_json FROM task_events WHERE task_id=?1 ORDER BY id").unwrap();
-        statement.query_map([task], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str(&s.unwrap()).unwrap()).collect()
+        let mut statement = conn
+            .prepare("SELECT payload_json FROM task_events WHERE task_id=?1 ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([task], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|s| serde_json::from_str(&s.unwrap()).unwrap())
+            .collect()
     }
 
     pub fn open(db_path: &Path) -> Result<Self> {
@@ -83,8 +104,13 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         // Startup recovery must never sweep another instance's live tasks.
-        let owner = std::fs::OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).share_mode(0).open(db_path.with_extension("owner"))?;
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(db_path.with_extension("owner"))?;
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -149,7 +175,10 @@ impl Store {
     /// fails straight after can still have it removed.
     pub fn set_worktree(&self, task_id: i64, branch: &str, path: &str) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
-        conn.execute("UPDATE tasks SET branch = ?2, worktree_path = ?3 WHERE id = ?1", params![task_id, branch, path])?;
+        conn.execute(
+            "UPDATE tasks SET branch = ?2, worktree_path = ?3 WHERE id = ?1",
+            params![task_id, branch, path],
+        )?;
         Ok(())
     }
 
@@ -169,7 +198,10 @@ impl Store {
 
     pub fn clear_worktree(&self, project_id: i64, task_id: i64) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
-        conn.execute("UPDATE tasks SET worktree_path = NULL WHERE project_id = ?1 AND id = ?2", params![project_id, task_id])?;
+        conn.execute(
+            "UPDATE tasks SET worktree_path = NULL WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+        )?;
         Ok(())
     }
 
@@ -220,6 +252,42 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Replace the whole price list. An empty fetch keeps the last one, so a
+    /// bad download never leaves every model unpriced.
+    pub fn save_prices(&self, prices: &[(String, Price)]) -> Result<()> {
+        if prices.is_empty() {
+            return Ok(());
+        }
+        let conn = self.0.lock().expect("store poisoned");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM model_prices", [])?;
+        for (model, p) in prices {
+            tx.execute(
+                "INSERT INTO model_prices (model, input, output, cache_read, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                params![model, p.input, p.output, p.cache_read],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn price(&self, model: &str) -> Option<Price> {
+        let conn = self.0.lock().expect("store poisoned");
+        conn.query_row(
+            "SELECT input, output, cache_read FROM model_prices WHERE model = ?1",
+            [model],
+            |r| {
+                Ok(Price {
+                    input: r.get(0)?,
+                    output: r.get(1)?,
+                    cache_read: r.get(2)?,
+                })
+            },
+        )
+        .ok()
+    }
+
     /// `None` means the run ended before the provider reported anything. That
     /// is recorded as `unavailable` with every count left NULL - never as a
     /// zero, which would read as "this run was free".
@@ -265,7 +333,16 @@ impl Store {
         diff_stat_json: &str,
         calls_used: u32,
     ) -> Result<()> {
-        self.finish_task_details(task_id, status, summary, diff_stat_json, None, 0, None, calls_used)
+        self.finish_task_details(
+            task_id,
+            status,
+            summary,
+            diff_stat_json,
+            None,
+            0,
+            None,
+            calls_used,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -299,7 +376,10 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            return Err(AppError::new(ErrorKind::NotFound, "task record no longer exists"));
+            return Err(AppError::new(
+                ErrorKind::NotFound,
+                "task record no longer exists",
+            ));
         }
         Ok(())
     }
@@ -309,7 +389,12 @@ impl Store {
     /// Tokens exclude cache reads, so a warm cache does not read as less work. `None`
     /// below five of them: a median of two runs is an anecdote, and the screen
     /// shows absolute numbers until there is more.
-    pub fn baseline(&self, task_id: i64, route_kind: &str, provider: &str) -> Result<Option<Baseline>> {
+    pub fn baseline(
+        &self,
+        task_id: i64,
+        route_kind: &str,
+        provider: &str,
+    ) -> Result<Option<Baseline>> {
         const MIN_RUNS: usize = 5;
         let conn = self.0.lock().expect("store poisoned");
         let mut stmt = conn.prepare(
@@ -322,7 +407,9 @@ impl Store {
               ORDER BY t.id DESC LIMIT 20",
         )?;
         let rows = stmt
-            .query_map(params![task_id, route_kind, provider], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .query_map(params![task_id, route_kind, provider], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.len() < MIN_RUNS {
             return Ok(None);
@@ -345,7 +432,12 @@ impl Store {
     /// ended.
     // ponytail: a Codex implement that changed nothing is `failed` and so not
     // counted; split failure kinds into their own column if that hides stalls.
-    pub fn stalled_tiers(&self, project_id: i64, provider: &str, mode: &str) -> Result<Vec<(RouteKind, Tier)>> {
+    pub fn stalled_tiers(
+        &self,
+        project_id: i64,
+        provider: &str,
+        mode: &str,
+    ) -> Result<Vec<(RouteKind, Tier)>> {
         let conn = self.0.lock().expect("store poisoned");
         let mut stmt = conn.prepare(
             "SELECT json_extract(t.route_json, '$.kind'), json_extract(t.route_json, '$.budget.preferredTier')
@@ -361,14 +453,22 @@ impl Store {
                     >= 2 * COUNT(*)",
         )?;
         let rows = stmt
-            .query_map(params![project_id, provider, mode], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .query_map(params![project_id, provider, mode], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         // A row from before tiers were recorded names none, and is skipped.
         Ok(rows
             .into_iter()
             .filter_map(|(kind, tier)| {
                 let parse = |s: Option<String>| s.map(serde_json::Value::String);
-                Some((serde_json::from_value(parse(kind)?).ok()?, serde_json::from_value(parse(tier)?).ok()?))
+                Some((
+                    serde_json::from_value(parse(kind)?).ok()?,
+                    serde_json::from_value(parse(tier)?).ok()?,
+                ))
             })
             .collect())
     }
@@ -441,8 +541,9 @@ impl Store {
 
     pub fn task_detail(&self, project_id: i64, task_id: i64) -> Result<TaskDetail> {
         let conn = self.0.lock().expect("store poisoned");
-        let mut detail = conn.query_row(
-            "SELECT t.id, t.prompt, t.status, t.started_at, t.ended_at, t.summary,
+        let mut detail = conn
+            .query_row(
+                "SELECT t.id, t.prompt, t.status, t.started_at, t.ended_at, t.summary,
                     t.route_json, t.diff_stat_json, t.patch_text, t.dirty_at_start,
                     t.calls_used, u.provider, u.model,
                     u.input_tokens + u.cached_input_tokens + u.output_tokens,
@@ -451,45 +552,45 @@ impl Store {
                     t.branch, t.worktree_path
                FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
               WHERE t.project_id = ?1 AND t.id = ?2",
-            params![project_id, task_id],
-            |r| {
-                let route_json: Option<String> = r.get(6)?;
-                let diff_json: Option<String> = r.get(7)?;
-                Ok(TaskDetail {
-                    id: r.get(0)?,
-                    prompt: r.get(1)?,
-                    status: r.get(2)?,
-                    started_at: r.get(3)?,
-                    ended_at: r.get(4)?,
-                    summary: r.get(5)?,
-                    route: route_json.and_then(|json| serde_json::from_str(&json).ok()),
-                    diff: diff_json
-                        .and_then(|json| serde_json::from_str(&json).ok())
-                        .unwrap_or_default(),
-                    patch_text: r.get(8)?,
-                    dirty_at_start: r.get::<_, i64>(9)? != 0,
-                    calls_used: r.get(10)?,
-                    provider: r.get(11)?,
-                    model: r.get(12)?,
-                    tokens: r.get(13)?,
-                    uncached_tokens: r.get(14)?,
-                    cached_tokens: r.get(15)?,
-                    cost_usd: r.get(16)?,
-                    cost_quality: r.get(17)?,
-                    unknown_events: r.get(18)?,
-                    duration_ms: r.get(19)?,
-                    branch: r.get(20)?,
-                    worktree_path: r.get(21)?,
-                    events: Vec::new(),
-                })
-            },
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                AppError::new(ErrorKind::NotFound, "that task is not in this project")
-            }
-            other => other.into(),
-        })?;
+                params![project_id, task_id],
+                |r| {
+                    let route_json: Option<String> = r.get(6)?;
+                    let diff_json: Option<String> = r.get(7)?;
+                    Ok(TaskDetail {
+                        id: r.get(0)?,
+                        prompt: r.get(1)?,
+                        status: r.get(2)?,
+                        started_at: r.get(3)?,
+                        ended_at: r.get(4)?,
+                        summary: r.get(5)?,
+                        route: route_json.and_then(|json| serde_json::from_str(&json).ok()),
+                        diff: diff_json
+                            .and_then(|json| serde_json::from_str(&json).ok())
+                            .unwrap_or_default(),
+                        patch_text: r.get(8)?,
+                        dirty_at_start: r.get::<_, i64>(9)? != 0,
+                        calls_used: r.get(10)?,
+                        provider: r.get(11)?,
+                        model: r.get(12)?,
+                        tokens: r.get(13)?,
+                        uncached_tokens: r.get(14)?,
+                        cached_tokens: r.get(15)?,
+                        cost_usd: r.get(16)?,
+                        cost_quality: r.get(17)?,
+                        unknown_events: r.get(18)?,
+                        duration_ms: r.get(19)?,
+                        branch: r.get(20)?,
+                        worktree_path: r.get(21)?,
+                        events: Vec::new(),
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    AppError::new(ErrorKind::NotFound, "that task is not in this project")
+                }
+                other => other.into(),
+            })?;
 
         let mut events = conn.prepare(
             "SELECT id, ts, stage, kind, provider, payload_json
@@ -617,8 +718,7 @@ fn row_to_project(row: &rusqlite::Row) -> rusqlite::Result<Project> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    let applied: u32 =
-        conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let applied: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied as usize) {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
@@ -633,7 +733,15 @@ mod tests {
     use super::*;
 
     fn new_task<'a>(project_id: i64, prompt: &'a str, mode: &'a str) -> NewTask<'a> {
-        NewTask { project_id, prompt, mode, route_json: None, branch: None, base_commit: None, dirty_at_start: false }
+        NewTask {
+            project_id,
+            prompt,
+            mode,
+            route_json: None,
+            branch: None,
+            base_commit: None,
+            dirty_at_start: false,
+        }
     }
 
     #[test]
@@ -651,10 +759,17 @@ mod tests {
     fn usage_is_one_snapshot_per_task() {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("a", "a").unwrap();
-        let task = store.create_task(new_task(project.id, "test", "balanced")).unwrap();
+        let task = store
+            .create_task(new_task(project.id, "test", "balanced"))
+            .unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
-        let count: i64 = store.0.lock().unwrap().query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0)).unwrap();
+        let count: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -662,16 +777,40 @@ mod tests {
     fn history_is_newest_first_and_never_a_zero_for_unknown_usage() {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("a", "a").unwrap();
-        let silent = store.create_task(new_task(project.id, "first", "balanced")).unwrap();
+        let silent = store
+            .create_task(new_task(project.id, "first", "balanced"))
+            .unwrap();
         store.record_usage(silent, None, "codex", None).unwrap();
-        let measured = store.create_task(new_task(project.id, "second", "balanced")).unwrap();
-        let usage = Usage { model: None, input_tokens: 10, cached_input_tokens: 100, output_tokens: 5, reasoning_tokens: 0, cost_usd: Some(0.01), cost_quality: CostQuality::Estimated };
-        store.record_usage(measured, None, "claude", Some(&usage)).unwrap();
+        let measured = store
+            .create_task(new_task(project.id, "second", "balanced"))
+            .unwrap();
+        let usage = Usage {
+            model: None,
+            input_tokens: 10,
+            cached_input_tokens: 100,
+            output_tokens: 5,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.01),
+            cost_quality: CostQuality::Estimated,
+        };
+        store
+            .record_usage(measured, None, "claude", Some(&usage))
+            .unwrap();
         store.finish_task(measured, "done", "ok", "[]", 1).unwrap();
 
         let rows = store.recent_tasks(project.id, 20).unwrap();
-        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [measured, silent]);
-        assert_eq!((rows[0].tokens, rows[0].calls_used, rows[0].cost_quality.as_deref()), (Some(115), Some(1), Some("estimated")));
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [measured, silent]
+        );
+        assert_eq!(
+            (
+                rows[0].tokens,
+                rows[0].calls_used,
+                rows[0].cost_quality.as_deref()
+            ),
+            (Some(115), Some(1), Some("estimated"))
+        );
         assert_eq!((rows[1].tokens, rows[1].status.as_str()), (None, "running"));
     }
 
@@ -695,10 +834,29 @@ mod tests {
             cost_usd: None,
             cost_quality: CostQuality::Unavailable,
         };
-        store.record_usage(task, None, "codex", Some(&usage)).unwrap();
-        store.append_event(task, "implement", "unknown", "codex", r#"{"type":"new.event"}"#).unwrap();
         store
-            .finish_task_details(task, "done", "finished", "[]", Some("diff --git"), 1, Some(1250), 1)
+            .record_usage(task, None, "codex", Some(&usage))
+            .unwrap();
+        store
+            .append_event(
+                task,
+                "implement",
+                "unknown",
+                "codex",
+                r#"{"type":"new.event"}"#,
+            )
+            .unwrap();
+        store
+            .finish_task_details(
+                task,
+                "done",
+                "finished",
+                "[]",
+                Some("diff --git"),
+                1,
+                Some(1250),
+                1,
+            )
             .unwrap();
 
         let detail = store.task_detail(project.id, task).unwrap();
@@ -712,7 +870,10 @@ mod tests {
 
     #[test]
     fn missing_task_cannot_be_finished_successfully() {
-        assert!(Store::in_memory().unwrap().finish_task(99, "done", "", "[]", 1).is_err());
+        assert!(Store::in_memory()
+            .unwrap()
+            .finish_task(99, "done", "", "[]", 1)
+            .is_err());
     }
 
     #[test]
@@ -722,10 +883,21 @@ mod tests {
         let db = dir.join("test.db");
         let store = Store::open(&db).unwrap();
         let project = store.touch_project("a", "a").unwrap();
-        let task = store.create_task(new_task(project.id, "test", "balanced")).unwrap();
+        let task = store
+            .create_task(new_task(project.id, "test", "balanced"))
+            .unwrap();
         drop(store);
         let store = Store::open(&db).unwrap();
-        let (status, ended): (String, Option<String>) = store.0.lock().unwrap().query_row("SELECT status, ended_at FROM tasks WHERE id=?1", [task], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let (status, ended): (String, Option<String>) = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, ended_at FROM tasks WHERE id=?1",
+                [task],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(status, "failed");
         assert!(ended.is_some());
         drop(store);
@@ -736,7 +908,9 @@ mod tests {
     fn migrations_are_idempotent() {
         let store = Store::in_memory().unwrap();
         let conn = store.0.lock().unwrap();
-        let before: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let before: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(before, MIGRATIONS.len() as u32);
         // Re-running must be a no-op, not a "table already exists" error.
         migrate(&conn).unwrap();
@@ -745,11 +919,22 @@ mod tests {
     #[test]
     fn failed_migration_rolls_back_schema() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE blocker (id); CREATE INDEX projects_recent ON blocker(id);").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blocker (id); CREATE INDEX projects_recent ON blocker(id);",
+        )
+        .unwrap();
         assert!(migrate(&conn).is_err());
-        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'projects'", [], |r| r.get(0)).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'projects'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(tables, 0);
-        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, 0);
     }
 
@@ -759,7 +944,12 @@ mod tests {
         for name in ["a", "b", "c", "b", "a", "c", "a"] {
             store.touch_project(name, name).unwrap();
         }
-        let paths: Vec<_> = store.recent_projects(10).unwrap().into_iter().map(|p| p.path).collect();
+        let paths: Vec<_> = store
+            .recent_projects(10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
         assert_eq!(paths, ["a", "c", "b"]);
     }
 
@@ -782,7 +972,11 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("C:/a", "a").unwrap();
         let task = store
-            .create_task(NewTask { branch: Some("main"), base_commit: Some("abc"), ..new_task(project.id, "do it", "balanced") })
+            .create_task(NewTask {
+                branch: Some("main"),
+                base_commit: Some("abc"),
+                ..new_task(project.id, "do it", "balanced")
+            })
             .unwrap();
         store.record_usage(task, None, "codex", None).unwrap();
 
@@ -804,10 +998,15 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("C:/a", "a").unwrap();
         let task = store
-            .create_task(NewTask { dirty_at_start: true, ..new_task(project.id, "do it", "efficient") })
+            .create_task(NewTask {
+                dirty_at_start: true,
+                ..new_task(project.id, "do it", "efficient")
+            })
             .unwrap();
         for kind in ["started", "toolUse", "done"] {
-            store.append_event(task, "run", kind, "codex", "{}").unwrap();
+            store
+                .append_event(task, "run", kind, "codex", "{}")
+                .unwrap();
         }
         store.finish_task(task, "done", "all set", "[]", 1).unwrap();
 
@@ -853,8 +1052,18 @@ mod tests {
         close(project.id, "do something else", "failed");
         close(other.id, "do it", "failed");
         // Ran out of plan usage: says nothing about the prompt, so not counted.
-        let spent = store.create_task(new_task(project.id, "do it", "balanced")).unwrap();
-        store.append_event(spent, "run", "failed", "claude", r#"{"kind":"failed","data":{"kind":"usageLimit","message":"limit"}}"#).unwrap();
+        let spent = store
+            .create_task(new_task(project.id, "do it", "balanced"))
+            .unwrap();
+        store
+            .append_event(
+                spent,
+                "run",
+                "failed",
+                "claude",
+                r#"{"kind":"failed","data":{"kind":"usageLimit","message":"limit"}}"#,
+            )
+            .unwrap();
         store.finish_task(spent, "failed", "", "[]", 1).unwrap();
 
         assert_eq!(store.prior_failures(project.id, "do it").unwrap(), 3);
@@ -869,14 +1078,30 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("C:/a", "a").unwrap();
         let other = store.touch_project("C:/b", "b").unwrap();
-        let run_in = |mode: &str, project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
-            let route = format!(r#"{{"kind":"{kind}"}}"#);
-            let task = store.create_task(NewTask { route_json: Some(&route), ..new_task(project_id, "p", mode) }).unwrap();
-            let usage = Usage { model: None, input_tokens: tokens, cached_input_tokens: tokens * 10, output_tokens: 0, reasoning_tokens: 0, cost_usd: None, cost_quality: CostQuality::Unavailable };
-            store.record_usage(task, None, provider, Some(&usage)).unwrap();
-            store.finish_task(task, status, "", "[]", 1).unwrap();
-            task
-        };
+        let run_in =
+            |mode: &str, project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
+                let route = format!(r#"{{"kind":"{kind}"}}"#);
+                let task = store
+                    .create_task(NewTask {
+                        route_json: Some(&route),
+                        ..new_task(project_id, "p", mode)
+                    })
+                    .unwrap();
+                let usage = Usage {
+                    model: None,
+                    input_tokens: tokens,
+                    cached_input_tokens: tokens * 10,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                    cost_usd: None,
+                    cost_quality: CostQuality::Unavailable,
+                };
+                store
+                    .record_usage(task, None, provider, Some(&usage))
+                    .unwrap();
+                store.finish_task(task, status, "", "[]", 1).unwrap();
+                task
+            };
         let run = |project_id: i64, kind: &str, provider: &str, status: &str, tokens: u64| {
             run_in("balanced", project_id, kind, provider, status, tokens)
         };
@@ -888,13 +1113,22 @@ mod tests {
         run(project.id, "implementOnce", "claude", "done", 1);
         run(other.id, "implementOnce", "codex", "done", 1);
         run_in("efficient", project.id, "implementOnce", "codex", "done", 1);
-        let current = store.create_task(new_task(project.id, "p", "balanced")).unwrap();
-        assert_eq!(store.baseline(current, "implementOnce", "codex").unwrap(), None);
+        let current = store
+            .create_task(new_task(project.id, "p", "balanced"))
+            .unwrap();
+        assert_eq!(
+            store.baseline(current, "implementOnce", "codex").unwrap(),
+            None
+        );
 
         run(project.id, "implementOnce", "codex", "done", 500);
         assert_eq!(
             store.baseline(current, "implementOnce", "codex").unwrap(),
-            Some(Baseline { runs: 5, median_tokens: 300, median_calls: 1 })
+            Some(Baseline {
+                runs: 5,
+                median_tokens: 300,
+                median_calls: 1
+            })
         );
     }
 
@@ -906,18 +1140,31 @@ mod tests {
         let project = store.touch_project("C:/a", "a").unwrap();
         let run = |kind: &str, tier: &str, provider: &str, status: &str| {
             let route = format!(r#"{{"kind":"{kind}","budget":{{"preferredTier":"{tier}"}}}}"#);
-            let task = store.create_task(NewTask { route_json: Some(&route), ..new_task(project.id, "p", "balanced") }).unwrap();
+            let task = store
+                .create_task(NewTask {
+                    route_json: Some(&route),
+                    ..new_task(project.id, "p", "balanced")
+                })
+                .unwrap();
             store.record_usage(task, None, provider, None).unwrap();
             store.finish_task(task, status, "", "[]", 1).unwrap();
             task
         };
-        let stalled = || store.stalled_tiers(project.id, "codex", "balanced").unwrap();
+        let stalled = || {
+            store
+                .stalled_tiers(project.id, "codex", "balanced")
+                .unwrap()
+        };
         for status in ["done", "done", "done", "budgetReached", "failed", "failed"] {
             run("implementOnce", "cheapest", "codex", status);
         }
         run("implementOnce", "cheapest", "claude", "reviewRejected");
         run("implementOnce", "standard", "codex", "budgetReached");
-        assert_eq!(stalled(), Vec::new(), "one stall in four finished runs is not a pattern");
+        assert_eq!(
+            stalled(),
+            Vec::new(),
+            "one stall in four finished runs is not a pattern"
+        );
 
         run("implementOnce", "cheapest", "codex", "reviewRejected");
         assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest)]);
@@ -927,15 +1174,27 @@ mod tests {
         for escalated in [false, false, false, true, true] {
             let task = run("planned", "standard", "codex", "done");
             if escalated {
-                store.append_event(task, "fix", "escalation", "codex", "{}").unwrap();
+                store
+                    .append_event(task, "fix", "escalation", "codex", "{}")
+                    .unwrap();
             }
         }
-        assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest), (RouteKind::Planned, Tier::Standard)]);
+        assert_eq!(
+            stalled(),
+            [
+                (RouteKind::ImplementOnce, Tier::Cheapest),
+                (RouteKind::Planned, Tier::Standard)
+            ]
+        );
 
         for _ in 0..50 {
             run("standard", "standard", "codex", "done");
         }
-        assert_eq!(stalled(), Vec::new(), "evidence older than the last 50 runs ages out");
+        assert_eq!(
+            stalled(),
+            Vec::new(),
+            "evidence older than the last 50 runs ages out"
+        );
     }
 
     #[test]

@@ -55,7 +55,11 @@ const CLAUDE_ARGS: &[&str] = &[
 ];
 
 pub async fn read(id: ProviderId) -> Limits {
-    let none = |why: String| Limits { id, windows: Vec::new(), unavailable: Some(why) };
+    let none = |why: String| Limits {
+        id,
+        windows: Vec::new(),
+        unavailable: Some(why),
+    };
     let Some(path) = which(id.program()) else {
         return none("not installed".into());
     };
@@ -68,15 +72,24 @@ pub async fn read(id: ProviderId) -> Limits {
     })
     .await;
     match answer {
-        Ok(Ok(windows)) => Limits { id, windows, unavailable: None },
+        Ok(Ok(windows)) => Limits {
+            id,
+            windows,
+            unavailable: None,
+        },
         Ok(Err(why)) => none(why),
-        Err(_) => none(format!("{} did not answer within {}s", id.program(), DEADLINE.as_secs())),
+        Err(_) => none(format!(
+            "{} did not answer within {}s",
+            id.program(),
+            DEADLINE.as_secs()
+        )),
     }
 }
 
 async fn ask_claude(program: &str) -> Result<Vec<Window>, String> {
     // Never in the user's project: nobody has consented to its settings here.
-    let mut run = proc::spawn(program, CLAUDE_ARGS, &std::env::temp_dir()).map_err(|e| e.to_string())?;
+    let mut run =
+        proc::spawn(program, CLAUDE_ARGS, &std::env::temp_dir()).map_err(|e| e.to_string())?;
     run.close_stdin();
     let mut text = String::new();
     while let Some(line) = run.lines.recv().await {
@@ -95,18 +108,25 @@ async fn ask_claude(program: &str) -> Result<Vec<Window>, String> {
 
 async fn ask_codex(program: &str) -> Result<Vec<Window>, String> {
     // The app server never exits on its own; dropping `run` closes its job.
-    let mut run = proc::spawn(program, &["app-server"], &std::env::temp_dir()).map_err(|e| e.to_string())?;
+    let mut run =
+        proc::spawn(program, &["app-server"], &std::env::temp_dir()).map_err(|e| e.to_string())?;
     for message in [
         json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "orteca", "version": env!("CARGO_PKG_VERSION")}}}),
         json!({"method": "initialized"}),
         json!({"id": 2, "method": "account/rateLimits/read"}),
     ] {
-        run.send_line(&message.to_string()).await.map_err(|e| e.to_string())?;
+        run.send_line(&message.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
     }
     while let Some(line) = run.lines.recv().await {
         match line {
             Line::Json(v) if v["id"] == 2 => return parse_codex(&v),
-            Line::Exit(code) => return Err(format!("codex app-server exited ({code:?}) before answering")),
+            Line::Exit(code) => {
+                return Err(format!(
+                    "codex app-server exited ({code:?}) before answering"
+                ))
+            }
             _ => {}
         }
     }
@@ -179,7 +199,8 @@ mod tests {
     use super::*;
 
     /// Recorded from claude 2.1.269 on a subscription, 2026-09-13.
-    const CLAUDE_USAGE: &str = "You are currently using your subscription to power your Claude Code usage\n\n\
+    const CLAUDE_USAGE: &str =
+        "You are currently using your subscription to power your Claude Code usage\n\n\
         Current session: 66% used · resets Sep 13, 3:50pm (Europe/Kyiv)\n\
         Current week (all models): 69% used · resets Sep 17, 11am (Europe/Kyiv)\n\n\
         What's contributing to your limits usage?\n\
@@ -191,16 +212,24 @@ mod tests {
         assert_eq!(windows.len(), 2, "the session statistics are not windows");
         assert_eq!(windows[0].label, "session");
         assert_eq!(windows[0].used_percent, 66.0);
-        assert_eq!(windows[0].resets_text.as_deref(), Some("Sep 13, 3:50pm (Europe/Kyiv)"));
+        assert_eq!(
+            windows[0].resets_text.as_deref(),
+            Some("Sep 13, 3:50pm (Europe/Kyiv)")
+        );
         assert_eq!(windows[1].label, "week (all models)");
         assert_eq!(windows[1].used_percent, 69.0);
     }
 
     #[test]
     fn claude_without_windows_says_why_and_never_reports_zero() {
-        let key = parse_claude("You are currently using your API key to power your Claude Code usage").unwrap_err();
+        let key =
+            parse_claude("You are currently using your API key to power your Claude Code usage")
+                .unwrap_err();
         assert!(key.contains("API key"), "{key}");
-        assert!(parse_claude("").is_err(), "no text is no reading, not 0% used");
+        assert!(
+            parse_claude("").is_err(),
+            "no text is no reading, not 0% used"
+        );
     }
 
     /// Recorded from codex-cli 0.154.0 on a Plus plan, 2026-09-13.
@@ -212,14 +241,24 @@ mod tests {
             "secondary": {"usedPercent": 39, "windowDurationMins": 10080, "resetsAt": 1789805328},
             "credits": {"hasCredits": false, "unlimited": false, "balance": "0"}, "planType": "plus"}}});
         let windows = parse_codex(&response).unwrap();
-        assert_eq!(windows[0], Window { label: "5-hour".into(), used_percent: 26.0, resets_at: Some(1789304323), resets_text: None });
+        assert_eq!(
+            windows[0],
+            Window {
+                label: "5-hour".into(),
+                used_percent: 26.0,
+                resets_at: Some(1789304323),
+                resets_text: None
+            }
+        );
         assert_eq!(windows[1].label, "week");
         assert_eq!(windows[1].used_percent, 39.0);
     }
 
     #[test]
     fn a_codex_error_is_unavailable_with_its_message() {
-        let why = parse_codex(&json!({"id": 2, "error": {"code": -32600, "message": "not logged in"}})).unwrap_err();
+        let why =
+            parse_codex(&json!({"id": 2, "error": {"code": -32600, "message": "not logged in"}}))
+                .unwrap_err();
         assert!(why.contains("not logged in"), "{why}");
         assert!(parse_codex(&json!({"id": 2, "result": {}})).is_err());
     }

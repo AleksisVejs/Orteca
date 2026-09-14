@@ -68,6 +68,8 @@ export interface Preflight {
   git: GitState;
   route: Route;
   model: ModelChoice;
+  /** What Plan runs on when Efficient mode lowers its reasoning effort. */
+  plan: ModelChoice | null;
   /** What the route's one Fix call would run on; null when it declares none. */
   escalation: ModelChoice | null;
   /** What the Review runs on when it is not the route's tier; null otherwise. */

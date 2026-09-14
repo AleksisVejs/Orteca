@@ -29,7 +29,8 @@ What exists and works:
 - Installing a missing CLI from the project screen, via the user's own npm
 - Routing with no model call: a keyword classifier picks one of five routes,
   each with call, turn and token ceilings declared before a provider starts; a
-  trivial task is one Implement call that verifies itself
+  trivial task is one Implement call, which verifies itself unless Orteca can
+  run the repository's tests after it (§4.3.7)
 - Plan, Review and Verify return schema-checked artifacts and cannot edit; a
   Review that is missing, invalid, or asks for changes ends the route with
   `reviewRejected`; a Verify that is missing, invalid, ran no check, or lists a
@@ -162,7 +163,7 @@ What is honestly available:
 | Metric | Label |
 |---|---|
 | Tokens used per call | `exact` (both CLIs report) |
-| Cost | `estimated` (Claude only), `unavailable` (Codex) |
+| Cost | `estimated` (Claude's own total; Codex from published API rates) |
 | Agent calls made | `exact` |
 | **Agent calls avoided** | `exact` — we chose the route, max route is known |
 | Turns used vs. `--max-turns` ceiling | `exact` |
@@ -225,7 +226,8 @@ sandbox flag — a stage-specific `--allowedTools` list grants only `Read`,
 `Grep`, `Glob`, read-only `git` inspection, and the allowlisted verification
 commands. Claude's native edit tools are also denied. Only Implement receives
 the broad shell grant, because a bare shell can write the repository even when
-native edit tools are denied.
+native edit tools are denied — and not even Implement when Orteca runs the
+tests after it (§4.3.7).
 
 **4.3 `project_symbols` / full repo indexing is premature.** Deferred. ripgrep is fast
 enough on a solo dev's repo and is always current.
@@ -348,9 +350,9 @@ from the CLI refusing a wrong one.
 
 | Tier | Claude | $/M in · out | Codex | $/M in · out |
 |---|---|---:|---|---:|
-| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-5.6-luna`, `medium` | 0.20 · 1.20 |
+| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-5.6-luna`, `low` | 0.20 · 1.20 |
 | `standard` | `sonnet`, `high` | 2 · 10 | `gpt-5.6-terra`, `medium` | 2 · 12 |
-| `deep` | `opus` (Opus 5), `high` | 5 · 25 | `gpt-5.6-sol`, `high` | 5 · 30 |
+| `deep` | `opus` (Opus 5), `high` | 5 · 25 | `gpt-5.6-sol`, `high` | 4 · 20 |
 
 Considered and not chosen: Haiku 4.5 ($1 · $5, 200k, no effort control), Fable
 5.1 ($10 · $50), GPT-6 Astra ($10 · $50, out 2026-09-03, Codex's default and the
@@ -375,8 +377,13 @@ How it was chosen:
    Sonnet at `low`, not Haiku. The whole route runs on one tier, because caches
    are per model.
 5. **A subscription isn't billed per token, but its allowance scales with
-   price**, so the ordering holds either way. None of these prices is turned
-   into a cost for Codex: it still reports tokens only, `unavailable`.
+   price**, so the ordering holds either way. Codex reports tokens only. At
+   startup Orteca fetches `https://models.dev/api.json` (its OpenAI rates
+   matched LiteLLM's on 2026-09-14; OpenRouter had Sol at half) into
+   `model_prices`, and prices each Codex turn at the rate of the model the
+   stage asked for, labelled `estimated`: on a ChatGPT sign-in it is what the
+   same tokens would cost on the API, not a bill. Offline keeps the last list.
+   One turn on an unpriced model leaves the whole run's cost `unavailable`.
 6. **Claude aliases follow the account**, and the id that ran comes back in
    `modelUsage`. Codex has no aliases, so its slugs are pinned in
    `routing::Tier::model` and must be updated when one is retired. Each `stage`
@@ -402,9 +409,11 @@ plan limit allows on a checked route, which evidence always outranks (§4.3.5).
 - The reason is in `route.tierReason`. The preview shows the model, effort and
   reason before anything starts.
 
-**Not measured yet.** No real run has used these flags. The next measurement
-repeats the §4.3.3 exercises on the `cheapest` tier with both CLIs and compares
-them to the rows above.
+Efficient mode has two measured stage overrides. Plan keeps the route's model
+and uses `low`; Implement returns to the tier default, so the provider can keep
+the same model's cache. A guarded Codex Review uses Terra `high`; its failed
+contract still buys the declared Sol `high` Fix. Balanced keeps the table's
+defaults. The measurements are in §4.3.6.
 
 Sources: Claude Code model config (code.claude.com/docs/en/model-config),
 Anthropic API prices (claude-api reference, cached 2026-06-24), OpenAI prices
@@ -523,9 +532,9 @@ than the plain CLI: an Opus review of a finished diff is ~$0.25 of it.
 Next, cheaper without a weaker review. When the repository declares a test
 command, guarded work runs it *before* the Review: a failure buys the Fix and
 the Review then reads the fix; passing work is reviewed with the brief saying
-the tests pass, so Opus spends on what they miss. The Review's effort in
-Efficient mode is `EFFICIENT_REVIEW_EFFORT` in `routing.rs`; Balanced stays on
-`high`.
+the tests pass, so the reviewer spends on what they miss. Efficient mode uses
+the measured provider-specific choice in `routing::Route::review_model`;
+Balanced stays on `deep` at `high`.
 
 That effort was chosen by a review-only benchmark: Orteca's exact Review argv
 and brief, on five seeded changes to a Node file server whose tests all pass,
@@ -547,6 +556,86 @@ reviewer. Both Opus efforts asked for changes on the correct fix because its
 regression test cannot fail (the URL parser strips `..` first). That is true,
 and it buys a Fix call; it does not depend on effort. Ten runs per arm on a toy
 repo: a direction, not a rate.
+
+The Codex stage matrix used five more short calls on the same no-dependency
+repository, with user config, plugins, apps and skills excluded. It stopped at
+five instead of the planned seven when the five-hour allowance moved from 60%
+to 76% used (the weekly window moved 56% to 58%). Acceptance checks stayed
+outside each run's working root.
+
+| Stage | Model / effort | Result | Reported tokens (total · cached · output) |
+|---|---|---|---:|
+| Plan | Luna `low` | valid artifact; all refactor constraints, API compatibility, exact errors and checks covered | 21,595 · 8,960 · 947 |
+| Plan | Luna `medium` | same quality; no rubric gain | 33,228 · 18,944 · 1,250 |
+| Implement | Luna `low` | correct duration fix; 7/7 hidden checks | 53,894 · 38,912 · 701 |
+| security Review | Terra `high` | found the prefix-sharing sibling escape, `high` severity | 24,441 · 11,008 · 903 |
+| security Review | Sol `low` | found the same defect, `high` severity | 36,095 · 22,656 · 802 |
+
+Luna `low` therefore replaces `medium` on `cheapest`, and Efficient Plan uses
+`low`. Terra `high` becomes the Efficient Codex guarded reviewer: it matched
+Sol `low` on the seeded defect with 32% fewer total reported tokens, finished
+first, and has the lower published token price. This is one implementation case
+and one review case, so project history still moves a stalled tier up; Balanced
+remains the conservative choice.
+
+Stage handoffs now carry only information the next process cannot recover from
+the working tree: Plan to Implement, and the last failed Review or Verify to
+Fix. Review gets the already-tested signal without the full Verify artifact;
+Verify and Review inspect the task and tree directly. User instructions still
+repeat in every stage.
+
+### 4.3.7 Orteca does the looking and the checking — 2026-09-14
+
+Every agent turn re-sends the CLI's own prompt and tool schemas, 21-23k on
+Claude (§4.3.3), so a run costs roughly its turn count times that. The recorded
+isolated Claude run went Glob → Read → Edit → reply: four turns for a file the
+brief had already named. Fewer turns and a smaller per-turn context are the
+levers. Skills are the opposite, more text on every turn, which is why they stay
+off.
+
+- **An `implementOnce` in a repository whose tests Orteca can run is Implement →
+  Verify**, that Verify Orteca's own (§8). The call is told not to run tests or
+  builds, and a failure buys the one Fix call. Before, the call ran a check
+  inside itself. Every Implement with a Verify after it gets the same line.
+- **An Implement that such a Verify follows gets no shell on Claude:** `--tools
+  Read,Edit,Write,Glob,Grep`, the same five granted, the denylist kept as a
+  backstop. Bash and PowerShell are the two biggest of the seven schemas. A
+  prompt that names a command-shaped job (`routing::needs_shell`: install,
+  dependency, bump, rename, delete, …) keeps the shell. Codex's only tool is its
+  shell, so Codex is unchanged. Each `stage` event records `shell`.
+- **Codex's Implement brief carries the first three candidate files** under 8 KB
+  each and 16 KB in all, symlinks skipped, so it opens them with no shell call.
+  Claude's does not: its Edit tool refuses a file it has not Read in the same
+  session, so pasting would pay for those bytes twice. Every brief now says to
+  open the named paths directly, with no search first.
+
+**Not measured yet.** The next measurement repeats the §4.3.6 typo, bug and
+feature tasks on both CLIs and compares turns and uncached tokens.
+
+### Parked: replace the CLI's own system prompt
+
+Most of each turn's ~21k is the CLI's built-in system prompt, not Orteca's
+brief. Both CLIs can replace it, which would shrink every turn of every stage:
+
+- `claude --system-prompt-file <file>` replaces the default prompt entirely
+  (`--append-system-prompt` only adds to it, and
+  `--exclude-dynamic-system-prompt-sections` is ignored alongside it). Whether
+  tool schemas and the repo's `CLAUDE.md` still load needs checking in the
+  `init` event. `--system-prompt-snapshot` is on by default, so a resume sends
+  the prompt recorded at the start.
+- `codex exec -c model_instructions_file=<file>` replaces Codex's built-in base
+  instructions rather than adding to them.
+
+Parked because the default prompts carry the tool-use guidance these models are
+tuned on, and only real runs show what a short prompt costs in quality. To pick
+it up: write one short prompt per CLI (use the tools to edit, stay in scope,
+never rewrite git history, stop when done), check both flags the §4.2 way, keep
+the file in Orteca's temp directory and never in the user's repo, then run the
+§4.3.6 tasks against the §4.3.7 rows. Keep it only if every acceptance check
+still passes.
+
+Sources: code.claude.com/docs/en/cli-reference,
+developers.openai.com/codex/config-reference.
 
 **4.4 Mid-task steering is asymmetric and the UI must say so.**
 
@@ -587,7 +676,7 @@ A module is a folder only once it outgrows one file. Actual layout today,
 
 ```
 src-tauri/
-  migrations/0001_init.sql … 0005_worktree.sql
+  migrations/0001_init.sql … 0006_model_prices.sql
   src/
     main.rs        Tauri commands + app setup
     error.rs       AppError { kind, message }, serialized to the frontend
@@ -716,9 +805,9 @@ Detection resolves the program against PATH x PATHEXT itself. `CreateProcess`
 only ever appends `.exe`, so `claude.cmd` — how both CLIs install on Windows —
 is invisible to a bare program name. The resolved path is what `run.rs` spawns.
 
-## 7. SQLite schema — 6 tables
+## 7. SQLite schema — 7 tables
 
-Migrations 0001 to 0005 are shipped; `file_cache` is deferred.
+Migrations 0001 to 0006 are shipped; `file_cache` is deferred.
 
 ```sql
 -- 0001 and 0002, shipped
@@ -750,6 +839,11 @@ tasks.patch_text, tasks.unknown_events, tasks.duration_ms
 -- 0005, shipped
 tasks.worktree_path  -- the separate copy a run worked in; NULL once removed.
                      -- tasks.branch then holds the copy's branch.
+
+-- 0006, shipped
+model_prices(model, input, output, cache_read, fetched_at)
+  -- USD per million tokens from models.dev, replaced whole on each fetch;
+  -- an empty or failed fetch keeps the last list (§4.3.4).
 
 -- deferred
 file_cache(project_id, path, sha256, size, lang, indexed_at)
@@ -809,22 +903,31 @@ route that just failed it. The table also had no default row; there is now a
 
 | Route | Stages | Calls |
 |---|---|---|
-| `ImplementOnce` | Implement | 1 |
+| `ImplementOnce` | Implement, then Verify when Orteca can run it | 1 |
 | `Standard` | Implement → Verify | 2 |
 | `Planned` | Plan → Implement → Verify | 3 |
 | `Escalated` | Plan → Implement → Review | 3 |
 | `Guarded` | Implement → Review → Verify, Plan first when large | 3 or 4 |
 
 `maxAgentCalls` is the number of stages. **Orteca runs a Verify itself when
-the repository declares its test command at the root** (`project::check_command`:
-a real `scripts.test`, else `Cargo.toml`), so on most repos a Verify is no agent
-call. A pass or a fail comes from the exit code, and the last 60 lines of output
-become the Verify artifact, so a failure still buys the Fix call with the
-output in its brief. Orteca picks the fence rather than building one: on Codex
-the command runs in `codex sandbox` (read-only, like a Codex Verify; a sandbox
-that fails to start hands the stage to the agent instead of failing it), on
-Claude it runs as Claude's Verify allowlist would have. With no declared
-command, or none on PATH, the agent verifies as before. Guarded work runs on
+the repository declares its test suites** (`project::check_commands`, at the
+root and one folder down: a real `scripts.test` in `package.json` run with the
+lockfile's package manager, `composer.json`'s test script or `phpunit.xml`,
+`Cargo.toml`, `go.mod`, pytest config), every one of them, so a Laravel app with
+a Vite `frontend/` runs both suites and on most repos a Verify is no agent call.
+A root suite claims its ecosystem, so a workspace's packages are not run twice.
+A suite whose dependencies are not installed - a fresh clone, or every run's
+separate copy - gets its install (`npm ci`, `pnpm install --frozen-lockfile`,
+`composer install`, ...) first; a suite whose tools are not on PATH is reported
+as not run, never passed. A pass or a fail comes from the exit code, and the
+last 60 lines of output become the Verify artifact, so a failure still buys the
+Fix call with the output in its brief. **Suites run as the user on both
+providers**, as the project's trust consent covers, not in `codex sandbox`: the
+sandbox account cannot `lstat` the folders above a repository under the user
+profile, Vite, Jest and npm realpath through them, so every such suite failed
+there and bought a Fix no edit could win; an install also needs the network the
+sandbox denies. With no declared suite, or none that can start, the agent
+verifies as before. Guarded work runs on
 `standard` with its Review on `deep` (`budget.reviewTier`), shown in the preview.
 
 Two rules the spec did not write down, both of which exist to stop Orteca
@@ -842,7 +945,7 @@ spending on its own initiative:
   one `fix` stage on that tier, in place of whatever stages were left: it is
   handed the failing artifact, may edit, and returns the Verify artifact. A
   passing Fix makes the task `done`; anything else is `verifyFailed`. There is
-  never a second Fix, `deep` and `implementOnce` routes have none, the call
+  never a second Fix, `deep` routes and an `implementOnce` with no Verify have none, the call
   ceiling grows by exactly that one call, and a budget stop never escalates.
 - **A held instruction is delivered by the next stage's brief, not by resuming
   the stage it arrived in** — unless that stage is the last one, where M5's

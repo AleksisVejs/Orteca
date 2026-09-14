@@ -43,7 +43,8 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
         // that follows may word it in a way `classify_failure` does not know,
         // so the kind is set here. Not yet seen in a recording.
         "rate_limit_event"
-            if v["rate_limit_info"]["status"] == "rejected" && v["rate_limit_info"]["isUsingOverage"] != true =>
+            if v["rate_limit_info"]["status"] == "rejected"
+                && v["rate_limit_info"]["isUsingOverage"] != true =>
         {
             let window = match v["rate_limit_info"]["rateLimitType"].as_str() {
                 Some("five_hour") => "session",
@@ -61,7 +62,9 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
 
 /// Claude returns a schema-constrained value in the final result event.
 pub fn structured_output(v: &Value) -> Option<Value> {
-    (v["type"] == "result").then(|| v.get("structured_output").cloned()).flatten()
+    (v["type"] == "result")
+        .then(|| v.get("structured_output").cloned())
+        .flatten()
 }
 
 fn block(b: &Value) -> Option<ProviderEvent> {
@@ -84,7 +87,14 @@ fn block(b: &Value) -> Option<ProviderEvent> {
 /// characters of the file's own body instead of its name. Name the fields
 /// rather than hoping at their spelling.
 const IDENTIFYING: &[&str] = &[
-    "file_path", "command", "pattern", "path", "url", "query", "description", "prompt",
+    "file_path",
+    "command",
+    "pattern",
+    "path",
+    "url",
+    "query",
+    "description",
+    "prompt",
 ];
 
 /// One line of "what did it touch" for the activity stream, not an argument dump.
@@ -121,8 +131,7 @@ fn result(v: &Value) -> Vec<ProviderEvent> {
                 .max_by_key(|(_, m)| n(&m["outputTokens"]))
                 .map(|(id, _)| id.clone())
         }),
-        input_tokens: n(&u["input_tokens"])
-            .saturating_add(n(&u["cache_creation_input_tokens"])),
+        input_tokens: n(&u["input_tokens"]).saturating_add(n(&u["cache_creation_input_tokens"])),
         cached_input_tokens: n(&u["cache_read_input_tokens"]),
         output_tokens: n(&u["output_tokens"]),
         reasoning_tokens: 0,
@@ -190,11 +199,23 @@ mod tests {
             "src/main.rs",
             "a Write must name the file, not quote it"
         );
-        assert_eq!(summary(serde_json::json!({"command": "cargo test", "description": "run tests"})), "cargo test");
-        assert_eq!(summary(serde_json::json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})), "a.rs");
-        assert_eq!(summary(serde_json::json!({"pattern": "TODO", "path": "src"})), "TODO");
+        assert_eq!(
+            summary(serde_json::json!({"command": "cargo test", "description": "run tests"})),
+            "cargo test"
+        );
+        assert_eq!(
+            summary(serde_json::json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})),
+            "a.rs"
+        );
+        assert_eq!(
+            summary(serde_json::json!({"pattern": "TODO", "path": "src"})),
+            "TODO"
+        );
         // Nothing recognised: still better than an empty line.
-        assert_eq!(summary(serde_json::json!({"whatever": "something"})), "something");
+        assert_eq!(
+            summary(serde_json::json!({"whatever": "something"})),
+            "something"
+        );
         assert_eq!(summary(serde_json::json!({"count": 3})), "");
     }
 
@@ -202,21 +223,34 @@ mod tests {
     #[test]
     fn a_long_summary_is_cut_without_splitting_a_character() {
         let long = "é".repeat(200);
-        assert_eq!(summary(serde_json::json!({"file_path": long})).chars().count(), 120);
+        assert_eq!(
+            summary(serde_json::json!({"file_path": long}))
+                .chars()
+                .count(),
+            120
+        );
     }
 
     /// Recorded 2.1.269 shape: no `model` on `result`, and `modelUsage` may
     /// list a helper model beside the one that did the work.
     #[test]
     fn the_model_is_the_one_that_wrote_the_most() {
-        let events = parse_line(&serde_json::json!({"type":"result", "subtype":"success", "result":"ok",
+        let events = parse_line(
+            &serde_json::json!({"type":"result", "subtype":"success", "result":"ok",
             "usage": {"input_tokens": 2, "output_tokens": 640},
             "modelUsage": {
                 "claude-haiku-4-5": {"outputTokens": 30},
                 "claude-sonnet-5": {"outputTokens": 610}
-            }}));
-        let usage = events.iter().find_map(|e| match e { ProviderEvent::Usage(u) => Some(u), _ => None });
-        assert_eq!(usage.and_then(|u| u.model.as_deref()), Some("claude-sonnet-5"));
+            }}),
+        );
+        let usage = events.iter().find_map(|e| match e {
+            ProviderEvent::Usage(u) => Some(u),
+            _ => None,
+        });
+        assert_eq!(
+            usage.and_then(|u| u.model.as_deref()),
+            Some("claude-sonnet-5")
+        );
     }
 
     #[test]
@@ -230,6 +264,9 @@ mod tests {
         let warned = parse_line(&serde_json::json!({"type": "rate_limit_event",
             "rate_limit_info": {"status": "allowed_warning", "rateLimitType": "seven_day"}}));
         assert!(warned.is_empty(), "a warning is not a stop");
-        assert_eq!(classify_failure("You've hit your session limit · resets 4pm"), FailureKind::UsageLimit);
+        assert_eq!(
+            classify_failure("You've hit your session limit · resets 4pm"),
+            FailureKind::UsageLimit
+        );
     }
 }

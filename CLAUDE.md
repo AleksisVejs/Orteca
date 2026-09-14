@@ -79,7 +79,8 @@ in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css
   Orteca reads git state and captures diffs; it does not rewrite the user's repo.
 - **Every metric carries a `cost_quality`** of `exact` | `estimated` | `unavailable`.
   Nothing reaches the UI unlabelled, and there is no savings percentage until a project
-  has a real baseline. Codex reports tokens but no cost — say so, don't infer one.
+  has a real baseline. Codex reports tokens but no cost — Orteca prices them from
+  models.dev's published rates as `estimated`, and an unpriced model stays `unavailable`.
 - Permissions are enforced by the provider CLIs (`--permission-mode acceptEdits`,
   `--sandbox workspace-write`). Orteca configures them and adds a denylist on top; it
   does not reimplement sandboxing. Never `--sandbox danger-full-access`.

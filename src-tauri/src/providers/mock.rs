@@ -38,7 +38,9 @@ pub fn replay(id: ProviderId, fixture: &Path) -> io::Result<Vec<ProviderEvent>> 
 
 /// A fixture by filename, for captures that are not a provider's happy path.
 pub fn named(file: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(file)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(file)
 }
 
 /// The bundled recording for a provider.
@@ -73,7 +75,9 @@ mod tests {
     #[test]
     fn an_isolated_claude_run_loads_none_of_the_users_setup() {
         let path = fixture(ProviderId::Claude).with_file_name("claude-isolated-run.jsonl");
-        let init: Value = std::fs::read_to_string(&path).unwrap().lines()
+        let init: Value = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
             .find(|v| v["subtype"] == "init")
             .expect("init event");
@@ -82,8 +86,13 @@ mod tests {
         assert_eq!(init["skills"], serde_json::json!([]));
 
         let events = replay(ProviderId::Claude, &path).expect("fixture");
-        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
-        assert!(events.iter().any(|e| matches!(e, ProviderEvent::Done { turns: 4, .. })));
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::Started { .. })
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::Done { turns: 4, .. })));
     }
 
     #[test]
@@ -146,7 +155,9 @@ mod tests {
             "Added the opened_seq bump to touch_project.".into()
         )));
         // Reasoning is not an assistant message and must not surface as text.
-        assert!(!events.contains(&ProviderEvent::Text("Check the store before editing.".into())));
+        assert!(!events.contains(&ProviderEvent::Text(
+            "Check the store before editing.".into()
+        )));
     }
 
     /// A real `codex exec` run, captured from the app on 2026-09-12: it edited
@@ -301,9 +312,7 @@ mod tests {
         });
         let events = ProviderId::Claude.parse_line(&assistant);
         assert_eq!(events, vec![ProviderEvent::Text("working".into())]);
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, ProviderEvent::Usage(_))));
+        assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Usage(_))));
     }
 
     #[test]
@@ -351,9 +360,14 @@ mod tests {
             .join("claude-auth-failure.jsonl");
         let events = replay(ProviderId::Claude, &path).expect("fixture should be readable");
 
-        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::Started { .. })
+        ));
         assert!(
-            !events.iter().any(|e| matches!(e, ProviderEvent::Done { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Done { .. })),
             "a refused run must never report Done"
         );
         let failure = events
@@ -379,11 +393,17 @@ mod tests {
             .join("codex-usage-limit.jsonl");
         let events = replay(ProviderId::Codex, &path).expect("fixture should be readable");
 
-        assert!(matches!(events.first(), Some(ProviderEvent::Started { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::Started { .. })
+        ));
         assert!(!events.iter().any(|e| matches!(e, ProviderEvent::Usage(_))));
         assert!(events.iter().any(|e| matches!(
             e,
-            ProviderEvent::Failed { kind: FailureKind::UsageLimit, .. }
+            ProviderEvent::Failed {
+                kind: FailureKind::UsageLimit,
+                ..
+            }
         )));
     }
 }

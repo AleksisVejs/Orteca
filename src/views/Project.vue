@@ -827,6 +827,9 @@ const AUTH: Record<Auth, string> = {
             Up to {{ preview.route.budget.maxTurns ?? "the provider’s limit" }} steps ·
             {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }} ·
             {{ preview.model.model }}, {{ preview.model.effort }} effort
+            <template v-if="preview.plan">
+              · plan at {{ preview.plan.effort }} effort
+            </template>
             <template v-if="preview.review">
               · review on {{ preview.review.model }}, {{ preview.review.effort }} effort
             </template>

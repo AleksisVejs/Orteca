@@ -7,14 +7,14 @@
 //! decide whether to spend tokens has already lost the argument.
 //!
 //! The route is fixed *before* a provider starts, and it carries its own
-//! ceilings. A trivial task gets exactly one agent call and verifies itself
-//! inside it. A task that crosses a ceiling stops and says so; it never quietly
+//! ceilings. A trivial task gets exactly one agent call, which verifies itself
+//! unless Orteca can run the tests after it. A task that crosses a ceiling stops and says so; it never quietly
 //! promotes itself to a longer route. The one exception is declared with the
 //! route: a Review or Verify that does not pass may buy a single Fix call on
 //! the next tier up (`budget.escalation`), and never a second.
 
-use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::providers::ProviderId;
 
@@ -123,7 +123,9 @@ impl Tier {
             // Opus 5, not Fable 5.1: twice the price for a lead that only shows
             // on the hardest benchmarks.
             (ProviderId::Claude, Self::Deep) => ("opus", "high"),
-            (ProviderId::Codex, Self::Cheapest) => ("gpt-5.6-luna", "medium"),
+            // Luna low planned the validation refactor and fixed the duration
+            // regression with full hidden-check quality (§4.3.6).
+            (ProviderId::Codex, Self::Cheapest) => ("gpt-5.6-luna", "low"),
             (ProviderId::Codex, Self::Standard) => ("gpt-5.6-terra", "medium"),
             // Sol, not Astra: half the price, and Astra has no SWE-bench Pro
             // score yet.
@@ -211,20 +213,32 @@ pub fn artifact_is_valid(stage: Stage, value: &serde_json::Value) -> bool {
     };
     match stage {
         Stage::Plan => {
-            object.get("objective").is_some_and(serde_json::Value::is_string)
-                && ["constraints", "affected_areas", "implementation_steps", "risks", "tests_required"]
-                    .iter()
-                    .all(|key| object.get(*key).is_some_and(serde_json::Value::is_array))
+            object
+                .get("objective")
+                .is_some_and(serde_json::Value::is_string)
+                && [
+                    "constraints",
+                    "affected_areas",
+                    "implementation_steps",
+                    "risks",
+                    "tests_required",
+                ]
+                .iter()
+                .all(|key| object.get(*key).is_some_and(serde_json::Value::is_array))
         }
         Stage::Review => {
-            object.get("findings").is_some_and(serde_json::Value::is_array)
+            object
+                .get("findings")
+                .is_some_and(serde_json::Value::is_array)
                 && object
                     .get("verdict")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|v| v == "pass" || v == "changes_requested")
         }
         Stage::Verify | Stage::Fix => {
-            object.get("checks").is_some_and(serde_json::Value::is_array)
+            object
+                .get("checks")
+                .is_some_and(serde_json::Value::is_array)
                 && object
                     .get("verdict")
                     .and_then(serde_json::Value::as_str)
@@ -304,8 +318,8 @@ pub struct ExecutionBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RouteKind {
-    /// One Implement call that inspects, edits and verifies itself. No Plan,
-    /// no Review, no second process.
+    /// One Implement call that inspects, edits and verifies itself, or leaves
+    /// the tests to Orteca when it can run them. No Plan, no Review.
     ImplementOnce,
     Standard,
     Planned,
@@ -327,9 +341,9 @@ pub struct Route {
     pub reason: &'static str,
     /// Why `budget.preferred_tier`, in the same way.
     pub tier_reason: &'static str,
-    /// Tracked paths the prompt appears to be about. Names only - never
-    /// contents, which the agent can read for itself more cheaply than Orteca
-    /// can pay to paste them in.
+    /// Tracked paths the prompt appears to be about. Names only: the runner
+    /// pastes the few small ones into a Codex brief, and never into Claude's,
+    /// whose Edit tool makes it Read a file first anyway.
     pub candidate_paths: Vec<String>,
     /// What each stage would have preferred to run on, recorded and not acted
     /// on. See `Capability::preferred_provider`.
@@ -337,8 +351,9 @@ pub struct Route {
 }
 
 impl Route {
+    /// One agent call and nothing after it, so the call checks its own work.
     pub fn is_single_call(&self) -> bool {
-        self.kind == RouteKind::ImplementOnce
+        self.stages == [Stage::Implement]
     }
 
     /// `true` when the checks run before the Review, so a failed check is fixed
@@ -348,87 +363,239 @@ impl Route {
         matches!((at(Stage::Verify), at(Stage::Review)), (Some(v), Some(r)) if v < r)
     }
 
+    /// Efficient plans keep the route's model and lower only its effort. The
+    /// implementation and its checks still protect the result, while keeping
+    /// the same model preserves the provider's prompt cache.
+    pub fn plan_model(&self, id: ProviderId) -> Option<ModelChoice> {
+        if self.mode != Mode::Efficient || !self.stages.contains(&Stage::Plan) {
+            return None;
+        }
+        let mut choice = self.budget.preferred_tier.model(id);
+        choice.effort = "low";
+        Some(choice)
+    }
+
     /// What the Review runs on when that is not the route's tier.
     pub fn review_model(&self, id: ProviderId) -> Option<ModelChoice> {
-        let mut choice = self.budget.review_tier?.model(id);
-        if let (Mode::Efficient, Some(effort)) = (self.mode, EFFICIENT_REVIEW_EFFORT) {
-            choice.effort = effort;
+        let review_tier = self.budget.review_tier?;
+        let mut choice = review_tier.model(id);
+        if self.mode == Mode::Efficient {
+            match id {
+                ProviderId::Claude => choice.effort = "medium",
+                // Terra high found the same seeded containment defect as Sol
+                // low with fewer tokens and lower latency (§4.3.6).
+                ProviderId::Codex => {
+                    choice = Tier::Standard.model(id);
+                    choice.effort = "high";
+                }
+            }
         }
         Some(choice)
     }
 }
 
-/// The effort a guarded Review asks for in Efficient mode; `None` keeps `deep`'s.
-/// `medium` caught every seeded defect `high` did, for ~20% less (§4.3.6).
-/// Balanced never changes.
-// ponytail: 5 cases x 2 runs on a toy repo; re-run the seeded benchmark when the
-// Review brief or the Opus model changes.
-const EFFICIENT_REVIEW_EFFORT: Option<&str> = Some("medium");
-
 /// Words that make a prompt complex, and what each is worth.
 const COMPLEXITY: &[(&str, u8)] = &[
-    ("architecture", 4), ("architectural", 4), ("redesign", 4), ("restructure", 4),
-    ("rewrite", 4), ("subsystem", 3), ("end-to-end", 3), ("orchestrat", 3),
-    ("migrate", 3), ("refactor", 3), ("across the", 3), ("throughout", 3),
-    ("every file", 3), ("whole codebase", 4), ("entire codebase", 4),
-    ("design", 2), ("implement", 2), ("introduce", 2), ("integrate", 2),
-    ("concurren", 2), ("async", 2), ("performance", 2), ("multiple", 2),
-    ("add support", 2), ("new module", 2), ("protocol", 2), ("state machine", 3),
+    ("architecture", 4),
+    ("architectural", 4),
+    ("redesign", 4),
+    ("restructure", 4),
+    ("rewrite", 4),
+    ("subsystem", 3),
+    ("end-to-end", 3),
+    ("orchestrat", 3),
+    ("migrate", 3),
+    ("refactor", 3),
+    ("across the", 3),
+    ("throughout", 3),
+    ("every file", 3),
+    ("whole codebase", 4),
+    ("entire codebase", 4),
+    ("design", 2),
+    ("implement", 2),
+    ("introduce", 2),
+    ("integrate", 2),
+    ("concurren", 2),
+    ("async", 2),
+    ("performance", 2),
+    ("multiple", 2),
+    ("add support", 2),
+    ("new module", 2),
+    ("protocol", 2),
+    ("state machine", 3),
     // A cause nobody has found yet. The fix may be one line; finding it is not.
-    ("intermittent", 3), ("flaky", 3), ("deadlock", 3), ("race condition", 3),
-    (" hang", 3), ("memory leak", 3), ("nondetermin", 3), ("sometimes", 2),
+    ("intermittent", 3),
+    ("flaky", 3),
+    ("deadlock", 3),
+    ("race condition", 3),
+    (" hang", 3),
+    ("memory leak", 3),
+    ("nondetermin", 3),
+    ("sometimes", 2),
     ("randomly", 2),
 ];
 
 /// Words that say a prompt is small. Subtracted, never below zero.
 const TRIVIAL: &[(&str, u8)] = &[
-    ("typo", 3), ("spelling", 3), ("comment", 2), ("docstring", 2),
-    ("rename", 2), ("whitespace", 3), ("formatting", 2), ("wording", 2),
-    ("log message", 2), ("bump", 2), ("changelog", 2), ("one-line", 3),
-    ("one line", 3), ("small fix", 2), ("readme", 2),
+    ("typo", 3),
+    ("spelling", 3),
+    ("comment", 2),
+    ("docstring", 2),
+    ("rename", 2),
+    ("whitespace", 3),
+    ("formatting", 2),
+    ("wording", 2),
+    ("log message", 2),
+    ("bump", 2),
+    ("changelog", 2),
+    ("one-line", 3),
+    ("one line", 3),
+    ("small fix", 2),
+    ("readme", 2),
 ];
 
 /// Words that make a prompt risky, independent of how complex it is.
 const RISK: &[(&str, u8)] = &[
-    ("delete", 3), ("drop table", 5), ("production", 4), ("irreversible", 4),
-    ("secret", 4), ("credential", 4), ("password", 4), ("api key", 4),
-    ("encrypt", 3), ("sandbox", 3), ("permission", 3), ("payment", 4),
-    ("billing", 3), ("upgrade", 2), ("breaking change", 3), ("data loss", 4),
+    ("delete", 3),
+    ("drop table", 5),
+    ("production", 4),
+    ("irreversible", 4),
+    ("secret", 4),
+    ("credential", 4),
+    ("password", 4),
+    ("api key", 4),
+    ("encrypt", 3),
+    ("sandbox", 3),
+    ("permission", 3),
+    ("payment", 4),
+    ("billing", 3),
+    ("upgrade", 2),
+    ("breaking change", 3),
+    ("data loss", 4),
 ];
 
 const SECURITY: &[&str] = &[
-    "security", "vulnerab", "exploit", "injection", "xss", "csrf", "sanitis",
-    "sanitiz", "secret", "credential", "password", "api key", "encrypt",
-    "certificate", "sandbox escape", "cve",
+    "security",
+    "vulnerab",
+    "exploit",
+    "injection",
+    "xss",
+    "csrf",
+    "sanitis",
+    "sanitiz",
+    "secret",
+    "credential",
+    "password",
+    "api key",
+    "encrypt",
+    "certificate",
+    "sandbox escape",
+    "cve",
 ];
 
 const AUTHZ: &[&str] = &[
-    "auth", "authoris", "authoriz", "authentic", "permission", "access control",
-    "rbac", "role", "login", "session token", "oauth", "privilege",
+    "auth",
+    "authoris",
+    "authoriz",
+    "authentic",
+    "permission",
+    "access control",
+    "rbac",
+    "role",
+    "login",
+    "session token",
+    "oauth",
+    "privilege",
 ];
 
 const SCHEMA: &[&str] = &[
-    "migration", "schema", "database", "sqlite", "table", "column", "index on",
-    "foreign key", "drop table", "alter table",
+    "migration",
+    "schema",
+    "database",
+    "sqlite",
+    "table",
+    "column",
+    "index on",
+    "foreign key",
+    "drop table",
+    "alter table",
 ];
 
 const ARCHITECTURE: &[&str] = &[
-    "architecture", "architectural", "redesign", "restructure", "rewrite",
-    "subsystem", "whole codebase", "entire codebase", "orchestrat",
-    "state machine", "end-to-end",
+    "architecture",
+    "architectural",
+    "redesign",
+    "restructure",
+    "rewrite",
+    "subsystem",
+    "whole codebase",
+    "entire codebase",
+    "orchestrat",
+    "state machine",
+    "end-to-end",
 ];
 
-const BUG: &[&str] = &["bug", "fix", "broken", "regression", "crash", "panic", "fails", "failing", "wrong"];
-const REFACTOR: &[&str] = &["refactor", "clean up", "cleanup", "tidy", "simplify", "extract", "rename"];
-const FRONTEND: &[&str] = &["ui", "css", "vue", "component", "screen", "button", "layout", "style", "frontend"];
+/// Words that say the edit itself needs a command: a dependency, a generator, a
+/// file moved or removed. Such a prompt keeps the shell even when Orteca runs
+/// the tests afterwards.
+const SHELL: &[&str] = &[
+    "install",
+    "dependenc",
+    "bump",
+    "upgrade",
+    "npm",
+    "yarn",
+    "pnpm",
+    "cargo",
+    "composer",
+    "pip ",
+    "git ",
+    "generat",
+    "lockfile",
+    "rename",
+    "move",
+    "delete",
+    "script",
+    "command",
+];
+
+pub fn needs_shell(prompt: &str) -> bool {
+    contains_any(&prompt.to_ascii_lowercase(), SHELL)
+}
+
+const BUG: &[&str] = &[
+    "bug",
+    "fix",
+    "broken",
+    "regression",
+    "crash",
+    "panic",
+    "fails",
+    "failing",
+    "wrong",
+];
+const REFACTOR: &[&str] = &[
+    "refactor", "clean up", "cleanup", "tidy", "simplify", "extract", "rename",
+];
+const FRONTEND: &[&str] = &[
+    "ui",
+    "css",
+    "vue",
+    "component",
+    "screen",
+    "button",
+    "layout",
+    "style",
+    "frontend",
+];
 
 /// Words too common to say anything about which files a prompt is about.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "that", "this", "with", "from", "into", "when", "then", "than",
-    "have", "has", "was", "were", "for", "not", "but", "all", "any", "each",
-    "make", "made", "should", "would", "could", "must", "please", "need", "want",
-    "file", "files", "code", "test", "tests", "line", "lines", "change", "changes",
-    "add", "added", "new", "use", "using", "also", "where", "what", "which",
+    "the", "and", "that", "this", "with", "from", "into", "when", "then", "than", "have", "has",
+    "was", "were", "for", "not", "but", "all", "any", "each", "make", "made", "should", "would",
+    "could", "must", "please", "need", "want", "file", "files", "code", "test", "tests", "line",
+    "lines", "change", "changes", "add", "added", "new", "use", "using", "also", "where", "what",
+    "which",
 ];
 
 /// The repository side of the decision. Collected once, cheaply, before the
@@ -484,7 +651,12 @@ const TEST_WORDS: &[&str] = &["test", "tests", "spec"];
 /// What a file is named for, with its extension and any test marker removed:
 /// `src/slug.rs`, `tests/test_slug.py` and `slug_test.rs` all give `slug`.
 fn stem(path: &str) -> Option<String> {
-    let name = path.rsplit('/').next()?.split('.').next()?.to_ascii_lowercase();
+    let name = path
+        .rsplit('/')
+        .next()?
+        .split('.')
+        .next()?
+        .to_ascii_lowercase();
     let words: Vec<&str> = name
         .split(['_', '-'])
         .filter(|w| !w.is_empty() && !TEST_WORDS.contains(w))
@@ -662,10 +834,20 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         // file and no small-edit word is of unknown scope, not a small one.
         && (signals.blast_radius > 0 || score(&prompt.to_ascii_lowercase(), TRIVIAL) > 0)
     {
+        // Tests Orteca runs itself cost no call, so the one call only edits and
+        // they run after it; a failure buys the Fix, as on any checked route.
+        let mut stages = vec![Stage::Implement];
+        if repo.checks_locally {
+            stages.push(Stage::Verify);
+        }
         (
             RouteKind::ImplementOnce,
-            vec![Stage::Implement],
-            "small, low-risk and narrow: one call that edits and verifies itself",
+            stages,
+            if repo.checks_locally {
+                "small, low-risk and narrow: one call edits, then Orteca runs the tests"
+            } else {
+                "small, low-risk and narrow: one call that edits and verifies itself"
+            },
         )
     } else {
         (
@@ -690,10 +872,13 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     // evidence ages out with the project's last 50 runs, which is what lets a
     // stepped-over tier be tried again.
     while repo.stalled_tiers.contains(&(kind, budget.preferred_tier)) {
-        let Some(up) = budget.preferred_tier.up() else { break };
+        let Some(up) = budget.preferred_tier.up() else {
+            break;
+        };
         budget.preferred_tier = up;
         raised = true;
-        tier_reason = "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
+        tier_reason =
+            "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
     }
     // Short on plan allowance, the one step down, and only where the run still
     // finishes: a Review or Verify catches a miss, and the Fix call it buys
@@ -703,7 +888,9 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     // ponytail: 10% of a plan window per call is a guess, not a measurement;
     // replace it with each route's measured draw once runs read limits before and after.
     const LOW_ROOM_PER_CALL: f64 = 10.0;
-    let checked = stages.iter().any(|s| matches!(s, Stage::Review | Stage::Verify));
+    let checked = stages
+        .iter()
+        .any(|s| matches!(s, Stage::Review | Stage::Verify));
     if let (Some(room), Some(down)) = (repo.headroom, budget.preferred_tier.down()) {
         let calls = budget.max_agent_calls + u32::from(checked);
         if checked
@@ -809,16 +996,20 @@ pub fn brief(
     let mut out = String::new();
 
     match stage {
-        Stage::Plan => out.push_str("Plan this work. Do not edit any file. Return only the structured plan.\n\n"),
+        Stage::Plan => out
+            .push_str("Plan this work. Do not edit any file. Return only the structured plan.\n\n"),
         Stage::Review => {
             out.push_str(
                 "Review the change that is already in the working tree against the task below. \
                  Do not edit any file. Return only the structured review; `pass` means the work \
                  is finished and needs no further call.",
             );
-            let tested = carried
-                .iter()
-                .any(|n| n.stage == Stage::Verify && n.artifact.as_ref().is_some_and(|a| stage_passed(Stage::Verify, a)));
+            let tested = carried.iter().any(|n| {
+                matches!(n.stage, Stage::Verify | Stage::Fix)
+                    && n.artifact
+                        .as_ref()
+                        .is_some_and(|a| stage_passed(n.stage, a))
+            });
             if tested {
                 out.push_str(
                     " The repository's tests already pass on it; spend the review on the \
@@ -840,7 +1031,8 @@ pub fn brief(
                  the structured result: every check you ran, whether it passed, and what it \
                  printed. `pass` means at least one check ran and every check passed. ",
             );
-            let reviewed = route.verifies_before_review() && carried.last().is_some_and(|n| n.stage == Stage::Verify);
+            let reviewed = route.verifies_before_review()
+                && carried.last().is_some_and(|n| n.stage == Stage::Verify);
             out.push_str(if reviewed {
                 "A review reads the fix after this call.\n\n"
             } else {
@@ -856,8 +1048,8 @@ pub fn brief(
 
     if !route.candidate_paths.is_empty() {
         out.push_str(
-            "\nStart here. These tracked paths match the task, most likely first; read the \
-             ones you need and ignore the rest:\n",
+            "\nStart here. These tracked paths match the task, most likely first; open the \
+             ones you need directly, with no search first, and ignore the rest:\n",
         );
         for path in &route.candidate_paths {
             out.push_str("- ");
@@ -877,7 +1069,25 @@ pub fn brief(
         }
     }
 
-    for note in carried {
+    // A new process can inspect the working tree. Carry only information it
+    // cannot recover there: the Plan into Implement, or the failed contract
+    // that triggered Fix. Review needs only the tested signal above.
+    let handoff: Vec<&StageNote> = match stage {
+        Stage::Implement => carried
+            .iter()
+            .rev()
+            .find(|n| n.stage == Stage::Plan)
+            .into_iter()
+            .collect(),
+        Stage::Fix => carried
+            .iter()
+            .rev()
+            .find(|n| matches!(n.stage, Stage::Review | Stage::Verify))
+            .into_iter()
+            .collect(),
+        Stage::Plan | Stage::Review | Stage::Verify => Vec::new(),
+    };
+    for note in handoff {
         match &note.artifact {
             Some(artifact) => {
                 out.push_str("\nValidated ");
@@ -916,6 +1126,12 @@ pub fn brief(
                  no check: stop once the edit is made. Do not broaden the task, refactor \
                  around it, or run the whole suite.\n",
             );
+        } else if route.stages.contains(&Stage::Verify) {
+            out.push_str(
+                "Make the change described above and nothing beyond it. A later stage \
+                 runs the checks, so do not run tests or builds yourself; stop when the \
+                 change is complete.\n",
+            );
         } else {
             out.push_str(
                 "Make the change described above and nothing beyond it. A later stage \
@@ -945,8 +1161,13 @@ mod tests {
     use super::*;
 
     const REPO: &[&str] = &[
-        "src/main.rs", "src/run.rs", "src/routing.rs", "src/store.rs",
-        "src/views/Project.vue", "docs/architecture.md", "README.md",
+        "src/main.rs",
+        "src/run.rs",
+        "src/routing.rs",
+        "src/store.rs",
+        "src/views/Project.vue",
+        "docs/architecture.md",
+        "README.md",
     ];
 
     fn repo(paths: &[&str]) -> RepoSignals {
@@ -962,21 +1183,46 @@ mod tests {
     #[test]
     fn candidates_are_ranked_by_name_recency_and_paired_tests() {
         let signals = RepoSignals {
-            tracked_paths: ["slugs.txt", "docs/slug-notes.md", "slugify.rs", "src/deep/slug.rs"]
-                .map(String::from)
-                .to_vec(),
+            tracked_paths: [
+                "slugs.txt",
+                "docs/slug-notes.md",
+                "slugify.rs",
+                "src/deep/slug.rs",
+            ]
+            .map(String::from)
+            .to_vec(),
             recent_paths: vec!["docs/slug-notes.md".into()],
             ..Default::default()
         };
         let r = route("tidy the slug code", Mode::Balanced, &signals);
-        assert_eq!(r.candidate_paths, ["docs/slug-notes.md", "src/deep/slug.rs", "slugs.txt", "slugify.rs"]);
+        assert_eq!(
+            r.candidate_paths,
+            [
+                "docs/slug-notes.md",
+                "src/deep/slug.rs",
+                "slugs.txt",
+                "slugify.rs"
+            ]
+        );
 
-        let r = balanced("fix slug.rs", &["src/deep/slug.rs", "tests/test_slug.py", "src/other.rs"]);
-        assert_eq!(r.candidate_paths, ["src/deep/slug.rs", "tests/test_slug.py"]);
-        assert_eq!(r.signals.blast_radius, 1, "a paired test widened the blast radius");
+        let r = balanced(
+            "fix slug.rs",
+            &["src/deep/slug.rs", "tests/test_slug.py", "src/other.rs"],
+        );
+        assert_eq!(
+            r.candidate_paths,
+            ["src/deep/slug.rs", "tests/test_slug.py"]
+        );
+        assert_eq!(
+            r.signals.blast_radius, 1,
+            "a paired test widened the blast radius"
+        );
         // Named by the prompt too: still paired, still not blast radius.
         let r = balanced("fix slug tests", &["src/slug.rs", "tests/test_slug.py"]);
-        assert_eq!(r.signals.blast_radius, 1, "a named paired test widened the blast radius");
+        assert_eq!(
+            r.signals.blast_radius, 1,
+            "a named paired test widened the blast radius"
+        );
     }
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {
@@ -988,26 +1234,68 @@ mod tests {
     /// guarded work, never onto a tier that stalled, never without a check.
     #[test]
     fn a_low_plan_limit_drops_a_checked_route_one_tier() {
-        let low = |room: f64| RepoSignals { headroom: Some(room), ..repo(REPO) };
+        let low = |room: f64| RepoSignals {
+            headroom: Some(room),
+            ..repo(REPO)
+        };
         let r = route("make the header bold", Mode::Balanced, &low(20.0));
         assert_eq!(r.kind, RouteKind::Standard);
-        assert_eq!((r.budget.preferred_tier, r.budget.escalation), (Tier::Cheapest, Some(Tier::Standard)));
+        assert_eq!(
+            (r.budget.preferred_tier, r.budget.escalation),
+            (Tier::Cheapest, Some(Tier::Standard))
+        );
         assert!(r.tier_reason.contains("one tier down"), "{}", r.tier_reason);
 
-        assert_eq!(route("make the header bold", Mode::Balanced, &low(60.0)).budget.preferred_tier, Tier::Standard, "enough room");
-        assert_eq!(balanced("make the header bold", REPO).budget.preferred_tier, Tier::Standard, "an unread limit is not a low one");
+        assert_eq!(
+            route("make the header bold", Mode::Balanced, &low(60.0))
+                .budget
+                .preferred_tier,
+            Tier::Standard,
+            "enough room"
+        );
+        assert_eq!(
+            balanced("make the header bold", REPO).budget.preferred_tier,
+            Tier::Standard,
+            "an unread limit is not a low one"
+        );
 
         let mut raised = low(5.0);
         raised.prior_failures = 1;
-        assert_eq!(route("make the header bold", Mode::Balanced, &raised).budget.preferred_tier, Tier::Deep, "evidence outranks allowance");
+        assert_eq!(
+            route("make the header bold", Mode::Balanced, &raised)
+                .budget
+                .preferred_tier,
+            Tier::Deep,
+            "evidence outranks allowance"
+        );
 
         let mut stalled = low(5.0);
         stalled.stalled_tiers = vec![(RouteKind::Standard, Tier::Cheapest)];
-        assert_eq!(route("make the header bold", Mode::Balanced, &stalled).budget.preferred_tier, Tier::Standard, "never onto a tier that stalled");
+        assert_eq!(
+            route("make the header bold", Mode::Balanced, &stalled)
+                .budget
+                .preferred_tier,
+            Tier::Standard,
+            "never onto a tier that stalled"
+        );
 
         let guarded = route("fix the password check", Mode::Balanced, &low(1.0));
-        assert_eq!((guarded.kind, guarded.budget.preferred_tier, guarded.budget.review_tier), (RouteKind::Guarded, Tier::Standard, Some(Tier::Deep)), "guarded work keeps its tiers");
-        assert_eq!(route("fix the typo", Mode::Balanced, &low(1.0)).budget.preferred_tier, Tier::Cheapest, "one call has no check to catch a miss");
+        assert_eq!(
+            (
+                guarded.kind,
+                guarded.budget.preferred_tier,
+                guarded.budget.review_tier
+            ),
+            (RouteKind::Guarded, Tier::Standard, Some(Tier::Deep)),
+            "guarded work keeps its tiers"
+        );
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &low(1.0))
+                .budget
+                .preferred_tier,
+            Tier::Cheapest,
+            "one call has no check to catch a miss"
+        );
     }
 
     /// The headline of the milestone: a small, low-risk, narrow task costs one
@@ -1019,16 +1307,66 @@ mod tests {
         assert_eq!(r.stages, [Stage::Implement]);
         assert_eq!(r.budget.max_agent_calls, 1);
         assert!(r.is_single_call());
-        assert!(!r.stages.contains(&Stage::Plan), "a typo does not need a plan");
-        assert!(!r.stages.contains(&Stage::Review), "a typo does not need a review");
+        assert!(
+            !r.stages.contains(&Stage::Plan),
+            "a typo does not need a plan"
+        );
+        assert!(
+            !r.stages.contains(&Stage::Review),
+            "a typo does not need a review"
+        );
 
-        let brief = brief(&r, Stage::Implement, "Fix the typo in the README heading", &[], &[]);
-        assert!(brief.contains("one focused check"), "verification happens inside the single call");
+        let brief = brief(
+            &r,
+            Stage::Implement,
+            "Fix the typo in the README heading",
+            &[],
+            &[],
+        );
+        assert!(
+            brief.contains("one focused check"),
+            "verification happens inside the single call"
+        );
         assert!(brief.contains("1 agent call"));
         // What §12 forbids: a generic multi-stage checklist on a small task.
         for word in ["Plan stage", "Review stage", "plan artifact"] {
-            assert!(!brief.contains(word), "a one-call brief must not carry `{word}`");
+            assert!(
+                !brief.contains(word),
+                "a one-call brief must not carry `{word}`"
+            );
         }
+    }
+
+    /// When Orteca can run the tests, the one call only edits: it is told not
+    /// to check, and Orteca's own Verify follows it.
+    #[test]
+    fn a_trivial_task_leaves_its_tests_to_orteca_when_it_can_run_them() {
+        let local = RepoSignals {
+            checks_locally: true,
+            ..repo(REPO)
+        };
+        let r = route("Fix the typo in the README heading", Mode::Balanced, &local);
+        assert_eq!(
+            (r.kind, r.stages.as_slice()),
+            (
+                RouteKind::ImplementOnce,
+                [Stage::Implement, Stage::Verify].as_slice()
+            )
+        );
+        assert!(!r.is_single_call());
+        let text = brief(
+            &r,
+            Stage::Implement,
+            "Fix the typo in the README heading",
+            &[],
+            &[],
+        );
+        assert!(
+            text.contains("do not run tests") && !text.contains("one focused check"),
+            "{text}"
+        );
+        assert!(needs_shell("bump lodash") && needs_shell("install the zod dependency"));
+        assert!(!needs_shell("Fix the typo in the README heading"));
     }
 
     #[test]
@@ -1047,8 +1385,14 @@ mod tests {
                 r.budget.max_agent_calls,
                 r.stages.len()
             );
-            assert!(r.budget.max_turns.is_some(), "`{prompt}` declared no turn ceiling");
-            assert!(r.budget.max_reported_tokens.is_some(), "`{prompt}` declared no token ceiling");
+            assert!(
+                r.budget.max_turns.is_some(),
+                "`{prompt}` declared no turn ceiling"
+            );
+            assert!(
+                r.budget.max_reported_tokens.is_some(),
+                "`{prompt}` declared no token ceiling"
+            );
         }
     }
 
@@ -1061,26 +1405,82 @@ mod tests {
         ] {
             let r = balanced(prompt, REPO);
             assert_eq!(r.kind, RouteKind::Guarded, "`{prompt}` was not guarded");
-            assert_eq!(r.stages, [Stage::Implement, Stage::Review, Stage::Verify], "`{prompt}` is small and needs no plan");
-            assert_eq!((r.budget.preferred_tier, r.budget.review_tier), (Tier::Standard, Some(Tier::Deep)));
-            assert!(r.signals.risk >= 5, "`{prompt}` scored risk {}", r.signals.risk);
+            assert_eq!(
+                r.stages,
+                [Stage::Implement, Stage::Review, Stage::Verify],
+                "`{prompt}` is small and needs no plan"
+            );
+            assert_eq!(
+                (r.budget.preferred_tier, r.budget.review_tier),
+                (Tier::Standard, Some(Tier::Deep))
+            );
+            assert!(
+                r.signals.risk >= 5,
+                "`{prompt}` scored risk {}",
+                r.signals.risk
+            );
         }
-        let large = balanced("redesign the authorization subsystem so every endpoint checks it", REPO);
-        assert_eq!(large.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
+        let large = balanced(
+            "redesign the authorization subsystem so every endpoint checks it",
+            REPO,
+        );
+        assert_eq!(
+            large.stages,
+            [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]
+        );
 
         // Tests Orteca runs itself go before the Review.
-        let local = RepoSignals { checks_locally: true, ..repo(REPO) };
-        let r = route("add an authorization check before the delete endpoint", Mode::Balanced, &local);
+        let local = RepoSignals {
+            checks_locally: true,
+            ..repo(REPO)
+        };
+        let r = route(
+            "add an authorization check before the delete endpoint",
+            Mode::Balanced,
+            &local,
+        );
         assert_eq!(r.stages, [Stage::Implement, Stage::Verify, Stage::Review]);
-        assert!(r.verifies_before_review() && !balanced("add an authorization check before the delete endpoint", REPO).verifies_before_review());
-        let r = route("redesign the authorization subsystem so every endpoint checks it", Mode::Balanced, &local);
-        assert_eq!(r.stages, [Stage::Plan, Stage::Implement, Stage::Verify, Stage::Review]);
+        assert!(
+            r.verifies_before_review()
+                && !balanced(
+                    "add an authorization check before the delete endpoint",
+                    REPO
+                )
+                .verifies_before_review()
+        );
+        let r = route(
+            "redesign the authorization subsystem so every endpoint checks it",
+            Mode::Balanced,
+            &local,
+        );
+        assert_eq!(
+            r.stages,
+            [Stage::Plan, Stage::Implement, Stage::Verify, Stage::Review]
+        );
 
-        // Balanced reviews on deep's own effort; Efficient only moves it once benchmarked.
+        // Balanced reviews on deep. Efficient uses the provider-specific
+        // combination that passed its seeded review benchmark.
         let claude = ProviderId::Claude;
         assert_eq!(r.review_model(claude), Some(Tier::Deep.model(claude)));
-        let lean = route("add an authorization check before the delete endpoint", Mode::Efficient, &local);
-        assert_eq!(lean.review_model(claude).map(|c| c.effort), Some(EFFICIENT_REVIEW_EFFORT.unwrap_or("high")));
+        let lean = route(
+            "add an authorization check before the delete endpoint",
+            Mode::Efficient,
+            &local,
+        );
+        assert_eq!(
+            lean.review_model(claude).map(|c| (c.model, c.effort)),
+            Some(("opus", "medium"))
+        );
+        assert_eq!(
+            lean.review_model(ProviderId::Codex)
+                .map(|c| (c.model, c.effort)),
+            Some(("gpt-5.6-terra", "high"))
+        );
+        assert_eq!(
+            r.review_model(ProviderId::Codex)
+                .map(|c| (c.model, c.effort)),
+            Some(("gpt-5.6-sol", "high"))
+        );
     }
 
     /// A prompt can read as small and still be dangerous. The gate wins.
@@ -1093,21 +1493,46 @@ mod tests {
 
     #[test]
     fn architectural_or_complex_work_is_planned_first() {
-        let r = balanced("redesign the storage subsystem so it can be swapped out", REPO);
+        let r = balanced(
+            "redesign the storage subsystem so it can be swapped out",
+            REPO,
+        );
         assert_eq!(r.kind, RouteKind::Planned);
         assert_eq!(r.stages[0], Stage::Plan);
         assert!(r.signals.architecture);
+
+        let lean = route(
+            "redesign the storage subsystem so it can be swapped out",
+            Mode::Efficient,
+            &repo(REPO),
+        );
+        assert_eq!(
+            lean.plan_model(ProviderId::Codex)
+                .map(|c| (c.model, c.effort)),
+            Some(("gpt-5.6-terra", "low"))
+        );
+        assert_eq!(
+            r.plan_model(ProviderId::Codex),
+            None,
+            "Balanced keeps the tier default"
+        );
     }
 
     #[test]
     fn a_prompt_that_failed_twice_is_escalated_rather_than_repeated() {
         let mut signals = repo(REPO);
         signals.prior_failures = 1;
-        assert_eq!(route("fix the typo", Mode::Balanced, &signals).kind, RouteKind::ImplementOnce);
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &signals).kind,
+            RouteKind::ImplementOnce
+        );
         signals.prior_failures = 2;
         let escalated = route("fix the typo", Mode::Balanced, &signals);
         assert_eq!(escalated.kind, RouteKind::Escalated);
-        assert_eq!(escalated.stages, [Stage::Plan, Stage::Implement, Stage::Review]);
+        assert_eq!(
+            escalated.stages,
+            [Stage::Plan, Stage::Implement, Stage::Review]
+        );
     }
 
     /// Efficient is the same table read two points further along, so work that
@@ -1136,7 +1561,11 @@ mod tests {
     /// authorisation, security or the schema.
     #[test]
     fn efficient_mode_does_not_relax_the_risk_gates() {
-        let r = route("add an authorization check before the delete endpoint", Mode::Efficient, &repo(REPO));
+        let r = route(
+            "add an authorization check before the delete endpoint",
+            Mode::Efficient,
+            &repo(REPO),
+        );
         assert_eq!(r.kind, RouteKind::Guarded);
         assert!(r.stages.contains(&Stage::Review));
     }
@@ -1145,45 +1574,95 @@ mod tests {
     /// stalling on this route here - and never down, and never past Deep.
     #[test]
     fn a_tier_only_steps_up_on_evidence_and_deep_is_the_ceiling() {
-        assert_eq!(balanced("fix the typo", REPO).budget.preferred_tier, Tier::Cheapest);
+        assert_eq!(
+            balanced("fix the typo", REPO).budget.preferred_tier,
+            Tier::Cheapest
+        );
         // One Fix call a tier up, only where a check can fail and a tier is left.
-        assert_eq!(balanced("fix the typo", REPO).budget.escalation, None, "one call has no check to fail");
+        assert_eq!(
+            balanced("fix the typo", REPO).budget.escalation,
+            None,
+            "one call has no check to fail"
+        );
         let standard = balanced("make the header bold", REPO);
-        assert_eq!((standard.budget.preferred_tier, standard.budget.escalation), (Tier::Standard, Some(Tier::Deep)));
-        assert_eq!(balanced("redesign the storage subsystem", REPO).budget.escalation, None, "nothing above deep");
+        assert_eq!(
+            (standard.budget.preferred_tier, standard.budget.escalation),
+            (Tier::Standard, Some(Tier::Deep))
+        );
+        assert_eq!(
+            balanced("redesign the storage subsystem", REPO)
+                .budget
+                .escalation,
+            None,
+            "nothing above deep"
+        );
         let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[]);
         assert!(fix.contains("did not pass") && !fix.contains("A later stage checks"));
-        assert!(fix.contains("3 agent calls for the whole task"), "the Fix brief did not count its own call: {fix}");
+        assert!(
+            fix.contains("3 agent calls for the whole task"),
+            "the Fix brief did not count its own call: {fix}"
+        );
 
         let mut signals = repo(REPO);
         signals.prior_failures = 1;
-        assert_eq!(route("fix the typo", Mode::Balanced, &signals).budget.preferred_tier, Tier::Standard);
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &signals)
+                .budget
+                .preferred_tier,
+            Tier::Standard
+        );
 
         let mut signals = repo(REPO);
-        signals.stalled_tiers = vec![(RouteKind::ImplementOnce, Tier::Cheapest), (RouteKind::ImplementOnce, Tier::Standard)];
+        signals.stalled_tiers = vec![
+            (RouteKind::ImplementOnce, Tier::Cheapest),
+            (RouteKind::ImplementOnce, Tier::Standard),
+        ];
         let r = route("fix the typo", Mode::Balanced, &signals);
         assert_eq!(r.budget.preferred_tier, Tier::Deep);
         assert!(r.tier_reason.contains("stalled"));
         // Evidence about another route kind says nothing about this one.
         signals.stalled_tiers = vec![(RouteKind::Standard, Tier::Cheapest)];
-        assert_eq!(route("fix the typo", Mode::Balanced, &signals).budget.preferred_tier, Tier::Cheapest);
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &signals)
+                .budget
+                .preferred_tier,
+            Tier::Cheapest
+        );
         signals.stalled_tiers = vec![(RouteKind::Planned, Tier::Deep)];
-        assert_eq!(route("redesign the storage subsystem", Mode::Balanced, &signals).budget.preferred_tier, Tier::Deep);
+        assert_eq!(
+            route("redesign the storage subsystem", Mode::Balanced, &signals)
+                .budget
+                .preferred_tier,
+            Tier::Deep
+        );
     }
 
     #[test]
     fn a_wide_prompt_leaves_the_one_call_route_even_when_it_scores_low() {
         let narrow = repo(&["src/widget/one_widget.rs", "docs/architecture.md"]);
         let prompt = "rename widget";
-        assert_eq!(route(prompt, Mode::Balanced, &narrow).kind, RouteKind::ImplementOnce);
+        assert_eq!(
+            route(prompt, Mode::Balanced, &narrow).kind,
+            RouteKind::ImplementOnce
+        );
 
         let broad = RepoSignals {
-            tracked_paths: (0..40).map(|i| format!("src/widget/{i}_widget.rs")).collect(),
+            tracked_paths: (0..40)
+                .map(|i| format!("src/widget/{i}_widget.rs"))
+                .collect(),
             ..Default::default()
         };
         let r = route(prompt, Mode::Balanced, &broad);
-        assert!(r.signals.blast_radius > 5, "blast radius was {}", r.signals.blast_radius);
-        assert_ne!(r.kind, RouteKind::ImplementOnce, "a prompt touching 40 files is not narrow");
+        assert!(
+            r.signals.blast_radius > 5,
+            "blast radius was {}",
+            r.signals.blast_radius
+        );
+        assert_ne!(
+            r.kind,
+            RouteKind::ImplementOnce,
+            "a prompt touching 40 files is not narrow"
+        );
     }
 
     #[test]
@@ -1201,8 +1680,14 @@ mod tests {
     fn a_brief_names_paths_and_pastes_no_contents() {
         let r = balanced("fix the run.rs typo", REPO);
         let text = brief(&r, Stage::Implement, "fix the run.rs typo", &[], &[]);
-        assert!(text.contains("src/run.rs"), "the candidate path was not named: {text}");
-        assert!(!text.contains("fn main"), "file contents leaked into the brief");
+        assert!(
+            text.contains("src/run.rs"),
+            "the candidate path was not named: {text}"
+        );
+        assert!(
+            !text.contains("fn main"),
+            "file contents leaked into the brief"
+        );
         assert!(r.candidate_paths.len() <= 10);
     }
 
@@ -1210,9 +1695,18 @@ mod tests {
     #[test]
     fn every_stage_brief_repeats_every_instruction_the_user_has_given() {
         let r = balanced("redesign the storage subsystem", REPO);
-        let constraints = vec!["keep the public API".to_string(), "no new dependencies".to_string()];
+        let constraints = vec![
+            "keep the public API".to_string(),
+            "no new dependencies".to_string(),
+        ];
         for stage in &r.stages {
-            let text = brief(&r, *stage, "redesign the storage subsystem", &constraints, &[]);
+            let text = brief(
+                &r,
+                *stage,
+                "redesign the storage subsystem",
+                &constraints,
+                &[],
+            );
             for c in &constraints {
                 assert!(text.contains(c.as_str()), "{} lost `{c}`", stage.name());
             }
@@ -1227,9 +1721,77 @@ mod tests {
             summary: "I think we should start with the store".into(),
             artifact: None,
         };
-        let text = brief(&r, Stage::Implement, "redesign the storage subsystem", &[], &[note]);
-        assert!(text.contains("no structured artifact"), "prose was passed off as an artifact");
+        let text = brief(
+            &r,
+            Stage::Implement,
+            "redesign the storage subsystem",
+            &[],
+            &[note],
+        );
+        assert!(
+            text.contains("no structured artifact"),
+            "prose was passed off as an artifact"
+        );
         assert!(text.contains("unvalidated"));
+    }
+
+    #[test]
+    fn handoffs_only_carry_information_the_next_stage_cannot_recover() {
+        let r = balanced("redesign the storage subsystem", REPO);
+        let plan = StageNote {
+            stage: Stage::Plan,
+            summary: "plan summary".into(),
+            artifact: Some(serde_json::json!({
+                "objective": "private-plan-marker", "constraints": [], "affected_areas": [],
+                "implementation_steps": ["one"], "risks": [], "tests_required": []
+            })),
+        };
+        let implementation = StageNote {
+            stage: Stage::Implement,
+            summary: "implementation-marker".into(),
+            artifact: None,
+        };
+        let failed = StageNote {
+            stage: Stage::Verify,
+            summary: "failed check".into(),
+            artifact: Some(serde_json::json!({
+                "checks": [{"command": "npm test", "passed": false, "output": "boom"}],
+                "verdict": "fail"
+            })),
+        };
+
+        let implement = brief(
+            &r,
+            Stage::Implement,
+            "task",
+            &[],
+            std::slice::from_ref(&plan),
+        );
+        assert!(implement.contains("private-plan-marker"));
+        let fix = brief(
+            &r,
+            Stage::Fix,
+            "task",
+            &[],
+            &[plan.clone(), implementation.clone(), failed.clone()],
+        );
+        assert!(
+            fix.contains("boom")
+                && !fix.contains("private-plan-marker")
+                && !fix.contains("implementation-marker")
+        );
+        let review = brief(
+            &r,
+            Stage::Review,
+            "task",
+            &[],
+            &[plan, implementation, failed],
+        );
+        assert!(
+            !review.contains("private-plan-marker")
+                && !review.contains("implementation-marker")
+                && !review.contains("boom")
+        );
     }
 
     #[test]
@@ -1243,13 +1805,20 @@ mod tests {
         let mut partial = good.clone();
         partial.as_object_mut().unwrap().remove("risks");
         assert!(!artifact_is_valid(Stage::Plan, &partial));
-        assert!(!artifact_is_valid(Stage::Plan, &serde_json::json!("a plan, honest")));
+        assert!(!artifact_is_valid(
+            Stage::Plan,
+            &serde_json::json!("a plan, honest")
+        ));
         // A Plan artifact is not a Review artifact, however well-formed.
         assert!(!artifact_is_valid(Stage::Review, &good));
 
         let review = |v: serde_json::Value| stage_passed(Stage::Review, &v);
-        assert!(review(serde_json::json!({"findings": [], "verdict": "pass"})));
-        assert!(!review(serde_json::json!({"findings": [], "verdict": "changes_requested"})));
+        assert!(review(
+            serde_json::json!({"findings": [], "verdict": "pass"})
+        ));
+        assert!(!review(
+            serde_json::json!({"findings": [], "verdict": "changes_requested"})
+        ));
         // Not an artifact at all, so not a pass: a missing review is not a
         // clean one.
         assert!(!review(serde_json::json!({"verdict": "pass"})));
@@ -1260,12 +1829,24 @@ mod tests {
     #[test]
     fn a_verify_pass_needs_a_check_and_no_failing_one() {
         let verify = |v: serde_json::Value| stage_passed(Stage::Verify, &v);
-        let ok = serde_json::json!({"command": "cargo test slug", "passed": true, "output": "1 passed"});
-        let bad = serde_json::json!({"command": "cargo test", "passed": false, "output": "1 failed"});
-        assert!(verify(serde_json::json!({"checks": [ok], "verdict": "pass"})));
-        assert!(!verify(serde_json::json!({"checks": [], "verdict": "pass"})), "a pass with nothing run");
-        assert!(!verify(serde_json::json!({"checks": [ok, bad], "verdict": "pass"})), "a pass over a failing check");
-        assert!(!verify(serde_json::json!({"checks": [ok], "verdict": "fail"})));
+        let ok =
+            serde_json::json!({"command": "cargo test slug", "passed": true, "output": "1 passed"});
+        let bad =
+            serde_json::json!({"command": "cargo test", "passed": false, "output": "1 failed"});
+        assert!(verify(
+            serde_json::json!({"checks": [ok], "verdict": "pass"})
+        ));
+        assert!(
+            !verify(serde_json::json!({"checks": [], "verdict": "pass"})),
+            "a pass with nothing run"
+        );
+        assert!(
+            !verify(serde_json::json!({"checks": [ok, bad], "verdict": "pass"})),
+            "a pass over a failing check"
+        );
+        assert!(!verify(
+            serde_json::json!({"checks": [ok], "verdict": "fail"})
+        ));
         assert!(!verify(serde_json::json!({"verdict": "pass"})));
     }
 
@@ -1273,13 +1854,28 @@ mod tests {
     /// and a cause nobody has found yet is not trivial because the words are few.
     #[test]
     fn unknown_scope_and_unfound_causes_leave_the_one_call_route() {
-        assert_eq!(balanced("make the header bold", REPO).kind, RouteKind::Standard);
-        assert_eq!(balanced("fix the typo", REPO).kind, RouteKind::ImplementOnce);
+        assert_eq!(
+            balanced("make the header bold", REPO).kind,
+            RouteKind::Standard
+        );
+        assert_eq!(
+            balanced("fix the typo", REPO).kind,
+            RouteKind::ImplementOnce
+        );
         assert_eq!(balanced("tidy run.rs", REPO).kind, RouteKind::ImplementOnce);
-        assert_ne!(balanced("fix the intermittent hang in run.rs", REPO).kind, RouteKind::ImplementOnce);
-        assert_ne!(balanced("the watcher is flaky", REPO).kind, RouteKind::ImplementOnce);
+        assert_ne!(
+            balanced("fix the intermittent hang in run.rs", REPO).kind,
+            RouteKind::ImplementOnce
+        );
+        assert_ne!(
+            balanced("the watcher is flaky", REPO).kind,
+            RouteKind::ImplementOnce
+        );
         // " hang" is not a substring of "change".
-        assert_eq!(balanced("change the typo in run.rs", REPO).kind, RouteKind::ImplementOnce);
+        assert_eq!(
+            balanced("change the typo in run.rs", REPO).kind,
+            RouteKind::ImplementOnce
+        );
     }
 
     #[test]
@@ -1292,7 +1888,11 @@ mod tests {
         assert!(Stage::Implement.writes());
         assert!(Stage::Fix.writes());
         for stage in [Stage::Plan, Stage::Review, Stage::Verify] {
-            assert!(!stage.writes(), "{} must not be allowed to edit", stage.name());
+            assert!(
+                !stage.writes(),
+                "{} must not be allowed to edit",
+                stage.name()
+            );
         }
         // Every schema has to be JSON a CLI will accept.
         for schema in [PLAN_SCHEMA, REVIEW_SCHEMA, VERIFY_SCHEMA] {
@@ -1306,7 +1906,10 @@ mod tests {
         assert_eq!(r.preferred_providers.len(), r.stages.len());
         assert_eq!(Capability::Deep.preferred_provider(), ProviderId::Claude);
         assert_eq!(Capability::Review.preferred_provider(), ProviderId::Claude);
-        assert_eq!(Capability::Implement.preferred_provider(), ProviderId::Codex);
+        assert_eq!(
+            Capability::Implement.preferred_provider(),
+            ProviderId::Codex
+        );
     }
 
     #[test]

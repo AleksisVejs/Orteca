@@ -38,6 +38,8 @@ struct Preflight {
     route: Route,
     /// What the route's tier asks this provider for.
     model: routing::ModelChoice,
+    /// What Plan runs on when Efficient mode lowers its reasoning effort.
+    plan: Option<routing::ModelChoice>,
     /// What the one Fix call would run on, if the route declares one.
     escalation: Option<routing::ModelChoice>,
     /// What the Review runs on, when that is not the route's tier.
@@ -62,7 +64,10 @@ impl ProviderOperations {
     fn begin(&self, provider: ProviderId) -> Result<tokio::sync::watch::Receiver<bool>> {
         let mut operations = self.0.lock().expect("provider operations poisoned");
         if operations.contains_key(&provider) {
-            return Err(AppError::new(ErrorKind::Invalid, "A provider operation is already running."));
+            return Err(AppError::new(
+                ErrorKind::Invalid,
+                "A provider operation is already running.",
+            ));
         }
         let (sender, receiver) = tokio::sync::watch::channel(false);
         operations.insert(provider, sender);
@@ -76,12 +81,25 @@ impl ProviderOperations {
             .expect("provider operations poisoned")
             .get(&provider)
             .cloned()
-            .ok_or_else(|| AppError::new(ErrorKind::NotFound, "That provider operation has already finished."))?;
-        sender.send(true).map_err(|_| AppError::new(ErrorKind::NotFound, "That provider operation has already finished."))
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorKind::NotFound,
+                    "That provider operation has already finished.",
+                )
+            })?;
+        sender.send(true).map_err(|_| {
+            AppError::new(
+                ErrorKind::NotFound,
+                "That provider operation has already finished.",
+            )
+        })
     }
 
     fn finish(&self, provider: ProviderId) {
-        self.0.lock().expect("provider operations poisoned").remove(&provider);
+        self.0
+            .lock()
+            .expect("provider operations poisoned")
+            .remove(&provider);
     }
 }
 
@@ -139,7 +157,11 @@ async fn detect_providers(found: tauri::ipc::Channel<Detected>) -> Result<Vec<De
 
     let mut detected = Vec::with_capacity(probes.len());
     for probe in probes {
-        detected.push(probe.await.map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?);
+        detected.push(
+            probe
+                .await
+                .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?,
+        );
     }
     Ok(detected)
 }
@@ -164,14 +186,39 @@ async fn start_task(
     let prepare_app = app.clone();
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
-    let recordings = app.path().app_data_dir().ok().map(|dir| dir.join("recordings"));
-    let request = tauri::async_runtime::spawn_blocking(move || prepare_run(&prepare_app.state::<Store>(), recordings, path, prompt, provider, mode, headroom, isolation)).await
-        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
+    let recordings = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("recordings"));
+    let request = tauri::async_runtime::spawn_blocking(move || {
+        prepare_run(
+            &prepare_app.state::<Store>(),
+            recordings,
+            path,
+            prompt,
+            provider,
+            mode,
+            headroom,
+            isolation,
+        )
+    })
+    .await
+    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
     let _ = task.send(request.task_id);
-    Ok(run::stream(&app.state::<Store>(), &app.state::<run::Live>(), request, |event| events.send(event.clone())
-        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))).await)
+    Ok(run::stream(
+        &app.state::<Store>(),
+        &app.state::<run::Live>(),
+        request,
+        |event| {
+            events
+                .send(event.clone())
+                .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))
+        },
+    )
+    .await)
 }
 
 /// Stop a running task and everything it spawned. Errors when the run has
@@ -196,7 +243,10 @@ async fn send_instruction(
     live: State<'_, run::Live>,
 ) -> Result<run::InstructionReceipt> {
     let Some(text) = run::clean_prompt(&text) else {
-        return Err(AppError::new(ErrorKind::Invalid, "Type the instruction first."));
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "Type the instruction first.",
+        ));
     };
     live.instruct(task_id, text, apply_now).await
 }
@@ -208,15 +258,29 @@ fn codex_acl_refusal() -> AppError {
     )
 }
 
-fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation) -> Result<PlannedRun> {
+fn plan_run(
+    store: &Store,
+    path: String,
+    prompt: String,
+    provider: ProviderId,
+    mode: Mode,
+    headroom: Option<f64>,
+    isolation: Isolation,
+) -> Result<PlannedRun> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
-        return Err(AppError::new(ErrorKind::Invalid, "Type what you want done first."));
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "Type what you want done first.",
+        ));
     };
     let (dir, project) = trusted_dir(store, &path)?;
     let git = project::git_state(&dir);
 
     // A copy's folder does not exist yet; it is checked once it does.
-    if provider == ProviderId::Codex && isolation == Isolation::CurrentTree && !proc::can_change_acl(&dir) {
+    if provider == ProviderId::Codex
+        && isolation == Isolation::CurrentTree
+        && !proc::can_change_acl(&dir)
+    {
         return Err(codex_acl_refusal());
     }
     if isolation == Isolation::Worktree && git.head.is_none() {
@@ -243,20 +307,48 @@ fn plan_run(store: &Store, path: String, prompt: String, provider: ProviderId, m
             // The frontend's reading, not a fresh one: the preview and the run
             // must be routed on the same number.
             headroom: headroom.filter(|room| room.is_finite()),
-            checks_locally: project::check_command(&dir).is_some_and(|command| providers::which(command[0]).is_some()),
+            checks_locally: run::checks_locally(&dir),
         },
     );
-    Ok(PlannedRun { dir, project, program, git, prompt, route })
+    Ok(PlannedRun {
+        dir,
+        project,
+        program,
+        git,
+        prompt,
+        route,
+    })
 }
 
 /// Show the exact route and ceilings before a provider is started.
 #[tauri::command]
-fn preview_task(path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation, store: State<Store>) -> Result<Preflight> {
+fn preview_task(
+    path: String,
+    prompt: String,
+    provider: ProviderId,
+    mode: Mode,
+    headroom: Option<f64>,
+    isolation: Isolation,
+    store: State<Store>,
+) -> Result<Preflight> {
     let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
     let model = planned.route.budget.preferred_tier.model(provider);
-    let escalation = planned.route.budget.escalation.map(|tier| tier.model(provider));
+    let plan = planned.route.plan_model(provider);
+    let escalation = planned
+        .route
+        .budget
+        .escalation
+        .map(|tier| tier.model(provider));
     let review = planned.route.review_model(provider);
-    Ok(Preflight { provider, git: planned.git, route: planned.route, model, escalation, review })
+    Ok(Preflight {
+        provider,
+        git: planned.git,
+        route: planned.route,
+        model,
+        plan,
+        escalation,
+        review,
+    })
 }
 
 /// How much of each plan's rolling limit is used, from each CLI's own answer.
@@ -278,15 +370,35 @@ async fn provider_limits() -> Vec<providers::limits::Limits> {
 /// project is trusted, the CLI exists, the baseline is taken, and the route and
 /// its ceilings are chosen and written down.
 #[allow(clippy::too_many_arguments)]
-fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: String, prompt: String, provider: ProviderId, mode: Mode, headroom: Option<f64>, isolation: Isolation) -> Result<run::Request> {
-    let PlannedRun { dir, project: record, program, git, prompt, route } = plan_run(store, path, prompt, provider, mode, headroom, isolation)?;
+fn prepare_run(
+    store: &Store,
+    recordings: Option<std::path::PathBuf>,
+    path: String,
+    prompt: String,
+    provider: ProviderId,
+    mode: Mode,
+    headroom: Option<f64>,
+    isolation: Isolation,
+) -> Result<run::Request> {
+    let PlannedRun {
+        dir,
+        project: record,
+        program,
+        git,
+        prompt,
+        route,
+    } = plan_run(store, path, prompt, provider, mode, headroom, isolation)?;
 
     // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
     let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
     // The baseline is taken before the agent runs, so the diff afterwards has
     // something honest to compare against.
     // A clean tree needs no snapshot: everything in the diff is the run's.
-    let before_run = if dirty_at_start { project::snapshot(&dir, git.head.as_deref()) } else { Some(Default::default()) };
+    let before_run = if dirty_at_start {
+        project::snapshot(&dir, git.head.as_deref())
+    } else {
+        Some(Default::default())
+    };
 
     // Stored before anything runs, so a run that dies in its first second still
     // says what it was allowed to do.
@@ -309,7 +421,8 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
             Err(e) => {
                 // The row is already open; it closes as what happened rather
                 // than as a run left running.
-                let _ = store.finish_task_details(task_id, "failed", &e.message, "[]", None, 0, None, 0);
+                let _ = store
+                    .finish_task_details(task_id, "failed", &e.message, "[]", None, 0, None, 0);
                 return Err(e);
             }
         },
@@ -319,7 +432,9 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
         task_id,
         id: provider,
         program,
-        dir: worktree.as_ref().map_or(dir, |copy| copy.path.clone().into()),
+        dir: worktree
+            .as_ref()
+            .map_or(dir, |copy| copy.path.clone().into()),
         prompt,
         route,
         base_commit: git.head,
@@ -333,13 +448,24 @@ fn prepare_run(store: &Store, recordings: Option<std::path::PathBuf>, path: Stri
 }
 
 /// Make the copy a run works in, on a branch named for its task.
-fn make_worktree(store: &Store, repo: &std::path::Path, git: &GitState, provider: ProviderId, task_id: i64) -> Result<project::Worktree> {
+fn make_worktree(
+    store: &Store,
+    repo: &std::path::Path,
+    git: &GitState,
+    provider: ProviderId,
+    task_id: i64,
+) -> Result<project::Worktree> {
     let copy = git.root.as_deref().and_then(|root| project::worktree_dir(root, task_id)).ok_or_else(|| {
         AppError::new(ErrorKind::Invalid, "A repository at the top of a drive has no folder beside it for a copy. Run it in this folder instead.")
     })?;
     let branch = format!("orteca/task-{task_id}");
     project::add_worktree(repo, &copy, &branch)?;
-    let worktree = project::Worktree { path: copy.to_string_lossy().into_owned(), branch, commit: None, commit_error: None };
+    let worktree = project::Worktree {
+        path: copy.to_string_lossy().into_owned(),
+        branch,
+        commit: None,
+        commit_error: None,
+    };
     // Recorded before anything else can fail, so the copy can always be removed.
     store.set_worktree(task_id, &worktree.branch, &worktree.path)?;
     if provider == ProviderId::Codex && !proc::can_change_acl(&copy) {
@@ -354,7 +480,10 @@ fn make_worktree(store: &Store, repo: &std::path::Path, git: &GitState, provider
 fn remove_worktree(path: String, task_id: i64, store: State<Store>) -> Result<()> {
     let (dir, record) = trusted_dir(&store, &path)?;
     let Some(copy) = store.worktree_path(record.id, task_id)? else {
-        return Err(AppError::new(ErrorKind::NotFound, "That run has no copy to remove."));
+        return Err(AppError::new(
+            ErrorKind::NotFound,
+            "That run has no copy to remove.",
+        ));
     };
     project::remove_worktree(&dir, std::path::Path::new(&copy))?;
     store.clear_worktree(record.id, task_id)
@@ -364,7 +493,10 @@ fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project
     let dir = project::validate_dir(path)?;
     let record = store.project(&dir.to_string_lossy())?;
     if !record.trusted {
-        return Err(AppError::new(ErrorKind::NotTrusted, "This project has not been trusted yet."));
+        return Err(AppError::new(
+            ErrorKind::NotTrusted,
+            "This project has not been trusted yet.",
+        ));
     }
     Ok((dir, record))
 }
@@ -374,7 +506,11 @@ fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project
 /// already has, and a failed install is reported rather than left as a button
 /// that appears to do nothing.
 #[tauri::command(async)]
-async fn install_provider(app: AppHandle, provider: ProviderId, operations: State<'_, ProviderOperations>) -> Result<Detected> {
+async fn install_provider(
+    app: AppHandle,
+    provider: ProviderId,
+    operations: State<'_, ProviderOperations>,
+) -> Result<Detected> {
     let npm = providers::which("npm").ok_or_else(|| {
         AppError::new(
             ErrorKind::CliMissing,
@@ -384,7 +520,14 @@ async fn install_provider(app: AppHandle, provider: ProviderId, operations: Stat
     let cancel = operations.begin(provider)?;
     let install = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        npm_install(provider, &npm, |line| { let _ = app.emit("install-event", (provider, line)); }, cancel),
+        npm_install(
+            provider,
+            &npm,
+            |line| {
+                let _ = app.emit("install-event", (provider, line));
+            },
+            cancel,
+        ),
     )
     .await;
     operations.finish(provider);
@@ -393,12 +536,16 @@ async fn install_provider(app: AppHandle, provider: ProviderId, operations: Stat
         Err(_) => {
             return Err(AppError::new(
                 ErrorKind::Io,
-                format!("{} installation timed out after 5 minutes.", provider.program()),
+                format!(
+                    "{} installation timed out after 5 minutes.",
+                    provider.program()
+                ),
             ));
         }
     }
 
-    let detected = tauri::async_runtime::spawn_blocking(move || provider.detect()).await
+    let detected = tauri::async_runtime::spawn_blocking(move || provider.detect())
+        .await
         .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?;
     if detected.path.is_none() {
         return Err(AppError::new(
@@ -459,7 +606,10 @@ async fn stream_tool(
     }
     Err(AppError::new(
         ErrorKind::Io,
-        format!("{} stopped without reporting an exit code", program.display()),
+        format!(
+            "{} stopped without reporting an exit code",
+            program.display()
+        ),
     ))
 }
 
@@ -470,7 +620,12 @@ async fn npm_install(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _install = INSTALL.try_lock().map_err(|_| AppError::new(ErrorKind::Invalid, "Another provider installation is already running."))?;
+    let _install = INSTALL.try_lock().map_err(|_| {
+        AppError::new(
+            ErrorKind::Invalid,
+            "Another provider installation is already running.",
+        )
+    })?;
     let package = provider.package();
     let (code, tail) = stream_tool(npm, &["install", "--global", package], emit, cancel).await?;
     if code == Some(0) {
@@ -488,7 +643,11 @@ async fn npm_install(
 /// it in their browser, and the CLI writes its own credential. All Orteca does
 /// is start it, show the output, and ask the CLI again when it is done.
 #[tauri::command(async)]
-async fn sign_in_provider(app: AppHandle, provider: ProviderId, operations: State<'_, ProviderOperations>) -> Result<Detected> {
+async fn sign_in_provider(
+    app: AppHandle,
+    provider: ProviderId,
+    operations: State<'_, ProviderOperations>,
+) -> Result<Detected> {
     static SIGN_IN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _lock = SIGN_IN
         .try_lock()
@@ -504,9 +663,14 @@ async fn sign_in_provider(app: AppHandle, provider: ProviderId, operations: Stat
 
     // A browser round trip is slow but not unbounded. Without this the button
     // would hang forever on a login the user abandoned - cancel arrives in M5.
-    let stream = stream_tool(&program, provider.login_args(), |line| {
-        let _ = app.emit("sign-in-event", (provider, line));
-    }, cancel);
+    let stream = stream_tool(
+        &program,
+        provider.login_args(),
+        |line| {
+            let _ = app.emit("sign-in-event", (provider, line));
+        },
+        cancel,
+    );
     let streamed = tokio::time::timeout(std::time::Duration::from_secs(300), stream).await;
     operations.finish(provider);
     let (code, tail) = match streamed {
@@ -531,9 +695,16 @@ async fn sign_in_provider(app: AppHandle, provider: ProviderId, operations: Stat
     Err(AppError::new(
         ErrorKind::Invalid,
         if tail.is_empty() {
-            format!("{} is still signed out (exit {code:?}).", provider.program())
+            format!(
+                "{} is still signed out (exit {code:?}).",
+                provider.program()
+            )
         } else {
-            format!("{} is still signed out: {}", provider.program(), tail.join(" "))
+            format!(
+                "{} is still signed out: {}",
+                provider.program(),
+                tail.join(" ")
+            )
         },
     ))
 }
@@ -567,7 +738,10 @@ fn task_detail(path: String, task_id: i64, store: State<Store>) -> Result<store:
 }
 
 #[tauri::command]
-fn cancel_provider_operation(provider: ProviderId, operations: State<ProviderOperations>) -> Result<()> {
+fn cancel_provider_operation(
+    provider: ProviderId,
+    operations: State<ProviderOperations>,
+) -> Result<()> {
     operations.cancel(provider)
 }
 
@@ -587,6 +761,13 @@ fn main() {
             app.manage(Store::open(&db).map_err(|e| e.message)?);
             app.manage(run::Live::default());
             app.manage(ProviderOperations::default());
+            // Codex runs are priced from this list. Offline keeps the last one.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(prices) = providers::codex::fetch_prices() {
+                    let _ = handle.state::<Store>().save_prices(&prices);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -620,10 +801,24 @@ mod tests {
         let root = std::env::temp_dir().join(format!("orteca-install-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let fake = root.join("fake.cmd");
-        std::fs::write(&fake, "@echo off\r\necho fake installer\r\nping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n").unwrap();
+        std::fs::write(
+            &fake,
+            "@echo off\r\necho fake installer\r\nping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n",
+        )
+        .unwrap();
         let (first, second) = tokio::join!(
-            npm_install(ProviderId::Codex, &fake, |_| {}, tokio::sync::watch::channel(false).1),
-            npm_install(ProviderId::Claude, &fake, |_| {}, tokio::sync::watch::channel(false).1),
+            npm_install(
+                ProviderId::Codex,
+                &fake,
+                |_| {},
+                tokio::sync::watch::channel(false).1
+            ),
+            npm_install(
+                ProviderId::Claude,
+                &fake,
+                |_| {},
+                tokio::sync::watch::channel(false).1
+            ),
         );
         assert!(first.is_ok());
         assert!(second.is_err());
@@ -651,11 +846,60 @@ mod tests {
         store.touch_project(key, "test").unwrap();
         assert!(trusted_dir(&store, key).is_err());
         store.set_trusted(key, true).unwrap();
-        for path in [root.clone(), root.join("."), root.join("sub/.."), std::path::PathBuf::from(root.to_string_lossy().to_uppercase())] {
+        for path in [
+            root.clone(),
+            root.join("."),
+            root.join("sub/.."),
+            std::path::PathBuf::from(root.to_string_lossy().to_uppercase()),
+        ] {
             let (dir, _) = trusted_dir(&store, path.to_str().unwrap()).unwrap();
             assert_eq!(dir, canonical);
         }
         assert!(trusted_dir(&store, root.join("sub").to_str().unwrap()).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Spends real usage. One Orteca run for a benchmark driver:
+    /// BENCH_DIR, BENCH_PROMPT, BENCH_PROVIDER (claude|codex), BENCH_MODE
+    /// (efficient|balanced), BENCH_OUT (TaskResult JSON).
+    /// `cargo test bench_run -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_run() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let dir = std::path::PathBuf::from(var("BENCH_DIR")).canonicalize().unwrap();
+        let key = dir.to_str().unwrap().to_string();
+        let store = Store::in_memory().unwrap();
+        store.touch_project(&key, "bench").unwrap();
+        store.set_trusted(&key, true).unwrap();
+        // The app loads this at startup; without it every Codex run is unpriced.
+        if let Some(prices) = providers::codex::fetch_prices() {
+            store.save_prices(&prices).unwrap();
+        }
+        fn json<T: serde::de::DeserializeOwned>(s: String) -> T {
+            serde_json::from_value(serde_json::Value::String(s)).unwrap()
+        }
+        let request = prepare_run(
+            &store,
+            None,
+            key,
+            var("BENCH_PROMPT"),
+            json(var("BENCH_PROVIDER")),
+            json(var("BENCH_MODE")),
+            None,
+            Isolation::CurrentTree,
+        )
+        .unwrap();
+        let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
+        std::fs::write(var("BENCH_OUT"), serde_json::to_string_pretty(&result).unwrap()).unwrap();
+    }
+
+    /// Free: prints both CLIs' rolling limits as JSON.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_limits() {
+        for id in ProviderId::ALL {
+            println!("LIMITS {}", serde_json::to_string(&providers::limits::read(id).await).unwrap());
+        }
     }
 }

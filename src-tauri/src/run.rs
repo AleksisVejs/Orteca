@@ -24,7 +24,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{AppError, ErrorKind};
 use crate::proc::{self, Line};
 use crate::project::{self, FileStat};
-use crate::providers::{claude, FailureKind, ProviderEvent, ProviderId, Steering, Usage};
+use crate::providers::{
+    claude, codex, CostQuality, FailureKind, ProviderEvent, ProviderId, Steering, Usage,
+};
 use crate::routing::{self, Route, Stage, StageNote};
 use crate::store::{Baseline, Store};
 
@@ -35,16 +37,36 @@ use crate::store::{Baseline, Store};
 // Claude exposes no OS-level sandbox flag the way `codex --sandbox` does.
 const CLAUDE_DENY_COMMANDS: &[&str] = &[
     // Rewriting or publishing the user's history. Orteca reads git, never rewrites it.
-    "git push:*", "git reset:*", "git clean:*", "git rebase:*",
-    "git restore:*", "git checkout --:*", "git filter-branch:*",
+    "git push:*",
+    "git reset:*",
+    "git clean:*",
+    "git rebase:*",
+    "git restore:*",
+    "git checkout --:*",
+    "git filter-branch:*",
     // Destroying files outside a normal edit.
-    "rm:*", "rmdir:*", "del:*", "rd:*", "Remove-Item:*",
+    "rm:*",
+    "rmdir:*",
+    "del:*",
+    "rd:*",
+    "Remove-Item:*",
     // Publishing under the user's name.
-    "npm publish:*", "cargo publish:*", "gh release:*",
+    "npm publish:*",
+    "cargo publish:*",
+    "gh release:*",
     // Reaching the network, which is how a bad instruction exfiltrates a repo.
-    "curl:*", "wget:*", "Invoke-WebRequest:*", "Invoke-RestMethod:*", "scp:*", "ssh:*",
+    "curl:*",
+    "wget:*",
+    "Invoke-WebRequest:*",
+    "Invoke-RestMethod:*",
+    "scp:*",
+    "ssh:*",
     // Touching the machine rather than the project.
-    "shutdown:*", "reg:*", "schtasks:*", "net user:*", "Set-ExecutionPolicy:*",
+    "shutdown:*",
+    "reg:*",
+    "schtasks:*",
+    "net user:*",
+    "Set-ExecutionPolicy:*",
 ];
 
 /// Tools that edit files. A stage that is not meant to write is denied them
@@ -72,9 +94,15 @@ fn claude_deny(writes: bool) -> Vec<String> {
 /// Claude has no read-only sandbox. Non-writing stages therefore receive a
 /// read/check allowlist instead of broad shell access; denying Edit/Write alone
 /// is not enough because a shell command can write the same file.
-fn claude_allowed(stage: Stage) -> Vec<String> {
+fn claude_allowed(plan: &StagePlan) -> Vec<String> {
+    let stage = plan.stage;
     if stage.writes() {
-        return ["Bash", "PowerShell"].into_iter().map(str::to_string).collect();
+        let tools: &[&str] = if plan.shell {
+            &["Bash", "PowerShell"]
+        } else {
+            &["Read", "Edit", "Write", "Glob", "Grep"]
+        };
+        return tools.iter().map(|t| (*t).to_string()).collect();
     }
 
     let mut tools = vec![
@@ -91,13 +119,21 @@ fn claude_allowed(stage: Stage) -> Vec<String> {
         // Not read-only, and not claimed to be: these run the repository's own
         // scripts, which the user consented to when trusting the project. What
         // they write still lands in the run's diff. Plan and Review get none.
-        tools.extend([
-            "Bash(npm test *)",
-            "Bash(npm run build *)",
-            "Bash(node --test *)",
-            "Bash(cargo test *)",
-            "Bash(cargo clippy *)",
-        ].into_iter().map(str::to_string));
+        tools.extend(
+            [
+                "Bash(npm test *)",
+                "Bash(npm run build *)",
+                "Bash(node --test *)",
+                "Bash(cargo test *)",
+                "Bash(cargo clippy *)",
+                "Bash(composer test *)",
+                "Bash(php vendor/bin/phpunit *)",
+                "Bash(go test *)",
+                "Bash(python -m pytest *)",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
     tools
 }
@@ -150,7 +186,10 @@ impl Live {
     /// Register a run and hand back the end `stream` listens on.
     fn open(&self, task_id: i64) -> mpsc::UnboundedReceiver<Control> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.0.lock().expect("live runs poisoned").insert(task_id, tx);
+        self.0
+            .lock()
+            .expect("live runs poisoned")
+            .insert(task_id, tx);
         rx
     }
 
@@ -279,15 +318,25 @@ pub struct StagePlan {
     /// The artifact contract, already written to a file. Claude takes the
     /// schema text inline, Codex takes the path.
     pub schema: Option<PathBuf>,
-    /// The route's tier, which names the model and effort on the command line.
+    /// The route's tier, which names the default model and effort.
     pub tier: routing::Tier,
-    /// Replaces the tier's effort. Only a guarded Review in Efficient mode sets it.
+    /// Stage-specific model override. Efficient Review can use a different
+    /// provider tier when the benchmark says it is enough.
+    pub model: Option<&'static str>,
+    /// Replaces the tier's effort for a benchmarked Plan or Review.
     pub effort: Option<&'static str>,
+    /// False for an Implement that Orteca's own tests follow: Claude then gets
+    /// no Bash or PowerShell, two fewer tool schemas on every turn. Codex's only
+    /// tool is its shell, so it ignores this.
+    pub shell: bool,
 }
 
 impl StagePlan {
     fn model(&self, id: ProviderId) -> routing::ModelChoice {
         let mut choice = self.tier.model(id);
+        if let Some(model) = self.model {
+            choice.model = model;
+        }
         if let Some(effort) = self.effort {
             choice.effort = effort;
         }
@@ -312,19 +361,22 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
     let writes = plan.stage.writes();
     match id {
         ProviderId::Codex => [
-            vec![
-                arg("exec"),
-                arg("-"),
-                arg("--json"),
-            ],
-            crate::providers::CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
+            vec![arg("exec"), arg("-"), arg("--json")],
+            crate::providers::CODEX_ISOLATION
+                .iter()
+                .map(|a| arg(a))
+                .collect(),
             model_args(id, plan),
             vec![
                 arg("--sandbox"),
                 // A stage with no business editing cannot edit. Codex has an
                 // OS-level fence for this; using it is cheaper and more certain
                 // than asking the agent nicely.
-                arg(if writes { "workspace-write" } else { "read-only" }),
+                arg(if writes {
+                    "workspace-write"
+                } else {
+                    "read-only"
+                }),
             ],
             plan.schema.as_deref().map_or_else(Vec::new, |path| {
                 vec![arg("--output-schema"), path.display().to_string()]
@@ -351,7 +403,11 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 // Without the user's settings every built-in tool schema loads
                 // in full. No stage uses the rest; the grants below narrow these.
                 arg("--tools"),
-                arg("Bash,PowerShell,Read,Edit,Write,Glob,Grep"),
+                arg(if plan.shell {
+                    "Bash,PowerShell,Read,Edit,Write,Glob,Grep"
+                } else {
+                    "Read,Edit,Write,Glob,Grep"
+                }),
                 arg("--permission-mode"),
                 arg("acceptEdits"),
                 // Streaming input is what makes a mid-task instruction possible:
@@ -369,7 +425,7 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("none"),
                 arg("--allowedTools"),
             ];
-            args.extend(claude_allowed(plan.stage));
+            args.extend(claude_allowed(plan));
             // The denylist narrows the write-stage shell grant and removes
             // native edit tools from every non-writing stage.
             args.push(arg("--disallowedTools"));
@@ -388,7 +444,12 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
 fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
     let choice = plan.model(id);
     match id {
-        ProviderId::Claude => vec!["--model".into(), choice.model.into(), "--effort".into(), choice.effort.into()],
+        ProviderId::Claude => vec![
+            "--model".into(),
+            choice.model.into(),
+            "--effort".into(),
+            choice.effort.into(),
+        ],
         ProviderId::Codex => vec![
             "--model".into(),
             choice.model.into(),
@@ -402,8 +463,9 @@ fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
 /// confirmed by asking the CLI for it without a value: it answers `option
 /// '--max-turns <turns>' argument missing`, which an unknown flag does not.
 fn turn_limit(plan: &StagePlan) -> Vec<String> {
-    plan.max_turns
-        .map_or_else(Vec::new, |turns| vec!["--max-turns".to_string(), turns.to_string()])
+    plan.max_turns.map_or_else(Vec::new, |turns| {
+        vec!["--max-turns".to_string(), turns.to_string()]
+    })
 }
 
 /// Claude takes the schema as text on the command line, not as a path.
@@ -411,7 +473,9 @@ fn schema_arg(plan: &StagePlan) -> Vec<String> {
     plan.stage
         .schema()
         .filter(|_| plan.schema.is_some())
-        .map_or_else(Vec::new, |schema| vec!["--json-schema".to_string(), schema.to_string()])
+        .map_or_else(Vec::new, |schema| {
+            vec!["--json-schema".to_string(), schema.to_string()]
+        })
 }
 
 /// Write a stage's artifact contract where the CLI can read it.
@@ -440,6 +504,8 @@ struct Outcome {
     usage: Option<Usage>,
     /// What earlier provider processes cost, added up. See `begin_process`.
     banked_cost: Option<f64>,
+    /// A Codex turn ran on a model with no known price. See `price_codex`.
+    unpriced: bool,
     failure: Option<String>,
     /// The kind a provider reported with its failure. A specific kind outlives
     /// a later generic one: Claude's spent plan arrives as a rate-limit event,
@@ -481,6 +547,10 @@ impl Outcome {
         self.begin_process();
         if let Some(usage) = self.usage.as_mut() {
             usage.cost_usd = self.banked_cost;
+            if self.unpriced {
+                usage.cost_usd = None;
+                usage.cost_quality = CostQuality::Unavailable;
+            }
         }
     }
 
@@ -518,9 +588,10 @@ impl Outcome {
 
     /// Why the run failed: the kind a provider reported, else read from the message.
     fn failure_kind(&self) -> Option<FailureKind> {
-        self.failure
-            .as_deref()
-            .map(|message| self.reported_kind.unwrap_or_else(|| crate::providers::classify_failure(message)))
+        self.failure.as_deref().map(|message| {
+            self.reported_kind
+                .unwrap_or_else(|| crate::providers::classify_failure(message))
+        })
     }
 
     /// What the task row and the result screen both call this run. A stop that
@@ -595,7 +666,11 @@ impl Recording {
     fn new(dir: Option<&Path>, task_id: i64, stage: Stage, id: ProviderId) -> Self {
         Self {
             path: dir.map(|dir| {
-                dir.join(format!("task-{task_id}-{}-{}.jsonl", stage.name(), id.program()))
+                dir.join(format!(
+                    "task-{task_id}-{}-{}.jsonl",
+                    stage.name(),
+                    id.program()
+                ))
             }),
             file: None,
         }
@@ -625,8 +700,16 @@ impl Recording {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        if std::io::Write::write_all(file, format!("{value}
-").as_bytes()).is_err() {
+        if std::io::Write::write_all(
+            file,
+            format!(
+                "{value}
+"
+            )
+            .as_bytes(),
+        )
+        .is_err()
+        {
             self.path = None;
             self.file = None;
         }
@@ -660,7 +743,10 @@ impl Launch {
         if id == ProviderId::Codex {
             argv.extend(model_args(id, plan));
         }
-        Launch { argv, opening: held.join("\n") }
+        Launch {
+            argv,
+            opening: held.join("\n"),
+        }
     }
 }
 
@@ -758,9 +844,26 @@ enum Next {
     Restart(Launch),
 }
 
-pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>) -> TaskResult {
+pub async fn stream(
+    store: &Store,
+    live: &Live,
+    request: Request,
+    emit: impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+) -> TaskResult {
     let started_at = std::time::Instant::now();
-    let Request { task_id, id, program, dir, prompt, route, base_commit, dirty_at_start, before_run, recordings, worktree } = request;
+    let Request {
+        task_id,
+        id,
+        program,
+        dir,
+        prompt,
+        route,
+        base_commit,
+        dirty_at_start,
+        before_run,
+        recordings,
+        worktree,
+    } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
     let mut control = live.open(task_id);
@@ -769,7 +872,15 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         id,
         program,
         dir,
-        plan: StagePlan { stage: Stage::Implement, max_turns: None, schema: None, tier: route.budget.preferred_tier, effort: None },
+        plan: StagePlan {
+            stage: Stage::Implement,
+            max_turns: None,
+            schema: None,
+            tier: route.budget.preferred_tier,
+            model: None,
+            effort: None,
+            shell: true,
+        },
         final_stage: true,
         remaining: Vec::new(),
         max_reported_tokens: route.budget.max_reported_tokens,
@@ -822,16 +933,27 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
             break;
         }
 
+        let tier = match (stage, route.budget.escalation, route.budget.review_tier) {
+            (Stage::Fix, Some(up), _) => up,
+            (Stage::Review, _, Some(review)) => review,
+            _ => route.budget.preferred_tier,
+        };
+        let choice = match stage {
+            Stage::Plan => route.plan_model(id),
+            Stage::Review => route.review_model(id),
+            _ => None,
+        };
         ctx.plan = StagePlan {
             stage,
             max_turns: route.budget.max_turns,
             schema: write_schema(task_id, stage),
-            tier: match (stage, route.budget.escalation, route.budget.review_tier) {
-                (Stage::Fix, Some(up), _) => up,
-                (Stage::Review, _, Some(review)) => review,
-                _ => route.budget.preferred_tier,
-            },
-            effort: route.review_model(id).filter(|_| stage == Stage::Review).map(|choice| choice.effort),
+            tier,
+            model: choice.map(|choice| choice.model),
+            effort: choice.map(|choice| choice.effort),
+            shell: !(stage == Stage::Implement
+                && stages[index + 1..].contains(&Stage::Verify)
+                && checks_locally(&ctx.dir)
+                && !routing::needs_shell(&prompt)),
         };
         ctx.final_stage = index + 1 == stages.len();
         ctx.remaining = stages[index..].to_vec();
@@ -845,10 +967,28 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         // names its command Orteca runs it: no model call, no false failure
         // from an agent's shell, and a failure still buys the Fix call.
         let checked_locally = stage == Stage::Verify
-            && verify_locally(store, &ctx, &mut state, &mut control, &emit, index, stages.len()).await;
+            && verify_locally(
+                store,
+                &ctx,
+                &mut state,
+                &mut control,
+                &emit,
+                index,
+                stages.len(),
+            )
+            .await;
         if !checked_locally {
-            let brief = routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
-            if let Err(e) = note(store, &ctx, "stage", &stage_payload(stage, index, stages.len(), &ctx.plan, id)) {
+            let mut brief =
+                routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
+            if id == ProviderId::Codex && stage == Stage::Implement {
+                brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
+            }
+            if let Err(e) = note(
+                store,
+                &ctx,
+                "stage",
+                &stage_payload(stage, index, stages.len(), &ctx.plan, id),
+            ) {
                 state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
                 break;
             }
@@ -932,7 +1072,9 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         && !outcome.cancelled
         && state.budget_stop.is_none()
         && state.notes.iter().any(|n| n.stage.writes())
-        && diff.iter().all(|f| f.origin == Some(project::Origin::BeforeRun))
+        && diff
+            .iter()
+            .all(|f| f.origin == Some(project::Origin::BeforeRun))
     {
         outcome.failure = Some(
             "Codex ended its implement stage without changing any file. A sandbox that fell back to read-only looks exactly like this."
@@ -941,7 +1083,10 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     }
     let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
     if let (Some(message), Some(kind)) = (&outcome.failure, outcome.failure_kind()) {
-        let event = ProviderEvent::Failed { kind, message: message.clone() };
+        let event = ProviderEvent::Failed {
+            kind,
+            message: message.clone(),
+        };
         if let Err(e) = record(store, task_id, "run", id, &event) {
             outcome.failure = Some(format!("{message}; could not log failure: {}", e.message));
         }
@@ -949,15 +1094,16 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     // A budget stop is its own outcome. It is not a failure - nothing went
     // wrong - and not a success, because the route did not finish. The work,
     // the diff and the usage are all kept exactly as they are.
-    let mut status = if state.budget_stop.is_some() && outcome.failure.is_none() && !outcome.cancelled {
-        match state.budget_stop.as_ref().map(|stop| stop.limit) {
-            Some("review") => "reviewRejected",
-            Some("verify") => "verifyFailed",
-            _ => "budgetReached",
-        }
-    } else {
-        outcome.status()
-    };
+    let mut status =
+        if state.budget_stop.is_some() && outcome.failure.is_none() && !outcome.cancelled {
+            match state.budget_stop.as_ref().map(|stop| stop.limit) {
+                Some("review") => "reviewRejected",
+                Some("verify") => "verifyFailed",
+                _ => "budgetReached",
+            }
+        } else {
+            outcome.status()
+        };
     // The last stage that actually said something. A Review that asked for
     // changes is the answer to the task, not the Verify that never ran.
     let summary = state
@@ -969,9 +1115,12 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
         .unwrap_or_else(|| outcome.summary());
     // Read before this task closes, so it is never its own comparison. A
     // baseline that cannot be read is no baseline, not a failed run.
-    let baseline = serde_json::to_value(route.kind)
-        .ok()
-        .and_then(|kind| store.baseline(task_id, kind.as_str()?, id.program()).ok().flatten());
+    let baseline = serde_json::to_value(route.kind).ok().and_then(|kind| {
+        store
+            .baseline(task_id, kind.as_str()?, id.program())
+            .ok()
+            .flatten()
+    });
     if let Err(e) = store.finish_task_details(
         task_id,
         status,
@@ -1008,13 +1157,62 @@ pub async fn stream(store: &Store, live: &Live, request: Request, emit: impl Fn(
     }
 }
 
-/// Run the repository's own test command as the Verify stage, with no model.
+/// The repository declares a test command and it is on PATH, so a Verify costs
+/// no agent call.
+pub fn checks_locally(dir: &Path) -> bool {
+    project::check_commands(dir).iter().any(runnable)
+}
+
+/// Every program a suite needs, its install included, is on PATH.
+fn runnable(check: &project::Check) -> bool {
+    check
+        .install
+        .iter()
+        .chain(std::iter::once(&check.test))
+        .all(|command| crate::providers::which(command[0]).is_some())
+}
+
+/// Small candidate files pasted into a Codex Implement brief, so Codex spends no
+/// shell call opening them. Claude gets none: its Edit tool refuses a file it has
+/// not Read in the same session, so pasting would pay for the bytes twice.
+/// Symlinks are skipped, because a tracked link can point outside the repository.
+// ponytail: first three candidates, 8 KB each, 16 KB in all; tune once runs show
+// how often a pasted file was the one edited.
+fn pasted_files(dir: &Path, paths: &[String]) -> String {
+    const EACH: u64 = 8_000;
+    const TOTAL: usize = 16_000;
+    let mut out = String::new();
+    for path in paths.iter().take(3) {
+        let full = dir.join(path);
+        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > EACH {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        if out.len() + text.len() > TOTAL {
+            continue;
+        }
+        out.push_str(&format!("\n--- {path} ---\n{text}\n"));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("\nCurrent contents of the likeliest paths above, so they need no opening:\n{out}--- end ---\n")
+}
+
+/// Run the repository's own test suites as the Verify stage, with no model.
 ///
-/// False, with nothing counted, when there is no command or no way to run it:
-/// the stage then goes to the agent as before. Orteca picks the fence and never
-/// builds one. Codex runs the command inside `codex sandbox`, read-only like a
-/// Codex Verify; Claude has no sandbox on Windows, so it runs as Claude's own
-/// Verify allowlist would have run it.
+/// False, with nothing counted, when no suite is declared or none can start:
+/// the stage then goes to the agent as before. A suite whose dependencies are
+/// missing has them installed first. Suites run as the user on either provider,
+/// as the project's trust consent covers: inside Codex's Windows sandbox a Vite,
+/// Jest or npm suite cannot read the folders above a repository under the user
+/// profile and dies before it tests anything, and an install needs the network
+/// the sandbox denies. A failure that is the fence's buys a Fix no edit can win.
 async fn verify_locally(
     store: &Store,
     ctx: &Context,
@@ -1024,29 +1222,102 @@ async fn verify_locally(
     index: usize,
     of: usize,
 ) -> bool {
-    // ponytail: ten minutes is a guess at a slow suite; make it per project when one needs longer.
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-    let Some(command) = project::check_command(&ctx.dir) else { return false };
-    let Some(tool) = crate::providers::which(command[0]) else { return false };
-    let tool = tool.to_string_lossy().into_owned();
-    let shown = command.join(" ");
-    let (program, mut args) = match ctx.id {
-        ProviderId::Codex => (
-            ctx.program.to_string_lossy().into_owned(),
-            vec!["sandbox", "-c", "windows.sandbox=\"elevated\"", "--", tool.as_str()],
+    let (checks, missing): (Vec<_>, Vec<_>) = project::check_commands(&ctx.dir)
+        .into_iter()
+        .partition(runnable);
+    if checks.is_empty() {
+        return false;
+    }
+    let label = |check: &project::Check, command: &[&str]| match check.dir.strip_prefix(&ctx.dir) {
+        Ok(sub) if !sub.as_os_str().is_empty() => format!(
+            "{}: {}",
+            sub.to_string_lossy().replace('\\', "/"),
+            command.join(" ")
         ),
-        ProviderId::Claude => (tool.clone(), Vec::new()),
+        _ => command.join(" "),
     };
-    args.extend(&command[1..]);
-    let Ok(mut run) = proc::spawn(&program, &args, &ctx.dir) else { return false };
+    let shown: Vec<String> = checks.iter().map(|c| label(c, &c.test)).collect();
 
     let stage = serde_json::json!({
         "kind": "stage",
-        "data": { "stage": Stage::Verify, "index": index, "of": of, "writes": false, "schema": true, "runner": "orteca", "command": shown },
+        "data": { "stage": Stage::Verify, "index": index, "of": of, "writes": false, "schema": true, "runner": "orteca", "command": shown.join(", ") },
     });
     let _ = note(store, ctx, "stage", &stage.to_string());
-    let started = ProviderEvent::ToolUse { name: "orteca".into(), summary: shown.clone() };
-    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &started).and_then(|()| emit(&started));
+    // A suite with nothing on PATH to run it is said out loud, never passed.
+    for check in &missing {
+        let event = ProviderEvent::Text(format!(
+            "{} did not run: it is not on PATH",
+            label(check, &check.test)
+        ));
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    }
+
+    let mut results = Vec::new();
+    for (check, shown) in checks.iter().zip(shown) {
+        let mut ran = Ran::Finished {
+            passed: true,
+            output: String::new(),
+        };
+        if let Some(install) = &check.install {
+            let named = label(check, install);
+            ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
+        }
+        if matches!(ran, Ran::Finished { passed: true, .. }) {
+            ran = run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await;
+        }
+        match ran {
+            Ran::Cancelled => return true,
+            Ran::NotStarted => {}
+            // A failed install is reported under its suite, with what it printed.
+            Ran::Finished { passed, output } => results.push(
+                serde_json::json!({ "command": shown, "passed": passed, "output": output }),
+            ),
+        }
+    }
+    if results.is_empty() {
+        return false;
+    }
+    let passed = results.iter().all(|check| check["passed"] == true);
+    state.structured = Some(serde_json::json!({
+        "checks": results,
+        "verdict": if passed { "pass" } else { "fail" },
+    }));
+    true
+}
+
+enum Ran {
+    Finished { passed: bool, output: String },
+    NotStarted,
+    Cancelled,
+}
+
+/// One command to its end, streamed into the run as Orteca's own tool use.
+async fn run_check(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    command: &[&str],
+    cwd: &Path,
+    shown: &str,
+) -> Ran {
+    // ponytail: ten minutes per command is a guess at a slow suite; make it per project when one needs longer.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    let say = |event: ProviderEvent| {
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    };
+    let Some(program) = crate::providers::which(command[0]) else {
+        return Ran::NotStarted;
+    };
+    let Ok(mut run) = proc::spawn(&program.to_string_lossy(), &command[1..], cwd) else {
+        say(ProviderEvent::Text(format!("{shown} did not start")));
+        return Ran::NotStarted;
+    };
+    say(ProviderEvent::ToolUse {
+        name: "orteca".into(),
+        summary: shown.to_string(),
+    });
 
     let mut tail = std::collections::VecDeque::new();
     let mut code = None;
@@ -1079,29 +1350,28 @@ async fn verify_locally(
         }
     }
     if state.outcome.cancelled {
-        return true;
+        return Ran::Cancelled;
     }
     let mut output = Vec::from(tail).join("\n");
-    // The sandbox failing to start is not the suite failing, and must not buy
-    // a Fix call.
-    if ctx.id == ProviderId::Codex && output.contains("windows sandbox failed") {
-        return false;
-    }
     if timed_out {
         output.push_str("\nStopped by Orteca after 10 minutes.");
     }
     let passed = code == Some(0) && !timed_out;
-    let finished = ProviderEvent::Text(format!("{shown} {}", if passed { "passed" } else { "did not pass" }));
-    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &finished).and_then(|()| emit(&finished));
-    state.structured = Some(serde_json::json!({
-        "checks": [{ "command": shown, "passed": passed, "output": output }],
-        "verdict": if passed { "pass" } else { "fail" },
-    }));
-    true
+    say(ProviderEvent::Text(format!(
+        "{shown} {}",
+        if passed { "passed" } else { "did not pass" }
+    )));
+    Ran::Finished { passed, output }
 }
 
 fn commit_message(task_id: i64, prompt: &str) -> String {
-    let line: String = prompt.lines().next().unwrap_or_default().chars().take(60).collect();
+    let line: String = prompt
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(60)
+        .collect();
     format!("Orteca task {task_id}: {line}")
 }
 
@@ -1115,7 +1385,13 @@ fn gate(route: &Route, state: &State, index: usize, stages: &[Stage]) -> Option<
     let remaining: Vec<Stage> = stages[index..].to_vec();
     let budget = &route.budget;
     let stop = |limit: &'static str, allowed: u64, observed: u64, message: String| {
-        Some(BudgetStop { limit, allowed, observed, remaining: remaining.clone(), message })
+        Some(BudgetStop {
+            limit,
+            allowed,
+            observed,
+            remaining: remaining.clone(),
+            message,
+        })
     };
 
     // The Fix call, once bought, is the one call the route declared on top.
@@ -1132,7 +1408,11 @@ fn gate(route: &Route, state: &State, index: usize, stages: &[Stage]) -> Option<
             ),
         );
     }
-    if let Some(stop) = token_stop(budget.max_reported_tokens, state.reported_tokens(), remaining.clone()) {
+    if let Some(stop) = token_stop(
+        budget.max_reported_tokens,
+        state.reported_tokens(),
+        remaining.clone(),
+    ) {
         return Some(stop);
     }
     None
@@ -1157,7 +1437,13 @@ fn token_stop(limit: Option<u64>, used: u64, remaining: Vec<Stage>) -> Option<Bu
 
 /// Close out one stage: validate whatever artifact came back, log it, and hand
 /// the next stage what it is entitled to.
-fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, escalation: Option<routing::Tier>) -> StageNote {
+fn finish_stage(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    stage: Stage,
+    escalation: Option<routing::Tier>,
+) -> StageNote {
     // An artifact counts only if it arrived as structured output and matches
     // the shape the stage contracted for. The alternative - reading the closing
     // prose and filling the fields from it - is exactly the guesswork the
@@ -1167,7 +1453,12 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, e
         .take()
         .filter(|value| routing::artifact_is_valid(stage, value));
     if stage.schema().is_some() {
-        let _ = note(store, ctx, "artifact", &artifact_payload(stage, artifact.as_ref()));
+        let _ = note(
+            store,
+            ctx,
+            "artifact",
+            &artifact_payload(stage, artifact.as_ref()),
+        );
     }
     // A review that asks for changes, or checks that did not pass, end the
     // route here - unless the route declared its one Fix call a tier up, which
@@ -1178,7 +1469,9 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, e
     // A stage that hit a budget stop did not complete; that stop is the result.
     if matches!(stage, Stage::Review | Stage::Verify | Stage::Fix)
         && state.budget_stop.is_none()
-        && !artifact.as_ref().is_some_and(|a| routing::stage_passed(stage, a))
+        && !artifact
+            .as_ref()
+            .is_some_and(|a| routing::stage_passed(stage, a))
     {
         if let Some(tier) = escalation.filter(|_| !state.escalated) {
             state.escalated = true;
@@ -1188,7 +1481,11 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, e
                 "data": { "after": stage, "tier": tier, "model": choice.model, "effort": choice.effort }
             });
             let _ = note(store, ctx, "escalation", &payload.to_string());
-            return StageNote { stage, summary: state.outcome.summary(), artifact };
+            return StageNote {
+                stage,
+                summary: state.outcome.summary(),
+                artifact,
+            };
         }
         let remaining = ctx.remaining.iter().skip(1).copied().collect();
         let stop = BudgetStop {
@@ -1207,7 +1504,11 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage, e
         state.budget_stop = Some(stop.clone());
         let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
     }
-    StageNote { stage, summary: state.outcome.summary(), artifact }
+    StageNote {
+        stage,
+        summary: state.outcome.summary(),
+        artifact,
+    }
 }
 
 /// The route, whole, as the event log stores it.
@@ -1215,7 +1516,13 @@ fn routing_payload(route: &Route) -> String {
     serde_json::json!({ "kind": "routing", "data": route }).to_string()
 }
 
-fn stage_payload(stage: Stage, index: usize, of: usize, plan: &StagePlan, id: ProviderId) -> String {
+fn stage_payload(
+    stage: Stage,
+    index: usize,
+    of: usize,
+    plan: &StagePlan,
+    id: ProviderId,
+) -> String {
     let choice = plan.model(id);
     serde_json::json!({
         "kind": "stage",
@@ -1229,6 +1536,7 @@ fn stage_payload(stage: Stage, index: usize, of: usize, plan: &StagePlan, id: Pr
             // for Codex this is the only record of it.
             "model": choice.model,
             "effort": choice.effort,
+            "shell": plan.shell,
         }
     })
     .to_string()
@@ -1258,6 +1566,28 @@ fn artifact_payload(stage: Stage, artifact: Option<&serde_json::Value>) -> Strin
     .to_string()
 }
 
+/// Codex reports tokens only. Each turn is priced at the published rate of the
+/// model this stage asked for, as a running total for the process - the shape
+/// `Usage::absorb` and `begin_process` already give a cost. One unpriced turn
+/// voids the task's cost: a total missing a turn reads cheaper than it was.
+fn price_codex(store: &Store, model: &str, outcome: &mut Outcome, events: &mut [ProviderEvent]) {
+    for event in events {
+        let ProviderEvent::Usage(usage) = event else {
+            continue;
+        };
+        // Codex names no model, so the result would read "unknown" without this.
+        usage.model.get_or_insert_with(|| model.to_string());
+        match store.price(model) {
+            Some(price) => {
+                let so_far = outcome.usage.as_ref().and_then(|u| u.cost_usd).unwrap_or(0.0);
+                usage.cost_usd = Some(so_far + codex::estimate(usage, price));
+                usage.cost_quality = CostQuality::Estimated;
+            }
+            None => outcome.unpriced = true,
+        }
+    }
+}
+
 /// Run one process to its end. Says whether the task is finished or is being
 /// picked back up somewhere else.
 async fn attempt(
@@ -1283,7 +1613,10 @@ async fn attempt(
     };
     // Prompt bytes bypass cmd.exe parsing and its command-line limit.
     if let Err(e) = run.send_line(&launch.opening).await {
-        state.outcome.failure = Some(format!("could not send prompt to {}: {e}", ctx.id.program()));
+        state.outcome.failure = Some(format!(
+            "could not send prompt to {}: {e}",
+            ctx.id.program()
+        ));
     }
     // A checkpoint provider is told no more input is coming. A live one keeps
     // its stdin, because that is what an instruction travels down - which also
@@ -1322,7 +1655,10 @@ async fn attempt(
                         state.structured = Some(structured);
                     }
                 }
-                let events = ctx.id.parse_line(&value);
+                let mut events = ctx.id.parse_line(&value);
+                if ctx.id == ProviderId::Codex {
+                    price_codex(store, ctx.plan.model(ctx.id).model, &mut state.outcome, &mut events);
+                }
                 // Each parser understands a subset of its CLI's event types and
                 // silently drops the rest. Harmless for the stream, fatal for
                 // the record: a Codex run whose tool calls all failed said so in
@@ -1332,14 +1668,26 @@ async fn attempt(
                 // complete while the stream stays readable.
                 if events.is_empty() {
                     state.unknown_events = state.unknown_events.saturating_add(1);
-                    if let Err(e) = store.append_event(ctx.task_id, ctx.stage(), "unknown", ctx.id.program(), &value.to_string()) {
-                        state.outcome.failure = Some(format!("could not record run event: {}", e.message));
+                    if let Err(e) = store.append_event(
+                        ctx.task_id,
+                        ctx.stage(),
+                        "unknown",
+                        ctx.id.program(),
+                        &value.to_string(),
+                    ) {
+                        state.outcome.failure =
+                            Some(format!("could not record run event: {}", e.message));
                         break;
                     }
                 }
                 for event in events {
-                    if let Err(e) = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event)) {
-                        state.outcome.failure = Some(format!("could not record or deliver run event: {}", e.message));
+                    if let Err(e) = record(store, ctx.task_id, ctx.stage(), ctx.id, &event)
+                        .and_then(|()| emit(&event))
+                    {
+                        state.outcome.failure = Some(format!(
+                            "could not record or deliver run event: {}",
+                            e.message
+                        ));
                         break;
                     }
                     if let ProviderEvent::Started { session_id } = &event {
@@ -1347,9 +1695,15 @@ async fn attempt(
                     }
                     let provider_budget_reached = matches!(
                         &event,
-                        ProviderEvent::Failed { kind: FailureKind::BudgetReached, .. }
+                        ProviderEvent::Failed {
+                            kind: FailureKind::BudgetReached,
+                            ..
+                        }
                     );
-                    if let ProviderEvent::Done { structured, turns, .. } = &event {
+                    if let ProviderEvent::Done {
+                        structured, turns, ..
+                    } = &event
+                    {
                         // Kept raw. Whether it is an artifact is decided by the
                         // stage's own contract once the stage is over.
                         if structured.is_some() {
@@ -1369,7 +1723,9 @@ async fn attempt(
                         // was given, which makes the ceiling the exact count;
                         // its `num_turns` uses a different unit (11 at 10).
                         if let Some(max) = ctx.plan.max_turns {
-                            state.turns_used = state.turns_used.saturating_add(max.saturating_sub(state.turns_this_call));
+                            state.turns_used = state
+                                .turns_used
+                                .saturating_add(max.saturating_sub(state.turns_this_call));
                             state.turns_this_call = state.turns_this_call.max(max);
                         }
                         state.outcome.failure = None;
@@ -1399,7 +1755,9 @@ async fn attempt(
                         }
                     }
                 }
-                if state.outcome.failure.is_some() { break; }
+                if state.outcome.failure.is_some() {
+                    break;
+                }
                 // Codex has no turn flag at 0.154.0, so Orteca counts for it.
                 // Between turns, never inside one: what this stops is the next
                 // turn, and it says so rather than pretending to interrupt.
@@ -1421,7 +1779,10 @@ async fn attempt(
                     // `error_max_turns`; a result that used exactly the ceiling
                     // and succeeded did not run out.
                     let stop = if ctx.id != ProviderId::Claude
-                        && ctx.plan.max_turns.is_some_and(|max| state.turns_this_call >= max)
+                        && ctx
+                            .plan
+                            .max_turns
+                            .is_some_and(|max| state.turns_this_call >= max)
                     {
                         Some(turn_stop(ctx, state))
                     } else {
@@ -1505,7 +1866,11 @@ async fn answer(
             run.cancel();
             Some(Next::Ended)
         }
-        Control::Instruct { text, apply_now, reply } => {
+        Control::Instruct {
+            text,
+            apply_now,
+            reply,
+        } => {
             // Every later stage's brief repeats this, whether the running
             // provider took it live, held it, or finished before it landed. An
             // instruction never silently expires.
@@ -1519,9 +1884,7 @@ async fn answer(
                     // a run whose stdin Orteca has already closed, which means
                     // the instruction arrived after the last turn ended.
                     match run.send_line(&claude::user_message(&text)).await {
-                        Ok(()) => {
-                            InstructionDisposition::Live
-                        }
+                        Ok(()) => InstructionDisposition::Live,
                         Err(_) => InstructionDisposition::TooLate,
                     }
                 }
@@ -1540,7 +1903,8 @@ async fn answer(
             // Never lost, whatever became of it: the task log is the record of
             // what the user asked for, the ones that had to wait included.
             if let Err(e) = note(store, ctx, "instruction", &instruction(&text, disposition)) {
-                state.outcome.failure = Some(format!("could not record the instruction: {}", e.message));
+                state.outcome.failure =
+                    Some(format!("could not record the instruction: {}", e.message));
                 return Some(Next::Ended);
             }
             let _ = reply.send(InstructionReceipt { disposition });
@@ -1602,12 +1966,21 @@ fn turn_stop(ctx: &Context, state: &State) -> BudgetStop {
 }
 
 fn instruction(text: &str, disposition: InstructionDisposition) -> String {
-    serde_json::json!({ "kind": "instruction", "data": { "text": text, "applied": disposition } }).to_string()
+    serde_json::json!({ "kind": "instruction", "data": { "text": text, "applied": disposition } })
+        .to_string()
 }
 
 /// Log the event, then show it. The log is the record; the emit is the view.
-fn record(store: &Store, task_id: i64, stage: &str, id: ProviderId, event: &ProviderEvent) -> crate::error::Result<()> {
-    let payload = serde_json::to_string(event).map_err(|e| crate::error::AppError::new(crate::error::ErrorKind::Invalid, e.to_string()))?;
+fn record(
+    store: &Store,
+    task_id: i64,
+    stage: &str,
+    id: ProviderId,
+    event: &ProviderEvent,
+) -> crate::error::Result<()> {
+    let payload = serde_json::to_string(event).map_err(|e| {
+        crate::error::AppError::new(crate::error::ErrorKind::Invalid, e.to_string())
+    })?;
     // ponytail: SQLite writes on the async runtime. They are single-row inserts
     // on a local file; move them to spawn_blocking if a run ever feels slow.
     store.append_event(task_id, stage, event.kind(), id.program(), &payload)?;
@@ -1647,7 +2020,54 @@ mod tests {
     }
 
     fn plan_for(stage: Stage) -> StagePlan {
-        StagePlan { stage, max_turns: Some(6), schema: write_schema(0, stage), tier: routing::Tier::Cheapest, effort: None }
+        StagePlan {
+            stage,
+            max_turns: Some(6),
+            schema: write_schema(0, stage),
+            tier: routing::Tier::Cheapest,
+            model: None,
+            effort: None,
+            shell: true,
+        }
+    }
+
+    /// An Implement that Orteca's own tests follow has no shell on Claude. The
+    /// denylist stays as a backstop.
+    #[test]
+    fn an_implement_followed_by_local_tests_has_no_shell() {
+        let claude = args(
+            ProviderId::Claude,
+            &StagePlan {
+                shell: false,
+                ..plan_for(Stage::Implement)
+            },
+        )
+        .join(" ");
+        assert!(
+            claude.contains("--tools Read,Edit,Write,Glob,Grep "),
+            "{claude}"
+        );
+        assert!(
+            claude.contains("--allowedTools Read Edit Write Glob Grep --disallowedTools"),
+            "{claude}"
+        );
+        assert!(claude.contains("Bash(git push:*)"));
+    }
+
+    #[test]
+    fn only_small_regular_files_are_pasted() {
+        let dir = std::env::temp_dir().join(format!("orteca-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("slug.js"), "export const slug = s => s;").unwrap();
+        std::fs::write(dir.join("big.js"), "x".repeat(9_000)).unwrap();
+        let paths = ["big.js", "missing.js", "slug.js"].map(String::from);
+        let text = pasted_files(&dir, &paths);
+        assert!(
+            text.contains("--- slug.js ---\nexport const slug") && !text.contains("big.js"),
+            "{text}"
+        );
+        assert_eq!(pasted_files(&dir, &paths[..2]), "");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1667,18 +2087,38 @@ mod tests {
     }
 
     fn task_request(store: &Store, label: &str) -> Request {
-        let dir = std::env::temp_dir().join(format!("orteca-stream-{label}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("orteca-stream-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap().success());
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
         let project = store.touch_project(dir.to_str().unwrap(), "test").unwrap();
         Request {
-            task_id: store.create_task(NewTask {
-                project_id: project.id, prompt: "test", mode: "balanced", route_json: None,
-                branch: None, base_commit: None, dirty_at_start: false,
-            }).unwrap(),
-            id: ProviderId::Codex, program: dir.join("fake.cmd"), dir,
-            prompt: "a\"b %PATH% & ^\n\\ --help".into(), route: one_call("fix the typo"),
-            base_commit: None, dirty_at_start: false, before_run: Some(Default::default()), recordings: None, worktree: None,
+            task_id: store
+                .create_task(NewTask {
+                    project_id: project.id,
+                    prompt: "test",
+                    mode: "balanced",
+                    route_json: None,
+                    branch: None,
+                    base_commit: None,
+                    dirty_at_start: false,
+                })
+                .unwrap(),
+            id: ProviderId::Codex,
+            program: dir.join("fake.cmd"),
+            dir,
+            prompt: "a\"b %PATH% & ^\n\\ --help".into(),
+            route: one_call("fix the typo"),
+            base_commit: None,
+            dirty_at_start: false,
+            before_run: Some(Default::default()),
+            recordings: None,
+            worktree: None,
         }
     }
 
@@ -1708,11 +2148,19 @@ mod tests {
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
         std::fs::write(dir.join("fake.js"), "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>input+=s);process.stdin.on('end',()=>{console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:input}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:80,output_tokens:20}}));process.exitCode=1;});").unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let result = stream(&store, &Live::default(), request, |e| { events.borrow_mut().push(e.clone()); Ok(()) }).await;
+        let result = stream(&store, &Live::default(), request, |e| {
+            events.borrow_mut().push(e.clone());
+            Ok(())
+        })
+        .await;
         // The shim echoes whatever reached its stdin. What matters is that
         // the user's exact bytes survived the brief that wraps them, quotes,
         // percent signs, carets, backslashes and newlines included.
-        assert!(result.summary.contains(&prompt), "prompt bytes were mangled: {}", result.summary);
+        assert!(
+            result.summary.contains(&prompt),
+            "prompt bytes were mangled: {}",
+            result.summary
+        );
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("code 1"));
         assert!(!events.borrow().is_empty());
@@ -1739,13 +2187,25 @@ mod tests {
         .unwrap();
 
         let emitted = std::cell::RefCell::new(Vec::new());
-        stream(&store, &Live::default(), request, |e| { emitted.borrow_mut().push(e.kind()); Ok(()) }).await;
+        stream(&store, &Live::default(), request, |e| {
+            emitted.borrow_mut().push(e.kind());
+            Ok(())
+        })
+        .await;
 
-        assert!(store.event_kinds(task).contains(&"unknown".to_string()), "unparsed line was dropped");
-        let raw = store.event_payloads(task).into_iter()
+        assert!(
+            store.event_kinds(task).contains(&"unknown".to_string()),
+            "unparsed line was dropped"
+        );
+        let raw = store
+            .event_payloads(task)
+            .into_iter()
             .find(|v| v["item"]["type"] == "unified_exec")
             .expect("raw payload was not kept verbatim");
-        assert_eq!(raw["item"]["error"], "sandbox setup failed", "the reason the run did nothing must survive");
+        assert_eq!(
+            raw["item"]["error"], "sandbox setup failed",
+            "the reason the run did nothing must survive"
+        );
         // Logged, not shown: the UI has no shape for an event nobody parsed.
         assert!(!emitted.borrow().contains(&"unknown"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -1761,16 +2221,24 @@ mod tests {
         let mut request = task_request(&store, "read-only");
         let dir = request.dir.clone();
         // Outside the repository, or the shim itself would be the run's diff.
-        let program = std::env::temp_dir().join(format!("orteca-read-only-{}.cmd", std::process::id()));
+        let program =
+            std::env::temp_dir().join(format!("orteca-read-only-{}.cmd", std::process::id()));
         let fixture = mock::named("codex-read-only-run.jsonl");
-        std::fs::write(&program, format!("@echo off\r\ntype \"{}\"\r\n", fixture.display())).unwrap();
+        std::fs::write(
+            &program,
+            format!("@echo off\r\ntype \"{}\"\r\n", fixture.display()),
+        )
+        .unwrap();
         request.program = program.clone();
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert!(result.diff.is_empty());
         assert_eq!(result.status, "failed");
-        assert!(result.failure.unwrap().contains("without changing any file"));
+        assert!(result
+            .failure
+            .unwrap()
+            .contains("without changing any file"));
         // The agent's own words stay the summary; they were never the signal.
         assert!(result.summary.contains("read-only"));
         std::fs::remove_file(program).unwrap();
@@ -1809,14 +2277,22 @@ mod tests {
 
         // Anything but JSONL makes the file a broken fixture, not a recording.
         let written = std::fs::read_to_string(&recording).expect("nothing was recorded");
-        assert_eq!(written.lines().count(), 2, "non-JSON output leaked in: {written}");
+        assert_eq!(
+            written.lines().count(),
+            2,
+            "non-JSON output leaked in: {written}"
+        );
 
         let replayed: Vec<String> = crate::providers::mock::replay(ProviderId::Codex, &recording)
             .expect("a recording must load as a fixture")
             .iter()
             .map(|e| serde_json::to_string(e).unwrap())
             .collect();
-        assert_eq!(replayed, live.into_inner(), "replay must reproduce the run it recorded");
+        assert_eq!(
+            replayed,
+            live.into_inner(),
+            "replay must reproduce the run it recorded"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1857,9 +2333,18 @@ ping -n 60 127.0.0.1 >nul
         );
 
         assert_eq!(result.status, "cancelled");
-        assert_eq!(result.failure, None, "a stop the user asked for is not a failure");
-        assert_eq!(result.summary, "half an answer", "what the agent already said is kept");
-        assert!(store.event_kinds(task).contains(&"cancel".to_string()), "the log must record the stop");
+        assert_eq!(
+            result.failure, None,
+            "a stop the user asked for is not a failure"
+        );
+        assert_eq!(
+            result.summary, "half an answer",
+            "what the agent already said is kept"
+        );
+        assert!(
+            store.event_kinds(task).contains(&"cancel".to_string()),
+            "the log must record the stop"
+        );
         // The sender goes with the run, so a late second click cannot claim to
         // have stopped something that is already over.
         assert!(live.send(task, Control::Cancel).is_err());
@@ -1869,11 +2354,17 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_control_cannot_reach_a_run_that_is_not_live() {
         let live = Live::default();
-        assert!(live.send(7, Control::Cancel).is_err(), "nothing to stop yet");
+        assert!(
+            live.send(7, Control::Cancel).is_err(),
+            "nothing to stop yet"
+        );
         let listening = live.open(7);
         assert!(live.send(7, Control::Cancel).is_ok());
         live.close(7);
-        assert!(live.send(7, Control::Cancel).is_err(), "a finished run cannot be stopped");
+        assert!(
+            live.send(7, Control::Cancel).is_err(),
+            "a finished run cannot be stopped"
+        );
         drop(listening);
     }
 
@@ -1884,15 +2375,21 @@ ping -n 60 127.0.0.1 >nul
     /// cost as the whole run's, while its tokens were summed correctly.
     #[test]
     fn cost_adds_across_processes_and_replaces_within_one() {
-        let usage = |cost_usd: Option<f64>| ProviderEvent::Usage(Usage {
-            model: None,
-            input_tokens: 1,
-            cached_input_tokens: 0,
-            output_tokens: 1,
-            reasoning_tokens: 0,
-            cost_usd,
-            cost_quality: if cost_usd.is_some() { crate::providers::CostQuality::Estimated } else { crate::providers::CostQuality::Unavailable },
-        });
+        let usage = |cost_usd: Option<f64>| {
+            ProviderEvent::Usage(Usage {
+                model: None,
+                input_tokens: 1,
+                cached_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_tokens: 0,
+                cost_usd,
+                cost_quality: if cost_usd.is_some() {
+                    crate::providers::CostQuality::Estimated
+                } else {
+                    crate::providers::CostQuality::Unavailable
+                },
+            })
+        };
         let mut outcome = Outcome::default();
         outcome.begin_process();
         outcome.absorb(&usage(Some(0.01)));
@@ -1904,7 +2401,11 @@ ping -n 60 127.0.0.1 >nul
         outcome.settle_cost();
 
         let total = outcome.usage.expect("usage was lost");
-        assert!((total.cost_usd.expect("cost was lost") - 0.05).abs() < 1e-9, "{:?}", total.cost_usd);
+        assert!(
+            (total.cost_usd.expect("cost was lost") - 0.05).abs() < 1e-9,
+            "{:?}",
+            total.cost_usd
+        );
         assert_eq!(total.input_tokens, 4, "tokens still add per report");
         assert_eq!(total.cost_quality, crate::providers::CostQuality::Estimated);
 
@@ -1912,7 +2413,51 @@ ping -n 60 127.0.0.1 >nul
         free.begin_process();
         free.absorb(&usage(None));
         free.settle_cost();
-        assert_eq!(free.usage.unwrap().cost_usd, None, "no reported cost stays unavailable, never 0");
+        assert_eq!(
+            free.usage.unwrap().cost_usd,
+            None,
+            "no reported cost stays unavailable, never 0"
+        );
+    }
+
+    #[test]
+    fn codex_turns_are_priced_per_process_and_an_unpriced_turn_voids_the_total() {
+        let store = Store::in_memory().unwrap();
+        let price = crate::store::Price { input: 1.0, output: 10.0, cache_read: 0.1 };
+        store.save_prices(&[("luna".into(), price)]).unwrap();
+        // $1 of input and $1 of output: $2 a turn.
+        let turn = || {
+            vec![ProviderEvent::Usage(Usage {
+                model: None,
+                input_tokens: 1_000_000,
+                cached_input_tokens: 0,
+                output_tokens: 100_000,
+                reasoning_tokens: 0,
+                cost_usd: None,
+                cost_quality: CostQuality::Unavailable,
+            })]
+        };
+        let run = |models: &[&str]| {
+            let mut outcome = Outcome::default();
+            for process in [models, models] {
+                outcome.begin_process();
+                for model in process {
+                    let mut events = turn();
+                    price_codex(&store, model, &mut outcome, &mut events);
+                    outcome.absorb(&events[0]);
+                }
+            }
+            outcome.settle_cost();
+            outcome.usage.unwrap()
+        };
+
+        let priced = run(&["luna", "luna"]);
+        assert!((priced.cost_usd.unwrap() - 8.0).abs() < 1e-9, "{:?}", priced.cost_usd);
+        assert_eq!(priced.cost_quality, CostQuality::Estimated);
+
+        let retired = run(&["luna", "retired"]);
+        assert_eq!(retired.cost_usd, None);
+        assert_eq!(retired.cost_quality, CostQuality::Unavailable);
     }
 
     /// A spent plan must reach the screen as `usageLimit`, which is what offers
@@ -1920,13 +2465,30 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_reported_usage_limit_is_not_overwritten_by_a_vaguer_failure() {
         let mut outcome = Outcome::default();
-        outcome.absorb(&ProviderEvent::Failed { kind: FailureKind::UsageLimit, message: "Claude's session usage limit is used up.".into() });
-        outcome.absorb(&ProviderEvent::Failed { kind: FailureKind::Crashed, message: "something went wrong".into() });
+        outcome.absorb(&ProviderEvent::Failed {
+            kind: FailureKind::UsageLimit,
+            message: "Claude's session usage limit is used up.".into(),
+        });
+        outcome.absorb(&ProviderEvent::Failed {
+            kind: FailureKind::Crashed,
+            message: "something went wrong".into(),
+        });
         assert_eq!(outcome.failure_kind(), Some(FailureKind::UsageLimit));
-        assert_eq!(outcome.failure.as_deref(), Some("something went wrong"), "the last words are still shown");
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("something went wrong"),
+            "the last words are still shown"
+        );
 
-        let mut unreported = Outcome { failure: Some("codex exited with code 1".into()), ..Outcome::default() };
-        assert_eq!(unreported.failure_kind(), Some(FailureKind::Crashed), "read from the message when no provider said");
+        let mut unreported = Outcome {
+            failure: Some("codex exited with code 1".into()),
+            ..Outcome::default()
+        };
+        assert_eq!(
+            unreported.failure_kind(),
+            Some(FailureKind::Crashed),
+            "read from the message when no provider said"
+        );
         unreported.failure = None;
         assert_eq!(unreported.failure_kind(), None, "no failure, no kind");
     }
@@ -1934,16 +2496,28 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_stop_is_rewritten_by_the_run_ending_but_not_by_a_single_turn() {
         let mut answered = Outcome::default();
-        answered.absorb(&ProviderEvent::Done { result: "shipped".into(), structured: None, turns: 1 });
+        answered.absorb(&ProviderEvent::Done {
+            result: "shipped".into(),
+            structured: None,
+            turns: 1,
+        });
         answered.finished = true;
         answered.cancelled = true;
         assert_eq!(answered.status(), "done", "the run had already ended");
 
         let mut mid_turn = Outcome::default();
-        mid_turn.absorb(&ProviderEvent::Done { result: "turn one".into(), structured: None, turns: 1 });
+        mid_turn.absorb(&ProviderEvent::Done {
+            result: "turn one".into(),
+            structured: None,
+            turns: 1,
+        });
         mid_turn.cancelled = true;
         assert!(mid_turn.done, "a turn did answer");
-        assert_eq!(mid_turn.status(), "cancelled", "but the run was stopped mid-work");
+        assert_eq!(
+            mid_turn.status(),
+            "cancelled",
+            "but the run was stopped mid-work"
+        );
 
         let mut stopped = Outcome {
             cancelled: true,
@@ -1989,18 +2563,26 @@ ping -n 60 127.0.0.1 >nul
             async {
                 // The first text means the shared turn is under way.
                 wait_for_kind(&mut hearing, "text").await;
-                let receipt = live.instruct(task, "also tidy up".into(), false).await.unwrap();
+                let receipt = live
+                    .instruct(task, "also tidy up".into(), false)
+                    .await
+                    .unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Live);
             }
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
-        assert!(result.summary.ends_with("also tidy up"), "the live instruction was not incorporated");
+        assert!(
+            result.summary.ends_with("also tidy up"),
+            "the live instruction was not incorporated"
+        );
         let usage = result.usage.expect("a steered run still reports usage");
         assert_eq!(usage.output_tokens, 1, "one result must be counted once");
         assert_eq!(usage.cost_usd, Some(0.01));
 
-        let payload = store.event_payloads(task).into_iter()
+        let payload = store
+            .event_payloads(task)
+            .into_iter()
             .find(|v| v["kind"] == "instruction")
             .expect("the instruction was not written to the log");
         assert_eq!(payload["data"]["applied"], "live");
@@ -2019,27 +2601,39 @@ ping -n 60 127.0.0.1 >nul
         let dir = request.dir.clone();
         let task = request.task_id;
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        std::fs::write(dir.join("fake.js"), concat!(
-            "process.stdin.resume();",
-            "console.log(JSON.stringify({type:'result',subtype:'success',result:'done',",
-            "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));",
-            "process.stdin.on('end',()=>setTimeout(()=>process.exit(0),500));",
-        )).unwrap();
+        std::fs::write(
+            dir.join("fake.js"),
+            concat!(
+                "process.stdin.resume();",
+                "console.log(JSON.stringify({type:'result',subtype:'success',result:'done',",
+                "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));",
+                "process.stdin.on('end',()=>setTimeout(()=>process.exit(0),500));",
+            ),
+        )
+        .unwrap();
 
         let live = Live::default();
         let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
         let (result, receipt) = tokio::join!(
-            stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
             async {
                 wait_for_kind(&mut hearing, "done").await;
-                live.instruct(task, "one more thing".into(), false).await.unwrap()
+                live.instruct(task, "one more thing".into(), false)
+                    .await
+                    .unwrap()
             }
         );
 
         assert_eq!(receipt.disposition, InstructionDisposition::TooLate);
         assert_eq!(result.status, "done", "{:?}", result.failure);
-        let payload = store.event_payloads(task).into_iter()
-            .find(|v| v["kind"] == "instruction").expect("the late instruction was not logged");
+        let payload = store
+            .event_payloads(task)
+            .into_iter()
+            .find(|v| v["kind"] == "instruction")
+            .expect("the late instruction was not logged");
         assert_eq!(payload["data"]["applied"], "tooLate");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2053,7 +2647,11 @@ ping -n 60 127.0.0.1 >nul
         let request = task_request(&store, "steer-held");
         let dir = request.dir.clone();
         let task = request.task_id;
-        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        std::fs::write(
+            &request.program,
+            "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
+        )
+        .unwrap();
         // The first process finishes naturally. The held instruction must then
         // enter the same session through a resumed process.
         std::fs::write(dir.join("fake.js"), concat!(
@@ -2071,7 +2669,10 @@ ping -n 60 127.0.0.1 >nul
         let live = Live::default();
         let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
         let (result, ()) = tokio::join!(
-            stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
             async {
                 wait_for_kind(&mut hearing, "text").await;
                 let receipt = live.instruct(task, "use tabs".into(), false).await.unwrap();
@@ -2081,7 +2682,9 @@ ping -n 60 127.0.0.1 >nul
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
         assert_eq!(result.summary, "boundary use tabs");
-        let payload = store.event_payloads(task).into_iter()
+        let payload = store
+            .event_payloads(task)
+            .into_iter()
             .find(|v| v["kind"] == "instruction")
             .expect("a held instruction still has to be recorded");
         assert_eq!(payload["data"]["applied"], "held");
@@ -2098,7 +2701,11 @@ ping -n 60 127.0.0.1 >nul
         let request = task_request(&store, "steer-resume");
         let dir = request.dir.clone();
         let task = request.task_id;
-        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        std::fs::write(
+            &request.program,
+            "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
+        )
+        .unwrap();
         // First run reports a session and then refuses to end. Resumed, it
         // reports what it was resumed with.
         std::fs::write(dir.join("fake.js"), concat!(
@@ -2116,26 +2723,39 @@ ping -n 60 127.0.0.1 >nul
         let live = Live::default();
         let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
         let (result, ()) = tokio::join!(
-            stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
             async {
                 wait_for_kind(&mut hearing, "text").await;
-                let receipt = live.instruct(task, "make it faster".into(), true).await.unwrap();
+                let receipt = live
+                    .instruct(task, "make it faster".into(), true)
+                    .await
+                    .unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Resumed);
             }
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
         assert_eq!(result.summary, "resumed sess-1 with make it faster");
-        let payload = store.event_payloads(task).into_iter()
+        let payload = store
+            .event_payloads(task)
+            .into_iter()
             .find(|v| v["kind"] == "instruction")
             .expect("the instruction was not logged");
         assert_eq!(payload["data"]["applied"], "resumed");
         // One task across two processes: the first one's words are still here.
-        let texts: Vec<String> = store.event_payloads(task).into_iter()
+        let texts: Vec<String> = store
+            .event_payloads(task)
+            .into_iter()
             .filter(|v| v["kind"] == "text")
             .map(|v| v["data"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert!(texts.contains(&"working".to_string()), "the log lost the first process");
+        assert!(
+            texts.contains(&"working".to_string()),
+            "the log lost the first process"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2147,7 +2767,11 @@ ping -n 60 127.0.0.1 >nul
         let request = task_request(&store, "steer-nosession");
         let dir = request.dir.clone();
         let task = request.task_id;
-        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        std::fs::write(
+            &request.program,
+            "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
+        )
+        .unwrap();
         // There is enough time to submit Apply now after text but before the
         // delayed session ID. Resumed, the shim reports the carried words.
         std::fs::write(dir.join("fake.js"), concat!(
@@ -2165,7 +2789,10 @@ ping -n 60 127.0.0.1 >nul
         let live = Live::default();
         let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
         let (result, ()) = tokio::join!(
-            stream(&store, &live, request, move |e| { let _ = heard.send(e.kind()); Ok(()) }),
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
             async {
                 wait_for_kind(&mut hearing, "text").await;
                 let receipt = live.instruct(task, "hurry".into(), true).await.unwrap();
@@ -2175,9 +2802,15 @@ ping -n 60 127.0.0.1 >nul
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
         assert_eq!(result.summary, "late hurry");
-        let payload = store.event_payloads(task).into_iter()
-            .find(|v| v["kind"] == "instruction").expect("not logged");
-        assert_eq!(payload["data"]["applied"], "held", "the receipt was honest while the session was pending");
+        let payload = store
+            .event_payloads(task)
+            .into_iter()
+            .find(|v| v["kind"] == "instruction")
+            .expect("not logged");
+        assert_eq!(
+            payload["data"]["applied"], "held",
+            "the receipt was honest while the session was pending"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2191,7 +2824,10 @@ ping -n 60 127.0.0.1 >nul
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("could not start codex"));
-        assert!(store.event_payloads(task).iter().any(|v| v["kind"] == "failed"));
+        assert!(store
+            .event_payloads(task)
+            .iter()
+            .any(|v| v["kind"] == "failed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2199,15 +2835,36 @@ ping -n 60 127.0.0.1 >nul
     async fn event_storage_and_delivery_failures_cannot_report_success() {
         for reject_storage in [false, true] {
             let store = Store::in_memory().unwrap();
-            let request = task_request(&store, if reject_storage { "storage-failure" } else { "delivery-failure" });
+            let request = task_request(
+                &store,
+                if reject_storage {
+                    "storage-failure"
+                } else {
+                    "delivery-failure"
+                },
+            );
             let dir = request.dir.clone();
             std::fs::write(&request.program, "@echo off\r\necho {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\r\nexit /b 0\r\n").unwrap();
-            if reject_storage { store.reject_events(); }
+            if reject_storage {
+                store.reject_events();
+            }
             let result = stream(&store, &Live::default(), request, |_| {
-                if reject_storage { Ok(()) } else { Err(crate::error::AppError::new(crate::error::ErrorKind::Io, "window unavailable")) }
-            }).await;
+                if reject_storage {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::new(
+                        crate::error::ErrorKind::Io,
+                        "window unavailable",
+                    ))
+                }
+            })
+            .await;
             assert_eq!(result.status, "failed");
-            assert!(result.failure.unwrap().contains(if reject_storage { "disk unavailable" } else { "window unavailable" }));
+            assert!(result.failure.unwrap().contains(if reject_storage {
+                "disk unavailable"
+            } else {
+                "window unavailable"
+            }));
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -2223,7 +2880,10 @@ ping -n 60 127.0.0.1 >nul
     fn arbitrary_prompts_never_reach_a_cmd_argument() {
         for id in ProviderId::ALL {
             for prompt in ["a\"b", "%PATH%", "a&b", "a^b", "a\nb", "\\", "--help"] {
-                assert!(!args(id, &plan_for(Stage::Implement)).contains(&prompt.to_string()), "{id:?}: {prompt:?}");
+                assert!(
+                    !args(id, &plan_for(Stage::Implement)).contains(&prompt.to_string()),
+                    "{id:?}: {prompt:?}"
+                );
             }
         }
     }
@@ -2256,7 +2916,10 @@ ping -n 60 127.0.0.1 >nul
         // Deny beats allow, and every rule covers both shells.
         for command in CLAUDE_DENY_COMMANDS {
             assert!(claude.contains(&format!("Bash({command})")), "{command}");
-            assert!(claude.contains(&format!("PowerShell({command})")), "{command}");
+            assert!(
+                claude.contains(&format!("PowerShell({command})")),
+                "{command}"
+            );
         }
         assert!(claude.contains("Bash(git push:*)"));
         assert!(claude.contains("Bash(rm:*)"));
@@ -2264,7 +2927,10 @@ ping -n 60 127.0.0.1 >nul
         // Granting the shells must not silently outrank the denylist.
         let allow = claude.find("--allowedTools").expect("allow");
         let deny = claude.find("--disallowedTools").expect("deny");
-        assert!(allow < deny, "denylist must come after the grant it narrows");
+        assert!(
+            allow < deny,
+            "denylist must come after the grant it narrows"
+        );
 
         let codex = args(ProviderId::Codex, &plan_for(Stage::Implement)).join(" ");
         assert!(codex.contains("--sandbox workspace-write"));
@@ -2290,11 +2956,27 @@ ping -n 60 127.0.0.1 >nul
             // `acceptEdits`, and matching text would pass either way.
             let claude = args(ProviderId::Claude, &plan_for(stage));
             for tool in CLAUDE_EDIT_TOOLS {
-                assert!(claude.iter().any(|a| a == tool), "{} could still call {tool}", stage.name());
+                assert!(
+                    claude.iter().any(|a| a == tool),
+                    "{} could still call {tool}",
+                    stage.name()
+                );
             }
-            assert!(claude.contains(&"Read".to_string()), "{} lost read access", stage.name());
-            assert!(!claude.contains(&"Bash".to_string()), "{} received arbitrary Bash", stage.name());
-            assert!(!claude.contains(&"PowerShell".to_string()), "{} received arbitrary PowerShell", stage.name());
+            assert!(
+                claude.contains(&"Read".to_string()),
+                "{} lost read access",
+                stage.name()
+            );
+            assert!(
+                !claude.contains(&"Bash".to_string()),
+                "{} received arbitrary Bash",
+                stage.name()
+            );
+            assert!(
+                !claude.contains(&"PowerShell".to_string()),
+                "{} received arbitrary PowerShell",
+                stage.name()
+            );
         }
         // Implement still writes, or nothing would ever change.
         let codex = args(ProviderId::Codex, &plan_for(Stage::Implement)).join(" ");
@@ -2311,16 +2993,33 @@ ping -n 60 127.0.0.1 >nul
     /// an inline schema, and takes a file.
     #[test]
     fn only_verified_ceiling_flags_reach_a_command_line() {
-        let plan = StagePlan { stage: Stage::Plan, max_turns: Some(7), schema: write_schema(0, Stage::Plan), tier: routing::Tier::Deep, effort: None };
+        let plan = StagePlan {
+            stage: Stage::Plan,
+            max_turns: Some(7),
+            schema: write_schema(0, Stage::Plan),
+            tier: routing::Tier::Deep,
+            model: None,
+            effort: None,
+            shell: true,
+        };
         let claude = args(ProviderId::Claude, &plan);
         assert!(claude.windows(2).any(|w| w == ["--max-turns", "7"]));
         assert!(claude.contains(&"--json-schema".to_string()));
         assert!(claude.contains(&routing::PLAN_SCHEMA.to_string()));
 
         let codex = args(ProviderId::Codex, &plan);
-        assert!(!codex.contains(&"--max-turns".to_string()), "codex 0.154.0 has no turn flag");
-        assert!(!codex.contains(&"--json-schema".to_string()), "codex takes a file, not inline JSON");
-        let at = codex.iter().position(|a| a == "--output-schema").expect("codex takes a schema file");
+        assert!(
+            !codex.contains(&"--max-turns".to_string()),
+            "codex 0.154.0 has no turn flag"
+        );
+        assert!(
+            !codex.contains(&"--json-schema".to_string()),
+            "codex takes a file, not inline JSON"
+        );
+        let at = codex
+            .iter()
+            .position(|a| a == "--output-schema")
+            .expect("codex takes a schema file");
         let path = std::path::Path::new(&codex[at + 1]);
         assert_eq!(std::fs::read_to_string(path).unwrap(), routing::PLAN_SCHEMA);
         // Never in the user's repository: a schema file in their diff would be
@@ -2333,10 +3032,33 @@ ping -n 60 127.0.0.1 >nul
 
         // The tier reaches both command lines as a model and an effort, and a
         // resumed Codex session keeps them instead of the account default.
-        assert!(claude.windows(4).any(|w| w == ["--model", "opus", "--effort", "high"]));
-        assert!(codex.windows(4).any(|w| w == ["--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\""]));
+        assert!(claude
+            .windows(4)
+            .any(|w| w == ["--model", "opus", "--effort", "high"]));
+        assert!(codex.windows(4).any(|w| w
+            == [
+                "--model",
+                "gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=\"high\""
+            ]));
         let resumed = Launch::resume(ProviderId::Codex, "abc-123", &[], &plan).argv;
         assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-5.6-sol"]));
+
+        let efficient_review = StagePlan {
+            model: Some("gpt-5.6-terra"),
+            effort: Some("high"),
+            ..plan_for(Stage::Review)
+        };
+        assert!(args(ProviderId::Codex, &efficient_review)
+            .windows(4)
+            .any(|w| w
+                == [
+                    "--model",
+                    "gpt-5.6-terra",
+                    "-c",
+                    "model_reasoning_effort=\"high\""
+                ]));
     }
 
     /// A shim that answers every call, logs the brief it was given, and exits.
@@ -2344,7 +3066,11 @@ ping -n 60 127.0.0.1 >nul
     /// turn ceiling is measured against.
     fn answering_shim(request: &Request, turns: usize) {
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        let log = request.dir.join("briefs.log").to_string_lossy().replace('\\', "/");
+        let log = request
+            .dir
+            .join("briefs.log")
+            .to_string_lossy()
+            .replace('\\', "/");
         std::fs::write(
             request.dir.join("fake.js"),
             format!(
@@ -2387,7 +3113,11 @@ ping -n 60 127.0.0.1 >nul
     fn claude_shim_answers(request: &mut Request, answers: &[serde_json::Value]) {
         request.id = ProviderId::Claude;
         std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
-        let log = request.dir.join("briefs.log").to_string_lossy().replace('\\', "/");
+        let log = request
+            .dir
+            .join("briefs.log")
+            .to_string_lossy()
+            .replace('\\', "/");
         let answers = serde_json::to_string(answers).unwrap();
         std::fs::write(
             request.dir.join("fake.js"),
@@ -2429,23 +3159,50 @@ ping -n 60 127.0.0.1 >nul
         let mut request = routed(&store, "worktree", one_call("fix the typo in the readme"));
         let repo = request.dir.clone();
         assert!(std::process::Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "initial"])
-            .current_dir(&repo).status().unwrap().success());
-        let copy = project::worktree_dir(&project::git_state(&repo).root.unwrap(), request.task_id).unwrap();
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial"
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        let copy = project::worktree_dir(&project::git_state(&repo).root.unwrap(), request.task_id)
+            .unwrap();
         let _ = std::fs::remove_dir_all(&copy);
-        project::add_worktree(&repo, &copy, &format!("orteca/test-{}", std::process::id())).unwrap();
+        project::add_worktree(&repo, &copy, &format!("orteca/test-{}", std::process::id()))
+            .unwrap();
         request.program = copy.join("fake.cmd");
         request.dir = copy.clone();
-        request.worktree = Some(project::Worktree { path: copy.to_string_lossy().into_owned(), branch: "test".into(), commit: None, commit_error: None });
+        request.worktree = Some(project::Worktree {
+            path: copy.to_string_lossy().into_owned(),
+            branch: "test".into(),
+            commit: None,
+            commit_error: None,
+        });
         answering_shim(&request, 1);
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
         let tree = result.worktree.expect("the copy was not reported");
-        assert!(tree.commit.is_some(), "not committed: {:?}", tree.commit_error);
+        assert!(
+            tree.commit.is_some(),
+            "not committed: {:?}",
+            tree.commit_error
+        );
         assert!(copy.join("briefs.log").exists());
-        assert!(!repo.join("briefs.log").exists(), "the run wrote in the user's folder");
+        assert!(
+            !repo.join("briefs.log").exists(),
+            "the run wrote in the user's folder"
+        );
         let _ = std::fs::remove_dir_all(&copy);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -2463,14 +3220,23 @@ ping -n 60 127.0.0.1 >nul
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "done");
-        assert_eq!(result.calls_used, 1, "a trivial task started more than one process");
+        assert_eq!(
+            result.calls_used, 1,
+            "a trivial task started more than one process"
+        );
         assert_eq!(result.route.budget.max_agent_calls, 1);
-        assert_eq!(result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(), [Stage::Implement]);
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement]
+        );
         assert!(result.budget_stop.is_none());
 
         let calls = briefs(&dir);
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].contains("one focused check"), "verification was not asked for in the one call");
+        assert!(
+            calls[0].contains("one focused check"),
+            "verification was not asked for in the one call"
+        );
 
         // The log has to show which stages ran, and no others.
         let stages: Vec<String> = store
@@ -2502,16 +3268,33 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(routing["data"]["budget"]["maxAgentCalls"], 1);
         assert!(routing["data"]["budget"]["maxTurns"].is_number());
         assert!(routing["data"]["signals"]["complexity"].is_number());
-        assert!(routing["data"]["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert!(routing["data"]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
         // The tier is recorded with why, and each stage names the model it asked for.
         assert!(routing["data"]["budget"]["preferredTier"].is_string());
-        assert!(routing["data"]["tierReason"].as_str().is_some_and(|r| !r.is_empty()));
-        let stage = payloads.iter().find(|v| v["kind"] == "stage").expect("no stage was recorded");
-        assert!(stage["data"]["model"].as_str().is_some_and(|m| !m.is_empty()));
+        assert!(routing["data"]["tierReason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
+        let stage = payloads
+            .iter()
+            .find(|v| v["kind"] == "stage")
+            .expect("no stage was recorded");
+        assert!(stage["data"]["model"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()));
         // Before the first provider event, not after.
-        let first_provider = payloads.iter().position(|v| v["kind"] == "started" || v["kind"] == "text");
-        let at = payloads.iter().position(|v| v["kind"] == "routing").unwrap();
-        assert!(first_provider.is_none_or(|p| at < p), "the route was recorded after the run began");
+        let first_provider = payloads
+            .iter()
+            .position(|v| v["kind"] == "started" || v["kind"] == "text");
+        let at = payloads
+            .iter()
+            .position(|v| v["kind"] == "routing")
+            .unwrap();
+        assert!(
+            first_provider.is_none_or(|p| at < p),
+            "the route was recorded after the run began"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2525,7 +3308,10 @@ ping -n 60 127.0.0.1 >nul
             Mode::Balanced,
             &RepoSignals::default(),
         );
-        assert_eq!(route.stages, [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]);
+        assert_eq!(
+            route.stages,
+            [Stage::Plan, Stage::Implement, Stage::Review, Stage::Verify]
+        );
         let mut request = routed(&store, "stages", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         // One answer that is both a passing Review and a passing Verify, since
@@ -2548,12 +3334,20 @@ ping -n 60 127.0.0.1 >nul
         );
         assert_eq!(result.calls_used, 4);
         let calls = briefs(&dir);
-        assert!(calls[0].contains("Do not edit any file"), "the plan stage was allowed to edit");
+        assert!(
+            calls[0].contains("Do not edit any file"),
+            "the plan stage was allowed to edit"
+        );
         assert!(calls[1].contains("Make the change"));
         assert!(calls[3].contains("Verify"));
         // Built a tier below, reviewed on deep.
         let payloads = store.event_payloads(task);
-        let model = |stage: &str| payloads.iter().find(|v| v["kind"] == "stage" && v["data"]["stage"] == stage).map(|v| v["data"]["model"].clone());
+        let model = |stage: &str| {
+            payloads
+                .iter()
+                .find(|v| v["kind"] == "stage" && v["data"]["stage"] == stage)
+                .map(|v| v["data"]["model"].clone())
+        };
         assert_eq!(model("implement"), Some("sonnet".into()));
         assert_eq!(model("review"), Some("opus".into()));
         std::fs::remove_dir_all(dir).unwrap();
@@ -2565,10 +3359,18 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_declared_test_command_is_verified_without_an_agent_call() {
         let store = Store::in_memory().unwrap();
-        let script = |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"console.log('header is not bold');process.exit({code})\""}}}}"#);
+        let script = |code: u8| {
+            format!(
+                r#"{{"scripts":{{"test":"node -e \"console.log('header is not bold');process.exit({code})\""}}}}"#
+            )
+        };
         let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
 
-        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         let mut request = routed(&store, "local-verify-pass", route.clone());
         let dir = request.dir.clone();
         std::fs::write(dir.join("package.json"), script(0)).unwrap();
@@ -2577,9 +3379,25 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(result.calls_used, 1, "an agent was asked to run the tests");
         let verify = result.stages.last().unwrap();
-        assert_eq!((verify.stage, verify.artifact.as_ref().map(|a| a["checks"][0]["command"].clone())), (Stage::Verify, Some("npm test".into())));
-        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
-        assert_eq!(project::check_command(&dir), None, "npm init's placeholder is not a test command");
+        assert_eq!(
+            (
+                verify.stage,
+                verify
+                    .artifact
+                    .as_ref()
+                    .map(|a| a["checks"][0]["command"].clone())
+            ),
+            (Stage::Verify, Some("npm test".into()))
+        );
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+        assert!(
+            project::check_commands(&dir).is_empty(),
+            "npm init's placeholder is not a test command"
+        );
         std::fs::remove_dir_all(dir).unwrap();
 
         let mut request = routed(&store, "local-verify-fail", route);
@@ -2588,10 +3406,20 @@ ping -n 60 127.0.0.1 >nul
         claude_shim(&mut request, &passing);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done");
-        assert_eq!(result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(), [Stage::Implement, Stage::Verify, Stage::Fix]);
-        assert_eq!(result.calls_used, 2, "only Implement and Fix are agent calls");
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify, Stage::Fix]
+        );
+        assert_eq!(
+            result.calls_used, 2,
+            "only Implement and Fix are agent calls"
+        );
         let calls = briefs(&dir);
-        assert!(calls[1].contains("header is not bold"), "the fix was not told what failed: {}", calls[1]);
+        assert!(
+            calls[1].contains("header is not bold"),
+            "the fix was not told what failed: {}",
+            calls[1]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2601,12 +3429,21 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn guarded_work_runs_its_tests_before_the_review() {
         let store = Store::in_memory().unwrap();
-        let script = |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"process.exit({code})\""}}}}"#);
+        let script =
+            |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"process.exit({code})\""}}}}"#);
         let review = serde_json::json!({"findings": [], "verdict": "pass"});
         let fixed = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
-        let signals = RepoSignals { checks_locally: true, ..RepoSignals::default() };
-        let route = routing::route("add an authorization check before the delete endpoint", Mode::Balanced, &signals);
-        let stages = |result: &TaskResult| result.stages.iter().map(|n| n.stage).collect::<Vec<_>>();
+        let signals = RepoSignals {
+            checks_locally: true,
+            ..RepoSignals::default()
+        };
+        let route = routing::route(
+            "add an authorization check before the delete endpoint",
+            Mode::Balanced,
+            &signals,
+        );
+        let stages =
+            |result: &TaskResult| result.stages.iter().map(|n| n.stage).collect::<Vec<_>>();
 
         let mut request = routed(&store, "guarded-tests-pass", route.clone());
         let dir = request.dir.clone();
@@ -2614,9 +3451,15 @@ ping -n 60 127.0.0.1 >nul
         claude_shim(&mut request, &review);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
-        assert_eq!(stages(&result), [Stage::Implement, Stage::Verify, Stage::Review]);
+        assert_eq!(
+            stages(&result),
+            [Stage::Implement, Stage::Verify, Stage::Review]
+        );
         assert_eq!(result.calls_used, 2);
-        assert!(briefs(&dir)[1].contains("tests already pass"), "the review was not told the tests pass");
+        assert!(
+            briefs(&dir)[1].contains("tests already pass"),
+            "the review was not told the tests pass"
+        );
         std::fs::remove_dir_all(dir).unwrap();
 
         let mut request = routed(&store, "guarded-tests-fail", route);
@@ -2625,11 +3468,20 @@ ping -n 60 127.0.0.1 >nul
         claude_shim_answers(&mut request, &[review.clone(), fixed, review]);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
-        assert_eq!(stages(&result), [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Review]);
+        assert_eq!(
+            stages(&result),
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Review]
+        );
         assert_eq!(result.calls_used, 3);
         let calls = briefs(&dir);
-        assert!(calls[1].contains("A review reads the fix"), "the fix was told it is the last call");
-        assert!(!calls[2].contains("tests already pass"), "the review was told failing tests pass");
+        assert!(
+            calls[1].contains("A review reads the fix"),
+            "the fix was told it is the last call"
+        );
+        assert!(
+            !calls[2].contains("tests already pass"),
+            "the review was told failing tests pass"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2663,7 +3515,11 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_route_that_runs_out_of_calls_stops_and_keeps_its_work() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        let mut route = routing::route(
+            "redesign the storage subsystem",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         assert_eq!(route.stages.len(), 3);
         // A ceiling below the route's own length: what a rolled-back budget, or
         // a resume the user asked for, would leave behind.
@@ -2684,11 +3540,21 @@ ping -n 60 127.0.0.1 >nul
         let stop = result.budget_stop.expect("no budget stop was reported");
         assert_eq!(stop.limit, "calls");
         assert_eq!(stop.allowed, 2);
-        assert_eq!(stop.remaining, [Stage::Verify], "the user is not told what is left");
-        assert!(stop.message.contains("up to you"), "the stop must hand the choice back");
+        assert_eq!(
+            stop.remaining,
+            [Stage::Verify],
+            "the user is not told what is left"
+        );
+        assert!(
+            stop.message.contains("up to you"),
+            "the stop must hand the choice back"
+        );
 
         // Work, diff and usage all preserved.
-        assert!(result.diff.iter().any(|f| f.path.contains("touched.txt")), "the diff was lost");
+        assert!(
+            result.diff.iter().any(|f| f.path.contains("touched.txt")),
+            "the diff was lost"
+        );
         assert!(result.usage.is_some(), "usage was lost");
         assert!(!result.summary.is_empty(), "what the agent said was lost");
         // And the route is unchanged: a stop never rewrites itself into a
@@ -2696,15 +3562,25 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(result.route.budget.max_agent_calls, 2);
         assert_eq!(result.route.stages.len(), 3);
 
-        let budget: Vec<_> = store.event_payloads(task).into_iter().filter(|v| v["kind"] == "budget").collect();
-        assert!(budget.iter().any(|v| v["data"]["decision"] == "stopped" && v["data"]["limit"] == "calls"));
+        let budget: Vec<_> = store
+            .event_payloads(task)
+            .into_iter()
+            .filter(|v| v["kind"] == "budget")
+            .collect();
+        assert!(budget
+            .iter()
+            .any(|v| v["data"]["decision"] == "stopped" && v["data"]["limit"] == "calls"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn a_turn_budget_stop_prevents_later_stages() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        let mut route = routing::route(
+            "redesign the storage subsystem",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         route.budget.max_turns = Some(1);
         let request = routed(&store, "turn-stop-route", route);
         let dir = request.dir.clone();
@@ -2714,7 +3590,10 @@ ping -n 60 127.0.0.1 >nul
 
         assert_eq!(result.status, "budgetReached");
         assert_eq!(result.failure, None);
-        assert_eq!(result.calls_used, 1, "the next stage started after a turn stop");
+        assert_eq!(
+            result.calls_used, 1,
+            "the next stage started after a turn stop"
+        );
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
             [Stage::Plan]
@@ -2731,7 +3610,11 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_budget_stop_never_escalates_by_itself() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        let mut route = routing::route(
+            "redesign the storage subsystem",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         route.budget.max_agent_calls = 1;
         let before = route.clone();
         let request = routed(&store, "no-escalation", route);
@@ -2742,8 +3625,15 @@ ping -n 60 127.0.0.1 >nul
 
         assert_eq!(result.status, "budgetReached");
         assert_eq!(result.calls_used, 1);
-        assert_eq!(briefs(&dir).len(), 1, "another provider process was started after the stop");
-        assert_eq!(result.route, before, "the route rewrote itself after being stopped");
+        assert_eq!(
+            briefs(&dir).len(),
+            1,
+            "another provider process was started after the stop"
+        );
+        assert_eq!(
+            result.route, before,
+            "the route rewrote itself after being stopped"
+        );
         // Only the first stage ever ran.
         let stages: Vec<String> = store
             .event_payloads(task)
@@ -2790,7 +3680,10 @@ exit /b 0
         assert_eq!(result.failure, None);
         let stop = result.budget_stop.expect("no budget stop was reported");
         assert_eq!(stop.limit, "turns");
-        assert_eq!(stop.observed, stop.allowed, "the stop said fewer turns than the ceiling Claude hit");
+        assert_eq!(
+            stop.observed, stop.allowed,
+            "the stop said fewer turns than the ceiling Claude hit"
+        );
         assert_eq!(u64::from(result.turns_used), stop.allowed);
         assert!(result.usage.is_some());
         std::fs::remove_dir_all(dir).unwrap();
@@ -2817,7 +3710,10 @@ exit /b 0
         assert_eq!(stop.limit, "turns");
         assert_eq!(stop.allowed, 2);
         assert!(result.turns_used >= 2);
-        assert!(!result.summary.is_empty(), "the work the stage did was thrown away");
+        assert!(
+            !result.summary.is_empty(),
+            "the work the stage did was thrown away"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2826,7 +3722,11 @@ exit /b 0
     #[tokio::test]
     async fn a_token_ceiling_stops_the_next_stage_not_the_running_one() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        let mut route = routing::route(
+            "redesign the storage subsystem",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         // Below what one turn of the shim reports, so the first stage completes
         // and the second never starts.
         route.budget.max_reported_tokens = Some(1);
@@ -2837,7 +3737,10 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.calls_used, 1, "the stage that was already running was cut short");
+        assert_eq!(
+            result.calls_used, 1,
+            "the stage that was already running was cut short"
+        );
         let stop = result.budget_stop.expect("no budget stop was reported");
         assert_eq!(stop.limit, "tokens");
         assert!(stop.observed > stop.allowed);
@@ -2864,7 +3767,10 @@ exit /b 0
         assert_eq!(result.failure, None);
         let stop = result.budget_stop.expect("no token stop was reported");
         assert_eq!(stop.limit, "tokens");
-        assert_eq!(stop.observed, 33, "the stop was not taken at the turn that crossed the ceiling");
+        assert_eq!(
+            stop.observed, 33,
+            "the stop was not taken at the turn that crossed the ceiling"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2874,7 +3780,11 @@ exit /b 0
     #[tokio::test]
     async fn an_instruction_given_in_one_stage_carries_into_the_next() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route("redesign the storage subsystem", Mode::Balanced, &RepoSignals::default());
+        let route = routing::route(
+            "redesign the storage subsystem",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         let request = routed(&store, "carried", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         answering_shim(&request, 1);
@@ -2890,7 +3800,9 @@ exit /b 0
                 // Once the first stage is genuinely talking, so this is an
                 // instruction to a running agent and not a race with start-up.
                 wait_for_kind(&mut hearing, "text").await;
-                let _ = live.instruct(task, "never touch the public API".into(), false).await;
+                let _ = live
+                    .instruct(task, "never touch the public API".into(), false)
+                    .await;
             }
         );
 
@@ -2902,11 +3814,15 @@ exit /b 0
         assert_eq!(result.calls_used, 3);
         let calls = briefs(&dir);
         assert!(
-            calls[1..].iter().all(|b| b.contains("never touch the public API")),
+            calls[1..]
+                .iter()
+                .all(|b| b.contains("never touch the public API")),
             "a later stage lost the instruction: {calls:?}"
         );
         assert!(
-            calls[1..].iter().all(|b| b.contains("Standing instructions")),
+            calls[1..]
+                .iter()
+                .all(|b| b.contains("Standing instructions")),
             "the instruction was not carried as a standing constraint"
         );
         // And it is in the log whatever became of it.
@@ -2943,16 +3859,35 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "reviewRejected");
-        assert_eq!(result.calls_used, 2, "a call was spent after the review rejected the work");
-        assert_eq!(result.stages.len(), 2, "Verify ran after a review that rejected the work");
+        assert_eq!(
+            result.calls_used, 2,
+            "a call was spent after the review rejected the work"
+        );
+        assert_eq!(
+            result.stages.len(),
+            2,
+            "Verify ran after a review that rejected the work"
+        );
         assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
-        let artifact = result.stages.last().unwrap().artifact.as_ref().expect("the review artifact was dropped");
+        let artifact = result
+            .stages
+            .last()
+            .unwrap()
+            .artifact
+            .as_ref()
+            .expect("the review artifact was dropped");
         assert_eq!(artifact["verdict"], "changes_requested");
-        let stop = result.budget_stop.as_ref().expect("review stop was not returned");
+        let stop = result
+            .budget_stop
+            .as_ref()
+            .expect("review stop was not returned");
         assert_eq!(stop.limit, "review");
         assert_eq!(stop.remaining, [Stage::Verify]);
         // Recorded, so the findings are not only on screen.
-        let logged = store.event_payloads(task).into_iter().find(|v| v["kind"] == "artifact" && v["data"]["stage"] == "review");
+        let logged = store
+            .event_payloads(task)
+            .into_iter()
+            .find(|v| v["kind"] == "artifact" && v["data"]["stage"] == "review");
         assert_eq!(logged.expect("no artifact row")["data"]["valid"], true);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2963,7 +3898,11 @@ exit /b 0
     #[tokio::test]
     async fn checks_that_did_not_pass_end_the_route_as_verify_failed() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         assert_eq!(route.stages, [Stage::Implement, Stage::Verify]);
         assert_eq!(route.budget.escalation, Some(routing::Tier::Deep));
         let mut request = routed(&store, "verify-failed", route);
@@ -2984,14 +3923,32 @@ exit /b 0
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
             [Stage::Implement, Stage::Verify, Stage::Fix]
         );
-        assert_eq!(result.failure, None, "failing checks are a stop, not a provider fault");
-        let stop = result.budget_stop.as_ref().expect("verify stop was not returned");
+        assert_eq!(
+            result.failure, None,
+            "failing checks are a stop, not a provider fault"
+        );
+        let stop = result
+            .budget_stop
+            .as_ref()
+            .expect("verify stop was not returned");
         assert_eq!(stop.limit, "verify");
         assert!(stop.remaining.is_empty());
         let payloads = store.event_payloads(task);
-        assert_eq!(payloads.iter().filter(|v| v["kind"] == "escalation").count(), 1);
-        let fix = payloads.iter().find(|v| v["kind"] == "stage" && v["data"]["stage"] == "fix").expect("no fix stage recorded");
-        assert_eq!(fix["data"]["model"], "opus", "the fix did not run a tier up");
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|v| v["kind"] == "escalation")
+                .count(),
+            1
+        );
+        let fix = payloads
+            .iter()
+            .find(|v| v["kind"] == "stage" && v["data"]["stage"] == "fix")
+            .expect("no fix stage recorded");
+        assert_eq!(
+            fix["data"]["model"], "opus",
+            "the fix did not run a tier up"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3000,7 +3957,11 @@ exit /b 0
     #[tokio::test]
     async fn a_fix_a_tier_up_that_passes_finishes_the_task() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
         let mut request = routed(&store, "escalated-pass", route);
         let dir = request.dir.clone();
         let failing = serde_json::json!({"checks": [{"command": "npm test", "passed": false, "output": "header is not bold"}], "verdict": "fail"});
@@ -3064,7 +4025,10 @@ exit /b 0
         route.budget.escalation = None;
         let mut request = routed(&store, "missing-review", route);
         let dir = request.dir.clone();
-        claude_shim(&mut request, &serde_json::json!({"objective": "not a review"}));
+        claude_shim(
+            &mut request,
+            &serde_json::json!({"objective": "not a review"}),
+        );
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
@@ -3087,18 +4051,31 @@ exit /b 0
         let mut request = routed(&store, "artifact", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         // A plan missing every required list, beside prose that reads like one.
-        claude_shim(&mut request, &serde_json::json!({"objective": "half a plan"}));
+        claude_shim(
+            &mut request,
+            &serde_json::json!({"objective": "half a plan"}),
+        );
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         let note = result.stages.first().expect("the stage left no note");
-        assert!(note.artifact.is_none(), "a half-built plan was accepted as a plan");
+        assert!(
+            note.artifact.is_none(),
+            "a half-built plan was accepted as a plan"
+        );
         // The words are kept as words, to be forwarded verbatim and labelled
         // unvalidated. They are never mined for the fields the schema would
         // have filled.
         assert_eq!(note.summary, "stage answered");
-        let logged = store.event_payloads(task).into_iter().find(|v| v["kind"] == "artifact").expect("no artifact row");
-        assert_eq!(logged["data"]["valid"], false, "a missing artifact must be recorded as missing");
+        let logged = store
+            .event_payloads(task)
+            .into_iter()
+            .find(|v| v["kind"] == "artifact")
+            .expect("no artifact row");
+        assert_eq!(
+            logged["data"]["valid"], false,
+            "a missing artifact must be recorded as missing"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

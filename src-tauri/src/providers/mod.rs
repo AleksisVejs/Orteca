@@ -112,7 +112,9 @@ impl Usage {
             self.model = next.model.clone();
         }
         self.input_tokens = self.input_tokens.saturating_add(next.input_tokens);
-        self.cached_input_tokens = self.cached_input_tokens.saturating_add(next.cached_input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(next.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(next.output_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(next.reasoning_tokens);
         // A turn that reported no cost does not erase one that did.
@@ -149,7 +151,12 @@ pub const CODEX_ISOLATION: &[&str] = &[
 /// `{"kind":"text","data":"..."}`. This is both the payload the UI receives
 /// and the row written to `task_events`, so there is one shape, not two.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ProviderEvent {
     Started {
         session_id: String,
@@ -378,7 +385,8 @@ impl ProviderId {
             cost_quality: match self {
                 // Claude's own total is a client-side estimate, not a bill.
                 Self::Claude => CostQuality::Estimated,
-                Self::Codex => CostQuality::Unavailable,
+                // Priced from published rates once they have been fetched.
+                Self::Codex => CostQuality::Estimated,
             },
             steering: self.steering(),
         }
@@ -478,7 +486,11 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
     env::split_paths(path)
         .filter(|dir| !dir.as_os_str().is_empty())
         .find_map(|dir| {
-            let dir = if dir.is_absolute() { dir } else { cwd.join(dir) };
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            };
             extensions
                 .iter()
                 .map(|ext| dir.join(format!("{program}{ext}")))
@@ -491,12 +503,16 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
 /// drawn, and a CLI that hangs must not hang the launch screen. `None` means it
 /// could not be asked at all - never a fabricated answer.
 fn capture(path: &Path, args: &[&str]) -> Option<(Vec<String>, Option<i32>)> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
     runtime.block_on(async {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             // Never in the user's project: detection runs before anyone has
             // consented to that repository, same reason npm install uses temp.
-            let mut run = crate::proc::spawn(&path.to_string_lossy(), args, &env::temp_dir()).ok()?;
+            let mut run =
+                crate::proc::spawn(&path.to_string_lossy(), args, &env::temp_dir()).ok()?;
             run.close_stdin();
             let mut lines = Vec::new();
             while let Some(line) = run.lines.recv().await {
@@ -511,13 +527,18 @@ fn capture(path: &Path, args: &[&str]) -> Option<(Vec<String>, Option<i32>)> {
                 }
             }
             None
-        }).await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     })
 }
 
 fn version_of(path: &Path) -> Option<String> {
     let (lines, code) = capture(path, &["--version"])?;
-    (code == Some(0)).then(|| lines.into_iter().next()).flatten()
+    (code == Some(0))
+        .then(|| lines.into_iter().next())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -544,24 +565,41 @@ mod tests {
         assert_eq!(total.input_tokens, 102);
         assert_eq!(total.output_tokens, 10);
         assert_eq!(total.cached_input_tokens, 20);
-        assert_eq!(total.cost_usd, Some(0.0405), "the cost is already a session total");
+        assert_eq!(
+            total.cost_usd,
+            Some(0.0405),
+            "the cost is already a session total"
+        );
 
         // Codex reports no cost at all, and that must not erase Claude's.
         let mut kept = turn(1, 1, Some(0.5));
-        kept.absorb(&Usage { cost_usd: None, cost_quality: CostQuality::Unavailable, ..turn(1, 1, None) });
+        kept.absorb(&Usage {
+            cost_usd: None,
+            cost_quality: CostQuality::Unavailable,
+            ..turn(1, 1, None)
+        });
         assert_eq!(kept.cost_usd, Some(0.5));
     }
 
     #[test]
     fn a_user_message_survives_quotes_and_newlines() {
-        let line = claude::user_message("say \"hi\"
-then stop");
-        assert_eq!(line.lines().count(), 1, "a newline would split the JSONL frame");
+        let line = claude::user_message(
+            "say \"hi\"
+then stop",
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "a newline would split the JSONL frame"
+        );
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "user");
         assert_eq!(v["message"]["role"], "user");
-        assert_eq!(v["message"]["content"], "say \"hi\"
-then stop");
+        assert_eq!(
+            v["message"]["content"],
+            "say \"hi\"
+then stop"
+        );
     }
 
     /// Resume has no --sandbox flag, so the mode travels as a config override.
@@ -576,7 +614,9 @@ then stop");
         // A resume must not bring the user's plugins and skills back.
         assert!(argv.contains(&CODEX_ISOLATION.join(" ")));
         // The prompt arrives on stdin, never as an argument.
-        assert!(ProviderId::Codex.resume_args("abc-123", None).contains(&"-".to_string()));
+        assert!(ProviderId::Codex
+            .resume_args("abc-123", None)
+            .contains(&"-".to_string()));
         // A resumed stage keeps the artifact contract its route asked for.
         let schema = PathBuf::from("C:/tmp/plan.json");
         let with_schema = ProviderId::Codex.resume_args("abc-123", Some(&schema));
@@ -598,10 +638,16 @@ then stop");
     async fn a_version_is_read_from_inside_the_blocking_pool() {
         let dir = temp_dir("blocking-pool");
         let shim = dir.join("shimmy.cmd");
-        std::fs::write(&shim, "@echo off
+        std::fs::write(
+            &shim,
+            "@echo off
 echo 1.2.3
-").unwrap();
-        let found = tokio::task::spawn_blocking(move || version_of(&shim)).await.unwrap();
+",
+        )
+        .unwrap();
+        let found = tokio::task::spawn_blocking(move || version_of(&shim))
+            .await
+            .unwrap();
         assert_eq!(found.as_deref(), Some("1.2.3"));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -670,22 +716,37 @@ echo 1.2.3
     fn shim(label: &str, body: &str) -> PathBuf {
         let cwd = temp_dir(label);
         let path = cwd.join("agent.cmd");
-        std::fs::write(&path, format!("@echo off
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off
 {body}
-")).unwrap();
+"
+            ),
+        )
+        .unwrap();
         path
     }
 
     #[test]
     fn claude_auth_comes_from_the_cli_not_a_credential_file() {
         // The exact shape `claude auth status --json` returned when logged out.
-        let out = shim("claude-out", r#"echo {"loggedIn":false,"authMethod":"none"}"#);
+        let out = shim(
+            "claude-out",
+            r#"echo {"loggedIn":false,"authMethod":"none"}"#,
+        );
         assert_eq!(ProviderId::Claude.auth(&out), Auth::SignedOut);
 
-        let sub = shim("claude-sub", r#"echo {"loggedIn":true,"authMethod":"claudeai"}"#);
+        let sub = shim(
+            "claude-sub",
+            r#"echo {"loggedIn":true,"authMethod":"claudeai"}"#,
+        );
         assert_eq!(ProviderId::Claude.auth(&sub), Auth::Subscription);
 
-        let key = shim("claude-key", r#"echo {"loggedIn":true,"authMethod":"apiKey"}"#);
+        let key = shim(
+            "claude-key",
+            r#"echo {"loggedIn":true,"authMethod":"apiKey"}"#,
+        );
         assert_eq!(ProviderId::Claude.auth(&key), Auth::ApiKey);
     }
 
@@ -738,7 +799,11 @@ echo }",
     fn version_detection_has_a_deadline() {
         let cwd = temp_dir("version-deadline");
         let shim = cwd.join("agent.cmd");
-        std::fs::write(&shim, "@echo off\r\nping -n 6 127.0.0.1 >nul\r\necho too late\r\n").unwrap();
+        std::fs::write(
+            &shim,
+            "@echo off\r\nping -n 6 127.0.0.1 >nul\r\necho too late\r\n",
+        )
+        .unwrap();
         assert_eq!(version_of(&shim), None);
         std::fs::remove_dir_all(cwd).unwrap();
     }
@@ -750,16 +815,24 @@ echo }",
         let cwd = temp_dir("probe-overlap");
         let shim = cwd.join("agent.cmd");
         // Slow, and the same answer to either question - only timing matters.
-        std::fs::write(&shim, "@echo off
+        std::fs::write(
+            &shim,
+            "@echo off
 ping -n 3 127.0.0.1 >nul
 echo agent 9.9.9
-").unwrap();
+",
+        )
+        .unwrap();
 
         let started = std::time::Instant::now();
         let (version, _) = ProviderId::Claude.probe(shim).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(version, Some("agent 9.9.9".into()), "the shim was not actually run");
+        assert_eq!(
+            version,
+            Some("agent 9.9.9".into()),
+            "the shim was not actually run"
+        );
         // One probe is about two seconds here; in series the pair is about four.
         assert!(
             elapsed < std::time::Duration::from_secs(3),
@@ -797,9 +870,6 @@ echo agent 9.9.9
 
     #[test]
     fn codex_can_never_report_a_cost() {
-        assert_eq!(
-            CostQuality::Unavailable,
-            CostQuality::Unavailable
-        );
+        assert_eq!(CostQuality::Unavailable, CostQuality::Unavailable);
     }
 }

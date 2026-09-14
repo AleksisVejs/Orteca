@@ -194,10 +194,15 @@ pub struct Snapshot(Vec<(String, Option<u64>)>);
 /// is reported as unknown, never guessed as the run's.
 pub fn snapshot(dir: &Path, base: Option<&str>) -> Option<Snapshot> {
     let dirty = diff_since(dir, base).ok()?;
-    Some(Snapshot(dirty.into_iter().map(|f| {
-        let print = fingerprint(&dir.join(&f.path));
-        (f.path, print)
-    }).collect()))
+    Some(Snapshot(
+        dirty
+            .into_iter()
+            .map(|f| {
+                let print = fingerprint(&dir.join(&f.path));
+                (f.path, print)
+            })
+            .collect(),
+    ))
 }
 
 /// Label each entry of a finished run's diff against the snapshot taken
@@ -229,7 +234,9 @@ fn fingerprint(path: &Path) -> Option<u64> {
             Ok(())
         }
     }
-    let mut file = std::fs::File::open(path).ok().filter(|f| f.metadata().is_ok_and(|m| m.is_file()))?;
+    let mut file = std::fs::File::open(path)
+        .ok()
+        .filter(|f| f.metadata().is_ok_and(|m| m.is_file()))?;
     let mut sink = Sink(Default::default());
     std::io::copy(&mut file, &mut sink).ok()?;
     Some(sink.0.finish())
@@ -249,7 +256,18 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
         }
     };
     {
-        let numstat = git_output(dir, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", base, "--"])?;
+        let numstat = git_output(
+            dir,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "-z",
+                base,
+                "--",
+            ],
+        )?;
         let mut records = numstat.split('\0');
         while let Some(line) = records.next() {
             let mut parts = line.splitn(3, '\t');
@@ -262,7 +280,9 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
                 // -z emits both names separately when Git detects a rename.
                 records.next();
                 records.next().unwrap_or_default()
-            } else { path };
+            } else {
+                path
+            };
             stats.push(FileStat {
                 path: path.to_string(),
                 added: added.parse().ok(),
@@ -365,20 +385,119 @@ fn new_file_patch(path: &str, text: &str) -> String {
     patch
 }
 
-/// The test command the repository declares at its root, if Orteca can run it
-/// without a model finding it: `npm test` for a real `scripts.test` (not `npm
-/// init`'s placeholder), else `cargo test` for a `Cargo.toml`.
-pub fn check_command(dir: &Path) -> Option<Vec<&'static str>> {
-    let npm = std::fs::read_to_string(dir.join("package.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|manifest| manifest["scripts"]["test"].as_str().map(|s| !s.contains("no test specified")))
-        .unwrap_or(false);
-    if npm {
-        Some(vec!["npm", "test"])
-    } else {
-        dir.join("Cargo.toml").is_file().then(|| vec!["cargo", "test"])
+/// A test suite Orteca runs itself, with no model finding it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    /// Where it runs: the repository root or a folder directly under it.
+    pub dir: PathBuf,
+    /// Runs first, and only when the suite's dependencies are not installed:
+    /// a fresh clone, or a run's separate copy, which git leaves without them.
+    pub install: Option<Vec<&'static str>>,
+    pub test: Vec<&'static str>,
+}
+
+/// Every test suite the repository declares, at its root and one folder down,
+/// so a PHP + JS app is not verified by `npm test` alone and a `frontend/` or
+/// `src-tauri/` suite is not missed. A root suite covers its own ecosystem, the
+/// way a workspace's root `npm test` covers its packages.
+pub fn check_commands(root: &Path) -> Vec<Check> {
+    let mut checks = checks_in(root);
+    let claimed: Vec<&str> = checks.iter().map(|(kind, _)| *kind).collect();
+    let mut children: Vec<PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        // `is_dir` on the entry's own type: a junction is not followed.
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.')
+                && !["node_modules", "vendor", "target", "dist", "build"].contains(&name.as_str())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    children.sort();
+    for child in children {
+        checks.extend(
+            checks_in(&child)
+                .into_iter()
+                .filter(|(kind, _)| !claimed.contains(kind)),
+        );
     }
+    // ponytail: six suites bounds a monorepo's Verify; deeper layouts fall back
+    // to the agent's Verify.
+    checks.into_iter().map(|(_, check)| check).take(6).collect()
+}
+
+fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
+    let has = |file: &str| dir.join(file).exists();
+    let manifest = |file: &str| {
+        std::fs::read_to_string(dir.join(file))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    };
+    let mentions = |file: &str, needle: &str| {
+        std::fs::read_to_string(dir.join(file)).is_ok_and(|text| text.contains(needle))
+    };
+    // `npm init`'s placeholder is not a test command.
+    let tests = |m: &serde_json::Value| {
+        let test = &m["scripts"]["test"];
+        test.is_array() || test.as_str().is_some_and(|s| !s.contains("no test specified"))
+    };
+    // A manifest with nothing to install needs no install, which is also what
+    // keeps a dependency-free suite from touching the network.
+    let missing = |m: &serde_json::Value, keys: &[&str], folder: &str| {
+        !has(folder) && keys.iter().any(|k| m[*k].as_object().is_some_and(|o| !o.is_empty()))
+    };
+    let check = |install: Option<Vec<&'static str>>, test: Vec<&'static str>| Check {
+        dir: dir.to_path_buf(),
+        install,
+        test,
+    };
+
+    let mut out = Vec::new();
+    if let Some(m) = manifest("package.json").filter(|m| tests(m)) {
+        let (install, test) = if has("pnpm-lock.yaml") {
+            (vec!["pnpm", "install", "--frozen-lockfile"], vec!["pnpm", "test"])
+        } else if has("yarn.lock") {
+            (vec!["yarn", "install"], vec!["yarn", "test"])
+        } else if has("bun.lock") || has("bun.lockb") {
+            (vec!["bun", "install"], vec!["bun", "run", "test"])
+        } else if has("package-lock.json") {
+            (vec!["npm", "ci"], vec!["npm", "test"])
+        } else {
+            // No lockfile, and Orteca does not add one to the user's diff.
+            (vec!["npm", "install", "--no-package-lock"], vec!["npm", "test"])
+        };
+        let install = missing(&m, &["dependencies", "devDependencies"], "node_modules")
+            .then_some(install);
+        out.push(("js", check(install, test)));
+    }
+    if let Some(m) = manifest("composer.json") {
+        let install = missing(&m, &["require", "require-dev"], "vendor")
+            .then(|| vec!["composer", "install", "--no-interaction"]);
+        if tests(&m) {
+            out.push(("php", check(install, vec!["composer", "test"])));
+        } else if has("phpunit.xml") || has("phpunit.xml.dist") {
+            out.push(("php", check(install, vec!["php", "vendor/bin/phpunit"])));
+        }
+    }
+    if has("Cargo.toml") {
+        out.push(("rust", check(None, vec!["cargo", "test"])));
+    }
+    if has("go.mod") {
+        out.push(("go", check(None, vec!["go", "test", "./..."])));
+    }
+    // ponytail: the `python` on PATH, not the project's venv; pick the venv's
+    // interpreter when a run shows that mattering.
+    if has("pytest.ini")
+        || mentions("pyproject.toml", "[tool.pytest")
+        || mentions("setup.cfg", "[tool:pytest]")
+        || mentions("tox.ini", "[pytest]")
+    {
+        out.push(("python", check(None, vec!["python", "-m", "pytest"])));
+    }
+    out
 }
 
 /// Every tracked path in the repository, as forward-slash relative paths.
@@ -404,14 +523,25 @@ pub fn tracked_paths(dir: &Path) -> Vec<String> {
 /// Paths touched by the last 50 commits, as `git log` names them. A ranking
 /// signal only: a repository with no history simply has none.
 pub fn recent_paths(dir: &Path) -> Vec<String> {
-    git_output(dir, &["-c", "core.quotepath=false", "log", "-n", "50", "--name-only", "--format="])
-        .unwrap_or_default()
-        .lines()
-        .filter(|p| !p.is_empty())
-        // ponytail: one huge commit can list every file; the cap bounds it.
-        .take(5_000)
-        .map(str::to_string)
-        .collect()
+    git_output(
+        dir,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "-n",
+            "50",
+            "--name-only",
+            "--format=",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|p| !p.is_empty())
+    // ponytail: one huge commit can list every file; the cap bounds it.
+    .take(5_000)
+    .map(str::to_string)
+    .collect()
 }
 
 /// Display name for a project directory: the folder name.
@@ -459,13 +589,20 @@ pub struct Worktree {
 /// repository at the top of a drive, which has nowhere beside it.
 pub fn worktree_dir(root: &str, task_id: i64) -> Option<PathBuf> {
     let root = PathBuf::from(root.replace('/', std::path::MAIN_SEPARATOR_STR));
-    Some(root.parent()?.join(".orteca-worktrees").join(format!("{}-{task_id}", display_name(&root))))
+    Some(
+        root.parent()?
+            .join(".orteca-worktrees")
+            .join(format!("{}-{task_id}", display_name(&root))),
+    )
 }
 
 /// A hooks folder that never exists, so git runs none of the repository's
 /// hooks: `--no-verify` alone still runs post-checkout and post-commit.
 fn no_hooks(copy: &Path) -> String {
-    format!("core.hooksPath={}", copy.parent().unwrap_or(copy).join(".no-hooks").display())
+    format!(
+        "core.hooksPath={}",
+        copy.parent().unwrap_or(copy).join(".no-hooks").display()
+    )
 }
 
 pub fn add_worktree(repo: &Path, copy: &Path, branch: &str) -> Result<()> {
@@ -474,7 +611,13 @@ pub fn add_worktree(repo: &Path, copy: &Path, branch: &str) -> Result<()> {
     }
     let hooks = no_hooks(copy);
     let path = copy.to_string_lossy();
-    git_run(repo, &["-c", &hooks, "worktree", "add", "-q", "-b", branch, &path, "HEAD"], "Git could not make a separate copy")?;
+    git_run(
+        repo,
+        &[
+            "-c", &hooks, "worktree", "add", "-q", "-b", branch, &path, "HEAD",
+        ],
+        "Git could not make a separate copy",
+    )?;
     Ok(())
 }
 
@@ -483,10 +626,28 @@ pub fn add_worktree(repo: &Path, copy: &Path, branch: &str) -> Result<()> {
 /// leave the work uncommitted.
 pub fn commit_worktree(copy: &Path, message: &str) -> Result<String> {
     let hooks = no_hooks(copy);
-    let quiet = ["-c", &hooks, "-c", "commit.gpgsign=false", "-c", "user.name=Orteca", "-c", "user.email=orteca@localhost"];
-    git_run(copy, &[&quiet[..], &["add", "-A"]].concat(), "Git could not stage the run's changes")?;
-    git_run(copy, &[&quiet[..], &["commit", "-q", "--no-verify", "-m", message]].concat(), "Git could not commit the run's changes")?;
-    git(copy, &["rev-parse", "HEAD"]).ok_or_else(|| AppError::new(ErrorKind::Io, "Git committed but could not name the commit"))
+    let quiet = [
+        "-c",
+        &hooks,
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "user.name=Orteca",
+        "-c",
+        "user.email=orteca@localhost",
+    ];
+    git_run(
+        copy,
+        &[&quiet[..], &["add", "-A"]].concat(),
+        "Git could not stage the run's changes",
+    )?;
+    git_run(
+        copy,
+        &[&quiet[..], &["commit", "-q", "--no-verify", "-m", message]].concat(),
+        "Git could not commit the run's changes",
+    )?;
+    git(copy, &["rev-parse", "HEAD"])
+        .ok_or_else(|| AppError::new(ErrorKind::Io, "Git committed but could not name the commit"))
 }
 
 /// Never forced: a copy with uncommitted work stays, and git says why. The
@@ -494,17 +655,28 @@ pub fn commit_worktree(copy: &Path, message: &str) -> Result<String> {
 pub fn remove_worktree(repo: &Path, copy: &Path) -> Result<()> {
     if !copy.exists() {
         // Already deleted by hand: only git's record of it is left.
-        git_run(repo, &["worktree", "prune"], "Git could not forget the missing copy")?;
+        git_run(
+            repo,
+            &["worktree", "prune"],
+            "Git could not forget the missing copy",
+        )?;
         return Ok(());
     }
-    git_run(repo, &["worktree", "remove", &copy.to_string_lossy()], "Git would not remove the copy")?;
+    git_run(
+        repo,
+        &["worktree", "remove", &copy.to_string_lossy()],
+        "Git would not remove the copy",
+    )?;
     Ok(())
 }
 
 /// A fresh machine may have no git at all, and every folder would then look
 /// like "not a repository".
 pub fn git_installed() -> bool {
-    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Run git and return trimmed stdout, or `None` if git failed or isn't there.
@@ -525,7 +697,10 @@ fn git_run(dir: &Path, args: &[&str], failure: &str) -> Result<String> {
         .current_dir(dir)
         .output()?;
     if !out.status.success() {
-        return Err(AppError::new(ErrorKind::Io, format!("{failure}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+        return Err(AppError::new(
+            ErrorKind::Io,
+            format!("{failure}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -535,11 +710,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_mixed_repository_declares_every_suite() {
+        let dir = temp_dir("check-commands");
+        let found = |dir: &Path| {
+            check_commands(dir)
+                .into_iter()
+                .map(|c| (c.dir, c.install, c.test))
+                .collect::<Vec<_>>()
+        };
+        assert!(found(&dir).is_empty());
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+        assert!(found(&dir).is_empty(), "npm init's placeholder");
+
+        // A Laravel app with its tests at the root and a Vite front end beside it,
+        // freshly cloned: nothing installed yet.
+        std::fs::remove_file(dir.join("package.json")).unwrap();
+        std::fs::write(
+            dir.join("composer.json"),
+            r#"{"require":{"laravel/framework":"^12"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("phpunit.xml"), "<phpunit/>").unwrap();
+        let web = dir.join("frontend");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(
+            web.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vite":"^6"}}"#,
+        )
+        .unwrap();
+        std::fs::write(web.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            found(&dir),
+            [
+                (
+                    dir.clone(),
+                    Some(vec!["composer", "install", "--no-interaction"]),
+                    vec!["php", "vendor/bin/phpunit"]
+                ),
+                (
+                    web.clone(),
+                    Some(vec!["pnpm", "install", "--frozen-lockfile"]),
+                    vec!["pnpm", "test"]
+                ),
+            ]
+        );
+
+        // Installed, nothing is installed again; a root JS suite claims JS.
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"node --test"}}"#).unwrap();
+        assert_eq!(
+            found(&dir),
+            [
+                (dir.clone(), None, vec!["npm", "test"]),
+                (dir.clone(), None, vec!["php", "vendor/bin/phpunit"]),
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn diff_in_an_unborn_repo_includes_staged_files() {
         let dir = temp_dir("diff-unborn");
-        assert!(Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap().success());
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
         std::fs::write(dir.join("staged.txt"), "one\n").unwrap();
-        assert!(Command::new("git").args(["add", "."]).current_dir(&dir).status().unwrap().success());
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
         let stats = diff_since(&dir, None).unwrap();
         assert!(stats.iter().any(|s| s.path == "staged.txt"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -549,14 +797,30 @@ mod tests {
     fn diff_preserves_unicode_spaces_and_rename_destinations() {
         let dir = temp_dir("diff-paths");
         let command = |args: &[&str]| {
-            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         command(&["init", "-q"]);
         command(&["config", "user.name", "test"]);
         command(&["config", "user.email", "test@example.com"]);
         for name in ["old.txt", "é file.txt", "binary.dat"] {
-            std::fs::write(dir.join(name), if name == "binary.dat" { b"\0old" } else { b"old\n" }).unwrap();
+            std::fs::write(
+                dir.join(name),
+                if name == "binary.dat" {
+                    b"\0old"
+                } else {
+                    b"old\n"
+                },
+            )
+            .unwrap();
         }
         command(&["add", "."]);
         command(&["commit", "-qm", "initial"]);
@@ -567,11 +831,17 @@ mod tests {
         std::fs::write(dir.join("新 file.txt"), "untracked").unwrap();
         let stats = diff_since(&dir, Some(&base)).unwrap();
         for name in ["new name.txt", "é file.txt", "binary.dat", "新 file.txt"] {
-            assert!(stats.iter().any(|f| f.path == name), "missing {name}: {stats:?}");
+            assert!(
+                stats.iter().any(|f| f.path == name),
+                "missing {name}: {stats:?}"
+            );
         }
         let text = stats.iter().find(|f| f.path == "é file.txt").unwrap();
         assert_eq!((text.added, text.deleted), (Some(1), Some(0)));
-        assert_eq!(stats.iter().find(|f| f.path == "binary.dat").unwrap().added, None);
+        assert_eq!(
+            stats.iter().find(|f| f.path == "binary.dat").unwrap().added,
+            None
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -579,8 +849,16 @@ mod tests {
     fn patch_contains_tracked_hunks_and_small_untracked_files() {
         let dir = temp_dir("patch");
         let command = |args: &[&str]| {
-            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         command(&["init", "-q"]);
         command(&["config", "user.name", "test"]);
@@ -594,8 +872,14 @@ mod tests {
 
         let patch = patch_since(&dir, Some(&base)).unwrap();
         assert!(patch.contains("+after"), "tracked hunk missing: {patch}");
-        assert!(patch.contains("diff --git a/new.txt b/new.txt"), "untracked hunk missing: {patch}");
-        assert!(patch.contains("+new content"), "untracked content missing: {patch}");
+        assert!(
+            patch.contains("diff --git a/new.txt b/new.txt"),
+            "untracked hunk missing: {patch}"
+        );
+        assert!(
+            patch.contains("+new content"),
+            "untracked content missing: {patch}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -605,8 +889,16 @@ mod tests {
     fn a_diff_tells_the_users_changes_from_the_runs() {
         let dir = temp_dir("diff-origin");
         let command = |args: &[&str]| {
-            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         command(&["init", "-q"]);
         command(&["config", "user.name", "test"]);
@@ -631,9 +923,22 @@ mod tests {
 
         let mut diff = diff_since(&dir, Some(&base)).unwrap();
         attribute(&dir, &mut diff, Some(&before));
-        let origin = |name: &str| diff.iter().find(|f| f.path == name).unwrap_or_else(|| panic!("missing {name}")).origin;
-        assert_eq!(origin("stray.txt"), Some(Origin::BeforeRun), "an untracked file from before the run was claimed");
-        assert_eq!(origin("gone.txt"), Some(Origin::BeforeRun), "a deletion from before the run was claimed");
+        let origin = |name: &str| {
+            diff.iter()
+                .find(|f| f.path == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .origin
+        };
+        assert_eq!(
+            origin("stray.txt"),
+            Some(Origin::BeforeRun),
+            "an untracked file from before the run was claimed"
+        );
+        assert_eq!(
+            origin("gone.txt"),
+            Some(Origin::BeforeRun),
+            "a deletion from before the run was claimed"
+        );
         assert_eq!(origin("edited.txt"), Some(Origin::Both));
         assert_eq!(origin("clean.txt"), Some(Origin::Run));
         assert_eq!(origin("created.txt"), Some(Origin::Run));
@@ -654,8 +959,16 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git_in = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git_in(&repo, &["init", "-q"]);
@@ -665,22 +978,46 @@ mod tests {
         git_in(&repo, &["add", "."]);
         git_in(&repo, &["commit", "-qm", "initial"]);
         for hook in ["post-checkout", "post-commit"] {
-            std::fs::write(repo.join(".git/hooks").join(hook), "#!/bin/sh\ntouch hook-ran\n").unwrap();
+            std::fs::write(
+                repo.join(".git/hooks").join(hook),
+                "#!/bin/sh\ntouch hook-ran\n",
+            )
+            .unwrap();
         }
         std::fs::write(repo.join("a.txt"), "mine\n").unwrap();
 
         let copy = worktree_dir(&git_state(&repo).root.unwrap(), 7).unwrap();
-        assert!(copy.ends_with(Path::new(".orteca-worktrees").join("repo-7")), "{}", copy.display());
+        assert!(
+            copy.ends_with(Path::new(".orteca-worktrees").join("repo-7")),
+            "{}",
+            copy.display()
+        );
         add_worktree(&repo, &copy, "orteca/task-7").unwrap();
-        assert_eq!(std::fs::read_to_string(copy.join("a.txt")).unwrap().replace("\r\n", "\n"), "old\n", "the copy took the user's uncommitted edit");
+        assert_eq!(
+            std::fs::read_to_string(copy.join("a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "old\n",
+            "the copy took the user's uncommitted edit"
+        );
 
         std::fs::write(copy.join("a.txt"), "agent\n").unwrap();
         std::fs::write(copy.join("new.txt"), "agent\n").unwrap();
         let sha = commit_worktree(&copy, "Orteca task 7: test").unwrap();
         assert_eq!(git_in(&repo, &["rev-parse", "orteca/task-7"]), sha);
-        assert_eq!(git_in(&repo, &["log", "-1", "--format=%an", "orteca/task-7"]), "Orteca");
-        assert!(!copy.join("hook-ran").exists() && !repo.join("hook-ran").exists(), "a repository hook ran");
-        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "mine\n", "the user's folder changed");
+        assert_eq!(
+            git_in(&repo, &["log", "-1", "--format=%an", "orteca/task-7"]),
+            "Orteca"
+        );
+        assert!(
+            !copy.join("hook-ran").exists() && !repo.join("hook-ran").exists(),
+            "a repository hook ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "mine\n",
+            "the user's folder changed"
+        );
         assert!(!repo.join("new.txt").exists());
 
         remove_worktree(&repo, &copy).unwrap();

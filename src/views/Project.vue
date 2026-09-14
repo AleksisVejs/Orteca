@@ -104,6 +104,7 @@ async function install(ids: ProviderId[]) {
       const fresh = await installProvider(id);
       providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
       provider.value = id;
+      void loadLimits();
     } catch (e) {
       installError.value = isAppError(e) ? e.message : String(e);
       break;
@@ -135,6 +136,9 @@ async function signIn(id: ProviderId) {
   try {
     const fresh = await signInProvider(id);
     providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
+    // A signed-out CLI reports no limits, so the reading taken at open is stale
+    // the moment a sign-in succeeds. Not awaited: it takes seconds.
+    void loadLimits();
   } catch (e) {
     signInError.value = isAppError(e) ? e.message : String(e);
   } finally {

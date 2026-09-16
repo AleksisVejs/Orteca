@@ -190,7 +190,11 @@ fn spawn_suspended(program: &str, args: &[&str], cwd: &Path) -> io::Result<Child
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .creation_flags(windows::Win32::System::Threading::CREATE_SUSPENDED.0)
+        .creation_flags(
+            (windows::Win32::System::Threading::CREATE_SUSPENDED
+                | windows::Win32::System::Threading::CREATE_NO_WINDOW)
+                .0,
+        )
         .kill_on_drop(true);
     // Inherit the user's TEMP when Orteca has nowhere better; a missing
     // LOCALAPPDATA is not a reason to refuse to run.

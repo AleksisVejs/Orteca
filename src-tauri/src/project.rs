@@ -1,7 +1,11 @@
 //! Opening a project: git state and the trust scan.
 
 use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
 use std::process::Command;
+
+/// Orteca has no console, so every child would otherwise get its own window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use serde::{Deserialize, Serialize};
 
@@ -826,6 +830,7 @@ fn merge(dir: &Path, branch: &str) -> Result<String> {
 pub fn git_installed() -> bool {
     Command::new("git")
         .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .is_ok_and(|o| o.status.success())
 }
@@ -847,6 +852,7 @@ fn git_run(dir: &Path, args: &[&str], failure: &str) -> Result<String> {
         .args(args)
         // A credential prompt on a terminal nobody sees would hang forever.
         .env("GIT_TERMINAL_PROMPT", "0")
+        .creation_flags(CREATE_NO_WINDOW)
         .current_dir(dir)
         .output()?;
     if !out.status.success() {

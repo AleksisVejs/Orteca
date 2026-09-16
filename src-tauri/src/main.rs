@@ -36,12 +36,10 @@ struct Preflight {
     provider: ProviderId,
     git: GitState,
     route: Route,
-    /// What the route's tier asks this provider for.
+    /// What the implementation asks this provider for, including route overrides.
     model: routing::ModelChoice,
     /// What Plan runs on when Efficient mode lowers its reasoning effort.
     plan: Option<routing::ModelChoice>,
-    /// What the one Fix call would run on, if the route declares one.
-    escalation: Option<routing::ModelChoice>,
     /// What the Review runs on, when that is not the route's tier.
     review: Option<routing::ModelChoice>,
 }
@@ -332,13 +330,11 @@ fn preview_task(
     store: State<Store>,
 ) -> Result<Preflight> {
     let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
-    let model = planned.route.budget.preferred_tier.model(provider);
-    let plan = planned.route.plan_model(provider);
-    let escalation = planned
+    let model = planned
         .route
-        .budget
-        .escalation
-        .map(|tier| tier.model(provider));
+        .work_model(provider)
+        .unwrap_or_else(|| planned.route.budget.preferred_tier.model(provider));
+    let plan = planned.route.plan_model(provider);
     let review = planned.route.review_model(provider);
     Ok(Preflight {
         provider,
@@ -346,7 +342,6 @@ fn preview_task(
         route: planned.route,
         model,
         plan,
-        escalation,
         review,
     })
 }
@@ -487,6 +482,24 @@ fn remove_worktree(path: String, task_id: i64, store: State<Store>) -> Result<()
     };
     project::remove_worktree(&dir, std::path::Path::new(&copy))?;
     store.clear_worktree(record.id, task_id)
+}
+
+/// Fetch, pull, commit, push or merge, after the user confirmed it. Trusted projects
+/// only: a commit runs the repository's own hooks. Returns the state after.
+#[tauri::command]
+async fn git_action(
+    path: String,
+    action: project::GitAction,
+    input: String,
+    store: State<'_, Store>,
+) -> Result<GitState> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        project::git_action(&dir, action, &input)?;
+        Ok(project::git_state(&dir))
+    })
+    .await
+    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?
 }
 
 fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
@@ -786,6 +799,7 @@ fn main() {
             preview_task,
             provider_limits,
             remove_worktree,
+            git_action,
             cancel_provider_operation
         ])
         .run(tauri::generate_context!())

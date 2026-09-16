@@ -65,7 +65,7 @@ async function projectView(api = {}) {
 
 const oneCall = {
   kind: 'implementOnce', mode: 'balanced', stages: ['implement'], reason: 'small, low-risk and narrow',
-  budget: { maxAgentCalls: 1, maxTurns: 10, maxReportedTokens: 150000, preferredTier: 'cheapest' },
+  budget: { preferredTier: 'cheapest' },
   signals: { complexity: 0, risk: 0, blastRadius: 1 }, candidatePaths: [], preferredProviders: ['codex'],
 };
 
@@ -383,7 +383,7 @@ test('a budget stop reads as its own outcome and never as a failure', async () =
     summary: 'got as far as the edit',
     diff: [{ path: 'src/a.rs', added: 3, deleted: 1 }],
     usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 2, reasoningTokens: 0, costUsd: null, costQuality: 'unavailable' },
-    route: { ...oneCall, kind: 'planned', stages: ['plan', 'implement', 'verify'], budget: { ...oneCall.budget, maxAgentCalls: 2 } },
+    route: { ...oneCall, kind: 'planned', stages: ['plan', 'implement', 'verify'] },
     stages: [{ stage: 'plan', summary: 'planned', artifact: null }, { stage: 'implement', summary: 'got as far as the edit', artifact: null }],
     callsUsed: 2,
     budgetStop: { limit: 'calls', allowed: 2, observed: 2, remaining: ['verify'], message: 'This route was given 2 agent calls, and they are used up.' },
@@ -398,19 +398,19 @@ test('a budget stop reads as its own outcome and never as a failure', async () =
   assert.equal(state.result.value.summary, 'got as far as the edit');
   assert.equal(state.result.value.diff.length, 1);
   assert.equal(state.tokens.value.total, 12);
-  // And the spend is shown against what was allowed, both exact.
+  // And the spend is shown, exact.
   // Through JSON: a computed hands back reactive proxies, which compare by
   // reference rather than by what they hold.
-  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 2, allowed: 2, stages: ['plan', 'implement', 'verify'], ran: ['plan', 'implement'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 2, stages: ['plan', 'implement', 'verify'], ran: ['plan', 'implement'] });
   assert.deepEqual(state.result.value.budgetStop.remaining, ['verify'], 'the user is not told what was left undone');
 });
 
-test('a trivial task reports the one call it was allowed', async () => {
+test('a trivial task reports the one call it spent', async () => {
   const { state } = await projectView({
     startTask: async () => ({ ...finished, status: 'done', failure: null, summary: 'fixed it', stages: [{ stage: 'implement', summary: 'fixed it', artifact: null }] }),
   });
   await state.run();
-  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 1, allowed: 1, stages: ['implement'], ran: ['implement'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(state.calls.value)), { used: 1, stages: ['implement'], ran: ['implement'] });
   assert.equal(state.result.value.budgetStop, null);
 });
 
@@ -499,16 +499,16 @@ test('an unread limit is not an empty one, and says why', async () => {
 test('a route that may not fit in the fullest window warns before it starts', async () => {
   const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(20, 88) });
   await settle();
-  const twoCalls = { ...oneCall, budget: { ...oneCall.budget, maxAgentCalls: 2 } };
-  state.preview.value = { provider: 'codex', route: twoCalls, escalation: { model: 'gpt-5.6-sol', effort: 'high' } };
-  assert.equal(state.limitWarning.value.calls, 3, 'the declared Fix call counts');
+  const threeStages = { ...oneCall, stages: ['implement', 'verify', 'review'] };
+  state.preview.value = { provider: 'codex', route: threeStages };
+  assert.equal(state.limitWarning.value.calls, 3, 'every stage is a call');
   assert.equal(state.limitWarning.value.window.label, '5-hour');
-  state.preview.value = { provider: 'claude', route: twoCalls, escalation: null };
-  assert.equal(state.limitWarning.value, null, '80% left covers two calls');
-  state.preview.value = { provider: 'codex', route: oneCall, escalation: null };
+  state.preview.value = { provider: 'claude', route: threeStages };
+  assert.equal(state.limitWarning.value, null, '80% left covers three calls');
+  state.preview.value = { provider: 'codex', route: oneCall };
   assert.equal(state.limitWarning.value, null, '12% left covers one call');
 
-  state.preview.value = { provider: 'codex', route: twoCalls, escalation: { model: 'gpt-5.6-sol', effort: 'high' } };
+  state.preview.value = { provider: 'codex', route: threeStages };
   assert.equal(state.alternative.value, 'claude', 'claude has 80% left against codex 12%');
   state.switchTo('claude');
   assert.equal(state.provider.value, 'claude');

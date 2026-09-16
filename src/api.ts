@@ -4,6 +4,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
   Detected,
+  GitAction,
+  GitState,
   Limits,
   Mode,
   OpenedProject,
@@ -60,6 +62,11 @@ export const previewTask = (path: string, prompt: string, provider: ProviderId, 
  *  work; the branch always stays. */
 export const removeWorktree = (path: string, taskId: number) =>
   invoke<void>("remove_worktree", { path, taskId });
+
+/** Runs one git command the user confirmed. `input` is the commit message or
+ *  the branch to merge. Returns the git state after it. */
+export const gitAction = (path: string, action: GitAction, input = "") =>
+  invoke<GitState>("git_action", { path, action, input });
 
 /** Plan limits from each CLI's own answer. Costs no tokens; takes seconds. */
 export const providerLimits = () => invoke<Limits[]>("provider_limits");

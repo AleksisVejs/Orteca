@@ -28,22 +28,24 @@ What exists and works:
   one until asked to apply it and then resumes its own session with it
 - Installing a missing CLI from the project screen, via the user's own npm
 - Routing with no model call: a keyword classifier picks one of five routes,
-  each with call, turn and token ceilings declared before a provider starts; a
-  trivial task is one Implement call, which verifies itself unless Orteca can
-  run the repository's tests after it (§4.3.7)
-- Plan, Review and Verify return schema-checked artifacts and cannot edit; a
-  Review that is missing, invalid, or asks for changes ends the route with
-  `reviewRejected`; a Verify that is missing, invalid, ran no check, or lists a
-  failing one ends it with `verifyFailed` — unless the route declared its one
-  Fix call a tier up, which runs first; a budget stop ends `budgetReached` and
-  never escalates on its own
+  each with its stages and tiers declared before a provider starts; a trivial
+  task is one Implement call, which verifies itself unless Orteca can run the
+  repository's tests after it (§4.3.7)
+- Plan, Review and Verify return schema-checked artifacts and cannot edit. A
+  failed Verify gets one Fix on the same tier, resuming the session that wrote
+  the change, then runs again; a Review runs once and its Fix is judged by
+  Verify. A check that still fails ends `verifyFailed` or `reviewRejected` with
+  the work kept (§8, §4.3.10)
+- Orteca runs the declared tests once before the agent starts. A suite that
+  already fails is shown to the agent and buys no Fix when it fails again
+  (§4.3.10)
 - A diff that tells the run's changes from files already dirty before it
-- Briefs name ranked candidate paths, never contents; the token ceiling is
-  checked on cumulative usage after every turn; a finished run is compared to
-  the median of comparable runs once five exist; the result shows the route
+- Briefs name ranked candidate paths, never contents; a finished run is
+  compared to the median of comparable runs once five exist; the result shows
+  the route
 - The project screen lists recent runs with their outcome, route, calls and
   labelled usage; each run opens its patch and append-only event log
-- A preflight preview shows the selected route, ceilings and existing working
+- A preflight preview shows the selected route, models and existing working
   tree changes before a provider starts; provider install and sign-in can be
   cancelled and are bounded to five minutes
 - Codex is refused up front on a repository whose folder ACL the user cannot
@@ -612,6 +614,144 @@ off.
 **Not measured yet.** The next measurement repeats the §4.3.6 typo, bug and
 feature tasks on both CLIs and compares turns and uncached tokens.
 
+### 4.3.8 No ceilings: fix until it passes — 2026-09-14
+
+Measured on a real task in RigInspectBE (Laravel, 664 tests): configurable
+reminder lead days, which needs a migration and schema dump, API validation, a
+cron rewrite and feature tests. One run each, Codex on both arms.
+
+| | Plain `codex exec` (user config, Sol high) | Orteca `guarded`, before |
+|---|---|---|
+| Wall time | 6m 44s | 17m 44s |
+| Tokens in (cached) · out | 916k (870k) · 7.0k | 1,476k (1,325k) · 23.3k |
+| Estimated cost | $0.68 | $1.36 |
+| `composer test` afterwards | 669 pass | 1 failing |
+| Outcome | done | `reviewRejected`, 3 open findings |
+
+Orteca's local Verify caught a schema dump the Terra implement broke, and its
+Review found three real defects. Then the call ceiling ended the run with them
+unfixed. Every stage was a fresh process: the Sol Fix re-read the repository
+(620k cached input), and nothing checked the Fix again before the Review.
+
+What changed:
+
+- **No call, turn or token ceiling.** `ExecutionBudget` is tiers only. A Review
+  or Verify that does not pass is followed by a Fix and the same check again (a
+  failed Review also re-runs a Verify that comes before it), for as many rounds
+  as it takes. The one stop is no progress: a check that still fails after a Fix
+  that left `patch_since` unchanged ends `reviewRejected` or `verifyFailed`.
+  The user's Stop ends any run.
+- **No escalation.** A Fix runs on the route's own tier, and **a Codex Fix
+  resumes the Implement session** (`codex exec resume <id>`, model and schema
+  kept), so the task and the files it read are already in its cached context.
+  A tier that keeps failing is still stepped over by `stalled_tiers` on the next
+  run; a run that needed fixes and finished no longer counts as a stall.
+- **A Review whose findings are all `low` passes**, and a second Review is
+  handed the first one's findings to check first. Without both, a picky
+  reviewer turns "until it passes" into a loop.
+- **The Review brief carries the patch** (up to 48 KB), so the reviewer does
+  not spend turns finding the change.
+- **Codex usage is per process again.** `turn.completed` carries the thread's
+  running totals, resumes included (the rollout's `total_token_usage`), so a
+  resumed Fix re-billed the Implement. `run::added_since` subtracts the thread's
+  previous report.
+
+Re-measured, same task, fresh clone, one run:
+
+| | Plain Codex | Orteca, no ceilings |
+|---|---|---|
+| Wall time | 6m 44s | 27m 29s |
+| Estimated cost | $0.68 | $2.28 (Terra thread $0.93, three Sol reviews $1.35) |
+| Stages | 1 call | Implement → Verify → 3× (Fix → Verify → Review), 7 calls |
+| `composer test` afterwards | 669 pass | 670 pass |
+| Outcome | done | done; the last Review passed with one `low` finding |
+
+It now finishes, and every medium finding the Reviews raised was fixed
+(`integer` accepting `"14"` against a strict compare, `whereDate` defeating the
+`next_checkup` index, `array` accepting an object). It is not cheaper or faster
+than the plain CLI on this task. Where the time went: the first Verify ran 6
+minutes because the broken draft made ParaTest error slowly until Composer's
+300-second timeout; every Verify also ran `npm ci` and the Vite suite for a
+PHP-only change; three Sol reviews took 10 minutes. Plain Codex on Sol wrote
+it right in one warm session that tested itself, which a Terra draft plus
+separate reviews cannot undercut.
+
+### 4.3.9 One strong schema session and change-aware Verify — 2026-09-15
+
+The next route removes the costs the comparison exposed. Schema-only work uses
+one Codex implementation session on Sol `medium`, with the implementation brief
+requiring a final boundary, migration/schema and index-use review. When the
+repository declares tests, Orteca runs Verify afterwards; otherwise that same
+session runs one focused check. Astra is deliberately excluded because its
+allowance draw is too high for this account.
+
+Local Verify now selects ecosystems from files changed by this run. A PHP-only
+change no longer installs or tests an adjacent Vite application. Changed
+Laravel tests run first as a cheap tripwire; the broad PHP suite runs only after
+they pass. Security and authorisation work still receives one independent
+Review. A rejected Review buys one Fix and Verify, never another Review. A
+failed Verify likewise buys at most one automatic Fix; another failure stops
+with its output instead of spending through the user's allowance. A test that
+cannot start a required executable is an environment failure and buys no Fix.
+
+The first live run of this route is not a valid comparison result. It used a
+clean RigInspectBE copy at `0aea720d`, but that copy did not include the
+benchmark checkout's untracked MySQL test environment. The initial Sol
+implementation took about 11 minutes; Verify then reached 13 test failures
+with zero assertions because `mysql.exe` was unavailable. Orteca treated that
+environment failure as a code defect and began Fix work. The run was stopped
+around 18 minutes, when a second Fix started, to preserve the remaining account
+allowance. It produced no result JSON, so no cost or correctness result is
+claimed. It also did not beat plain Codex's 6m 44s time. This invalid run is
+what prompted the hard one-Fix ceiling and missing-executable stop above.
+
+### 4.3.10 Check before the change, and resume Claude's Fix — 2026-09-16
+
+The invalid run in §4.3.9 failed because the checks could not pass on that
+machine at all, and a failing Verify cannot say whether the change or the
+setup is at fault. Orteca now asks before anything changes:
+
+- **A quick check runs once before the first stage** of any route with a
+  Verify Orteca can run itself: for a Laravel suite, the smallest test file
+  under `tests/Feature` (`php artisan test <file>`), which boots the app and
+  its database. The suites are picked from the route's candidate paths, the
+  same way Verify picks them from the changed paths; ecosystems with no cheap
+  slice skip the check. A pass is remembered for this launch by folder,
+  commit, dirty-file fingerprints and suites.
+- **A suite that already fails is shown to the Implement stage** (it may be the
+  task), and **when the same suite fails after the change, no Fix is started**:
+  the run ends `verifyFailed` with the output kept and a message saying the
+  checks failed before the run. A different suite failing still buys its Fix.
+- **Claude's Fix resumes the Implement session** (`claude -p ... --resume
+  <id>`), as Codex's already did. The task and every file it read are in its
+  context, and Claude's Edit tool refuses a file it has not Read in the same
+  session, so a fresh Fix paid to read the files again.
+
+Installs were already once per tree: a suite's install runs only while
+`node_modules` or `vendor` is missing, so the §4.3.8 `npm ci` on every Verify
+is gone since change-aware Verify.
+
+Measured the same day on the RigInspectBE `easy` task (one run each, after
+the benchmark stopped junctioning `vendor/`, which broke ParaTest): both
+providers finished `done` in one call, 3/3 hidden checks, Claude $0.31 in
+4.2 min, Codex (Luna) $0.017 in 3.9 min. The full suite ran before and after
+(~60-75 s each), so the first design cost a whole suite run per task.
+
+Why a quick check, not the full suite, and not in parallel:
+
+- The full suite before the change is ~60 s on RigInspectBE and caught one
+  flaky parallel failure (`PersonalDataExportTest`, a temp-file clash) on an
+  unchanged tree. One flake marked the suite as already failing, which would
+  have denied a real failure its Fix. One file, run alone, does not race.
+- Running it beside Implement is unsafe in the default mode: the agent edits
+  the same tree the suite is reading, and every run of a Laravel suite shares
+  one MySQL test database.
+- The suite already runs on every core (`--parallel --processes=8` on 8
+  logical cores); `composer` itself adds ~1 s.
+
+**Not measured yet.** Whether the resumed Claude Fix is cheaper once its
+prompt cache has expired during a long Verify.
+
 ### Parked: replace the CLI's own system prompt
 
 Most of each turn's ~21k is the CLI's built-in system prompt, not Orteca's
@@ -691,7 +831,7 @@ src-tauri/
       codex.rs     exec --json parser
       limits.rs    plan limits read from each CLI (§4.3.5)
       mock.rs      replays fixtures/*.jsonl through the real parsers
-    run.rs         route runner: stages, argv, stream, budgets, event log, diff, result
+    run.rs         route runner: stages, argv, stream, fix rounds, event log, diff, result
     routing.rs     deterministic classifier + route builder + stage briefs
     orchestrator.rs *  folded into run.rs — see below
 src/
@@ -873,14 +1013,15 @@ signals: complexity 0-10, risk 0-10,
 |---|---|
 | complexity <= 3, risk <= 3, blast <= 5, and blast >= 1 or a small-edit word | **Implement once** — inspect named paths, edit, run one focused verification inside that call; no Plan or Review |
 | architecture OR complexity >= 7 | Understand → **Plan** → Implement → Verify |
-| security OR authz OR schema_change | Implement → **Review** → Verify; **Plan** first when also architectural or complexity >= 7 |
+| security OR authz | Implement → **Review** → Verify; **Plan** first when also architectural or complexity >= 7 |
+| schema_change | one strong Implement/self-review → Verify when local checks exist |
 | implement failed twice | escalate: Plan → Implement → Review |
 
 `Efficient` shifts thresholds up by 2 (fewer stages) and chooses the cheapest
 capable configured tier. `Balanced` uses the route as written. A route declares
-its call and turn ceilings before any provider is started; tiny tasks have a
-one-call ceiling. Escalation is never automatic after a budget stop: the user
-must choose to spend more.
+its stages and tiers before any provider is started; tiny tasks are one call.
+Verify gets at most one automatic Fix, and an independent Review runs at most
+once (§4.3.9).
 
 Capability → provider map lives in one table, not in the router:
 
@@ -904,24 +1045,27 @@ route that just failed it. The table also had no default row; there is now a
 | Route | Stages | Calls |
 |---|---|---|
 | `ImplementOnce` | Implement, then Verify when Orteca can run it | 1 |
-| `Standard` | Implement → Verify | 2 |
+| `Standard` | Implement → Verify; schema-only work omits Verify when no local check exists | 1 or 2 |
 | `Planned` | Plan → Implement → Verify | 3 |
 | `Escalated` | Plan → Implement → Review | 3 |
 | `Guarded` | Implement → Review → Verify, Plan first when large | 3 or 4 |
 
-`maxAgentCalls` is the number of stages. **Orteca runs a Verify itself when
+Calls are the number of stages, plus a Fix and Verify when a check fails.
+Review is never repeated. **Orteca runs a Verify itself when
 the repository declares its test suites** (`project::check_commands`, at the
 root and one folder down: a real `scripts.test` in `package.json` run with the
 lockfile's package manager, `composer.json`'s test script or `phpunit.xml`,
-`Cargo.toml`, `go.mod`, pytest config), every one of them, so a Laravel app with
-a Vite `frontend/` runs both suites and on most repos a Verify is no agent call.
+`Cargo.toml`, `go.mod`, pytest config). After an edit, only ecosystems positively
+identified by this run's changed paths execute; unknown-only changes keep the
+full set. Changed Laravel tests run first, and a failure skips the broad suite.
+On most repositories Verify is therefore no agent call.
 A root suite claims its ecosystem, so a workspace's packages are not run twice.
 A suite whose dependencies are not installed - a fresh clone, or every run's
 separate copy - gets its install (`npm ci`, `pnpm install --frozen-lockfile`,
 `composer install`, ...) first; a suite whose tools are not on PATH is reported
 as not run, never passed. A pass or a fail comes from the exit code, and the
-last 60 lines of output become the Verify artifact, so a failure still buys the
-Fix call with the output in its brief. **Suites run as the user on both
+last 60 lines of output become the Verify artifact, so a failure is fixed with
+the output in the Fix brief. **Suites run as the user on both
 providers**, as the project's trust consent covers, not in `codex sandbox`: the
 sandbox account cannot `lstat` the folders above a repository under the user
 profile, Vite, Jest and npm realpath through them, so every such suite failed
@@ -930,23 +1074,14 @@ sandbox denies. With no declared suite, or none that can start, the agent
 verifies as before. Guarded work runs on
 `standard` with its Review on `deep` (`budget.reviewTier`), shown in the preview.
 
-Two rules the spec did not write down, both of which exist to stop Orteca
-spending on its own initiative:
+Rules the spec did not write down:
 
-- **A Review that is missing, invalid, or returns `changes_requested` ends the
-  route there with `reviewRejected`; a Verify that does not report a pass
-  backed by at least one check, none failing, ends it with `verifyFailed`.** A
-  stage that ends cleanly while printing failures is not `done`, and no Verify
-  call is spent confirming what a review has already rejected. The findings are
-  the result; what to do about them is the user's to choose.
-- **Bounded escalation: one Fix call, declared before the run.** A route with a
-  Review or Verify stage whose tier is not `deep` carries `budget.escalation`,
-  the next tier up. The first Review or Verify that does not pass is followed by
-  one `fix` stage on that tier, in place of whatever stages were left: it is
-  handed the failing artifact, may edit, and returns the Verify artifact. A
-  passing Fix makes the task `done`; anything else is `verifyFailed`. There is
-  never a second Fix, `deep` routes and an `implementOnce` with no Verify have none, the call
-  ceiling grows by exactly that one call, and a budget stop never escalates.
+- **A Review that asks for changes on a high or medium finding is followed by
+  one Fix and Verify; it is not repeated. A Verify that does not report a pass
+  backed by at least one check, none failing, gets at most one Fix and Verify**
+  (§4.3.9). A stage that ends cleanly while printing failures is not `done`.
+  The run ends `reviewRejected` or `verifyFailed` when a Fix changed nothing;
+  the findings are kept.
 - **A held instruction is delivered by the next stage's brief, not by resuming
   the stage it arrived in** — unless that stage is the last one, where M5's
   behaviour is unchanged. Resuming as well would pay for a second process to say
@@ -1063,7 +1198,13 @@ record branch, HEAD sha, `git status --porcelain`, `git stash list`
 
 Isolation choice at task start: `Current tree` (default) | `New branch` | `Worktree`.
 Orteca never runs a destructive git command. Diff captured with
-`git diff <base_commit>` plus `git status` for untracked files.
+`git diff <base_commit>` plus `git status` for untracked files. The project
+screen's git bar runs fetch, `pull --ff-only`, `add -A` + commit, a plain
+push (`push -u <origin or first remote> HEAD` when nothing is tracked yet) and
+`merge --no-edit <local branch>` on a clean tree only, aborted on any clash so
+it lands whole or not at all. Each runs only after a second click that says what it will do, and only on a
+trusted project (a commit runs the repo's hooks). The header shows the
+upstream and ahead/behind from `rev-list --left-right --count HEAD...@{u}`.
 
 **As built.** A tree that is dirty at start is snapshotted before the first
 provider starts: every already-changed path, with a hash of its contents. After
@@ -1112,10 +1253,6 @@ a file named for a prompt word scores 3, a path containing one scores 1, a path
 in recent history gets +2, and a test named like a matched file (`test_slug.py`
 beside `slug.rs`) is listed with it without counting towards blast radius.
 Ties go shallowest and shortest first. The top 10 go in the brief, ranked.
-
-The token ceiling is checked on cumulative reported usage after every turn,
-where the turn ceiling is checked, as well as before each stage. A single-stage
-route therefore stops at the turn that crossed it rather than never.
 
 Baselines: the median tokens and calls of the last 20 runs in the project that
 finished `done` on the same route kind and provider and reported usage. Fewer
@@ -1192,22 +1329,18 @@ rides along with metrics. Each slice ends commit-ready with tests.
    comparable tasks, show a rolling-median comparison labelled `estimated`.
    Before that, the result screen shows absolute tokens and calls avoided.
 3. **Efficiency is a control, not a slogan.** Do not claim a task was efficient
-   merely because most input was cached. The run must have a declared budget,
-   a small-task single-call path, and an honest budget-reached outcome before
-   Orteca can make that claim.
+   merely because most input was cached. The run must have a small-task
+   single-call path and honest outcomes before Orteca can make that claim.
 4. **`budgetReached` is a fifth task status, and `reviewRejected` and
    `verifyFailed` are explicit stop outcomes beside it.** Neither is a failure when the provider completed
    normally; neither is a success because the route did not finish. The work,
    diff, findings, and reported usage are kept exactly as they are, and the
    remaining stages are named so the user knows what they are being asked to
-   decide about. Continuing is a fresh Run — a deliberate act — and Orteca never
-   takes it on their behalf. The single exception is the one Fix call a route
-   declares in its budget before it starts.
-5. **The one exemption from the call ceiling is an instruction the user gave.**
-   A resume that carries a mid-task instruction is allowed past `max_agent_calls`
-   and is still counted and logged. The rule the budget enforces is that Orteca
-   never spends more *on its own initiative*; refusing here would lose an
-   instruction the user was promised would arrive.
+   decide about. Since §4.3.8 a stop means a Fix changed nothing, and
+   `budgetReached` survives only on older rows.
+5. **Bounded recovery (2026-09-15).** Verify gets one automatic Fix. Review runs
+   once, and its one Fix is judged by deterministic Verify. Another attempt is
+   the user's decision (§4.3.9).
 
 ## 16. Notes for whoever picks this up
 
@@ -1272,9 +1405,8 @@ rides along with metrics. Each slice ends commit-ready with tests.
   value: a real one says `option '--max-turns <turns>' argument missing`, an
   invented one says `unknown option`. `--help` short-circuits before either
   check and exits 0 whatever you put in front of it, so it proves nothing.
-- Codex has no turn ceiling at 0.154.0 and no way to add one. Orteca counts
-  `turn.completed` and closes the Job Object at the ceiling. This cannot stop a
-  turn that is already running, and neither the doc nor the UI says it can.
+- Codex has no turn ceiling at 0.154.0 and no way to add one. Orteca no longer
+  sets one on either CLI (§4.3.8); the user's Stop is what ends a runaway call.
 - Never invoke a real provider CLI from a test. Fixtures are recorded JSONL
   replayed by `providers::mock`.
 - The Rust crate root is `src-tauri/`; run `cargo` from there. `npm run tauri

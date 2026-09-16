@@ -5,6 +5,7 @@ import {
   cancelTask,
   detectProviders,
   getTaskDetail,
+  gitAction,
   installProvider,
   isAppError,
   onInstallEvent,
@@ -20,6 +21,8 @@ import {
 import type {
   Auth,
   Detected,
+  GitAction,
+  GitState,
   Isolation,
   LimitWindow,
   Limits,
@@ -210,11 +213,12 @@ function limitLine(id: ProviderId): string | null {
 // Replace it with each route's measured draw once runs read limits before and after.
 const PERCENT_PER_CALL = 5;
 
-/** The fullest window that may not cover every call this route can make. */
+/** The fullest window that may not cover this route's stages. A check that
+ *  fails adds a fix and the check again on top. */
 const limitWarning = computed(() => {
   const p = preview.value;
   if (!p) return null;
-  const calls = p.route.budget.maxAgentCalls + (p.escalation ? 1 : 0);
+  const calls = p.route.stages.length;
   const windows = limits.value.find((l) => l.id === p.provider)?.windows ?? [];
   const tight = windows
     .filter((w) => 100 - w.usedPercent < calls * PERCENT_PER_CALL)
@@ -388,6 +392,55 @@ async function removeCopy(id: number) {
   }
 }
 
+// Git without the AI. Every command waits for a second click that says
+// exactly what it will do; none of them can force or reset anything.
+const git = ref<GitState>(props.opened.git);
+const gitAsk = ref<GitAction | null>(null);
+const gitBusy = ref(false);
+const gitError = ref<string | null>(null);
+const commitMessage = ref("");
+const mergeBranch = ref("");
+
+function gitQuestion(action: GitAction): string {
+  const g = git.value;
+  const remote = g.upstream ?? "the remote";
+  const n = (count: number | null, word: string) => `${count ?? 0} ${word}${count === 1 ? "" : "s"}`;
+  switch (action) {
+    case "fetch":
+      return `Download what's new on ${remote}? Your files stay as they are.`;
+    case "pull":
+      return `Bring ${n(g.behind, "commit")} from ${remote} into your files? Git stops if that needs a merge.`;
+    case "commit":
+      return `Commit all ${n(g.dirtyCount, "changed file")} on ${g.branch ?? "this detached HEAD"}?`;
+    case "push":
+      return g.upstream
+        ? `Send ${n(g.ahead, "commit")} to ${remote}? Others will see them.`
+        : `Publish ${g.branch ?? "this branch"} to the remote for the first time? Others will see it.`;
+    case "merge":
+      return `Bring ${mergeBranch.value || "a branch"} into ${g.branch ?? "this detached HEAD"}? If they change the same lines, Orteca stops and changes nothing.`;
+  }
+}
+
+async function runGit(action: GitAction) {
+  if (gitAsk.value !== action) {
+    gitAsk.value = action;
+    gitError.value = null;
+    if (action === "merge") mergeBranch.value = git.value.branches[0] ?? "";
+    return;
+  }
+  gitBusy.value = true;
+  try {
+    const input = action === "merge" ? mergeBranch.value : commitMessage.value;
+    git.value = await gitAction(props.opened.project.path, action, input);
+    if (action === "commit") commitMessage.value = "";
+    gitAsk.value = null;
+  } catch (e) {
+    gitError.value = isAppError(e) ? e.message : String(e);
+  } finally {
+    gitBusy.value = false;
+  }
+}
+
 const preview = ref<Preflight | null>(null);
 const previewing = ref(false);
 const previewError = ref<string | null>(null);
@@ -413,7 +466,10 @@ async function refreshPreview() {
   previewError.value = null;
   try {
     const planned = await previewTask(props.opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value);
-    if (request === previewRequest) preview.value = planned;
+    if (request === previewRequest) {
+      preview.value = planned;
+      git.value = planned.git;
+    }
   } catch (e) {
     if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
   } finally {
@@ -614,30 +670,27 @@ const STAGE_LABELS: Record<string, string> = {
   implement: "Making changes",
   review: "Reviewing the work",
   verify: "Checking that it works",
-  fix: "Fixing it with a stronger model",
+  fix: "Fixing what didn’t pass",
 };
 
 function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] ?? stage;
 }
 
-/** What the route spent against what it was allowed. Both numbers are exact:
- *  Orteca chose the route, so it knows the ceiling as well as the spend. */
+/** What the route spent. Exact: Orteca started every process itself. */
 const calls = computed(() => {
   const r = result.value;
   if (!r) return null;
   return {
     used: r.callsUsed,
-    // The Fix call, once bought, is the one call the route declared on top.
-    allowed: r.route.budget.maxAgentCalls + (r.stages.some((s) => s.stage === "fix") ? 1 : 0),
     stages: r.route.stages,
     ran: r.stages.map((s) => s.stage),
   };
 });
 
 /** Every stage that ran, then the route's stages that did not. Stages run in
- *  order, so the ones that ran are the front of the route — unless a Fix call
- *  was bought, which takes the place of whatever was left. */
+ *  order, so the ones that ran are the front of the route — unless a Fix ran,
+ *  after which the run's own order is the whole story. */
 const routeSteps = computed(() => {
   const r = result.value;
   if (!r) return [];
@@ -701,17 +754,82 @@ const AUTH: Record<Auth, string> = {
 </script>
 
 <template>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Workspace">
+      <div class="brand">Orteca<span>Workspace</span></div>
+      <nav aria-label="Project navigation">
+        <a href="#task">New task <span aria-hidden="true">+</span></a>
+        <a v-if="history.length || historyError" href="#past-work">Past work</a>
+        <a href="#ai-helpers">AI helpers</a>
+        <button @click="$emit('close')">Switch project</button>
+      </nav>
+      <div class="sidebar-project">
+        <strong>{{ opened.project.name }}</strong>
+        <span>{{ git.branch ?? "detached" }}</span>
+      </div>
+      <p class="sidebar-foot">One prompt in.<br />Finished work out.</p>
+    </aside>
   <main class="project">
     <header>
       <button class="back" title="Back to projects" aria-label="Back to projects" @click="$emit('close')">
         &larr;
       </button>
       <h1>{{ opened.project.name }}</h1>
-      <span class="chip">{{ opened.git.branch ?? "detached" }}</span>
-      <span v-if="opened.git.dirty" class="chip warn">
-        {{ opened.git.dirtyCount }} uncommitted
+      <span class="chip">{{ git.branch ?? "detached" }}</span>
+      <span v-if="git.dirty" class="chip warn">
+        {{ git.dirtyCount }} uncommitted
+      </span>
+      <span v-if="git.upstream" class="chip">
+        {{ git.upstream }} · {{ git.behind ?? "—" }} behind · {{ git.ahead ?? "—" }} ahead
       </span>
     </header>
+
+    <section v-if="git.isRepo" class="git-bar" aria-label="Git">
+      <div class="git-buttons">
+        <button class="btn" :disabled="running || gitBusy || !git.upstream" @click="runGit('fetch')">Fetch</button>
+        <button class="btn" :disabled="running || gitBusy || !git.behind" @click="runGit('pull')">Pull</button>
+        <button class="btn" :disabled="running || gitBusy || !git.dirty" @click="runGit('commit')">Commit</button>
+        <button class="btn" :disabled="running || gitBusy || git.ahead === 0" @click="runGit('push')">Push</button>
+        <button
+          class="btn"
+          :disabled="running || gitBusy || git.dirty || !git.branches.length"
+          :title="git.dirty ? 'Commit your changes first' : undefined"
+          @click="runGit('merge')"
+        >
+          Merge
+        </button>
+      </div>
+      <div v-if="gitAsk" class="git-confirm">
+        <p class="note">{{ gitQuestion(gitAsk) }}</p>
+        <input
+          v-if="gitAsk === 'commit'"
+          v-model="commitMessage"
+          class="git-message"
+          placeholder="Commit message"
+          aria-label="Commit message"
+          @keydown.enter="runGit('commit')"
+        />
+        <select v-if="gitAsk === 'merge'" v-model="mergeBranch" class="git-message mono" aria-label="Branch to merge">
+          <option v-for="b in git.branches" :key="b" :value="b">{{ b }}</option>
+        </select>
+        <div class="git-buttons">
+          <button
+            class="btn git-yes"
+            :disabled="gitBusy || (gitAsk === 'commit' && !commitMessage.trim()) || (gitAsk === 'merge' && !mergeBranch)"
+            @click="runGit(gitAsk)"
+          >
+            {{ gitBusy ? "Working…" : "Yes, " + gitAsk }}
+          </button>
+          <button class="btn" :disabled="gitBusy" @click="gitAsk = null">Cancel</button>
+        </div>
+      </div>
+      <p v-if="gitError" class="git-error">{{ gitError }}</p>
+    </section>
+
+    <div class="welcome">
+      <h2>What do you want to build?</h2>
+      <p>Tell it what you need. Orteca handles the steps.</p>
+    </div>
 
     <!-- One prompt, one clear action. Details stay available without crowding the first step. -->
     <section class="ask card">
@@ -816,7 +934,7 @@ const AUTH: Record<Auth, string> = {
         <!-- Only reported figures reach the words; the per-call threshold is a guess and is not shown as a number. -->
         <span v-if="limitWarning" class="missing limit-warning" role="status">
           {{ preview.provider }}’s {{ limitWarning.window.label }} limit is {{ Math.round(limitWarning.window.usedPercent) }}% used<template v-if="limitWarning.resets">, resets {{ limitWarning.resets }}</template>.
-          This can take up to {{ limitWarning.calls }} AI {{ limitWarning.calls === 1 ? "call" : "calls" }}, so it might not finish.
+          This takes at least {{ limitWarning.calls }} AI {{ limitWarning.calls === 1 ? "call" : "calls" }}, so it might not finish.
           <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
         </span>
         <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
@@ -824,8 +942,6 @@ const AUTH: Record<Auth, string> = {
           <summary>Show the plan</summary>
           <p class="note">{{ preview.route.reason }}</p>
           <p class="note budget-line">
-            Up to {{ preview.route.budget.maxTurns ?? "the provider’s limit" }} steps ·
-            {{ preview.route.budget.maxAgentCalls }} AI {{ preview.route.budget.maxAgentCalls === 1 ? "call" : "calls" }} ·
             {{ preview.model.model }}, {{ preview.model.effort }} effort
             <template v-if="preview.plan">
               · plan at {{ preview.plan.effort }} effort
@@ -833,8 +949,8 @@ const AUTH: Record<Auth, string> = {
             <template v-if="preview.review">
               · review on {{ preview.review.model }}, {{ preview.review.effort }} effort
             </template>
-            <template v-if="preview.escalation">
-              · one more call on {{ preview.escalation.model }}, {{ preview.escalation.effort }} effort, if a check or review doesn’t pass
+            <template v-if="preview.route.stages.some((s) => s === 'verify' || s === 'review')">
+              · fixes and checks again until it passes
             </template>
           </p>
           <p class="note">{{ preview.route.tierReason }}</p>
@@ -993,10 +1109,10 @@ const AUTH: Record<Auth, string> = {
         <!-- Four tiles. Every one labelled, none faked when unknown. -->
         <div class="tiles">
           <div v-if="calls" class="tile">
-            <span class="figure">{{ calls.used }} / {{ calls.allowed }}</span>
+            <span class="figure">{{ calls.used }}</span>
             <span class="note">
-              agent {{ calls.allowed === 1 ? "call" : "calls" }} used ·
-              {{ result.turnsUsed }} / {{ result.route.budget.maxTurns ?? "provider-defined" }} turns —
+              agent {{ calls.used === 1 ? "call" : "calls" }} used ·
+              {{ result.turnsUsed }} turns —
               {{ calls.ran.join(" → ") || "none" }}
             </span>
           </div>
@@ -1082,7 +1198,7 @@ const AUTH: Record<Auth, string> = {
       </div>
     </section>
 
-    <section v-if="history.length || historyError" class="block">
+    <section v-if="history.length || historyError" id="past-work" class="block">
       <h2 class="label">Past work</h2>
       <p v-if="historyError" class="missing">history unavailable</p>
       <ul v-else class="card history">
@@ -1151,7 +1267,7 @@ const AUTH: Record<Auth, string> = {
       </div>
     </section>
 
-    <section class="block">
+    <section id="ai-helpers" class="block">
       <h2 class="label">AI helpers</h2>
       <p v-if="providerError" class="missing">Could not check the AI helpers.</p>
       <ul v-else class="card providers">
@@ -1218,6 +1334,7 @@ const AUTH: Record<Auth, string> = {
       </p>
     </section>
   </main>
+  </div>
 </template>
 
 <style scoped>
@@ -1229,18 +1346,103 @@ const AUTH: Record<Auth, string> = {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+.workspace {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  min-height: 100%;
+}
+.sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 28px 16px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+.brand {
+  padding: 0 12px 28px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.brand span,
+.sidebar-project span {
+  display: block;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: normal;
+}
+.sidebar nav {
+  display: grid;
+  gap: 4px;
+}
+.sidebar nav a,
+.sidebar nav button {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  text-decoration: none;
+  text-align: left;
+  font-size: 12px;
+}
+.sidebar nav a:first-child {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.sidebar nav a:hover,
+.sidebar nav button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.sidebar-project {
+  margin-top: 32px;
+  padding: 16px 12px;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.sidebar-foot {
+  margin: auto 12px 0;
+  padding-top: 24px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
 .project {
   min-height: 100%;
-  max-width: 720px;
+  min-width: 0;
+  width: 100%;
+  max-width: 1000px;
   margin: 0 auto;
-  padding: 56px var(--pad) 72px;
+  padding: 28px clamp(24px, 4vw, 56px) 64px;
 }
 
 header {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 28px;
+  flex-wrap: wrap;
+  margin-bottom: 36px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.welcome {
+  margin-bottom: 24px;
+}
+.welcome h2 {
+  margin: 0;
+  font-size: 30px;
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+.welcome p {
+  margin: 8px 0 0;
+  color: var(--text-dim);
 }
 .back {
   padding: 2px 8px 4px;
@@ -1253,6 +1455,7 @@ header {
   background: var(--surface-2);
 }
 h1 {
+  overflow-wrap: anywhere;
   margin: 0;
   font-size: 20px;
   font-weight: 600;
@@ -1272,14 +1475,53 @@ h1 {
   border-color: var(--border);
 }
 
+.git-bar {
+  display: grid;
+  gap: var(--gap);
+  margin: -20px 0 32px;
+}
+.git-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.git-confirm {
+  display: grid;
+  gap: 8px;
+}
+.git-confirm .note {
+  margin: 0;
+}
+.git-yes {
+  color: var(--warn);
+}
+.git-message {
+  max-width: 420px;
+  padding: 8px 12px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font: inherit;
+}
+.git-message::placeholder {
+  color: var(--text-faint);
+}
+.git-error {
+  margin: 0;
+  color: var(--err);
+  white-space: pre-wrap;
+}
+
 /* Prompt card */
 .ask {
+  border-color: var(--border-strong);
   position: relative;
   overflow: hidden;
   transition: border-color 120ms ease;
 }
 .ask:focus-within {
-  border-color: var(--border-strong);
+  border-color: var(--info);
 }
 .ask-heading {
   display: block;
@@ -1375,9 +1617,7 @@ textarea:disabled {
   gap: 4px 10px;
   margin: 0 12px 12px;
   padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
+  border-top: 1px solid var(--border);
 }
 .preview-title {
   font-size: 12px;
@@ -1573,7 +1813,7 @@ textarea:disabled {
 }
 
 .outcome {
-  padding: 18px;
+  padding: 24px;
 }
 .summary {
   margin: 0 0 16px;
@@ -1581,7 +1821,7 @@ textarea:disabled {
 
 .tiles {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1px;
   background: var(--border);
   border: 1px solid var(--border);
@@ -1590,6 +1830,7 @@ textarea:disabled {
   margin-bottom: 16px;
 }
 .tile {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1690,7 +1931,19 @@ textarea:disabled {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  padding: 7px 0;
+  padding: 12px 0;
+}
+.providers li {
+  flex-wrap: wrap;
+}
+.history li:hover {
+  background: var(--surface-2);
+}
+.history-entry:focus-visible {
+  outline-offset: 4px;
+}
+.steer:focus-within {
+  border-color: var(--info);
 }
 .providers li + li,
 .history li + li {
@@ -1820,6 +2073,25 @@ textarea:disabled {
 }
 
 @media (max-width: 600px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sidebar {
+    position: static;
+    height: auto;
+    padding: 12px var(--pad);
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand,
+  .sidebar-project,
+  .sidebar-foot {
+    display: none;
+  }
+  .sidebar nav {
+    display: flex;
+    flex-wrap: wrap;
+  }
   .project {
     padding-top: 32px;
   }

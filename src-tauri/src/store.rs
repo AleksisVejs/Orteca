@@ -426,10 +426,9 @@ impl Store {
     /// mode: at least five finished runs among the project's last 50, two in
     /// five of them `budgetReached`, `reviewRejected` or `verifyFailed`.
     /// `failed` is left out, because a rate limit or an expired sign-in says
-    /// nothing about the model. Mode is kept apart because Efficient's tighter
-    /// ceilings stop runs that Balanced would have let finish. A run that needed
-    /// its Fix call a tier up is a stall of the tier it started on, however it
-    /// ended.
+    /// nothing about the model. Mode is kept apart because the two modes run
+    /// different tiers. A run that needed fixes and then finished is not a
+    /// stall: fixing until the checks pass is how a route works.
     // ponytail: a Codex implement that changed nothing is `failed` and so not
     // counted; split failure kinds into their own column if that hides stalls.
     pub fn stalled_tiers(
@@ -448,9 +447,7 @@ impl Store {
                 AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed')
               GROUP BY 1, 2
              HAVING COUNT(*) >= 5
-                AND 5 * SUM(t.status != 'done'
-                            OR EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = 'escalation'))
-                    >= 2 * COUNT(*)",
+                AND 5 * SUM(t.status != 'done') >= 2 * COUNT(*)",
         )?;
         let rows = stmt
             .query_map(params![project_id, provider, mode], |r| {
@@ -1169,23 +1166,14 @@ mod tests {
         run("implementOnce", "cheapest", "codex", "reviewRejected");
         assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest)]);
 
-        // A run that needed its Fix call is a stall of the tier it started on,
-        // even when the Fix made it done.
-        for escalated in [false, false, false, true, true] {
+        // A run that needed fixes and then finished did not stall.
+        for _ in 0..5 {
             let task = run("planned", "standard", "codex", "done");
-            if escalated {
-                store
-                    .append_event(task, "fix", "escalation", "codex", "{}")
-                    .unwrap();
-            }
+            store
+                .append_event(task, "fix", "stage", "codex", "{}")
+                .unwrap();
         }
-        assert_eq!(
-            stalled(),
-            [
-                (RouteKind::ImplementOnce, Tier::Cheapest),
-                (RouteKind::Planned, Tier::Standard)
-            ]
-        );
+        assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest)]);
 
         for _ in 0..50 {
             run("standard", "standard", "codex", "done");

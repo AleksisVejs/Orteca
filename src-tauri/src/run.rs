@@ -1,6 +1,6 @@
 //! Running a route: prompt -> stages -> streams -> diff -> result.
 //!
-//! The route and its ceilings are decided in `routing` before anything here
+//! The route and its model choices are decided in `routing` before anything here
 //! starts a process. This module's job is to honour them: run each stage in
 //! turn, normalise every line through the provider's parser, write each event
 //! to the append-only log, let the user steer and stop it, and end with a diff
@@ -9,10 +9,9 @@
 //! A trivial task's route is one Implement stage, so that path is exactly the
 //! single-stage run Milestone 4 shipped, with a budget attached.
 //!
-//! What this module will not do is spend more than the route declared. When a
-//! ceiling is reached the run stops with `budgetReached`, keeping the work, the
-//! diff and the usage - and it never promotes itself to a longer route to
-//! finish the job. Spending more is the user's decision to make.
+//! A failed Verify can be fixed and checked again until it passes or a Fix
+//! makes no progress. An independent Review runs once; its Fix is judged by
+//! Verify instead of buying another reviewer.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -252,8 +251,8 @@ const CANCEL_PAYLOAD: &str = r#"{"kind":"cancel","data":{"by":"user"}}"#;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetStop {
-    /// Which ceiling or explicit stage outcome: `calls`, `turns`, `tokens` or
-    /// `review`.
+    /// Which check a Fix could not move: `review` or `verify`. Older rows also
+    /// carry `calls`, `turns` and `tokens`, from when routes had ceilings.
     pub limit: &'static str,
     pub allowed: u64,
     pub observed: u64,
@@ -288,18 +287,16 @@ pub struct TaskResult {
     pub duration_ms: u64,
     /// The diff includes edits that were already in the working tree.
     pub dirty_at_start: bool,
-    /// The route this run was given before any provider started, ceilings and
+    /// The route this run was given before any provider started, tiers and
     /// classifier signals included.
     pub route: Route,
     /// Stages that actually ran, in order, with any validated artifact.
     pub stages: Vec<StageNote>,
-    /// Provider processes started, stages and resumes together. With
-    /// `route.budget.max_agent_calls` this is the "calls avoided" figure, and
-    /// it is exact: Orteca chose the route and knows the ceiling.
+    /// Provider processes started, stages and resumes together.
     pub calls_used: u32,
-    /// Provider turns that completed. Exact for the same reason.
+    /// Provider turns that completed.
     pub turns_used: u32,
-    /// Set when a ceiling or review outcome stopped the run.
+    /// Set when a Fix changed nothing and a check still did not pass.
     pub budget_stop: Option<BudgetStop>,
     /// Comparable finished runs in this project, once there are five. The UI
     /// shows no savings figure without it.
@@ -312,9 +309,6 @@ pub struct TaskResult {
 #[derive(Debug, Clone)]
 pub struct StagePlan {
     pub stage: Stage,
-    /// The turn ceiling this process may use. Passed to Claude, which has a
-    /// flag for it; enforced by Orteca counting turns for Codex, which has not.
-    pub max_turns: Option<u32>,
     /// The artifact contract, already written to a file. Claude takes the
     /// schema text inline, Codex takes the path.
     pub schema: Option<PathBuf>,
@@ -352,10 +346,9 @@ impl StagePlan {
 /// the widest access Orteca asks for, and a stage that is not meant to edit
 /// gets `read-only` instead.
 ///
-/// Both budget and schema flags were checked against the installed CLIs on
-/// 2026-09-12 rather than taken from the spec. `claude --max-turns <turns>`
-/// exists and is accepted, though it is missing from `--help`; `codex exec`
-/// has no turn flag at all, which is why Orteca counts turns itself.
+/// The schema flags were checked against the installed CLIs on 2026-09-12
+/// rather than taken from the spec. No turn ceiling is passed: a stage runs
+/// until it is done (§4.3.8).
 pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
     let arg = str::to_string;
     let writes = plan.stage.writes();
@@ -430,7 +423,6 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             // native edit tools from every non-writing stage.
             args.push(arg("--disallowedTools"));
             args.extend(claude_deny(writes));
-            args.extend(turn_limit(plan));
             args.extend(schema_arg(plan));
             args.extend(model_args(id, plan));
             args
@@ -457,15 +449,6 @@ fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             format!("model_reasoning_effort=\"{}\"", choice.effort),
         ],
     }
-}
-
-/// Claude's own turn ceiling. Absent from `--help`, present in the parser, and
-/// confirmed by asking the CLI for it without a value: it answers `option
-/// '--max-turns <turns>' argument missing`, which an unknown flag does not.
-fn turn_limit(plan: &StagePlan) -> Vec<String> {
-    plan.max_turns.map_or_else(Vec::new, |turns| {
-        vec!["--max-turns".to_string(), turns.to_string()]
-    })
 }
 
 /// Claude takes the schema as text on the command line, not as a path.
@@ -748,6 +731,20 @@ impl Launch {
             opening: held.join("\n"),
         }
     }
+
+    /// A Fix continues the session that wrote the change, which already holds
+    /// the task and every file it read. Claude also needs this for its Edit
+    /// tool, which refuses a file it has not Read in the same session.
+    fn fix(id: ProviderId, session: &str, brief: &str, plan: &StagePlan) -> Self {
+        match id {
+            ProviderId::Codex => Self::resume(id, session, &[brief.to_string()], plan),
+            ProviderId::Claude => {
+                let mut launch = Self::first(id, brief, plan);
+                launch.argv.extend(["--resume".into(), session.into()]);
+                launch
+            }
+        }
+    }
 }
 
 /// What a task is for as long as it runs. Separate from `State` because none
@@ -765,11 +762,6 @@ struct Context {
     /// merge it into, and resuming this one as well would pay twice to say the
     /// same thing.
     final_stage: bool,
-    /// The current stage plus the stages after it. Used to tell the user what
-    /// a turn ceiling left unstarted.
-    remaining: Vec<Stage>,
-    /// The route's cumulative token ceiling, checked after every turn.
-    max_reported_tokens: Option<u64>,
 }
 
 impl Context {
@@ -786,11 +778,8 @@ struct State {
     recording: Recording,
     /// Provider processes started so far, stages and resumes together.
     calls_used: u32,
-    /// Completed turns across the whole task, and within this process. The
-    /// second is what a turn ceiling is measured against, because that is what
-    /// `claude --max-turns` counts and what Codex would count if it could.
+    /// Completed turns across the whole task.
     turns_used: u32,
-    turns_this_call: u32,
     /// Every instruction the user has given, in order. Unlike `held` this is
     /// never cleared: each later stage's brief repeats all of them, so an
     /// instruction never silently expires.
@@ -799,14 +788,22 @@ struct State {
     notes: Vec<StageNote>,
     /// The structured artifact this stage returned, before it is validated.
     structured: Option<serde_json::Value>,
-    /// Set when a ceiling ended the run. No later stage starts after this.
+    /// Set when a Fix changed nothing and its check still failed. No later
+    /// stage starts after this.
     budget_stop: Option<BudgetStop>,
     /// The route is finished early, and not because anything went wrong: a
-    /// review asked for changes, so the remaining stages have nothing useful
-    /// left to do. What happens next is the user's call.
+    /// Fix changed nothing, so another round has nothing new to try. What
+    /// happens next is the user's call.
     halt: bool,
-    /// The route's one Fix call has been bought. Never reset: there is no second.
-    escalated: bool,
+    /// The session that wrote the change. A Fix resumes it, so the task
+    /// and the files it already read stay in its cached context.
+    work_session: Option<String>,
+    /// Whether the last Fix changed the tree, until a check passes. A check
+    /// that still fails after a Fix that changed nothing ends the run.
+    fix_changed: Option<bool>,
+    /// The running totals Codex last reported for each thread, which is what
+    /// a resumed process's report is measured from.
+    thread_totals: HashMap<String, Usage>,
     /// Non-JSON output - the only clue a CLI leaves when it dies badly.
     noise: Vec<String>,
     /// JSONL records that had no known provider event shape.
@@ -819,20 +816,6 @@ struct State {
     /// Apply-now arrived before Codex identified its session. Restart as soon
     /// as the Started event supplies the ID instead of dropping the request.
     apply_now_pending: bool,
-}
-
-impl State {
-    /// Cumulative uncached tokens: what the inter-turn guard is measured
-    /// against. Cache reads are left out, as the baseline leaves them out: the
-    /// CLI re-reads its own ~40-55k context every turn, so counting it put a
-    /// finished trivial run past its ceiling. A run whose provider reported
-    /// nothing has no honest number and therefore cannot have crossed a ceiling.
-    fn reported_tokens(&self) -> u64 {
-        self.outcome
-            .usage
-            .as_ref()
-            .map_or(0, |u| u.input_tokens.saturating_add(u.output_tokens))
-    }
 }
 
 /// What happens after one process ends.
@@ -874,7 +857,6 @@ pub async fn stream(
         dir,
         plan: StagePlan {
             stage: Stage::Implement,
-            max_turns: None,
             schema: None,
             tier: route.budget.preferred_tier,
             model: None,
@@ -882,21 +864,20 @@ pub async fn stream(
             shell: true,
         },
         final_stage: true,
-        remaining: Vec::new(),
-        max_reported_tokens: route.budget.max_reported_tokens,
     };
     let mut state = State {
         outcome: Outcome::default(),
         recording: Recording::new(None, task_id, Stage::Implement, id),
         calls_used: 0,
         turns_used: 0,
-        turns_this_call: 0,
         constraints: Vec::new(),
         notes: Vec::new(),
         structured: None,
         budget_stop: None,
         halt: false,
-        escalated: false,
+        work_session: None,
+        fix_changed: None,
+        thread_totals: HashMap::new(),
         noise: Vec::new(),
         unknown_events: 0,
         held: Vec::new(),
@@ -911,8 +892,28 @@ pub async fn stream(
         state.outcome.failure = Some(format!("could not record the route: {}", e.message));
     }
 
-    // Mutable because a stage that does not pass may be followed by the one Fix
-    // call the route declared, in place of whatever stages were left.
+    // The checks once before anything changes. A suite that already fails is
+    // the task itself or a setup problem, such as a database that is not
+    // running, and a failure afterwards cannot say which. So it buys no
+    // automatic Fix, and the agent is shown what failed.
+    let mut failing_before = Vec::new();
+    if route.stages.contains(&Stage::Verify) && state.outcome.failure.is_none() {
+        ctx.plan.stage = Stage::Verify;
+        let scope = VerifyScope {
+            index: 0,
+            of: route.stages.len(),
+            base_commit: base_commit.as_deref(),
+            before_run: before_run.as_ref(),
+            before_change: Some(&route.candidate_paths),
+        };
+        if verify_locally(store, &ctx, &mut state, &mut control, &emit, scope).await == Some(false) {
+            failing_before = state.structured.as_ref().map(failed_checks).unwrap_or_default();
+        }
+        state.structured = None;
+    }
+
+    // Mutable because a failed check is followed by a Fix and the same check.
+    // An independent Review runs at most once; its fix is judged by Verify.
     let mut stages = route.stages.clone();
     let mut index = 0;
     while index < stages.len() {
@@ -924,28 +925,20 @@ pub async fn stream(
         {
             break;
         }
-        // Checked before the stage, never during it. Orteca cannot interrupt a
-        // turn that is already running, so the honest place to enforce a
-        // ceiling is the gap between one call and the next.
-        if let Some(stop) = gate(&route, &state, index, &stages) {
-            let _ = note(store, &ctx, "budget", &budget_payload("stopped", &stop));
-            state.budget_stop = Some(stop);
-            break;
-        }
-
-        let tier = match (stage, route.budget.escalation, route.budget.review_tier) {
-            (Stage::Fix, Some(up), _) => up,
-            (Stage::Review, _, Some(review)) => review,
+        // A Fix stays on the tier that wrote the change: a resumed session on
+        // another model would re-read its whole history uncached.
+        let tier = match (stage, route.budget.review_tier) {
+            (Stage::Review, Some(review)) => review,
             _ => route.budget.preferred_tier,
         };
         let choice = match stage {
             Stage::Plan => route.plan_model(id),
             Stage::Review => route.review_model(id),
+            Stage::Implement | Stage::Fix => route.work_model(id),
             _ => None,
         };
         ctx.plan = StagePlan {
             stage,
-            max_turns: route.budget.max_turns,
             schema: write_schema(task_id, stage),
             tier,
             model: choice.map(|choice| choice.model),
@@ -956,12 +949,15 @@ pub async fn stream(
                 && !routing::needs_shell(&prompt)),
         };
         ctx.final_stage = index + 1 == stages.len();
-        ctx.remaining = stages[index..].to_vec();
         state.outcome.begin_stage();
         state.structured = None;
         state.session = None;
-        state.turns_this_call = 0;
         state.recording = Recording::new(recordings.as_deref(), task_id, stage, id);
+        // What a Fix is measured against: one that leaves this unchanged made
+        // no progress, and another round would only repeat it.
+        let before_fix = (stage == Stage::Fix)
+            .then(|| project::patch_since(&ctx.dir, base_commit.as_deref()).ok())
+            .flatten();
 
         // A Verify is a test command and a pass or a fail. When the repository
         // names its command Orteca runs it: no model call, no false failure
@@ -973,15 +969,40 @@ pub async fn stream(
                 &mut state,
                 &mut control,
                 &emit,
-                index,
-                stages.len(),
+                VerifyScope {
+                    index,
+                    of: stages.len(),
+                    base_commit: base_commit.as_deref(),
+                    before_run: before_run.as_ref(),
+                    before_change: None,
+                },
             )
-            .await;
+            .await
+            .is_some();
         if !checked_locally {
             let mut brief =
                 routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
             if id == ProviderId::Codex && stage == Stage::Implement {
                 brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
+            }
+            if stage == Stage::Review {
+                brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
+            }
+            if stage == Stage::Implement && !failing_before.is_empty() {
+                let output: Vec<String> = failing_before
+                    .iter()
+                    .map(|check| format!("{}
+{}", check["command"].as_str().unwrap_or_default(), check["output"].as_str().unwrap_or_default()))
+                    .collect();
+                brief.push_str(&format!(
+                    "
+
+Before any change, the project's checks already fail. This may be the task, or a setup problem no edit can fix:
+{}",
+                    output.join("
+
+")
+                ));
             }
             if let Err(e) = note(
                 store,
@@ -996,26 +1017,67 @@ pub async fn stream(
             // Usually one pass. A checkpoint provider told to apply an instruction
             // now ends its process and comes back through here resuming its own
             // session.
-            let mut launch = Launch::first(id, &brief, &ctx.plan);
+            let mut launch = match state.work_session.as_deref() {
+                Some(session) if stage == Stage::Fix => Launch::fix(id, session, &brief, &ctx.plan),
+                _ => Launch::first(id, &brief, &ctx.plan),
+            };
             loop {
                 match attempt(store, &ctx, &mut state, &mut control, &emit, launch).await {
                     Next::Ended => break,
                     Next::Restart(again) => launch = again,
                 }
             }
+            if stage.writes() && state.session.is_some() {
+                state.work_session = state.session.clone();
+            }
         }
 
         // A stage that ended in an instruction still waiting is not a stage
         // that lost it: the constraint list carries it into the next brief.
         state.held.clear();
-        let note_for_stage = finish_stage(store, &ctx, &mut state, stage, route.budget.escalation);
+        if stage == Stage::Fix {
+            let after = project::patch_since(&ctx.dir, base_commit.as_deref()).ok();
+            state.fix_changed =
+                Some(before_fix.is_none() || after.is_none() || before_fix != after);
+        }
+        let fixing_review = stage == Stage::Fix
+            && state
+                .notes
+                .last()
+                .is_some_and(|note| note.stage == Stage::Review);
+        let (note_for_stage, failed) = finish_stage(store, &ctx, &mut state, stage);
         state.notes.push(note_for_stage);
-        if state.escalated && !stages.contains(&Stage::Fix) {
-            stages.truncate(index + 1);
-            stages.push(Stage::Fix);
-            // A failed check does not cancel the Review still to come: it reads the fix.
-            if stage == Stage::Verify && route.verifies_before_review() {
-                stages.push(Stage::Review);
+        // An Implement that changed nothing has nothing to check. Testing an
+        // untouched tree only makes the user wait for the same answer.
+        if stage == Stage::Implement
+            && state.outcome.failure.is_none()
+            && !state.outcome.cancelled
+            && changed_nothing(&ctx.dir, base_commit.as_deref(), before_run.as_ref())
+        {
+            break;
+        }
+        let round = Round {
+            stage,
+            // A Fix that a Verify follows is judged by that Verify.
+            failed: failed
+                && state.outcome.failure.is_none()
+                && !(stage == Stage::Fix && stages.get(index + 1) == Some(&Stage::Verify)),
+            fixing_review,
+            fix_changed: state.fix_changed,
+            notes: &state.notes,
+            failing_before: &failing_before,
+            verifies_before_review: route.verifies_before_review(),
+            remaining: &stages[index + 1..],
+        };
+        match after_stage(round) {
+            Then::Continue => {}
+            Then::Stop(stop) => {
+                let _ = note(store, &ctx, "budget", &budget_payload("stopped", &stop));
+                state.halt = true;
+                state.budget_stop = Some(stop);
+            }
+            Then::Retry(again) => {
+                stages.splice(index + 1..index + 1, again);
             }
         }
         index += 1;
@@ -1067,19 +1129,18 @@ pub async fn stream(
     // carries none of it - the rejections exist only in Codex's own rollout.
     // What the stream cannot hide is the repository: a writing stage that left
     // no change of its own did not do what `done` would claim. Prose is not read.
-    if id == ProviderId::Codex
-        && outcome.failure.is_none()
+    // Claude gets the same check: it can answer an implement brief with a
+    // question and change nothing, and that is not a finished task either.
+    if outcome.failure.is_none()
         && !outcome.cancelled
         && state.budget_stop.is_none()
         && state.notes.iter().any(|n| n.stage.writes())
-        && diff
-            .iter()
-            .all(|f| f.origin == Some(project::Origin::BeforeRun))
+        && ran_nothing(&diff)
     {
-        outcome.failure = Some(
-            "Codex ended its implement stage without changing any file. A sandbox that fell back to read-only looks exactly like this."
-                .into(),
-        );
+        outcome.failure = Some(match id {
+            ProviderId::Codex => "Codex ended its implement stage without changing any file. A sandbox that fell back to read-only looks exactly like this.".into(),
+            _ => format!("{} ended its implement stage without changing any file. Its reply is above.", id.program()),
+        });
     }
     let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
     if let (Some(message), Some(kind)) = (&outcome.failure, outcome.failure_kind()) {
@@ -1178,6 +1239,20 @@ fn runnable(check: &project::Check) -> bool {
 /// Symlinks are skipped, because a tracked link can point outside the repository.
 // ponytail: first three candidates, 8 KB each, 16 KB in all; tune once runs show
 // how often a pasted file was the one edited.
+/// The change a Review reads, pasted so it does not spend turns finding it.
+/// A patch too large to paste is left for the reviewer to open.
+fn pasted_diff(dir: &Path, base: Option<&str>) -> String {
+    const MAX_BYTES: usize = 48 * 1024;
+    match project::patch_since(dir, base) {
+        Ok(patch) if !patch.trim().is_empty() && patch.len() <= MAX_BYTES => format!(
+            "\nThe change under review, as a patch against where the run started. Open \
+             other files only where the patch is not enough:\n```diff\n{}\n```\n",
+            patch.trim_end()
+        ),
+        _ => String::new(),
+    }
+}
+
 fn pasted_files(dir: &Path, paths: &[String]) -> String {
     const EACH: u64 = 8_000;
     const TOTAL: usize = 16_000;
@@ -1213,20 +1288,54 @@ fn pasted_files(dir: &Path, paths: &[String]) -> String {
 /// Jest or npm suite cannot read the folders above a repository under the user
 /// profile and dies before it tests anything, and an install needs the network
 /// the sandbox denies. A failure that is the fence's buys a Fix no edit can win.
+struct VerifyScope<'a> {
+    index: usize,
+    of: usize,
+    base_commit: Option<&'a str>,
+    before_run: Option<&'a project::Snapshot>,
+    /// Set for the check before any change: the paths the route expects to
+    /// touch pick the suites, since nothing has changed yet.
+    before_change: Option<&'a [String]>,
+}
+
+/// Trees whose checks passed before a run, keyed by folder, commit, what was
+/// already dirty and which suites ran. A pass is only as old as this launch.
+// ponytail: in memory, so a restart runs the suites again; a table if that hurts.
+static PASSED_BEFORE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Returns `None` when Orteca cannot run the checks itself, otherwise whether
+/// they passed. A cancelled check is not a pass.
 async fn verify_locally(
     store: &Store,
     ctx: &Context,
     state: &mut State,
     control: &mut mpsc::UnboundedReceiver<Control>,
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
-    index: usize,
-    of: usize,
-) -> bool {
-    let (checks, missing): (Vec<_>, Vec<_>) = project::check_commands(&ctx.dir)
+    scope: VerifyScope<'_>,
+) -> Option<bool> {
+    let changed_paths: Vec<String> = match scope.before_change {
+        Some(expected) => expected.to_vec(),
+        None => {
+            let mut changed =
+                project::diff_since(&ctx.dir, scope.base_commit).unwrap_or_default();
+            project::attribute(&ctx.dir, &mut changed, scope.before_run);
+            changed
+                .into_iter()
+                .filter(|file| file.origin != Some(project::Origin::BeforeRun))
+                .map(|file| file.path)
+                .collect()
+        }
+    };
+    let (mut checks, missing): (Vec<_>, Vec<_>) =
+        project::relevant_check_commands(&ctx.dir, &changed_paths)
         .into_iter()
         .partition(runnable);
+    let before_change = scope.before_change.is_some();
+    if before_change {
+        checks.retain(|check| quick_check(check).is_some());
+    }
     if checks.is_empty() {
-        return false;
+        return None;
     }
     let label = |check: &project::Check, command: &[&str]| match check.dir.strip_prefix(&ctx.dir) {
         Ok(sub) if !sub.as_os_str().is_empty() => format!(
@@ -1238,13 +1347,27 @@ async fn verify_locally(
     };
     let shown: Vec<String> = checks.iter().map(|c| label(c, &c.test)).collect();
 
-    let stage = serde_json::json!({
-        "kind": "stage",
-        "data": { "stage": Stage::Verify, "index": index, "of": of, "writes": false, "schema": true, "runner": "orteca", "command": shown.join(", ") },
-    });
-    let _ = note(store, ctx, "stage", &stage.to_string());
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (&ctx.dir, scope.base_commit, scope.before_run, &shown).hash(&mut hasher);
+        hasher.finish()
+    };
+    if before_change {
+        if PASSED_BEFORE.lock().is_ok_and(|passed| passed.contains(&key)) {
+            return Some(true);
+        }
+        let event = ProviderEvent::Text("Running the checks once before anything changes".into());
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    } else {
+        let stage = serde_json::json!({
+            "kind": "stage",
+            "data": { "stage": Stage::Verify, "index": scope.index, "of": scope.of, "writes": false, "schema": true, "runner": "orteca", "command": shown.join(", ") },
+        });
+        let _ = note(store, ctx, "stage", &stage.to_string());
+    }
     // A suite with nothing on PATH to run it is said out loud, never passed.
-    for check in &missing {
+    for check in missing.iter().filter(|_| !before_change) {
         let event = ProviderEvent::Text(format!(
             "{} did not run: it is not on PATH",
             label(check, &check.test)
@@ -1262,27 +1385,139 @@ async fn verify_locally(
             let named = label(check, install);
             ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
         }
+        if matches!(ran, Ran::Finished { passed: true, .. }) && !before_change {
+            if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
+                let args: Vec<&str> = focused.iter().map(String::as_str).collect();
+                let named = label(check, &args);
+                ran = run_check(store, ctx, state, control, emit, &args, &check.dir, &named).await;
+                if let Ran::Finished {
+                    passed: true,
+                    output,
+                } = &ran
+                {
+                    results.push(serde_json::json!({
+                        "command": named,
+                        "passed": true,
+                        "output": output,
+                    }));
+                }
+            }
+        }
+        // Before the change the quick check stands in for the suite, and its
+        // result is recorded under the suite's name so a later Verify matches it.
         if matches!(ran, Ran::Finished { passed: true, .. }) {
-            ran = run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await;
+            ran = match quick_check(check).filter(|_| before_change) {
+                Some(quick) => {
+                    let args: Vec<&str> = quick.iter().map(String::as_str).collect();
+                    let named = label(check, &args);
+                    run_check(store, ctx, state, control, emit, &args, &check.dir, &named).await
+                }
+                None => {
+                    run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown)
+                        .await
+                }
+            };
         }
         match ran {
-            Ran::Cancelled => return true,
+            Ran::Cancelled => return Some(false),
             Ran::NotStarted => {}
             // A failed install is reported under its suite, with what it printed.
-            Ran::Finished { passed, output } => results.push(
-                serde_json::json!({ "command": shown, "passed": passed, "output": output }),
-            ),
+            Ran::Finished { passed, output } => {
+                if !passed
+                    && !before_change
+                    && missing_program(&output)
+                    && state.outcome.failure.is_none()
+                {
+                    state.outcome.failure = Some(format!(
+                        "{shown} could not run because a required program is missing. No automatic fix was started."
+                    ));
+                }
+                results.push(
+                    serde_json::json!({ "command": shown, "passed": passed, "output": output }),
+                );
+            }
         }
     }
     if results.is_empty() {
-        return false;
+        return None;
     }
     let passed = results.iter().all(|check| check["passed"] == true);
+    // A tree git could not list has no fingerprint to remember a pass by.
+    if before_change && passed && scope.before_run.is_some() {
+        if let Ok(mut passed_before) = PASSED_BEFORE.lock() {
+            passed_before.push(key);
+        }
+    }
     state.structured = Some(serde_json::json!({
         "checks": results,
         "verdict": if passed { "pass" } else { "fail" },
     }));
-    true
+    Some(passed)
+}
+
+/// A changed Laravel test is the cheapest useful tripwire before a broad
+/// Composer suite. Other ecosystems keep their declared command unchanged.
+fn focused_php_check(root: &Path, check: &project::Check, changed: &[String]) -> Option<Vec<String>> {
+    if check.kind != "php" || !check.dir.join("artisan").is_file() {
+        return None;
+    }
+    let prefix = check
+        .dir
+        .strip_prefix(root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut tests: Vec<String> = changed
+        .iter()
+        .filter_map(|path| {
+            let relative = if prefix.is_empty() {
+                path.as_str()
+            } else {
+                path.strip_prefix(&format!("{prefix}/"))?
+            };
+            (relative.starts_with("tests/") && relative.ends_with(".php"))
+                .then(|| relative.replace('\\', "/"))
+        })
+        .take(8)
+        .collect();
+    if tests.is_empty() {
+        return None;
+    }
+    let mut command = vec!["php".into(), "artisan".into(), "test".into()];
+    command.append(&mut tests);
+    Some(command)
+}
+
+/// One small test file for the check before a change: it boots the app and,
+/// in a Laravel feature test, its database, so a broken setup shows in seconds
+/// instead of a full suite. A single file also keeps a flaky parallel test from
+/// marking the whole suite as failing. Other ecosystems have no generic small
+/// slice, so they skip the check before the change.
+// ponytail: Laravel only, smallest file by size; add an ecosystem when one has a cheap slice.
+fn quick_check(check: &project::Check) -> Option<Vec<String>> {
+    if check.kind != "php" || !check.dir.join("artisan").is_file() {
+        return None;
+    }
+    let file = ["tests/Feature", "tests/Unit"].iter().find_map(|sub| {
+        std::fs::read_dir(check.dir.join(sub))
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.ends_with("Test.php")
+                    .then_some((entry.metadata().ok()?.len(), name))
+            })
+            .min()
+            .map(|(_, name)| format!("{sub}/{name}"))
+    })?;
+    Some(vec!["php".into(), "artisan".into(), "test".into(), file])
+}
+
+fn missing_program(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("is not recognized as an internal or external command")
+        || output.contains("command not found")
 }
 
 enum Ran {
@@ -1292,6 +1527,7 @@ enum Ran {
 }
 
 /// One command to its end, streamed into the run as Orteca's own tool use.
+#[allow(clippy::too_many_arguments)]
 async fn run_check(
     store: &Store,
     ctx: &Context,
@@ -1375,75 +1611,147 @@ fn commit_message(task_id: i64, prompt: &str) -> String {
     format!("Orteca task {task_id}: {line}")
 }
 
-/// Whether the next stage may start.
-///
-/// Three ceilings, checked in the order that a user would want to hear about
-/// them. None of them can stop a turn that is already running, and none of them
-/// ever answers "so run a bigger route instead" - a stop is a stop, and going
-/// further is the user's call.
-fn gate(route: &Route, state: &State, index: usize, stages: &[Stage]) -> Option<BudgetStop> {
-    let remaining: Vec<Stage> = stages[index..].to_vec();
-    let budget = &route.budget;
-    let stop = |limit: &'static str, allowed: u64, observed: u64, message: String| {
-        Some(BudgetStop {
-            limit,
-            allowed,
-            observed,
-            remaining: remaining.clone(),
-            message,
-        })
-    };
-
-    // The Fix call, once bought, is the one call the route declared on top.
-    let allowed = budget.max_agent_calls + u32::from(state.escalated);
-    if state.calls_used >= allowed {
-        return stop(
-            "calls",
-            allowed.into(),
-            state.calls_used.into(),
-            format!(
-                "This route was given {} agent call{}, and they are used up.                  The work so far is kept; running the rest is up to you.",
-                budget.max_agent_calls,
-                if budget.max_agent_calls == 1 { "" } else { "s" }
-            ),
-        );
-    }
-    if let Some(stop) = token_stop(
-        budget.max_reported_tokens,
-        state.reported_tokens(),
-        remaining.clone(),
-    ) {
-        return Some(stop);
-    }
-    None
+/// A finished stage, as far as deciding what follows it.
+struct Round<'a> {
+    stage: Stage,
+    /// A check did not pass, nothing failed around it, and no later stage
+    /// already judges it.
+    failed: bool,
+    /// This stage is a Fix for a Review's findings.
+    fixing_review: bool,
+    fix_changed: Option<bool>,
+    notes: &'a [StageNote],
+    failing_before: &'a [serde_json::Value],
+    verifies_before_review: bool,
+    remaining: &'a [Stage],
 }
 
-/// The stop a token ceiling leaves behind, once cumulative reported tokens are
-/// past it. Usage only arrives with a completed turn, so this can only ever
-/// act between turns - it never claims to interrupt one.
-fn token_stop(limit: Option<u64>, used: u64, remaining: Vec<Stage>) -> Option<BudgetStop> {
-    let limit = limit?;
-    (used > limit).then(|| BudgetStop {
-        limit: "tokens",
-        allowed: limit,
-        observed: used,
+enum Then {
+    Continue,
+    Stop(BudgetStop),
+    /// Run these stages next.
+    Retry(Vec<Stage>),
+}
+
+/// What follows a finished stage. A Fix that changed nothing stops the run; a
+/// suite that failed before the change, or a Verify that already had its Fix,
+/// hands back to the user; anything else that failed gets a Fix and its check.
+fn after_stage(round: Round<'_>) -> Then {
+    let remaining = || round.remaining.to_vec();
+    if round.fixing_review && round.fix_changed == Some(false) {
+        return Then::Stop(stuck(round.notes, remaining()));
+    }
+    if !round.failed {
+        return Then::Continue;
+    }
+    if round.fix_changed == Some(false) {
+        return Then::Stop(stuck(round.notes, remaining()));
+    }
+    if round.stage == Stage::Verify {
+        let failed_again = round
+            .notes
+            .last()
+            .and_then(|note| note.artifact.as_ref())
+            .is_some_and(|artifact| {
+                failed_checks(artifact).iter().any(|now| {
+                    round
+                        .failing_before
+                        .iter()
+                        .any(|then| then["command"] == now["command"])
+                })
+            });
+        if failed_again {
+            return Then::Stop(failed_before_run(remaining()));
+        }
+        if round.notes.iter().any(|note| note.stage == Stage::Fix) {
+            return Then::Stop(fix_limit(remaining()));
+        }
+        return Then::Retry(vec![Stage::Fix, Stage::Verify]);
+    }
+    // A Review runs once. Its fix is judged by deterministic Verify, whether
+    // Verify was originally before or after it.
+    if round.stage == Stage::Review && round.verifies_before_review {
+        return Then::Retry(vec![Stage::Fix, Stage::Verify]);
+    }
+    Then::Retry(vec![Stage::Fix])
+}
+
+/// The stop a Fix that changed nothing leaves behind: the check it answered
+/// still does not pass, and another round would only repeat it.
+fn stuck(notes: &[StageNote], remaining: Vec<Stage>) -> BudgetStop {
+    let review = notes
+        .iter()
+        .rev()
+        .find(|n| matches!(n.stage, Stage::Review | Stage::Verify))
+        .is_some_and(|n| n.stage == Stage::Review);
+    BudgetStop {
+        limit: if review { "review" } else { "verify" },
+        allowed: 0,
+        observed: 0,
         remaining,
-        message: format!(
-            "This run has reported {used} tokens, past the {limit} this route budgeted. \
-             Nothing further was started; the work so far is kept."
-        ),
+        message: if review {
+            "The last fix changed nothing and the review still asks for changes. Its findings are kept; what to do next is up to you."
+        } else {
+            "The last fix changed nothing and the checks still do not pass. What they printed is kept; what to do next is up to you."
+        }
+        .into(),
+    }
+}
+
+/// A failed Verify gets one automatic repair. More attempts can consume an
+/// allowance without converging, so the failing output is returned to the user.
+fn fix_limit(remaining: Vec<Stage>) -> BudgetStop {
+    BudgetStop {
+        limit: "verify",
+        allowed: 1,
+        observed: 1,
+        remaining,
+        message: "One automatic fix was attempted and the checks still do not pass. Their output is kept; another attempt is the user's decision."
+            .into(),
+    }
+}
+
+/// A check that failed before the run changed anything fails again. Orteca
+/// cannot tell a broken setup from unfinished work, so the user decides.
+fn failed_before_run(remaining: Vec<Stage>) -> BudgetStop {
+    BudgetStop {
+        limit: "verify",
+        allowed: 0,
+        observed: 0,
+        remaining,
+        message: "These checks already failed before the run changed anything, so no automatic fix was started. Their output is kept; check the project's setup, then run again."
+            .into(),
+    }
+}
+
+/// Every check in a Verify artifact that did not pass.
+fn failed_checks(artifact: &serde_json::Value) -> Vec<serde_json::Value> {
+    artifact["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|check| check["passed"] != true)
+        .cloned()
+        .collect()
+}
+
+/// Close out one stage: validate whatever artifact came back, log it, and say
+/// whether a check it contracted for did not pass.
+/// Every file in the diff was already changed before the run started.
+fn ran_nothing(diff: &[project::FileStat]) -> bool {
+    diff.iter().all(|f| f.origin == Some(project::Origin::BeforeRun))
+}
+
+/// The run has not changed the repository yet. A diff that cannot be read
+/// counts as a change: stopping early on a guess would hide real work.
+fn changed_nothing(dir: &Path, base: Option<&str>, before: Option<&project::Snapshot>) -> bool {
+    project::diff_since(dir, base).is_ok_and(|mut diff| {
+        project::attribute(dir, &mut diff, before);
+        ran_nothing(&diff)
     })
 }
 
-/// Close out one stage: validate whatever artifact came back, log it, and hand
-/// the next stage what it is entitled to.
-fn finish_stage(
-    store: &Store,
-    ctx: &Context,
-    state: &mut State,
-    stage: Stage,
-    escalation: Option<routing::Tier>,
-) -> StageNote {
+fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -> (StageNote, bool) {
     // An artifact counts only if it arrived as structured output and matches
     // the shape the stage contracted for. The alternative - reading the closing
     // prose and filling the fields from it - is exactly the guesswork the
@@ -1460,55 +1768,24 @@ fn finish_stage(
             &artifact_payload(stage, artifact.as_ref()),
         );
     }
-    // A review that asks for changes, or checks that did not pass, end the
-    // route here - unless the route declared its one Fix call a tier up, which
-    // then runs in place of whatever was left. Verifying a change the review
-    // just rejected spends a call to confirm something already known, and a
-    // second fix would be Orteca spending past what the route declared. The
-    // findings are the result; what to do about them is the user's to choose.
-    // A stage that hit a budget stop did not complete; that stop is the result.
-    if matches!(stage, Stage::Review | Stage::Verify | Stage::Fix)
-        && state.budget_stop.is_none()
+    // A review that asks for changes, a missing artifact, or checks that did
+    // not pass: the caller follows it with a Fix. A passing check clears the
+    // no-progress record, so an old Fix never stops a new round.
+    let failed = matches!(stage, Stage::Review | Stage::Verify | Stage::Fix)
         && !artifact
             .as_ref()
-            .is_some_and(|a| routing::stage_passed(stage, a))
-    {
-        if let Some(tier) = escalation.filter(|_| !state.escalated) {
-            state.escalated = true;
-            let choice = tier.model(ctx.id);
-            let payload = serde_json::json!({
-                "kind": "escalation",
-                "data": { "after": stage, "tier": tier, "model": choice.model, "effort": choice.effort }
-            });
-            let _ = note(store, ctx, "escalation", &payload.to_string());
-            return StageNote {
-                stage,
-                summary: state.outcome.summary(),
-                artifact,
-            };
-        }
-        let remaining = ctx.remaining.iter().skip(1).copied().collect();
-        let stop = BudgetStop {
-            limit: if stage == Stage::Review { "review" } else { "verify" },
-            allowed: 0,
-            observed: 0,
-            remaining,
-            message: if stage == Stage::Review {
-                "The review did not return a valid pass. Its findings are kept; deciding whether to change the work is up to you."
-            } else {
-                "The checks did not report a pass. What they printed is kept; deciding whether to change the work is up to you."
-            }
-            .into(),
-        };
-        state.halt = true;
-        state.budget_stop = Some(stop.clone());
-        let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
+            .is_some_and(|a| routing::stage_passed(stage, a));
+    if !failed && matches!(stage, Stage::Review | Stage::Verify) {
+        state.fix_changed = None;
     }
-    StageNote {
-        stage,
-        summary: state.outcome.summary(),
-        artifact,
-    }
+    (
+        StageNote {
+            stage,
+            summary: state.outcome.summary(),
+            artifact,
+        },
+        failed,
+    )
 }
 
 /// The route, whole, as the event log stores it.
@@ -1570,6 +1847,36 @@ fn artifact_payload(stage: Stage, artifact: Option<&serde_json::Value>) -> Strin
 /// model this stage asked for, as a running total for the process - the shape
 /// `Usage::absorb` and `begin_process` already give a cost. One unpriced turn
 /// voids the task's cost: a total missing a turn reads cheaper than it was.
+/// Codex reports a thread's running totals, and a resumed process carries on
+/// the same thread: checked against its rollout on 2026-09-14, a Fix resumed
+/// after a 418k Implement reported 1.15M. Each report is turned into what it
+/// added since the thread's previous one, or a resumed Fix bills the Implement
+/// again.
+fn added_since(
+    totals: &mut HashMap<String, Usage>,
+    session: Option<&str>,
+    events: &mut [ProviderEvent],
+) {
+    let Some(session) = session else {
+        return;
+    };
+    for event in events {
+        let ProviderEvent::Usage(usage) = event else {
+            continue;
+        };
+        let reported = usage.clone();
+        if let Some(before) = totals.get(session) {
+            usage.input_tokens = usage.input_tokens.saturating_sub(before.input_tokens);
+            usage.cached_input_tokens = usage
+                .cached_input_tokens
+                .saturating_sub(before.cached_input_tokens);
+            usage.output_tokens = usage.output_tokens.saturating_sub(before.output_tokens);
+            usage.reasoning_tokens = usage.reasoning_tokens.saturating_sub(before.reasoning_tokens);
+        }
+        totals.insert(session.to_string(), reported);
+    }
+}
+
 fn price_codex(store: &Store, model: &str, outcome: &mut Outcome, events: &mut [ProviderEvent]) {
     for event in events {
         let ProviderEvent::Usage(usage) = event else {
@@ -1602,7 +1909,6 @@ async fn attempt(
     // Counted before the spawn can fail: a process Orteca tried to start is a
     // call it spent, and hiding the failures would flatter the metric.
     state.calls_used = state.calls_used.saturating_add(1);
-    state.turns_this_call = 0;
     state.outcome.begin_process();
     let mut run = match proc::spawn(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir) {
         Ok(run) => run,
@@ -1657,6 +1963,7 @@ async fn attempt(
                 }
                 let mut events = ctx.id.parse_line(&value);
                 if ctx.id == ProviderId::Codex {
+                    added_since(&mut state.thread_totals, state.session.as_deref(), &mut events);
                     price_codex(store, ctx.plan.model(ctx.id).model, &mut state.outcome, &mut events);
                 }
                 // Each parser understands a subset of its CLI's event types and
@@ -1693,13 +2000,6 @@ async fn attempt(
                     if let ProviderEvent::Started { session_id } = &event {
                         state.session = Some(session_id.clone());
                     }
-                    let provider_budget_reached = matches!(
-                        &event,
-                        ProviderEvent::Failed {
-                            kind: FailureKind::BudgetReached,
-                            ..
-                        }
-                    );
                     if let ProviderEvent::Done {
                         structured, turns, ..
                     } = &event
@@ -1710,35 +2010,8 @@ async fn attempt(
                             state.structured = structured.clone();
                         }
                         state.turns_used = state.turns_used.saturating_add(*turns);
-                        state.turns_this_call = state.turns_this_call.saturating_add(*turns);
                     }
                     state.outcome.absorb(&event);
-                    // `absorb` quite correctly records provider failures, but
-                    // this particular failure is the route's own ceiling. It
-                    // must remain a budget outcome, and the process must be
-                    // stopped before it can enter another stage.
-                    if provider_budget_reached {
-                        // `error_max_turns` is a failed result, so no `Done`
-                        // counted its turns. The CLI stopped at the ceiling it
-                        // was given, which makes the ceiling the exact count;
-                        // its `num_turns` uses a different unit (11 at 10).
-                        if let Some(max) = ctx.plan.max_turns {
-                            state.turns_used = state
-                                .turns_used
-                                .saturating_add(max.saturating_sub(state.turns_this_call));
-                            state.turns_this_call = state.turns_this_call.max(max);
-                        }
-                        state.outcome.failure = None;
-                        state.outcome.reported_kind = None;
-                        if state.budget_stop.is_none() {
-                            let stop = turn_stop(ctx, state);
-                            let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
-                            state.budget_stop = Some(stop);
-                        }
-                        state.outcome.finished = true;
-                        run.cancel();
-                        ending = Some(Next::Ended);
-                    }
                     if matches!(event, ProviderEvent::Done { .. }) {
                         match ctx.id.steering() {
                             // The CLI ends itself once its one turn is done.
@@ -1757,47 +2030,6 @@ async fn attempt(
                 }
                 if state.outcome.failure.is_some() {
                     break;
-                }
-                // Codex has no turn flag at 0.154.0, so Orteca counts for it.
-                // Between turns, never inside one: what this stops is the next
-                // turn, and it says so rather than pretending to interrupt.
-                // Not conditioned on the stage looking finished: Codex ends
-                // every turn with what its parser calls a result, so waiting for
-                // an "unfinished" process would mean never enforcing this at
-                // all. A run that used every turn it was given did reach its
-                // ceiling, and saying so is the honest reading.
-                // The token ceiling is held to the same place: cumulative usage
-                // across every stage so far, checked as each result reports it
-                // (Claude reports only per result, which may span several turns),
-                // so a stage that keeps taking turns stops at the first one
-                // that crosses it rather than only at the next stage boundary.
-                // A process already ending toward a resume is still drained
-                // through here: a turn it completed may cross the ceiling, and
-                // then the resume must not start.
-                if !matches!(ending, Some(Next::Ended)) && state.budget_stop.is_none() {
-                    // Claude enforces its own `--max-turns` and says so with
-                    // `error_max_turns`; a result that used exactly the ceiling
-                    // and succeeded did not run out.
-                    let stop = if ctx.id != ProviderId::Claude
-                        && ctx
-                            .plan
-                            .max_turns
-                            .is_some_and(|max| state.turns_this_call >= max)
-                    {
-                        Some(turn_stop(ctx, state))
-                    } else {
-                        token_stop(
-                            ctx.max_reported_tokens,
-                            state.reported_tokens(),
-                            ctx.remaining.iter().skip(1).copied().collect(),
-                        )
-                    };
-                    if let Some(stop) = stop {
-                        let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
-                        state.budget_stop = Some(stop);
-                        run.cancel();
-                        ending = Some(Next::Ended);
-                    }
                 }
                 if ending.is_none() && state.apply_now_pending {
                     ending = restart_held(ctx, state, &run);
@@ -1921,11 +2153,8 @@ async fn answer(
 /// last launch. Called immediately for Apply now, when a delayed session ID
 /// arrives, or at the natural process boundary for an ordinary Send.
 ///
-/// This resume is exempt from the call ceiling, deliberately. It exists to
-/// deliver something the *user* asked for while the run was going, and the rule
-/// the budget enforces is that Orteca never spends more on its own initiative.
-/// Refusing here would lose an instruction the user was promised would arrive.
-/// The extra call is still counted, and still logged.
+/// It delivers something the *user* asked for while the run was going, so it
+/// is never refused. The extra call is still counted, and still logged.
 fn restart_held(ctx: &Context, state: &mut State, run: &proc::Run) -> Option<Next> {
     let session = state.session.as_deref()?;
     if state.held.is_empty() {
@@ -1946,23 +2175,6 @@ fn restart_held(ctx: &Context, state: &mut State, run: &proc::Run) -> Option<Nex
 fn note(store: &Store, ctx: &Context, kind: &str, payload: &str) -> crate::error::Result<()> {
     store.append_event(ctx.task_id, ctx.stage(), kind, ctx.id.program(), payload)?;
     Ok(())
-}
-
-/// The stop a turn ceiling leaves behind. The route's remaining stages are
-/// listed because they are what the user is being asked to decide about.
-fn turn_stop(ctx: &Context, state: &State) -> BudgetStop {
-    let allowed = ctx.plan.max_turns.unwrap_or(0);
-    BudgetStop {
-        limit: "turns",
-        allowed: allowed.into(),
-        observed: state.turns_this_call.into(),
-        remaining: ctx.remaining.iter().skip(1).copied().collect(),
-        message: format!(
-            "The {} stage reached its ceiling of {allowed} turns. What it had already \
-             done is kept; carrying on is up to you.",
-            ctx.stage()
-        ),
-    }
 }
 
 fn instruction(text: &str, disposition: InstructionDisposition) -> String {
@@ -2022,7 +2234,6 @@ mod tests {
     fn plan_for(stage: Stage) -> StagePlan {
         StagePlan {
             stage,
-            max_turns: Some(6),
             schema: write_schema(0, stage),
             tier: routing::Tier::Cheapest,
             model: None,
@@ -2096,6 +2307,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        // The shims' own logs are not the run's work: a Fix judged by whether it
+        // changed the tree must not see them change.
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "briefs.log\nargv.log\n").unwrap();
         let project = store.touch_project(dir.to_str().unwrap(), "test").unwrap();
         Request {
             task_id: store
@@ -2242,6 +2457,45 @@ mod tests {
         // The agent's own words stay the summary; they were never the signal.
         assert!(result.summary.contains("read-only"));
         std::fs::remove_file(program).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Real run, 2026-09-16: "Fetch latest changes" routed to implement, Claude
+    /// answered with a question about `git fetch`, and the task read "Done".
+    #[tokio::test]
+    async fn a_claude_implement_stage_that_only_asked_a_question_is_not_done() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "claude-asked");
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        // Outside the repository, or the shim itself would be the run's diff.
+        let shim = std::env::temp_dir().join(format!("orteca-claude-asked-{}", std::process::id()));
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(shim.join("fake.cmd"), "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        std::fs::write(
+            shim.join("fake.js"),
+            concat!(
+                "process.stdin.resume();",
+                "console.log(JSON.stringify({type:'result',subtype:'success',",
+                "result:'Did you mean git fetch? Want me to run it?',",
+                "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));",
+                "process.stdin.on('end',()=>process.exit(0));",
+            ),
+        )
+        .unwrap();
+        request.program = shim.join("fake.cmd");
+        request.route.stages = vec![Stage::Implement, Stage::Verify];
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert!(result.diff.is_empty());
+        // Nothing changed, so nothing is tested: the answer comes back at once.
+        let ran: Vec<Stage> = result.stages.iter().map(|n| n.stage).collect();
+        assert_eq!(ran, [Stage::Implement]);
+        assert_eq!(result.status, "failed");
+        assert!(result.failure.unwrap().contains("without changing any file"));
+        assert!(result.summary.contains("git fetch"));
+        std::fs::remove_dir_all(shim).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2418,6 +2672,37 @@ ping -n 60 127.0.0.1 >nul
             None,
             "no reported cost stays unavailable, never 0"
         );
+    }
+
+    /// A resumed Codex thread reports its running totals; only what the
+    /// resumed process added is its own, and another thread starts from zero.
+    #[test]
+    fn a_resumed_codex_thread_counts_only_what_it_added() {
+        let usage = |input, cached, output| {
+            ProviderEvent::Usage(Usage {
+                model: None,
+                input_tokens: input,
+                cached_input_tokens: cached,
+                output_tokens: output,
+                reasoning_tokens: 0,
+                cost_usd: None,
+                cost_quality: CostQuality::Unavailable,
+            })
+        };
+        let tokens = |event: &ProviderEvent| match event {
+            ProviderEvent::Usage(u) => (u.input_tokens, u.cached_input_tokens, u.output_tokens),
+            _ => unreachable!(),
+        };
+        let mut totals = HashMap::new();
+        let mut implement = [usage(55, 363, 10)];
+        added_since(&mut totals, Some("t"), &mut implement);
+        assert_eq!(tokens(&implement[0]), (55, 363, 10));
+        let mut fix = [usage(142, 1004, 12)];
+        added_since(&mut totals, Some("t"), &mut fix);
+        assert_eq!(tokens(&fix[0]), (87, 641, 2));
+        let mut review = [usage(5, 0, 1)];
+        added_since(&mut totals, Some("r"), &mut review);
+        assert_eq!(tokens(&review[0]), (5, 0, 1));
     }
 
     #[test]
@@ -2987,15 +3272,13 @@ ping -n 60 127.0.0.1 >nul
         }
     }
 
-    /// Both budget flags are the ones the installed CLIs actually accept,
-    /// checked against them rather than taken from the spec. Claude has a turn
-    /// ceiling and takes its schema inline; Codex has neither a turn flag nor
-    /// an inline schema, and takes a file.
+    /// The schema flags are the ones the installed CLIs actually accept,
+    /// checked against them rather than taken from the spec. Claude takes its
+    /// schema inline and Codex takes a file. Neither gets a turn ceiling.
     #[test]
-    fn only_verified_ceiling_flags_reach_a_command_line() {
+    fn only_verified_flags_reach_a_command_line() {
         let plan = StagePlan {
             stage: Stage::Plan,
-            max_turns: Some(7),
             schema: write_schema(0, Stage::Plan),
             tier: routing::Tier::Deep,
             model: None,
@@ -3003,7 +3286,10 @@ ping -n 60 127.0.0.1 >nul
             shell: true,
         };
         let claude = args(ProviderId::Claude, &plan);
-        assert!(claude.windows(2).any(|w| w == ["--max-turns", "7"]));
+        assert!(
+            !claude.contains(&"--max-turns".to_string()),
+            "a stage runs until it is done"
+        );
         assert!(claude.contains(&"--json-schema".to_string()));
         assert!(claude.contains(&routing::PLAN_SCHEMA.to_string()));
 
@@ -3076,7 +3362,7 @@ ping -n 60 127.0.0.1 >nul
             format!(
                 "const fs=require('fs');let input='';process.stdin.setEncoding('utf8');\
                  process.stdin.on('data',s=>input+=s);process.stdin.on('end',()=>{{\
-                 fs.appendFileSync('{log}','=== CALL ===\\n'+input);\
+                 fs.appendFileSync('{log}','=== CA'+'LL ===\\n'+input);\
                  console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:input}}}}));\
                  for(let i=0;i<{turns};i++)console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:10,output_tokens:1}}}}));\
                  process.exitCode=0;}});"
@@ -3125,14 +3411,196 @@ ping -n 60 127.0.0.1 >nul
                 "const fs=require('fs');const answers={answers};let buf='',answered=false;process.stdin.setEncoding('utf8');\
                  process.stdin.on('data',d=>{{buf+=d;const ls=buf.split('\\n');buf=ls.pop();\
                  for(const l of ls){{if(!l.trim()||answered)continue;answered=true;\
-                 const n=fs.existsSync('{log}')?fs.readFileSync('{log}','utf8').split('=== CALL ===').length-1:0;\
-                 fs.appendFileSync('{log}','=== CALL ===' + JSON.parse(l).message.content);\
+                 const n=fs.existsSync('{log}')?fs.readFileSync('{log}','utf8').split('=== CA'+'LL ===').length-1:0;\
+                 fs.appendFileSync('{log}','=== CA'+'LL ===' + JSON.parse(l).message.content);\
                  console.log(JSON.stringify({{type:'result',subtype:'success',result:'stage answered',\
                  structured_output:answers[Math.min(n,answers.length-1)],usage:{{input_tokens:10,output_tokens:1}},total_cost_usd:0.01}}));}}}});\
                  process.stdin.on('end',()=>process.exit(0));"
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_failed_verify_is_fixed_once_unless_it_failed_before_the_run() {
+        let failing = serde_json::json!({"checks": [{"command": "npm test", "passed": false, "output": "no"}], "verdict": "fail"});
+        let verify = StageNote { stage: Stage::Verify, summary: String::new(), artifact: Some(failing.clone()) };
+        let fix = StageNote { stage: Stage::Fix, summary: String::new(), artifact: None };
+        let round = |notes, failing_before| Round {
+            stage: Stage::Verify,
+            failed: true,
+            fixing_review: false,
+            fix_changed: None,
+            notes,
+            failing_before,
+            verifies_before_review: false,
+            remaining: &[],
+        };
+        let first = [verify.clone()];
+        let after_fix = [verify.clone(), fix, verify];
+        let before = [failing["checks"][0].clone()];
+        let other = [serde_json::json!({"command": "cargo test", "passed": false})];
+
+        assert!(matches!(after_stage(round(&first, &[])), Then::Retry(s) if s == [Stage::Fix, Stage::Verify]));
+        assert!(matches!(after_stage(round(&first, &other)), Then::Retry(_)), "another suite failing before is no excuse");
+        assert!(matches!(after_stage(round(&first, &before)), Then::Stop(stop) if stop.message.contains("already failed")));
+        assert!(matches!(after_stage(round(&after_fix, &[])), Then::Stop(stop) if stop.message.contains("One automatic fix")));
+        assert!(matches!(after_stage(Round { failed: false, ..round(&first, &before) }), Then::Continue));
+    }
+
+    /// A `package.json` whose test fails the first time it runs, saying why,
+    /// and passes every time after.
+    const FAILS_ONCE: &str = r#"{"scripts":{"test":"node -e \"const f=require('fs');if(f.existsSync('ran'))process.exit(0);f.writeFileSync('ran','');console.log('header is not bold');process.exit(1)\""}}"#;
+
+    /// A stand-in Laravel app: `composer test` runs the suite, the quick check
+    /// runs one test file, and both log what ran. A `broken` file fails both,
+    /// the way a database that is not running would. `None` when PHP or
+    /// Composer is not on PATH, so the caller can skip.
+    fn fake_laravel(dir: &std::path::Path) -> Option<()> {
+        crate::providers::which("php")?;
+        crate::providers::which("composer")?;
+        std::fs::write(
+            dir.join("composer.json"),
+            r#"{"scripts":{"test":"@php artisan suite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("artisan"),
+            "<?php\nfile_put_contents('runs.log', implode(' ', array_slice($argv, 1)) . \"\\n\", FILE_APPEND);\n\
+             if (file_exists('broken')) { echo \"SQLSTATE connection refused\\n\"; exit(1); }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
+        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\n// more\n").unwrap();
+        Some(())
+    }
+
+    #[test]
+    fn the_check_before_a_change_is_one_small_laravel_test() {
+        let dir = std::env::temp_dir().join(format!("orteca-quick-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
+        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\n// more\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/helpers.php"), "").unwrap();
+        let check = |kind| project::Check {
+            kind,
+            dir: dir.clone(),
+            install: None,
+            test: vec!["composer", "test"],
+        };
+        assert_eq!(quick_check(&check("php")), None, "no artisan, not Laravel");
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        assert_eq!(
+            quick_check(&check("php")),
+            Some(vec!["php".into(), "artisan".into(), "test".into(), "tests/Feature/SmallTest.php".into()])
+        );
+        assert_eq!(quick_check(&check("js")), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Checks that already failed before the change are shown to the agent,
+    /// and failing again buys no Fix: Orteca cannot tell a broken setup from
+    /// unfinished work.
+    #[tokio::test]
+    async fn checks_that_failed_before_the_run_buy_no_fix() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let mut request = routed(&store, "failed-before", route);
+        let dir = request.dir.clone();
+        if fake_laravel(&dir).is_none() {
+            eprintln!("skipped: php or composer is not on PATH");
+            return;
+        }
+        std::fs::write(dir.join("broken"), "").unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "verifyFailed", "{:?}", result.failure);
+        assert_eq!(result.calls_used, 1, "a failure the run did not cause bought a Fix");
+        assert_eq!(
+            result.stages.iter().map(|note| note.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify]
+        );
+        let stop = result.budget_stop.expect("the stop was not returned");
+        assert!(stop.message.contains("already failed"), "{}", stop.message);
+        assert!(
+            briefs(&dir)[0].contains("SQLSTATE connection refused"),
+            "the agent was not shown what already fails"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pass before the change is remembered for the same tree, so the next
+    /// run does not pay for the quick check twice.
+    #[tokio::test]
+    async fn a_passing_check_before_the_run_is_not_repeated_for_the_same_tree() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        let mut dir = None;
+        // The quick check, then Verify: the untracked test files count as
+        // changed, so their tripwire runs before the suite. The second run
+        // skips the quick check.
+        let verify = "test tests/Feature/LargerTest.php tests/Feature/SmallTest.php\nsuite\n";
+        let first = format!("test tests/Feature/SmallTest.php\n{verify}");
+        for runs in [first.clone(), format!("{first}{verify}")] {
+            let mut request = routed(&store, "passed-before", route.clone());
+            if fake_laravel(&request.dir).is_none() {
+                eprintln!("skipped: php or composer is not on PATH");
+                return;
+            }
+            claude_shim(&mut request, &passing);
+            let here = request.dir.clone();
+            let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+            assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+            assert_eq!(std::fs::read_to_string(here.join("runs.log")).unwrap(), runs);
+            dir = Some(here);
+        }
+        std::fs::remove_dir_all(dir.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn changed_laravel_tests_become_the_early_tripwire() {
+        let dir = std::env::temp_dir().join(format!(
+            "orteca-focused-php-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        let check = project::Check {
+            kind: "php",
+            dir: dir.clone(),
+            install: None,
+            test: vec!["composer", "test"],
+        };
+        assert_eq!(
+            focused_php_check(
+                &dir,
+                &check,
+                &[
+                    "app/Console/Command.php".into(),
+                    "tests/Feature/ReminderTest.php".into(),
+                ],
+            ),
+            Some(vec![
+                "php".into(),
+                "artisan".into(),
+                "test".into(),
+                "tests/Feature/ReminderTest.php".into(),
+            ])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// What each call was actually asked to do.
@@ -3224,7 +3692,6 @@ ping -n 60 127.0.0.1 >nul
             result.calls_used, 1,
             "a trivial task started more than one process"
         );
-        assert_eq!(result.route.budget.max_agent_calls, 1);
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
             [Stage::Implement]
@@ -3252,7 +3719,7 @@ ping -n 60 127.0.0.1 >nul
     /// Every routing and budget decision is in the log, because Milestone 7
     /// cannot score a route it cannot see.
     #[tokio::test]
-    async fn the_route_and_its_ceilings_are_recorded_before_anything_runs() {
+    async fn the_route_is_recorded_before_anything_runs() {
         let store = Store::in_memory().unwrap();
         let request = routed(&store, "recorded", one_call("fix the typo in the readme"));
         let (dir, task) = (request.dir.clone(), request.task_id);
@@ -3265,8 +3732,6 @@ ping -n 60 127.0.0.1 >nul
             .find(|v| v["kind"] == "routing")
             .expect("no routing decision was recorded");
         assert_eq!(routing["data"]["kind"], "implementOnce");
-        assert_eq!(routing["data"]["budget"]["maxAgentCalls"], 1);
-        assert!(routing["data"]["budget"]["maxTurns"].is_number());
         assert!(routing["data"]["signals"]["complexity"].is_number());
         assert!(routing["data"]["reason"]
             .as_str()
@@ -3354,8 +3819,8 @@ ping -n 60 127.0.0.1 >nul
     }
 
     /// A repository that names its test command is verified by Orteca running
-    /// it: no Verify call. A failure still buys the Fix, which is told what the
-    /// suite printed.
+    /// it: no Verify call. A failure is followed by a Fix, which is told what the
+    /// suite printed, and the suite runs again on the fix.
     #[tokio::test]
     async fn a_declared_test_command_is_verified_without_an_agent_call() {
         let store = Store::in_memory().unwrap();
@@ -3402,13 +3867,14 @@ ping -n 60 127.0.0.1 >nul
 
         let mut request = routed(&store, "local-verify-fail", route);
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), script(1)).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
         claude_shim(&mut request, &passing);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done");
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
-            [Stage::Implement, Stage::Verify, Stage::Fix]
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Verify],
+            "the fix was not checked again"
         );
         assert_eq!(
             result.calls_used, 2,
@@ -3423,9 +3889,44 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn a_missing_test_dependency_never_buys_an_agent_fix() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let mut request = routed(&store, "missing-test-program", route);
+        let dir = request.dir.clone();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"node -e \"console.log('mysql is not recognized as an internal or external command');process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.calls_used, 1, "an environment failure bought a Fix");
+        assert!(
+            result
+                .failure
+                .as_deref()
+                .is_some_and(|message| message.contains("required program is missing"))
+        );
+        assert_eq!(
+            result.stages.iter().map(|note| note.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Guarded work in a repository with a test command runs the tests before
     /// the deep Review. Passing work is reviewed knowing the tests pass; a
-    /// failure buys the Fix, and the Review still reads the fix.
+    /// failure is fixed and tested again, and the Review reads the fix.
     #[tokio::test]
     async fn guarded_work_runs_its_tests_before_the_review() {
         let store = Store::in_memory().unwrap();
@@ -3464,23 +3965,34 @@ ping -n 60 127.0.0.1 >nul
 
         let mut request = routed(&store, "guarded-tests-fail", route);
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), script(1)).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
         claude_shim_answers(&mut request, &[review.clone(), fixed, review]);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(
             stages(&result),
-            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Review]
+            [
+                Stage::Implement,
+                Stage::Verify,
+                Stage::Fix,
+                Stage::Verify,
+                Stage::Review
+            ]
         );
         assert_eq!(result.calls_used, 3);
         let calls = briefs(&dir);
         assert!(
-            calls[1].contains("A review reads the fix"),
-            "the fix was told it is the last call"
+            calls[1].contains("runs again after this call"),
+            "{}",
+            calls[1]
         );
         assert!(
-            !calls[2].contains("tests already pass"),
-            "the review was told failing tests pass"
+            calls[2].contains("tests already pass"),
+            "the review was not told the fix passed its tests"
+        );
+        assert!(
+            calls[2].contains("The change under review"),
+            "the review was not handed the patch"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3507,270 +4019,6 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(result.status, "done");
         assert_eq!(result.stages.len(), 1);
         assert_eq!(result.stages[0].artifact, Some(artifact));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Running out of calls is its own outcome. The diff, the usage and the
-    /// work so far all survive it, and no stage starts afterwards.
-    #[tokio::test]
-    async fn a_route_that_runs_out_of_calls_stops_and_keeps_its_work() {
-        let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
-            "redesign the storage subsystem",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        assert_eq!(route.stages.len(), 3);
-        // A ceiling below the route's own length: what a rolled-back budget, or
-        // a resume the user asked for, would leave behind.
-        route.budget.max_agent_calls = 2;
-        let request = routed(&store, "out-of-calls", route);
-        let (dir, task) = (request.dir.clone(), request.task_id);
-        answering_shim(&request, 1);
-        // Something in the working tree, so "the work is kept" is testable.
-        std::fs::write(dir.join("touched.txt"), "work the agent did").unwrap();
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.failure, None, "a budget stop is not a failure");
-        assert_eq!(result.calls_used, 2, "a third call was started anyway");
-        assert_eq!(briefs(&dir).len(), 2);
-
-        let stop = result.budget_stop.expect("no budget stop was reported");
-        assert_eq!(stop.limit, "calls");
-        assert_eq!(stop.allowed, 2);
-        assert_eq!(
-            stop.remaining,
-            [Stage::Verify],
-            "the user is not told what is left"
-        );
-        assert!(
-            stop.message.contains("up to you"),
-            "the stop must hand the choice back"
-        );
-
-        // Work, diff and usage all preserved.
-        assert!(
-            result.diff.iter().any(|f| f.path.contains("touched.txt")),
-            "the diff was lost"
-        );
-        assert!(result.usage.is_some(), "usage was lost");
-        assert!(!result.summary.is_empty(), "what the agent said was lost");
-        // And the route is unchanged: a stop never rewrites itself into a
-        // bigger budget so it can carry on.
-        assert_eq!(result.route.budget.max_agent_calls, 2);
-        assert_eq!(result.route.stages.len(), 3);
-
-        let budget: Vec<_> = store
-            .event_payloads(task)
-            .into_iter()
-            .filter(|v| v["kind"] == "budget")
-            .collect();
-        assert!(budget
-            .iter()
-            .any(|v| v["data"]["decision"] == "stopped" && v["data"]["limit"] == "calls"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_turn_budget_stop_prevents_later_stages() {
-        let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
-            "redesign the storage subsystem",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        route.budget.max_turns = Some(1);
-        let request = routed(&store, "turn-stop-route", route);
-        let dir = request.dir.clone();
-        answering_shim(&request, 3);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.failure, None);
-        assert_eq!(
-            result.calls_used, 1,
-            "the next stage started after a turn stop"
-        );
-        assert_eq!(
-            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
-            [Stage::Plan]
-        );
-        let stop = result.budget_stop.expect("no turn budget stop");
-        assert_eq!(stop.limit, "turns");
-        assert_eq!(stop.remaining, [Stage::Implement, Stage::Verify]);
-        assert_eq!(briefs(&dir).len(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// The rule the milestone turns on: after a budget stop nothing escalates.
-    /// Not a longer route, not one more call, not a quiet retry.
-    #[tokio::test]
-    async fn a_budget_stop_never_escalates_by_itself() {
-        let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
-            "redesign the storage subsystem",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        route.budget.max_agent_calls = 1;
-        let before = route.clone();
-        let request = routed(&store, "no-escalation", route);
-        let (dir, task) = (request.dir.clone(), request.task_id);
-        answering_shim(&request, 1);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.calls_used, 1);
-        assert_eq!(
-            briefs(&dir).len(),
-            1,
-            "another provider process was started after the stop"
-        );
-        assert_eq!(
-            result.route, before,
-            "the route rewrote itself after being stopped"
-        );
-        // Only the first stage ever ran.
-        let stages: Vec<String> = store
-            .event_payloads(task)
-            .into_iter()
-            .filter(|v| v["kind"] == "stage")
-            .map(|v| v["data"]["stage"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(stages, ["plan"]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_claude_result_that_used_every_turn_and_succeeded_is_done() {
-        let store = Store::in_memory().unwrap();
-        let mut route = one_call("fix the typo");
-        route.budget.max_turns = Some(2);
-        let mut request = routed(&store, "claude-full-turns", route);
-        request.id = ProviderId::Claude;
-        let dir = request.dir.clone();
-        std::fs::write(&request.program, "@echo off
-echo {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":2,\"result\":\"ok\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}
-exit /b 0
-").unwrap();
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "done");
-        assert!(result.budget_stop.is_none());
-        assert_eq!(result.turns_used, 2);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn claude_max_turns_is_reported_as_a_budget_stop() {
-        let store = Store::in_memory().unwrap();
-        let mut request = routed(&store, "claude-turn-stop", one_call("fix the typo"));
-        request.id = ProviderId::Claude;
-        let dir = request.dir.clone();
-        std::fs::write(&request.program, "@echo off\r\necho {\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"ceiling\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}\r\nexit /b 0\r\n").unwrap();
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.failure, None);
-        let stop = result.budget_stop.expect("no budget stop was reported");
-        assert_eq!(stop.limit, "turns");
-        assert_eq!(
-            stop.observed, stop.allowed,
-            "the stop said fewer turns than the ceiling Claude hit"
-        );
-        assert_eq!(u64::from(result.turns_used), stop.allowed);
-        assert!(result.usage.is_some());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Codex has no turn flag, so Orteca counts turns for it. The ceiling ends
-    /// the stage between turns - it does not claim to interrupt one - and what
-    /// the stage already did is kept.
-    #[tokio::test]
-    async fn a_turn_ceiling_ends_a_stage_without_failing_it() {
-        let store = Store::in_memory().unwrap();
-        let mut route = one_call("fix the typo in the readme");
-        route.budget.max_turns = Some(2);
-        let request = routed(&store, "turns", route);
-        let dir = request.dir.clone();
-        // Four turns offered against a ceiling of two.
-        answering_shim(&request, 4);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.failure, None);
-        let stop = result.budget_stop.expect("no budget stop was reported");
-        assert_eq!(stop.limit, "turns");
-        assert_eq!(stop.allowed, 2);
-        assert!(result.turns_used >= 2);
-        assert!(
-            !result.summary.is_empty(),
-            "the work the stage did was thrown away"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A token ceiling is an inter-turn guard and says so. It cannot stop a
-    /// turn that is already running, so what it stops is the next stage.
-    #[tokio::test]
-    async fn a_token_ceiling_stops_the_next_stage_not_the_running_one() {
-        let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
-            "redesign the storage subsystem",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        // Below what one turn of the shim reports, so the first stage completes
-        // and the second never starts.
-        route.budget.max_reported_tokens = Some(1);
-        let request = routed(&store, "tokens", route);
-        let dir = request.dir.clone();
-        answering_shim(&request, 1);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(
-            result.calls_used, 1,
-            "the stage that was already running was cut short"
-        );
-        let stop = result.budget_stop.expect("no budget stop was reported");
-        assert_eq!(stop.limit, "tokens");
-        assert!(stop.observed > stop.allowed);
-        assert_eq!(stop.remaining, [Stage::Implement, Stage::Verify]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Cumulative usage is checked as each turn reports it, not only between
-    /// stages: a one-stage route has no boundary at all, and still stops at the
-    /// turn that crossed its ceiling.
-    #[tokio::test]
-    async fn cumulative_usage_stops_a_stage_between_turns() {
-        let store = Store::in_memory().unwrap();
-        let mut route = one_call("fix the typo in the readme");
-        // 11 tokens a turn, so the third turn crosses it.
-        route.budget.max_reported_tokens = Some(25);
-        let request = routed(&store, "token-turns", route);
-        let dir = request.dir.clone();
-        answering_shim(&request, 4);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "budgetReached");
-        assert_eq!(result.failure, None);
-        let stop = result.budget_stop.expect("no token stop was reported");
-        assert_eq!(stop.limit, "tokens");
-        assert_eq!(
-            stop.observed, 33,
-            "the stop was not taken at the turn that crossed the ceiling"
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3806,12 +4054,12 @@ exit /b 0
             }
         );
 
-        // The shim echoes its brief, which is no Verify artifact, so the route
-        // ends there - after every stage ran, which is what this test is about.
+        // The shim echoes its brief, which is no Verify artifact, and changes
+        // nothing, so its Fix makes no progress and the route ends there.
         assert_eq!(result.status, "verifyFailed");
-        // Three stages, three calls: the instruction did not buy an extra
-        // process to say the same thing twice.
-        assert_eq!(result.calls_used, 3);
+        // One call per stage: the instruction did not buy an extra process to
+        // say the same thing twice.
+        assert_eq!(result.calls_used as usize, result.stages.len());
         let calls = briefs(&dir);
         assert!(
             calls[1..]
@@ -3830,19 +4078,16 @@ exit /b 0
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A review that asks for changes ends the route there. Orteca does not add
-    /// a fix call the user did not ask for, and does not spend a Verify call
-    /// confirming something the review has already rejected.
+    /// A review that asks for changes is followed by one Fix. A Fix that
+    /// changes nothing stops before Verify, with the findings kept.
     #[tokio::test]
-    async fn a_review_that_asks_for_changes_does_not_buy_another_call() {
+    async fn a_rejected_review_whose_fix_changes_nothing_ends_the_route() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
+        let route = routing::route(
             "add an authorization check before the delete endpoint",
             Mode::Balanced,
             &RepoSignals::default(),
         );
-        // A route with no Fix call to buy, such as one already on deep.
-        route.budget.escalation = None;
         let mut request = routed(&store, "review", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         // Every call reports a Review artifact asking for changes. Only the
@@ -3860,19 +4105,11 @@ exit /b 0
 
         assert_eq!(result.status, "reviewRejected");
         assert_eq!(
-            result.calls_used, 2,
-            "a call was spent after the review rejected the work"
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Review, Stage::Fix]
         );
-        assert_eq!(
-            result.stages.len(),
-            2,
-            "Verify ran after a review that rejected the work"
-        );
-        assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
-        let artifact = result
-            .stages
-            .last()
-            .unwrap()
+        assert_eq!(result.calls_used, 3);
+        let artifact = result.stages[1]
             .artifact
             .as_ref()
             .expect("the review artifact was dropped");
@@ -3883,6 +4120,7 @@ exit /b 0
             .expect("review stop was not returned");
         assert_eq!(stop.limit, "review");
         assert_eq!(stop.remaining, [Stage::Verify]);
+        assert!(stop.message.contains("changed nothing"), "{}", stop.message);
         // Recorded, so the findings are not only on screen.
         let logged = store
             .event_payloads(task)
@@ -3893,10 +4131,10 @@ exit /b 0
     }
 
     /// A Verify that ends cleanly while one of its checks failed is not `done`,
-    /// whatever verdict it gave itself. It buys the one Fix call a tier up, and
-    /// when that fails too the route ends there: the cap is one call.
+    /// whatever verdict it gave itself. It is fixed on the same tier and checked
+    /// again; when the Fix changes nothing the route ends as `verifyFailed`.
     #[tokio::test]
-    async fn checks_that_did_not_pass_end_the_route_as_verify_failed() {
+    async fn checks_a_fix_cannot_move_end_the_route_as_verify_failed() {
         let store = Store::in_memory().unwrap();
         let route = routing::route(
             "make the header bold",
@@ -3904,7 +4142,6 @@ exit /b 0
             &RepoSignals::default(),
         );
         assert_eq!(route.stages, [Stage::Implement, Stage::Verify]);
-        assert_eq!(route.budget.escalation, Some(routing::Tier::Deep));
         let mut request = routed(&store, "verify-failed", route);
         let (dir, task) = (request.dir.clone(), request.task_id);
         claude_shim(
@@ -3918,10 +4155,10 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "verifyFailed");
-        assert_eq!(result.calls_used, 3);
+        assert_eq!(result.calls_used, 4);
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
-            [Stage::Implement, Stage::Verify, Stage::Fix]
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Verify]
         );
         assert_eq!(
             result.failure, None,
@@ -3934,28 +4171,61 @@ exit /b 0
         assert_eq!(stop.limit, "verify");
         assert!(stop.remaining.is_empty());
         let payloads = store.event_payloads(task);
-        assert_eq!(
+        let model = |stage: &str| {
             payloads
                 .iter()
-                .filter(|v| v["kind"] == "escalation")
-                .count(),
-            1
-        );
-        let fix = payloads
-            .iter()
-            .find(|v| v["kind"] == "stage" && v["data"]["stage"] == "fix")
-            .expect("no fix stage recorded");
+                .find(|v| v["kind"] == "stage" && v["data"]["stage"] == stage)
+                .map(|v| v["data"]["model"].clone())
+        };
         assert_eq!(
-            fix["data"]["model"], "opus",
-            "the fix did not run a tier up"
+            model("fix"),
+            model("implement"),
+            "the fix left the model that wrote the change"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The Fix call can rescue the task: checks that failed on the route's tier
-    /// pass after a fix a tier up, and the run is done.
     #[tokio::test]
-    async fn a_fix_a_tier_up_that_passes_finishes_the_task() {
+    async fn a_changed_fix_gets_no_second_paid_attempt_when_verify_still_fails() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let mut request = routed(&store, "one-fix", route);
+        let dir = request.dir.clone();
+        let failing = serde_json::json!({
+            "checks": [{"command": "npm test", "passed": false, "output": "still failing"}],
+            "verdict": "fail"
+        });
+        claude_shim(&mut request, &failing);
+        let shim = dir.join("fake.js");
+        let script = std::fs::read_to_string(&shim).unwrap().replacen(
+            "fs.appendFileSync(",
+            "if(n===2)fs.writeFileSync('changed.txt','changed');fs.appendFileSync(",
+            1,
+        );
+        std::fs::write(&shim, script).unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "verifyFailed");
+        assert_eq!(
+            result.stages.iter().map(|note| note.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Verify]
+        );
+        assert_eq!(result.calls_used, 4, "a second Fix call was started");
+        let stop = result.budget_stop.expect("the retry limit was not returned");
+        assert_eq!((stop.limit, stop.allowed, stop.observed), ("verify", 1, 1));
+        assert!(stop.message.contains("One automatic fix"), "{}", stop.message);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Fix rescues the task: checks that failed pass when they run again on
+    /// the fix, and the run is done.
+    #[tokio::test]
+    async fn a_fix_that_passes_its_check_again_finishes_the_task() {
         let store = Store::in_memory().unwrap();
         let route = routing::route(
             "make the header bold",
@@ -3971,7 +4241,7 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "done");
-        assert_eq!(result.calls_used, 3);
+        assert_eq!(result.calls_used, 4);
         assert!(result.budget_stop.is_none());
         let calls = briefs(&dir);
         assert!(
@@ -3982,47 +4252,64 @@ exit /b 0
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A review that asks for changes buys the same one call, and the Fix takes
-    /// the place of the Verify that was left.
+    /// A review runs once. Its findings are fixed, then the existing Verify
+    /// stage checks the result without buying another independent review.
     #[tokio::test]
-    async fn a_rejected_review_buys_one_fix_in_place_of_what_was_left() {
+    async fn a_rejected_review_is_fixed_then_verified() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
+        let route = routing::route(
             "add an authorization check before the delete endpoint",
             Mode::Balanced,
             &RepoSignals::default(),
         );
-        route.budget.preferred_tier = routing::Tier::Standard;
-        route.budget.escalation = Some(routing::Tier::Deep);
-        let mut request = routed(&store, "escalated-review", route);
+        let mut request = routed(&store, "review-again", route);
         let dir = request.dir.clone();
         let rejected = serde_json::json!({
             "findings": [{"severity": "high", "file": "a.rs", "line": 1, "issue": "unchecked", "fix": "check it"}],
             "verdict": "changes_requested"
         });
-        let passing = serde_json::json!({"checks": [{"command": "cargo test auth", "passed": true, "output": "ok"}], "verdict": "pass"});
+        // Valid as a Fix and Verify, since the shim gives both the same answer.
+        let passing = serde_json::json!({"findings": [], "checks": [{"command": "cargo test auth", "passed": true, "output": "ok"}], "verdict": "pass"});
         claude_shim_answers(&mut request, &[rejected.clone(), rejected, passing]);
+        let shim = dir.join("fake.js");
+        let script = std::fs::read_to_string(&shim).unwrap().replacen(
+            "fs.appendFileSync(",
+            "if(n===2)fs.writeFileSync('fixed.txt','fixed');fs.appendFileSync(",
+            1,
+        );
+        std::fs::write(&shim, script).unwrap();
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
-        assert_eq!(result.status, "done");
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(
             result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
-            [Stage::Implement, Stage::Review, Stage::Fix]
+            [
+                Stage::Implement,
+                Stage::Review,
+                Stage::Fix,
+                Stage::Verify
+            ]
         );
-        assert_eq!(result.calls_used, 3);
+        assert_eq!(result.calls_used, 4);
+        let calls = briefs(&dir);
+        assert!(
+            calls[2].contains("Validated review artifact") && calls[2].contains("unchecked"),
+            "the fix was not told what the review found: {}",
+            calls[2]
+        );
+        assert!(calls[1].contains("The change under review"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn a_missing_review_artifact_rejects_the_route_without_verify() {
+    async fn a_missing_review_artifact_is_not_a_pass() {
         let store = Store::in_memory().unwrap();
-        let mut route = routing::route(
+        let route = routing::route(
             "add an authorization check before the delete endpoint",
             Mode::Balanced,
             &RepoSignals::default(),
         );
-        route.budget.escalation = None;
         let mut request = routed(&store, "missing-review", route);
         let dir = request.dir.clone();
         claude_shim(
@@ -4033,10 +4320,129 @@ exit /b 0
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
         assert_eq!(result.status, "reviewRejected");
-        assert_eq!(result.stages.len(), 2);
-        assert_eq!(result.stages.last().unwrap().stage, Stage::Review);
-        assert!(result.stages.last().unwrap().artifact.is_none());
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Review, Stage::Fix]
+        );
+        assert!(result.stages[1].artifact.is_none());
         assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("review"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A Codex Fix resumes the session that wrote the change, on the same
+    /// model, instead of a fresh process that reads everything again.
+    #[tokio::test]
+    async fn a_codex_fix_resumes_the_session_that_wrote_the_change() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let request = routed(&store, "fix-resumes", route);
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(
+            &request.program,
+            "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
+        )
+        .unwrap();
+        let log = dir.join("argv.log").to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            dir.join("fake.js"),
+            format!(
+                "const fs=require('fs');const a=process.argv.slice(2);let i='';\
+                 process.stdin.setEncoding('utf8');process.stdin.on('data',d=>i+=d);\
+                 process.stdin.on('end',()=>{{fs.appendFileSync('{log}',a.join(' ')+'\\n');\
+                 if(a.includes('resume')){{console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',\
+                 text:JSON.stringify({{checks:[{{command:'npm test',passed:true,output:'ok'}}],verdict:'pass'}})}}}}));}}\
+                 else{{console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
+                 console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:'edited'}}}}));}}\
+                 console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));}});"
+            ),
+        )
+        .unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(
+            result.status, "done",
+            "{:?} {:?}",
+            result.failure, result.budget_stop
+        );
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Verify]
+        );
+        let calls: Vec<String> = std::fs::read_to_string(dir.join("argv.log"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(!calls[0].contains("resume"), "{}", calls[0]);
+        assert!(calls[1].starts_with("exec resume sess-1"), "{}", calls[1]);
+        assert!(
+            calls[1].contains("gpt-5.6-terra"),
+            "the fix left the model that wrote the change: {}",
+            calls[1]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Claude's Fix continues the session that wrote the change.
+    #[tokio::test]
+    async fn a_claude_fix_resumes_the_session_that_wrote_the_change() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route(
+            "make the header bold",
+            Mode::Balanced,
+            &RepoSignals::default(),
+        );
+        let mut request = routed(&store, "claude-fix-resumes", route);
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(
+            &request.program,
+            "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
+        )
+        .unwrap();
+        let log = dir.join("argv.log").to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            dir.join("fake.js"),
+            format!(
+                "const fs=require('fs');fs.appendFileSync('{log}',process.argv.slice(2).join(' ')+'\\n');\
+                 let answered=false;process.stdin.setEncoding('utf8');process.stdin.on('data',()=>{{if(answered)return;answered=true;\
+                 console.log(JSON.stringify({{type:'system',subtype:'init',session_id:'claude-1'}}));\
+                 console.log(JSON.stringify({{type:'result',subtype:'success',result:'ok',\
+                 structured_output:{{checks:[{{command:'npm test',passed:true,output:'ok'}}],verdict:'pass'}},\
+                 usage:{{input_tokens:1,output_tokens:1}},total_cost_usd:0.01}}));}});\
+                 process.stdin.on('end',()=>process.exit(0));"
+            ),
+        )
+        .unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(
+            result.status, "done",
+            "{:?} {:?}",
+            result.failure, result.budget_stop
+        );
+        assert_eq!(
+            result.stages.iter().map(|n| n.stage).collect::<Vec<_>>(),
+            [Stage::Implement, Stage::Verify, Stage::Fix, Stage::Verify]
+        );
+        let calls: Vec<String> = std::fs::read_to_string(dir.join("argv.log"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(!calls[0].contains("--resume"), "{}", calls[0]);
+        assert!(calls[1].starts_with("-p "), "{}", calls[1]);
+        assert!(calls[1].ends_with("--resume claude-1"), "{}", calls[1]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

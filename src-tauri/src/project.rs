@@ -18,6 +18,25 @@ pub struct GitState {
     pub head: Option<String>,
     pub dirty: bool,
     pub dirty_count: usize,
+    /// The remote branch this one tracks, and how far apart they were at the
+    /// last fetch. All `None` when the branch tracks nothing.
+    pub upstream: Option<String>,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
+    /// Local branches other than the current one: what Merge can bring in.
+    pub branches: Vec<String>,
+}
+
+/// A git command the user picked by name and confirmed. None of them can
+/// throw work away: pull only fast-forwards and push is never forced.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitAction {
+    Fetch,
+    Pull,
+    Commit,
+    Push,
+    Merge,
 }
 
 /// A potential agent configuration source, or a path the scan could not inspect.
@@ -147,7 +166,25 @@ pub fn git_state(dir: &Path) -> GitState {
     let status = git(dir, &["status", "--porcelain"]).unwrap_or_default();
     let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
 
+    let upstream = git(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let counts = upstream
+        .as_ref()
+        .and_then(|_| git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]))
+        .unwrap_or_default();
+    let mut counts = counts.split_whitespace().map(|n| n.parse().ok());
+
+    let branches = git(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|b| Some(*b) != branch.as_deref())
+        .map(String::from)
+        .collect();
+
     GitState {
+        branches,
+        upstream,
+        ahead: counts.next().flatten(),
+        behind: counts.next().flatten(),
         is_repo: true,
         root: Some(root),
         branch,
@@ -186,7 +223,7 @@ pub enum Origin {
 
 /// Every file that was already changed when a run started, with a fingerprint
 /// of its contents. Taken before the first provider starts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 pub struct Snapshot(Vec<(String, Option<u64>)>);
 
 /// Record what is already dirty, so the diff afterwards can tell the user's
@@ -388,6 +425,9 @@ fn new_file_patch(path: &str, text: &str) -> String {
 /// A test suite Orteca runs itself, with no model finding it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Check {
+    /// Ecosystem this command verifies. Used to skip unrelated suites after a
+    /// run changes only one side of a mixed repository.
+    pub kind: &'static str,
     /// Where it runs: the repository root or a folder directly under it.
     pub dir: PathBuf,
     /// Runs first, and only when the suite's dependencies are not installed:
@@ -429,6 +469,57 @@ pub fn check_commands(root: &Path) -> Vec<Check> {
     checks.into_iter().map(|(_, check)| check).take(6).collect()
 }
 
+/// Keep only suites that can exercise the files this run changed. Unknown or
+/// non-code-only changes keep the full set: skipping is allowed only when a
+/// changed path positively identifies an ecosystem.
+pub fn relevant_check_commands(root: &Path, changed_paths: &[String]) -> Vec<Check> {
+    let checks = check_commands(root);
+    let kinds: std::collections::HashSet<&str> = changed_paths
+        .iter()
+        .filter_map(|path| {
+            let path = path.to_ascii_lowercase();
+            let name = Path::new(&path).file_name()?.to_str()?;
+            let extension = Path::new(&path).extension().and_then(|ext| ext.to_str());
+            if name == "composer.json"
+                || name == "composer.lock"
+                || name.starts_with("phpunit.xml")
+                || extension == Some("php")
+            {
+                Some("php")
+            } else if name == "package.json"
+                || [
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "bun.lockb",
+                ]
+                .contains(&name)
+                || ["js", "jsx", "ts", "tsx", "vue", "css", "scss"].contains(&extension?)
+            {
+                Some("js")
+            } else if name == "cargo.toml" || name == "cargo.lock" || extension == Some("rs") {
+                Some("rust")
+            } else if name == "go.mod" || name == "go.sum" || extension == Some("go") {
+                Some("go")
+            } else if extension == Some("py")
+                || ["pytest.ini", "pyproject.toml", "setup.cfg"].contains(&name)
+            {
+                Some("python")
+            } else {
+                None
+            }
+        })
+        .collect();
+    if kinds.is_empty() {
+        return checks;
+    }
+    checks
+        .into_iter()
+        .filter(|check| kinds.contains(check.kind))
+        .collect()
+}
+
 fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
     let has = |file: &str| dir.join(file).exists();
     let manifest = |file: &str| {
@@ -449,7 +540,8 @@ fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
     let missing = |m: &serde_json::Value, keys: &[&str], folder: &str| {
         !has(folder) && keys.iter().any(|k| m[*k].as_object().is_some_and(|o| !o.is_empty()))
     };
-    let check = |install: Option<Vec<&'static str>>, test: Vec<&'static str>| Check {
+    let check = |kind, install: Option<Vec<&'static str>>, test: Vec<&'static str>| Check {
+        kind,
         dir: dir.to_path_buf(),
         install,
         test,
@@ -471,22 +563,25 @@ fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
         };
         let install = missing(&m, &["dependencies", "devDependencies"], "node_modules")
             .then_some(install);
-        out.push(("js", check(install, test)));
+        out.push(("js", check("js", install, test)));
     }
     if let Some(m) = manifest("composer.json") {
         let install = missing(&m, &["require", "require-dev"], "vendor")
             .then(|| vec!["composer", "install", "--no-interaction"]);
         if tests(&m) {
-            out.push(("php", check(install, vec!["composer", "test"])));
+            out.push(("php", check("php", install, vec!["composer", "test"])));
         } else if has("phpunit.xml") || has("phpunit.xml.dist") {
-            out.push(("php", check(install, vec!["php", "vendor/bin/phpunit"])));
+            out.push((
+                "php",
+                check("php", install, vec!["php", "vendor/bin/phpunit"]),
+            ));
         }
     }
     if has("Cargo.toml") {
-        out.push(("rust", check(None, vec!["cargo", "test"])));
+        out.push(("rust", check("rust", None, vec!["cargo", "test"])));
     }
     if has("go.mod") {
-        out.push(("go", check(None, vec!["go", "test", "./..."])));
+        out.push(("go", check("go", None, vec!["go", "test", "./..."])));
     }
     // ponytail: the `python` on PATH, not the project's venv; pick the venv's
     // interpreter when a run shows that mattering.
@@ -495,7 +590,10 @@ fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
         || mentions("setup.cfg", "[tool:pytest]")
         || mentions("tox.ini", "[pytest]")
     {
-        out.push(("python", check(None, vec!["python", "-m", "pytest"])));
+        out.push((
+            "python",
+            check("python", None, vec!["python", "-m", "pytest"]),
+        ));
     }
     out
 }
@@ -670,6 +768,59 @@ pub fn remove_worktree(repo: &Path, copy: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs as the user, with their identity and their hooks: this is their
+/// commit, not a run's. `input` is the commit message or the branch to merge.
+pub fn git_action(dir: &Path, action: GitAction, input: &str) -> Result<()> {
+    match action {
+        GitAction::Fetch => git_run(dir, &["fetch"], "Git could not fetch"),
+        GitAction::Pull => git_run(dir, &["pull", "--ff-only"], "Git could not pull"),
+        GitAction::Commit => {
+            let message = input.trim();
+            if message.is_empty() {
+                return Err(AppError::new(ErrorKind::Invalid, "A commit needs a message."));
+            }
+            git_run(dir, &["add", "-A"], "Git could not stage your changes")?;
+            git_run(dir, &["commit", "-q", "-m", message], "Git could not commit")
+        }
+        // A branch that tracks nothing yet gets linked on its first push.
+        GitAction::Push if git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_some() => {
+            git_run(dir, &["push"], "Git could not push")
+        }
+        GitAction::Push => {
+            let remotes = git(dir, &["remote"]).unwrap_or_default();
+            let remote = remotes
+                .lines()
+                .find(|r| *r == "origin")
+                .or_else(|| remotes.lines().next())
+                .ok_or_else(|| AppError::new(ErrorKind::Invalid, "This repository has no remote to push to."))?;
+            git_run(dir, &["push", "-u", remote, "HEAD"], "Git could not push")
+        }
+        GitAction::Merge => merge(dir, input),
+    }
+    .map(drop)
+}
+
+/// Only a clean tree, so a clash can be undone with nothing of the user's
+/// caught in it: the merge either lands whole or leaves no trace.
+fn merge(dir: &Path, branch: &str) -> Result<String> {
+    if !git_state(dir).branches.iter().any(|b| b == branch) {
+        return Err(AppError::new(ErrorKind::Invalid, "That branch does not exist here."));
+    }
+    if git(dir, &["status", "--porcelain"]).is_some() {
+        return Err(AppError::new(ErrorKind::Invalid, "Commit your changes before merging."));
+    }
+    git_run(dir, &["merge", "--no-edit", branch], "Git could not merge").map_err(|e| {
+        // A clash is reported on stdout, so the error text alone may be empty.
+        let clashes = git(dir, &["diff", "--name-only", "--diff-filter=U"]);
+        let _ = git_run(dir, &["merge", "--abort"], "");
+        let reason = match clashes {
+            Some(files) => format!("{branch} and this branch change the same lines in: {}.", files.lines().collect::<Vec<_>>().join(", ")),
+            None => e.message,
+        };
+        AppError::new(ErrorKind::Invalid, format!("{reason} Nothing was changed."))
+    })
+}
+
 /// A fresh machine may have no git at all, and every folder would then look
 /// like "not a repository".
 pub fn git_installed() -> bool {
@@ -694,6 +845,8 @@ fn git_run(dir: &Path, args: &[&str], failure: &str) -> Result<String> {
     let out = Command::new("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
+        // A credential prompt on a terminal nobody sees would hang forever.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(dir)
         .output()?;
     if !out.status.success() {
@@ -769,6 +922,109 @@ mod tests {
                 (dir.clone(), None, vec!["php", "vendor/bin/phpunit"]),
             ]
         );
+        assert_eq!(
+            relevant_check_commands(&dir, &["app/Console/Command.php".into()])
+                .into_iter()
+                .map(|check| check.kind)
+                .collect::<Vec<_>>(),
+            ["php"],
+            "a backend-only change ran an unrelated JavaScript suite"
+        );
+        assert_eq!(
+            relevant_check_commands(&dir, &["src/app.ts".into()])
+                .into_iter()
+                .map(|check| check.kind)
+                .collect::<Vec<_>>(),
+            ["js"],
+            "a frontend-only change ran an unrelated PHP suite"
+        );
+        assert_eq!(
+            relevant_check_commands(&dir, &["database/schema/mysql-schema.sql".into()]).len(),
+            2,
+            "an unknown-only change guessed which suite could cover it"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_commit_pushed_from_one_clone_is_fetched_and_pulled_by_another() {
+        let root = temp_dir("git-actions");
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        for clone in ["mine", "theirs"] {
+            run(&root, &["clone", "-q", "remote.git", clone]);
+            let dir = root.join(clone);
+            run(&dir, &["config", "user.name", "test"]);
+            run(&dir, &["config", "user.email", "test@example.com"]);
+            run(&dir, &["checkout", "-q", "-b", "main"]);
+        }
+        let (mine, theirs) = (root.join("mine"), root.join("theirs"));
+
+        std::fs::write(mine.join("a.txt"), "one\n").unwrap();
+        assert!(git_action(&mine, GitAction::Commit, "  ").is_err(), "an empty message was committed");
+        git_action(&mine, GitAction::Commit, "Add a").unwrap();
+        assert_eq!(git_state(&mine).upstream, None);
+        git_action(&mine, GitAction::Push, "").unwrap();
+        assert_eq!(git_state(&mine).upstream.as_deref(), Some("origin/main"), "first push did not link the branch");
+        run(&theirs, &["fetch", "-q"]);
+        run(&theirs, &["checkout", "-q", "-B", "main", "--track", "origin/main"]);
+
+        std::fs::write(mine.join("a.txt"), "two\n").unwrap();
+        git_action(&mine, GitAction::Commit, "Change a").unwrap();
+        assert_eq!(git_state(&mine).ahead, Some(1));
+        git_action(&mine, GitAction::Push, "").unwrap();
+        assert_eq!(git_state(&mine).ahead, Some(0));
+
+        assert_eq!(git_state(&theirs).behind, Some(0), "behind before any fetch");
+        git_action(&theirs, GitAction::Fetch, "").unwrap();
+        assert_eq!(git_state(&theirs).behind, Some(1));
+        git_action(&theirs, GitAction::Pull, "").unwrap();
+        let state = git_state(&theirs);
+        assert_eq!((state.ahead, state.behind), (Some(0), Some(0)));
+        assert_eq!(std::fs::read_to_string(theirs.join("a.txt")).unwrap().trim(), "two");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_merge_lands_whole_or_leaves_no_trace() {
+        let dir = temp_dir("git-merge");
+        let run = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        let commit = |file: &str, text: &str| {
+            std::fs::write(dir.join(file), text).unwrap();
+            git_action(&dir, GitAction::Commit, file).unwrap();
+        };
+        commit("a.txt", "base\n");
+        run(&["checkout", "-q", "-b", "clean"]);
+        commit("b.txt", "new\n");
+        run(&["checkout", "-q", "-b", "clash", "main"]);
+        commit("a.txt", "theirs\n");
+        run(&["checkout", "-q", "main"]);
+        commit("a.txt", "ours\n");
+
+        assert_eq!(git_state(&dir).branches, ["clash", "clean"]);
+        assert!(git_action(&dir, GitAction::Merge, "--help").is_err());
+
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let clash = git_action(&dir, GitAction::Merge, "clash").unwrap_err();
+        assert!(clash.message.contains("a.txt") && clash.message.contains("Nothing was changed"), "{}", clash.message);
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), head);
+        assert!(!git_state(&dir).dirty, "a clash left the tree mid-merge");
+
+        std::fs::write(dir.join("a.txt"), "unsaved\n").unwrap();
+        assert!(git_action(&dir, GitAction::Merge, "clean").is_err(), "merged over uncommitted work");
+        git_action(&dir, GitAction::Commit, "save").unwrap();
+
+        git_action(&dir, GitAction::Merge, "clean").unwrap();
+        assert!(dir.join("b.txt").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

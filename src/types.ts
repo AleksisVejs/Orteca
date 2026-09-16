@@ -51,7 +51,15 @@ export interface GitState {
   head: string | null;
   dirty: boolean;
   dirtyCount: number;
+  /** The tracked remote branch and the distance at the last fetch; null when none. */
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  /** Local branches other than the current one. */
+  branches: string[];
 }
+
+export type GitAction = "fetch" | "pull" | "commit" | "push" | "merge";
 
 export interface TrustFinding {
   path: string;
@@ -67,11 +75,10 @@ export interface Preflight {
   provider: ProviderId;
   git: GitState;
   route: Route;
+  /** What implementation asks this provider for, including route overrides. */
   model: ModelChoice;
   /** What Plan runs on when Efficient mode lowers its reasoning effort. */
   plan: ModelChoice | null;
-  /** What the route's one Fix call would run on; null when it declares none. */
-  escalation: ModelChoice | null;
   /** What the Review runs on when it is not the route's tier; null otherwise. */
   review: ModelChoice | null;
 }
@@ -186,19 +193,10 @@ export interface Signals {
   priorFailures: number;
 }
 
-/** The ceilings a route declares before any provider is started. */
+/** The tiers a route runs on. There is no call, turn or token ceiling: a
+ *  failed check is fixed and run again until it passes. */
 export interface ExecutionBudget {
-  maxAgentCalls: number;
-  /** Passed to Claude, which has the flag; counted by Orteca for Codex, which
-   *  does not. Either way the number is real. */
-  maxTurns: number | null;
-  /** An inter-turn guard. It cannot stop a turn already running, so what it
-   *  stops is the next stage. */
-  maxReportedTokens: number | null;
   preferredTier: Tier;
-  /** The tier of the one Fix call a failed Review or Verify may buy. Null
-   *  when the route has no such stage or is already on `deep`. */
-  escalation: Tier | null;
   /** Guarded work is reviewed on this tier rather than `preferredTier`. */
   reviewTier: Tier | null;
 }
@@ -304,11 +302,10 @@ export interface TaskResult {
   route: Route;
   /** The stages that actually ran, in order. */
   stages: StageNote[];
-  /** Provider processes started. With `route.budget.maxAgentCalls` this is the
-   *  calls-avoided figure, and it is exact. */
+  /** Provider processes started, stages and resumes together. */
   callsUsed: number;
   turnsUsed: number;
-  /** Set when a ceiling or review outcome stopped the run. */
+  /** Set when a fix changed nothing and a check still did not pass. */
   budgetStop: BudgetStop | null;
   /** null until the project has enough comparable runs to compare against. */
   baseline: Baseline | null;

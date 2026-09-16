@@ -5,16 +5,18 @@
 
 :root {
   /* surfaces: four steps, bg -> raised -> hover */
-  --bg: #08090a;
-  --surface: #0e1011;
-  --surface-2: #14171a;
-  --border: #1b1f22;
-  --border-strong: #272d31;
+  --bg: #0a0e11;
+  --surface: #10161a;
+  --surface-2: #1c242d;
+  --border: #222c34;
+  --border-strong: #414e5b;
+  --button: #465366;
+  --button-hover: #56657c;
 
   /* text: three steps, never more */
   --text: #e8eaed;
-  --text-dim: #99a0a7;
-  --text-faint: #616970;
+  --text-dim: #b1bdcc;
+  --text-faint: #8e9baa;
 
   /* accent: green means an outcome (done, saved, measured). Used sparingly. */
   --accent: #3ecf8e;
@@ -96,16 +98,16 @@ button {
   cursor: default;
 }
 
-/* One primary per screen. Light fill, like the submit control in the mocks. */
+/* Slate actions keep green reserved for measured outcomes. */
 .btn.primary {
-  background: var(--text);
-  border-color: var(--text);
-  color: var(--bg);
+  background: var(--button);
+  border-color: var(--button-hover);
+  color: var(--text);
   font-weight: 500;
 }
 .btn.primary:hover:not(:disabled) {
-  background: #fff;
-  border-color: #fff;
+  background: var(--button-hover);
+  border-color: var(--text-faint);
 }
 .btn.primary:disabled {
   background: var(--surface-2);
@@ -119,17 +121,25 @@ button {
   color: var(--text-faint);
 }
 
-/* Section label: small, spaced, uppercase, faint. */
+/* Quiet, readable section headings. */
 .label {
   margin: 0 0 10px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-dim);
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent-dim);
+  outline: 2px solid var(--info);
   outline-offset: 2px;
+}
+
+::selection {
+  background: var(--button);
+  color: var(--text);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) var(--bg);
 }

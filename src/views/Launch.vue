@@ -38,14 +38,14 @@ async function forget(path: string) {
     <div class="hero">
       <div class="tile"><VeloMark :size="64" /></div>
       <h1>Orteca</h1>
-      <p class="tagline">Tell it what you need. Orteca handles the steps.</p>
+      <p class="tagline">The efficient way to run coding agents.</p>
 
-      <button class="btn primary open" @click="choose">Choose a project</button>
+      <button class="btn primary open" @click="choose">Choose a project <span aria-hidden="true">→</span></button>
       <p v-if="error" class="error">{{ error }}</p>
     </div>
 
     <section v-if="recents.length" class="recents">
-      <h2 class="label">Recent</h2>
+      <h2 class="label">Recent projects</h2>
       <ul class="card">
         <li v-for="p in recents" :key="p.path">
           <button class="entry" @click="emit('open', p.path)">
@@ -69,7 +69,7 @@ async function forget(path: string) {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  max-width: 560px;
+  max-width: 620px;
   margin: 0 auto;
   padding: 48px var(--pad);
 }
@@ -82,12 +82,8 @@ async function forget(path: string) {
 .tile {
   display: inline-grid;
   place-items: center;
-  width: 76px;
-  height: 76px;
-  border-radius: 20px;
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 0 0 1px var(--mark-rim), 0 18px 40px var(--mark-shadow);
+  width: 88px;
+  height: 88px;
 }
 
 h1 {
@@ -98,12 +94,16 @@ h1 {
 }
 
 .tagline {
-  margin: 6px 0 28px;
+  margin: 6px 0 36px;
   color: var(--text-dim);
 }
 
 .open {
-  min-width: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 16px 18px;
 }
 
 .error {
@@ -133,7 +133,8 @@ h1 {
 .recents li:hover {
   background: var(--surface-2);
 }
-.recents li:hover .forget {
+.recents li:hover .forget,
+.recents li:focus-within .forget {
   opacity: 1;
 }
 
@@ -155,7 +156,7 @@ h1 {
 }
 
 .forget {
-  opacity: 0;
+  opacity: 0.65;
   padding: 4px 8px;
   border-radius: var(--r-sm);
   color: var(--text-faint);

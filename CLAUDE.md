@@ -26,6 +26,7 @@ node scripts/make-icon.mjs          # rebuild src-tauri/icons/ from src/assets/v
 npm run build                       # vue-tsc --noEmit + vite build
 npm test                            # node --test scripts/*.test.mjs
 node --test scripts/app.test.mjs    # single JS test file
+node scripts/bench/riginspect.mjs easy   # spends real usage; see its header
 cd src-tauri && cargo test          # Rust tests
 cd src-tauri && cargo test trust_scan -- --nocapture   # single Rust test
 npm run tauri dev                   # full app (root, not src-tauri)
@@ -43,10 +44,13 @@ Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens an
   `send_instruction`, `recent_tasks`, `remove_worktree`) and app setup. `start_task` routes the
   prompt, snapshots a dirty tree, and refuses Codex on a folder whose ACL the user
   cannot change, all before any CLI starts. The `Store` is Tauri managed state.
-- `routing.rs` — pure keyword classifier, route and ceilings per route, stage
+- `routing.rs` — pure keyword classifier, route and tiers per route, stage
   briefs, artifact checks. No model call and no I/O beyond what `main.rs` hands it.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
-  budget stops, diff, `TaskResult`. It never spends past the route's ceilings.
+  fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A quick
+  check (one small Laravel test file) runs before the agent starts; a failed Verify gets one Fix (resuming
+  the session that wrote the change) and runs again, a Review runs once, and
+  checks that already failed before the run buy no Fix.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the
@@ -76,7 +80,9 @@ in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css
   the mock provider. Both CLIs are installed but neither can complete a run, and
   "CLI missing" is a first-class UI state, not an error.
 - **Never run a destructive git command** (`push --force`, `reset --hard`, `clean -fd`).
-  Orteca reads git state and captures diffs; it does not rewrite the user's repo.
+  Orteca changes the user's repo only when the user asks and confirms: the git bar's
+  fetch, `pull --ff-only`, commit, plain push and a clean-tree merge that aborts on
+  a clash (`project::git_action`). Nothing there may force, reset or discard work.
 - **Every metric carries a `cost_quality`** of `exact` | `estimated` | `unavailable`.
   Nothing reaches the UI unlabelled, and there is no savings percentage until a project
   has a real baseline. Codex reports tokens but no cost — Orteca prices them from

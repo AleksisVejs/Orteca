@@ -6,12 +6,12 @@
 //! it asks a provider what it thinks - a classifier that spends tokens to
 //! decide whether to spend tokens has already lost the argument.
 //!
-//! The route is fixed *before* a provider starts, and it carries its own
-//! ceilings. A trivial task gets exactly one agent call, which verifies itself
-//! unless Orteca can run the tests after it. A task that crosses a ceiling stops and says so; it never quietly
-//! promotes itself to a longer route. The one exception is declared with the
-//! route: a Review or Verify that does not pass may buy a single Fix call on
-//! the next tier up (`budget.escalation`), and never a second.
+//! The route is fixed *before* a provider starts. A trivial task gets exactly
+//! one agent call, which verifies itself unless Orteca can run the tests after
+//! it. A route never promotes itself to a longer one, and it has no call, turn
+//! or token ceiling: a Review or Verify that does not pass is followed by a Fix
+//! and the same check again. Reviews are independent but bounded: one review
+//! can buy one fix, then deterministic verification is the completion gate.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -142,8 +142,8 @@ pub enum Stage {
     Implement,
     Review,
     Verify,
-    /// The one call a Review or Verify that did not pass may buy, a tier up:
-    /// it fixes what was found and checks the fix in the same call.
+    /// Follows a Review or Verify that did not pass, on the route's own tier:
+    /// it fixes what was found, and the check that failed runs again after it.
     Fix,
 }
 
@@ -250,14 +250,23 @@ pub fn artifact_is_valid(stage: Stage, value: &serde_json::Value) -> bool {
 
 /// `true` when a Review or Verify artifact says the work is finished. Anything
 /// that is not a valid artifact saying `pass` is not a pass, and neither is a
-/// Verify or Fix pass with no check behind it or with a check that failed.
+/// Verify or Fix pass with no check behind it or with a check that failed. A
+/// Review whose findings are all `low` passes whatever its verdict: those are
+/// notes, and another fix-and-review round for them is spend nobody needs.
 pub fn stage_passed(stage: Stage, value: &serde_json::Value) -> bool {
-    artifact_is_valid(stage, value)
-        && value["verdict"] == "pass"
-        && (stage == Stage::Review
-            || value["checks"].as_array().is_some_and(|checks| {
-                !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
-            }))
+    if !artifact_is_valid(stage, value) {
+        return false;
+    }
+    if stage == Stage::Review {
+        return value["verdict"] == "pass"
+            || value["findings"].as_array().is_some_and(|findings| {
+                !findings.is_empty() && findings.iter().all(|f| f["severity"] == "low")
+            });
+    }
+    value["verdict"] == "pass"
+        && value["checks"].as_array().is_some_and(|checks| {
+            !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
+        })
 }
 
 /// What the classifier read out of the prompt and the repository. Serialised
@@ -283,32 +292,15 @@ pub struct Signals {
     pub prior_failures: u32,
 }
 
-/// The ceilings a route declares before any provider is started.
+/// The tiers a route runs on, chosen before any provider is started. There is
+/// no call, turn or token ceiling: a route runs until its checks pass (§4.3.8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionBudget {
-    /// Provider processes this route may start, stages and resumes together.
-    pub max_agent_calls: u32,
-    /// Turn ceiling for one provider process.
-    ///
-    /// `claude --max-turns <turns>` exists - it is missing from `--help` but
-    /// the CLI's own parser accepts it - and is passed through. `codex exec`
-    /// has no equivalent at 0.154.0, so for Codex this is enforced by Orteca
-    /// counting completed turns and ending the process at the ceiling. The
-    /// number is real either way; only who enforces it differs.
-    pub max_turns: Option<u32>,
-    /// Cumulative provider-reported tokens. An inter-turn guard: Orteca cannot
-    /// interrupt a turn that is already running, so this is checked once a turn
-    /// has completed, and what it stops is the *next* stage.
-    pub max_reported_tokens: Option<u64>,
     /// Cheapest capable tier for this task class, after adaptation. Every
-    /// stage of the route runs on it: caches are per model, so switching
-    /// between stages would pay for the same context twice.
+    /// stage of the route runs on it, Fix included: caches are per model, so
+    /// switching between stages would pay for the same context twice.
     pub preferred_tier: Tier,
-    /// The tier of the one Fix call a Review or Verify that does not pass may
-    /// buy. `None` when the route has no such stage or is already on `Deep`.
-    /// The cap is structural: one call, never a second.
-    pub escalation: Option<Tier>,
     /// The tier a Review runs on when it is not `preferred_tier`. Guarded work
     /// is built a tier below and reviewed on `deep`: a read-only look at a
     /// finished diff is where the stronger model earns its price.
@@ -373,6 +365,20 @@ impl Route {
         let mut choice = self.budget.preferred_tier.model(id);
         choice.effort = "low";
         Some(choice)
+    }
+
+    /// Schema work gets one stronger Codex session instead of a cheaper draft
+    /// followed by several expensive repairs. Both modes use the same proven
+    /// Sol family; lower-consumption challengers can be benchmarked later
+    /// without putting Astra on the user's allowance.
+    pub fn work_model(&self, id: ProviderId) -> Option<ModelChoice> {
+        if id != ProviderId::Codex || !self.signals.schema_change {
+            return None;
+        }
+        Some(ModelChoice {
+            model: "gpt-5.6-sol",
+            effort: "medium",
+        })
     }
 
     /// What the Review runs on when that is not the route's tier.
@@ -796,7 +802,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             vec![Stage::Plan, Stage::Implement, Stage::Review],
             "this prompt has already failed twice, so it is planned and reviewed",
         )
-    } else if signals.security || signals.authz || signals.schema_change {
+    } else if signals.security || signals.authz {
         // A plan earns its call when the work is big enough to go wrong in its
         // shape. A one-function fix is not, and its Review still runs (§4.3.6).
         let large = signals.architecture || signals.complexity >= 7u8.saturating_add(shift);
@@ -819,6 +825,23 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
                 "security, authorisation or schema work this large is planned, reviewed and verified"
             } else {
                 "security, authorisation or schema work is reviewed and verified; it is small enough to need no plan"
+            },
+        )
+    } else if signals.schema_change {
+        // A separate reviewer made the real schema benchmark slower and more
+        // expensive than one strong Codex session. Keep deterministic tests,
+        // and let the implementation session perform its own boundary review.
+        let mut stages = vec![Stage::Implement];
+        if repo.checks_locally {
+            stages.push(Stage::Verify);
+        }
+        (
+            RouteKind::Standard,
+            stages,
+            if repo.checks_locally {
+                "schema work uses one strong implementation session, then Orteca runs the relevant tests"
+            } else {
+                "schema work uses one strong session that implements, reviews and verifies itself"
             },
         )
     } else if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
@@ -857,7 +880,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         )
     };
 
-    let mut budget = budget_for(kind, mode, stages.len());
+    let mut budget = budget_for(kind, mode);
     let mut tier_reason = "the tier this route is trusted with";
     let mut raised = false;
     if signals.prior_failures >= 1 {
@@ -881,10 +904,9 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
     }
     // Short on plan allowance, the one step down, and only where the run still
-    // finishes: a Review or Verify catches a miss, and the Fix call it buys
-    // runs on the tier this route would have used. Never on a tier evidence
-    // raised, never on guarded or twice-failed work, never onto a tier that
-    // stalled here.
+    // finishes: a Review or Verify catches a miss and the Fix after it repairs
+    // it. Never on a tier evidence raised, never on guarded or twice-failed
+    // work, never onto a tier that stalled here.
     // ponytail: 10% of a plan window per call is a guess, not a measurement;
     // replace it with each route's measured draw once runs read limits before and after.
     const LOW_ROOM_PER_CALL: f64 = 10.0;
@@ -892,7 +914,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         .iter()
         .any(|s| matches!(s, Stage::Review | Stage::Verify));
     if let (Some(room), Some(down)) = (repo.headroom, budget.preferred_tier.down()) {
-        let calls = budget.max_agent_calls + u32::from(checked);
+        let calls = stages.len() as u32 + u32::from(checked);
         if checked
             && !raised
             && matches!(kind, RouteKind::Standard | RouteKind::Planned)
@@ -900,16 +922,9 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             && room < LOW_ROOM_PER_CALL * f64::from(calls)
         {
             budget.preferred_tier = down;
-            tier_reason = "the plan limit is low, so it runs one tier down; its checks, and a Fix call on the usual tier, catch a miss";
+            tier_reason = "the plan limit is low, so it runs one tier down; its checks and fixes catch a miss";
         }
     }
-    // Only a stage with a pass/fail contract can show that the tier was not
-    // enough, so only a route with one declares the Fix call.
-    budget.escalation = stages
-        .iter()
-        .any(|s| matches!(s, Stage::Review | Stage::Verify))
-        .then(|| budget.preferred_tier.up())
-        .flatten();
     let preferred_providers = stages
         .iter()
         .map(|s| s.capability().preferred_provider())
@@ -929,30 +944,10 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     }
 }
 
-/// Ceilings per route.
-///
-/// First estimates, and honest about it: the token numbers come from the five
-/// observed runs in architecture §4.3.1, where a two-file slug fix cost between
-/// 90k and 257k reported tokens. They are set to stop a run that has clearly
-/// lost the plot, not to trim one that is working. Milestone 7's baselines are
-/// what replace guesses with measurements.
-fn budget_for(kind: RouteKind, mode: Mode, calls: usize) -> ExecutionBudget {
-    // A runaway guard, not a budget: Claude reports tokens only when a call
-    // ends, so this is the one thing that stops a looping call mid-run. Tokens
-    // do the budgeting. Per-route turn counts cut correct runs short at 10, and
-    // gave a big route's stages fewer turns than a small route's one call (§4.3.6).
-    const RUNAWAY_TURNS: u32 = 50;
-    let tokens = match kind {
-        RouteKind::ImplementOnce => 150_000,
-        RouteKind::Standard => 300_000,
-        RouteKind::Planned | RouteKind::Escalated => 600_000,
-        RouteKind::Guarded => 800_000,
-    };
+/// Tiers per route.
+fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
     let efficient = mode == Mode::Efficient;
     ExecutionBudget {
-        max_agent_calls: calls as u32,
-        max_turns: Some(RUNAWAY_TURNS),
-        max_reported_tokens: Some(if efficient { tokens / 4 * 3 } else { tokens }),
         preferred_tier: match (kind, efficient) {
             (RouteKind::ImplementOnce, _) | (RouteKind::Standard, true) => Tier::Cheapest,
             // Guarded builds on standard and reviews on deep: four deep calls
@@ -963,7 +958,6 @@ fn budget_for(kind: RouteKind, mode: Mode, calls: usize) -> ExecutionBudget {
             | (RouteKind::Guarded, _) => Tier::Standard,
             _ => Tier::Deep,
         },
-        escalation: None,
         review_tier: (kind == RouteKind::Guarded).then_some(Tier::Deep),
     }
 }
@@ -1001,15 +995,20 @@ pub fn brief(
         Stage::Review => {
             out.push_str(
                 "Review the change that is already in the working tree against the task below. \
-                 Do not edit any file. Return only the structured review; `pass` means the work \
-                 is finished and needs no further call.",
+                 Do not edit any file. Return only the structured review. Ask for changes only \
+                 for a high or medium finding; report low ones, which do not hold the work up.",
             );
-            let tested = carried.iter().any(|n| {
-                matches!(n.stage, Stage::Verify | Stage::Fix)
-                    && n.artifact
+            // The latest check, not any: a pass before a later fix says nothing
+            // about the tree as it is now.
+            let tested = carried
+                .iter()
+                .rev()
+                .find(|n| matches!(n.stage, Stage::Verify | Stage::Fix))
+                .is_some_and(|n| {
+                    n.artifact
                         .as_ref()
                         .is_some_and(|a| stage_passed(n.stage, a))
-            });
+                });
             if tested {
                 out.push_str(
                     " The repository's tests already pass on it; spend the review on the \
@@ -1024,21 +1023,13 @@ pub fn brief(
              check you ran, whether it passed, and what it printed. `pass` means at least one \
              check ran and every check passed.\n\n",
         ),
-        Stage::Fix => {
-            out.push_str(
-                "An earlier stage of this task did not pass; what it found is below. Fix that and \
-                 nothing beyond it, then run the focused checks that prove the fix. Return only \
-                 the structured result: every check you ran, whether it passed, and what it \
-                 printed. `pass` means at least one check ran and every check passed. ",
-            );
-            let reviewed = route.verifies_before_review()
-                && carried.last().is_some_and(|n| n.stage == Stage::Verify);
-            out.push_str(if reviewed {
-                "A review reads the fix after this call.\n\n"
-            } else {
-                "This is the last call this task gets.\n\n"
-            });
-        }
+        Stage::Fix => out.push_str(
+            "An earlier stage of this task did not pass; what it found is below. Fix that and \
+             nothing beyond it, then run the focused checks that prove the fix. Return only \
+             the structured result: every check you ran, whether it passed, and what it \
+             printed. `pass` means at least one check ran and every check passed. The check \
+             that failed runs again after this call.\n\n",
+        ),
         Stage::Implement => {}
     }
 
@@ -1070,8 +1061,8 @@ pub fn brief(
     }
 
     // A new process can inspect the working tree. Carry only information it
-    // cannot recover there: the Plan into Implement, or the failed contract
-    // that triggered Fix. Review needs only the tested signal above.
+    // cannot recover there: the Plan into Implement or the failed contract
+    // that triggered Fix.
     let handoff: Vec<&StageNote> = match stage {
         Stage::Implement => carried
             .iter()
@@ -1082,7 +1073,7 @@ pub fn brief(
         Stage::Fix => carried
             .iter()
             .rev()
-            .find(|n| matches!(n.stage, Stage::Review | Stage::Verify))
+            .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix))
             .into_iter()
             .collect(),
         Stage::Plan | Stage::Review | Stage::Verify => Vec::new(),
@@ -1113,11 +1104,14 @@ pub fn brief(
         }
     }
 
-    out.push_str("\nBudget: ");
-    out.push_str(&describe_budget(route, stage));
-    out.push('\n');
-
     if stage == Stage::Implement {
+        if route.signals.schema_change {
+            out.push_str(
+                "Before finishing, review the completed diff for strict input types, \
+                 migration/schema agreement, and queries that bypass useful indexes. \
+                 Correct any issue you find in this same session.\n",
+            );
+        }
         if route.is_single_call() {
             out.push_str(
                 "This is the only agent call for this task. Make the change. If it changes \
@@ -1128,9 +1122,11 @@ pub fn brief(
             );
         } else if route.stages.contains(&Stage::Verify) {
             out.push_str(
-                "Make the change described above and nothing beyond it. A later stage \
-                 runs the checks, so do not run tests or builds yourself; stop when the \
-                 change is complete.\n",
+                "Make the change described above and nothing beyond it. If it changes \
+                 behaviour, add or update tests that pin every rule the task states, \
+                 edge values included: the later checks only catch what a test covers. \
+                 A later stage runs the checks, so do not run tests or builds yourself; \
+                 stop when the change is complete.\n",
             );
         } else {
             out.push_str(
@@ -1140,20 +1136,6 @@ pub fn brief(
         }
     }
     out
-}
-
-fn describe_budget(route: &Route, stage: Stage) -> String {
-    // A Fix runs on the one call the route declared on top of its own.
-    let calls = route.budget.max_agent_calls + u32::from(stage == Stage::Fix);
-    let mut text = format!(
-        "{calls} agent call{} for the whole task",
-        if calls == 1 { "" } else { "s" }
-    );
-    if let Some(turns) = route.budget.max_turns {
-        text.push_str(&format!(", at most {turns} turns in this one"));
-    }
-    text.push('.');
-    text
 }
 
 #[cfg(test)]
@@ -1229,8 +1211,8 @@ mod tests {
         route(prompt, Mode::Balanced, &repo(paths))
     }
 
-    /// Short on allowance, a checked route runs one tier down and keeps its Fix
-    /// call on the usual tier. Never where evidence raised the tier, never on
+    /// Short on allowance, a checked route runs one tier down. Never where
+    /// evidence raised the tier, never on
     /// guarded work, never onto a tier that stalled, never without a check.
     #[test]
     fn a_low_plan_limit_drops_a_checked_route_one_tier() {
@@ -1240,10 +1222,7 @@ mod tests {
         };
         let r = route("make the header bold", Mode::Balanced, &low(20.0));
         assert_eq!(r.kind, RouteKind::Standard);
-        assert_eq!(
-            (r.budget.preferred_tier, r.budget.escalation),
-            (Tier::Cheapest, Some(Tier::Standard))
-        );
+        assert_eq!(r.budget.preferred_tier, Tier::Cheapest);
         assert!(r.tier_reason.contains("one tier down"), "{}", r.tier_reason);
 
         assert_eq!(
@@ -1305,7 +1284,6 @@ mod tests {
         let r = balanced("Fix the typo in the README heading", REPO);
         assert_eq!(r.kind, RouteKind::ImplementOnce);
         assert_eq!(r.stages, [Stage::Implement]);
-        assert_eq!(r.budget.max_agent_calls, 1);
         assert!(r.is_single_call());
         assert!(
             !r.stages.contains(&Stage::Plan),
@@ -1327,7 +1305,6 @@ mod tests {
             brief.contains("one focused check"),
             "verification happens inside the single call"
         );
-        assert!(brief.contains("1 agent call"));
         // What §12 forbids: a generic multi-stage checklist on a small task.
         for word in ["Plan stage", "Review stage", "plan artifact"] {
             assert!(
@@ -1362,7 +1339,9 @@ mod tests {
             &[],
         );
         assert!(
-            text.contains("do not run tests") && !text.contains("one focused check"),
+            text.contains("do not run tests")
+                && text.contains("pin every rule")
+                && !text.contains("one focused check"),
             "{text}"
         );
         assert!(needs_shell("bump lodash") && needs_shell("install the zod dependency"));
@@ -1370,38 +1349,10 @@ mod tests {
     }
 
     #[test]
-    fn every_route_declares_its_ceilings_before_anything_starts() {
-        for prompt in [
-            "fix the typo",
-            "add a button to the settings screen and wire it up",
-            "redesign the storage subsystem",
-            "add an authorisation check to the admin route",
-        ] {
-            let r = balanced(prompt, REPO);
-            assert_eq!(
-                r.budget.max_agent_calls as usize,
-                r.stages.len(),
-                "`{prompt}` budgeted {} calls for {} stages",
-                r.budget.max_agent_calls,
-                r.stages.len()
-            );
-            assert!(
-                r.budget.max_turns.is_some(),
-                "`{prompt}` declared no turn ceiling"
-            );
-            assert!(
-                r.budget.max_reported_tokens.is_some(),
-                "`{prompt}` declared no token ceiling"
-            );
-        }
-    }
-
-    #[test]
-    fn security_authz_and_schema_work_is_reviewed_on_deep_and_verified() {
+    fn security_and_authz_work_is_reviewed_on_deep_and_verified() {
         for prompt in [
             "sanitize the user input to close the injection vulnerability",
             "add an authorization check before the delete endpoint",
-            "write a migration that adds a column to the tasks table",
         ] {
             let r = balanced(prompt, REPO);
             assert_eq!(r.kind, RouteKind::Guarded, "`{prompt}` was not guarded");
@@ -1483,6 +1434,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schema_work_uses_one_strong_codex_session_and_local_verify() {
+        let prompt = "write a migration that adds a column to the tasks table";
+        let balanced_route = balanced(prompt, REPO);
+        assert_eq!(
+            (balanced_route.kind, balanced_route.stages.as_slice()),
+            (RouteKind::Standard, [Stage::Implement].as_slice())
+        );
+        assert_eq!(
+            balanced_route
+                .work_model(ProviderId::Codex)
+                .map(|choice| (choice.model, choice.effort)),
+            Some(("gpt-5.6-sol", "medium"))
+        );
+        assert!(brief(&balanced_route, Stage::Implement, prompt, &[], &[])
+            .contains("migration/schema agreement"));
+
+        let local = RepoSignals {
+            checks_locally: true,
+            ..repo(REPO)
+        };
+        let efficient = route(prompt, Mode::Efficient, &local);
+        assert_eq!(efficient.stages, [Stage::Implement, Stage::Verify]);
+        assert_eq!(
+            efficient
+                .work_model(ProviderId::Codex)
+                .map(|choice| (choice.model, choice.effort)),
+            Some(("gpt-5.6-sol", "medium"))
+        );
+    }
+
     /// A prompt can read as small and still be dangerous. The gate wins.
     #[test]
     fn a_small_sounding_security_change_is_never_the_one_call_route() {
@@ -1553,7 +1535,6 @@ mod tests {
                 full.stages.len(),
                 lean.stages.len()
             );
-            assert!(lean.budget.max_reported_tokens <= full.budget.max_reported_tokens);
         }
     }
 
@@ -1578,29 +1559,13 @@ mod tests {
             balanced("fix the typo", REPO).budget.preferred_tier,
             Tier::Cheapest
         );
-        // One Fix call a tier up, only where a check can fail and a tier is left.
-        assert_eq!(
-            balanced("fix the typo", REPO).budget.escalation,
-            None,
-            "one call has no check to fail"
-        );
         let standard = balanced("make the header bold", REPO);
-        assert_eq!(
-            (standard.budget.preferred_tier, standard.budget.escalation),
-            (Tier::Standard, Some(Tier::Deep))
-        );
-        assert_eq!(
-            balanced("redesign the storage subsystem", REPO)
-                .budget
-                .escalation,
-            None,
-            "nothing above deep"
-        );
+        assert_eq!(standard.budget.preferred_tier, Tier::Standard);
         let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[]);
-        assert!(fix.contains("did not pass") && !fix.contains("A later stage checks"));
+        assert!(fix.contains("did not pass") && fix.contains("runs again after this call"));
         assert!(
-            fix.contains("3 agent calls for the whole task"),
-            "the Fix brief did not count its own call: {fix}"
+            !fix.contains("agent call"),
+            "a brief carries no call ceiling: {fix}"
         );
 
         let mut signals = repo(REPO);
@@ -1818,6 +1783,16 @@ mod tests {
         ));
         assert!(!review(
             serde_json::json!({"findings": [], "verdict": "changes_requested"})
+        ));
+        let finding = |severity: &str| {
+            serde_json::json!({"severity": severity, "file": "a.rs", "line": 1, "issue": "i", "fix": "f"})
+        };
+        assert!(
+            review(serde_json::json!({"findings": [finding("low")], "verdict": "changes_requested"})),
+            "low findings are notes, not another round"
+        );
+        assert!(!review(
+            serde_json::json!({"findings": [finding("low"), finding("medium")], "verdict": "changes_requested"})
         ));
         // Not an artifact at all, so not a pass: a missing review is not a
         // clean one.

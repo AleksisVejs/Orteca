@@ -551,34 +551,6 @@ const ARCHITECTURE: &[&str] = &[
     "end-to-end",
 ];
 
-/// Words that say the edit itself needs a command: a dependency, a generator, a
-/// file moved or removed. Such a prompt keeps the shell even when Orteca runs
-/// the tests afterwards.
-const SHELL: &[&str] = &[
-    "install",
-    "dependenc",
-    "bump",
-    "upgrade",
-    "npm",
-    "yarn",
-    "pnpm",
-    "cargo",
-    "composer",
-    "pip ",
-    "git ",
-    "generat",
-    "lockfile",
-    "rename",
-    "move",
-    "delete",
-    "script",
-    "command",
-];
-
-pub fn needs_shell(prompt: &str) -> bool {
-    contains_any(&prompt.to_ascii_lowercase(), SHELL)
-}
-
 const BUG: &[&str] = &[
     "bug",
     "fix",
@@ -1404,8 +1376,6 @@ mod tests {
                 && !text.contains("one focused check"),
             "{text}"
         );
-        assert!(needs_shell("bump lodash") && needs_shell("install the zod dependency"));
-        assert!(!needs_shell("Fix the typo in the README heading"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ Toolchain: Node 22, Rust 1.98 MSVC, VS 2022 Build Tools (`VC.Tools.x86.x64`).
 ## Architecture
 
 Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens and a modal.
+The Project screen is a shell plus pages in `src/views/project/`, sharing `state.ts`.
 
 - `main.rs` — Tauri commands (projects: `open_project`, `recent_projects`,
   `trust_project`, `forget_project`; providers: `detect_providers`,

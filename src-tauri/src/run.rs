@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AppError, ErrorKind};
@@ -262,6 +262,26 @@ pub struct BudgetStop {
     pub message: String,
 }
 
+/// A session a follow-up can pick back up. A provider's cache is per model
+/// and cools a few minutes after the last call, so both travel with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resume {
+    pub session: String,
+    pub model: String,
+    /// When the session's last call ended, in Unix milliseconds.
+    pub ended_at: u64,
+    /// The user's new words. The session already holds everything before them.
+    #[serde(default, skip_serializing)]
+    pub reply: String,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// What the UI gets when the run ends.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +323,9 @@ pub struct TaskResult {
     pub baseline: Option<Baseline>,
     /// The separate copy the run worked in, if the user asked for one.
     pub worktree: Option<project::Worktree>,
+    /// What a follow-up would resume. `None` for a copy, whose folder a
+    /// follow-up does not run in.
+    pub resume: Option<Resume>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -630,6 +653,15 @@ pub struct Request {
     /// What the call that read the prompt reported, usage included. Empty when
     /// no such call ran.
     pub classified: Vec<ProviderEvent>,
+    /// Files and folders the user attached, already checked to exist. Named
+    /// in every brief; Claude also needs their folders granted to read them.
+    pub attachments: Vec<PathBuf>,
+    /// A follow-up: the session to pick back up, if its model is still the one
+    /// the first stage asks for.
+    pub resume: Option<Resume>,
+    /// A reply that continues `task_id` rather than opening a task of its own:
+    /// its usage adds to the task's, and its prompt is logged as a new turn.
+    pub continued: bool,
 }
 
 /// The raw event stream of one run, kept so a paid run can be replayed free.
@@ -765,6 +797,7 @@ struct Context {
     /// merge it into, and resuming this one as well would pay twice to say the
     /// same thing.
     final_stage: bool,
+    attachments: Vec<PathBuf>,
 }
 
 impl Context {
@@ -819,6 +852,8 @@ struct State {
     /// Apply-now arrived before Codex identified its session. Restart as soon
     /// as the Started event supplies the ID instead of dropping the request.
     apply_now_pending: bool,
+    /// The last writing or answering session, for a follow-up.
+    resume_point: Option<Resume>,
 }
 
 /// What happens after one process ends.
@@ -850,6 +885,9 @@ pub async fn stream(
         recordings,
         worktree,
         classified,
+        attachments,
+        mut resume,
+        continued,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -868,6 +906,7 @@ pub async fn stream(
             shell: true,
         },
         final_stage: true,
+        attachments,
     };
     let mut state = State {
         outcome: Outcome::default(),
@@ -887,11 +926,16 @@ pub async fn stream(
         held: Vec::new(),
         session: None,
         apply_now_pending: false,
+        resume_point: None,
     };
 
     // The whole decision, recorded before a single process starts. Without this
     // row a later milestone can see what a run cost but not what it was allowed
     // to cost, and cannot tell a good route from a lucky one.
+    if continued {
+        let turn = serde_json::json!({ "kind": "turn", "data": { "prompt": prompt } });
+        let _ = note(store, &ctx, "turn", &turn.to_string());
+    }
     if let Err(e) = note(store, &ctx, "routing", &routing_payload(&route)) {
         state.outcome.failure = Some(format!("could not record the route: {}", e.message));
     }
@@ -959,19 +1003,25 @@ pub async fn stream(
             Stage::Implement | Stage::Fix => route.work_model(id),
             _ => None,
         };
+        // A Claude Fix resumes the Implement session, and any change to the tool
+        // list re-bills that whole history uncached (~74k tokens on a real run).
+        // `--json-schema` adds a StructuredOutput tool Implement never had, so a
+        // Fix the next Verify judges goes without it.
+        let schema = write_schema(task_id, stage).filter(|_| {
+            !(id == ProviderId::Claude
+                && stage == Stage::Fix
+                && stages.get(index + 1) == Some(&Stage::Verify))
+        });
         ctx.plan = StagePlan {
             stage,
-            schema: write_schema(task_id, stage),
+            schema,
             tier,
             model: choice.map(|choice| choice.model),
             effort: choice.map(|choice| choice.effort),
             // A question may only run `git diff`/`status` anyway; the two shell
             // tool schemas cost more than that is worth on every question.
-            shell: stage != Stage::Answer
-                && !(stage == Stage::Implement
-                    && stages[index + 1..].contains(&Stage::Verify)
-                    && checks_locally(&ctx.dir)
-                    && !routing::needs_shell(&prompt)),
+            // Implement keeps them so a resumed Fix sees the same tool list.
+            shell: stage != Stage::Answer,
         };
         ctx.final_stage = index + 1 == stages.len();
         state.outcome.begin_stage();
@@ -1005,11 +1055,18 @@ pub async fn stream(
             .await
             .is_some();
         if !checked_locally {
+            // A follow-up resumes on the first stage that calls a model, and only
+            // on the model it ran on: any other reads the whole history uncached.
+            let resuming = resume
+                .take()
+                .filter(|r| r.model == ctx.plan.model(id).model);
+            let words = resuming.as_ref().map_or(prompt.as_str(), |r| r.reply.as_str());
             let mut brief =
-                routing::brief(&route, stage, &prompt, &state.constraints, &state.notes);
-            if id == ProviderId::Codex && stage == Stage::Implement {
+                routing::brief(&route, stage, words, &state.constraints, &state.notes);
+            if id == ProviderId::Codex && stage == Stage::Implement && resuming.is_none() {
                 brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
             }
+            brief.push_str(&attached_note(&ctx.attachments));
             if stage == Stage::Review {
                 brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
             }
@@ -1042,8 +1099,11 @@ Before any change, the project's checks already fail. This may be the task, or a
             // Usually one pass. A checkpoint provider told to apply an instruction
             // now ends its process and comes back through here resuming its own
             // session.
-            let mut launch = match state.work_session.as_deref() {
-                Some(session) if stage == Stage::Fix => Launch::fix(id, session, &brief, &ctx.plan),
+            let mut launch = match (&resuming, state.work_session.as_deref()) {
+                (Some(r), _) => Launch::fix(id, &r.session, &brief, &ctx.plan),
+                (None, Some(session)) if stage == Stage::Fix => {
+                    Launch::fix(id, session, &brief, &ctx.plan)
+                }
                 _ => Launch::first(id, &brief, &ctx.plan),
             };
             loop {
@@ -1054,6 +1114,14 @@ Before any change, the project's checks already fail. This may be the task, or a
             }
             if stage.writes() && state.session.is_some() {
                 state.work_session = state.session.clone();
+            }
+            if let Some(session) = state.session.clone().filter(|_| stage.writes() || stage == Stage::Answer) {
+                state.resume_point = Some(Resume {
+                    session,
+                    model: ctx.plan.model(id).model.into(),
+                    ended_at: now_ms(),
+                    reply: String::new(),
+                });
             }
         }
 
@@ -1074,6 +1142,11 @@ Before any change, the project's checks already fail. This may be the task, or a
         if checked_locally {
             // Orteca ran the tests itself; no model was asked anything.
             (note_for_stage.model, note_for_stage.effort) = (None, None);
+            // No model spoke, so the summary would fall back to an earlier
+            // stage - a Fix's own "pass" over the Verify that just failed.
+            if failed {
+                note_for_stage.summary = failed_summary(note_for_stage.artifact.as_ref());
+            }
         }
         state.notes.push(note_for_stage);
         // An Implement that changed nothing has nothing to check. Testing an
@@ -1120,7 +1193,12 @@ Before any change, the project's checks already fail. This may be the task, or a
 
     // A run that never reported usage has no honest number; this writes the
     // `unavailable` row rather than leaving the task looking free.
-    if let Err(e) = store.record_usage(task_id, None, id.program(), outcome.usage.as_ref()) {
+    let recorded = if continued {
+        store.add_usage(task_id, id.program(), outcome.usage.as_ref())
+    } else {
+        store.record_usage(task_id, None, id.program(), outcome.usage.as_ref())
+    };
+    if let Err(e) = recorded {
         outcome.failure = Some(format!("could not save usage: {}", e.message));
     }
 
@@ -1195,13 +1273,18 @@ Before any change, the project's checks already fail. This may be the task, or a
             outcome.status()
         };
     // The last stage that actually said something. A Review that asked for
-    // changes is the answer to the task, not the Verify that never ran.
+    // changes is the answer to the task, not the Verify that never ran. A
+    // finished route skips the checkers' JSON: the writer's words are the answer.
     let summary = state
         .notes
         .iter()
         .rev()
         .map(|n| n.summary.clone())
-        .find(|s| !s.trim().is_empty())
+        .find(|s| {
+            !s.trim().is_empty()
+                && !(status == "done"
+                    && serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object()))
+        })
         .unwrap_or_else(|| outcome.summary());
     // Read before this task closes, so it is never its own comparison. A
     // baseline that cannot be read is no baseline, not a failed run.
@@ -1243,6 +1326,7 @@ Before any change, the project's checks already fail. This may be the task, or a
         turns_used: state.turns_used,
         budget_stop: state.budget_stop,
         baseline,
+        resume: state.resume_point.filter(|_| worktree.is_none()),
         worktree,
     }
 }
@@ -1764,6 +1848,23 @@ fn failed_checks(artifact: &serde_json::Value) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// A local Verify that failed, in words: each failing command and its output.
+fn failed_summary(artifact: Option<&serde_json::Value>) -> String {
+    artifact
+        .map(failed_checks)
+        .unwrap_or_default()
+        .iter()
+        .map(|check| {
+            format!(
+                "`{}` did not pass.\n\n```\n{}\n```",
+                check["command"].as_str().unwrap_or("check"),
+                check["output"].as_str().unwrap_or_default().trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Close out one stage: validate whatever artifact came back, log it, and say
 /// whether a check it contracted for did not pass.
 /// Every file in the diff was already changed before the run started.
@@ -1789,7 +1890,7 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
         .structured
         .take()
         .filter(|value| routing::artifact_is_valid(stage, value));
-    if stage.schema().is_some() {
+    if ctx.plan.schema.is_some() {
         let _ = note(
             store,
             ctx,
@@ -1926,6 +2027,43 @@ fn price_codex(store: &Store, model: &str, outcome: &mut Outcome, events: &mut [
     }
 }
 
+/// The user's attachments, as a line the agent can act on. Empty when none.
+fn attached_note(attachments: &[PathBuf]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "
+
+The user attached these files and folders on purpose. Attaching is the user sharing them with you, so open any attached image rather than asking what it shows. Read or view the rest as the task needs; do not edit them unless the task says to:
+",
+    );
+    for path in attachments {
+        out.push_str(&format!("- {}
+", path.display()));
+    }
+    out
+}
+
+/// Codex reads outside the workspace under its sandbox already. Claude only
+/// reaches directories it is given, so each attachment's folder is added.
+// ponytail: --add-dir also lets acceptEdits write there; the brief asks it not to.
+fn attachment_args(id: ProviderId, attachments: &[PathBuf]) -> Vec<String> {
+    if id != ProviderId::Claude {
+        return Vec::new();
+    }
+    // Paths, not strings: `C:\a\` and `C:\a` are one folder.
+    let mut dirs: Vec<&Path> = attachments
+        .iter()
+        .filter_map(|p| if p.is_dir() { Some(p.as_path()) } else { p.parent() })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs.into_iter()
+        .flat_map(|d| ["--add-dir".to_string(), d.display().to_string()])
+        .collect()
+}
+
 /// Run one process to its end. Says whether the task is finished or is being
 /// picked back up somewhere else.
 async fn attempt(
@@ -1936,7 +2074,9 @@ async fn attempt(
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     launch: Launch,
 ) -> Next {
-    let borrowed: Vec<&str> = launch.argv.iter().map(String::as_str).collect();
+    let mut argv = launch.argv;
+    argv.extend(attachment_args(ctx.id, &ctx.attachments));
+    let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Counted before the spawn can fail: a process Orteca tried to start is a
     // call it spent, and hiding the failures would flatter the metric.
     state.calls_used = state.calls_used.saturating_add(1);
@@ -2004,7 +2144,10 @@ async fn attempt(
                 // trace of why the run did nothing. Keep the raw line. It is not
                 // emitted - the UI has no shape for it - so the log stays
                 // complete while the stream stays readable.
-                if events.is_empty() {
+                // Claude's running thinking-token count says nothing the usage
+                // event does not; logging it buried real unknowns 3 to 1.
+                let tick = value["type"] == "system" && value["subtype"] == "thinking_tokens";
+                if events.is_empty() && !tick {
                     state.unknown_events = state.unknown_events.saturating_add(1);
                     if let Err(e) = store.append_event(
                         ctx.task_id,
@@ -2273,10 +2416,10 @@ mod tests {
         }
     }
 
-    /// An Implement that Orteca's own tests follow has no shell on Claude. The
-    /// denylist stays as a backstop.
+    /// A stage without a shell (an Answer) gets no Bash or PowerShell on
+    /// Claude. The denylist stays as a backstop.
     #[test]
-    fn an_implement_followed_by_local_tests_has_no_shell() {
+    fn a_stage_without_a_shell_has_no_shell_tools() {
         let claude = args(
             ProviderId::Claude,
             &StagePlan {
@@ -2310,6 +2453,18 @@ mod tests {
         );
         assert_eq!(pasted_files(&dir, &paths[..2]), "");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attachments_grant_claude_their_folders_once_and_are_named_in_the_brief() {
+        let dir = std::env::temp_dir();
+        let files = vec![dir.join("a.png"), dir.join("b.txt"), dir.clone()];
+        let argv = attachment_args(ProviderId::Claude, &files);
+        assert_eq!(argv.len(), 2, "{argv:?}");
+        assert_eq!(std::path::Path::new(&argv[1]), dir.as_path());
+        assert!(attachment_args(ProviderId::Codex, &files).is_empty());
+        assert!(attached_note(&files).contains(&files[0].display().to_string()));
+        assert!(attached_note(&[]).is_empty());
     }
 
     #[test]
@@ -2355,6 +2510,9 @@ mod tests {
                     dirty_at_start: false,
                 })
                 .unwrap(),
+            attachments: Vec::new(),
+            resume: None,
+            continued: false,
             id: ProviderId::Codex,
             program: dir.join("fake.cmd"),
             dir,
@@ -2569,8 +2727,13 @@ mod tests {
             "non-JSON output leaked in: {written}"
         );
 
-        let replayed: Vec<String> = crate::providers::mock::replay(ProviderId::Codex, &recording)
-            .expect("a recording must load as a fixture")
+        let mut replayed = crate::providers::mock::replay(ProviderId::Codex, &recording)
+            .expect("a recording must load as a fixture");
+        // The recording keeps what the CLI said. The model Codex leaves out is
+        // Orteca's addition, made to a replay the same way as to a live run.
+        let model = result.usage.as_ref().and_then(|u| u.model.clone()).expect("the run names its model");
+        price_codex(&store, &model, &mut Outcome::default(), &mut replayed);
+        let replayed: Vec<String> = replayed
             .iter()
             .map(|e| serde_json::to_string(e).unwrap())
             .collect();
@@ -4217,6 +4380,22 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn a_failed_local_verify_speaks_for_itself() {
+        let artifact = serde_json::json!({
+            "checks": [
+                {"command": "composer test", "passed": false, "output": "Class X cannot be found\n"},
+                {"command": "npm test", "passed": true, "output": "ok"}
+            ],
+            "verdict": "fail"
+        });
+        assert_eq!(
+            failed_summary(Some(&artifact)),
+            "`composer test` did not pass.\n\n```\nClass X cannot be found\n```"
+        );
+        assert_eq!(failed_summary(None), "");
+    }
+
     #[tokio::test]
     async fn a_changed_fix_gets_no_second_paid_attempt_when_verify_still_fails() {
         let store = Store::in_memory().unwrap();
@@ -4476,6 +4655,59 @@ ping -n 60 127.0.0.1 >nul
         assert!(calls[1].starts_with("-p "), "{}", calls[1]);
         assert!(calls[1].ends_with("--resume claude-1"), "{}", calls[1]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A follow-up resumes the session it was handed and sends only the reply,
+    /// unless the first stage now asks for another model.
+    #[tokio::test]
+    async fn a_follow_up_resumes_on_the_same_model_and_sends_only_the_reply() {
+        let store = Store::in_memory().unwrap();
+        let fake_claude = |request: &mut Request| {
+            request.id = ProviderId::Claude;
+            let dir = request.dir.clone();
+            std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+            let log = dir.join("argv.log").to_string_lossy().replace('\\', "/");
+            std::fs::write(
+                dir.join("fake.js"),
+                format!(
+                    "const fs=require('fs');process.stdin.setEncoding('utf8');process.stdin.once('data',d=>{{\
+                     fs.appendFileSync('{log}',process.argv.slice(2).join(' ')+'\\n'+d+'\\n');\
+                     console.log(JSON.stringify({{type:'system',subtype:'init',session_id:'claude-2'}}));\
+                     console.log(JSON.stringify({{type:'result',subtype:'success',result:'which table?',\
+                     usage:{{input_tokens:1,output_tokens:1}},total_cost_usd:0.01}}));}});\
+                     process.stdin.on('end',()=>process.exit(0));"
+                ),
+            )
+            .unwrap();
+            dir
+        };
+
+        let mut first = routed(&store, "follow-up-1", one_call("fix the typo in the readme"));
+        let dir = fake_claude(&mut first);
+        let point = stream(&store, &Live::default(), first, |_| Ok(())).await.resume.unwrap();
+        assert_eq!(point.session, "claude-2");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let mut same = routed(&store, "follow-up-2", one_call("fix the typo in the readme"));
+        let dir = fake_claude(&mut same);
+        same.resume = Some(Resume { session: "claude-1".into(), reply: "the quotes table".into(), ..point.clone() });
+        same.prompt = "fix the typo".into();
+        stream(&store, &Live::default(), same, |_| Ok(())).await;
+        let log = std::fs::read_to_string(dir.join("argv.log")).unwrap();
+        assert!(log.contains("--resume claude-1"), "{log}");
+        assert!(log.contains("the quotes table"), "{log}");
+        assert!(!log.contains("fix the typo"), "the resumed session already has the request: {log}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let mut other = routed(&store, "follow-up-3", one_call("fix the typo in the readme"));
+        let dir = fake_claude(&mut other);
+        other.prompt = "fix the typo".into();
+        other.resume = Some(Resume { model: "some-other-model".into(), reply: "x".into(), ..point });
+        stream(&store, &Live::default(), other, |_| Ok(())).await;
+        let log = std::fs::read_to_string(dir.join("argv.log")).unwrap();
+        assert!(!log.contains("--resume"), "{log}");
+        assert!(log.contains("fix the typo"), "{log}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Structured output that does not match the contract is not an artifact,

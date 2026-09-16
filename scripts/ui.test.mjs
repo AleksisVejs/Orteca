@@ -6,7 +6,7 @@ import { parse } from '@vue/compiler-sfc';
 // No preview is allowed for this review. These are source-level checks of
 // docs/ui.md, not claims about rendered layout or visual accessibility.
 const tokens = readFileSync(new URL('../src/styles/tokens.css', import.meta.url), 'utf8');
-for (const folder of ['views', 'components']) {
+for (const folder of ['views', 'views/project', 'components']) {
   for (const file of readdirSync(new URL(`../src/${folder}/`, import.meta.url)).filter(f => f.endsWith('.vue'))) {
     const source = readFileSync(new URL(`../src/${folder}/${file}`, import.meta.url), 'utf8');
     const { descriptor } = parse(source);

@@ -47,8 +47,8 @@ is the only place colour, radius and spacing are defined.
 - `--r` (10px) for cards, panels and the logo tile. `--r-sm` (6px) for
   buttons, chips and inner groups. `999px` for status pills. Nothing else.
 - Borders are 1px hairlines. Never 2px, never doubled.
-- Content columns are capped: 560px on Launch, 720px on Project. Full-bleed
-  layouts are not part of this app.
+- Content columns are capped: 560px on Launch, 760px in the Project main pane.
+  Full-bleed layouts are not part of this app.
 - Vertical rhythm: 32px between sections, 16–18px inside a card.
 
 ## Type
@@ -68,8 +68,9 @@ is the only place colour, radius and spacing are defined.
 
 - **There is no component library and there will not be one.** Shared
   primitives live in `tokens.css` as plain classes: `.card`, `.btn`,
-  `.btn.primary`, `.chip`, `.label`, `.mono`. Everything else is scoped CSS in
-  the view that uses it.
+  `.btn.primary`, `.chip`, `.label`, `.mono`, `.note`, `.missing`, `.link`,
+  `.grow`, `.dot`, `.diff`, `.code-view`, `.copy`. Everything else is scoped CSS
+  in the file that uses it.
 - **Do not extract a component until the third use.** Two copies of a row is
   cheaper than one wrong abstraction.
 - One `.btn.primary` per screen, maximum. It is a light fill on dark, so it
@@ -77,9 +78,17 @@ is the only place colour, radius and spacing are defined.
 - **A destructive or consenting action is never the primary button.** "Trust
   and open" is a plain button in `--warn`; the safe choice is the easy one.
 - Icons are inline SVG in the file that needs them. No icon package.
-- No sidebar, no tab bar, no breadcrumb until there are genuinely more than
-  three destinations. The mock set shows a sidebar for a five-screen app; this
-  app has two screens and a modal, and fake navigation is worse than none.
+- The Project screen is a shell (`views/Project.vue`: sidebar, top bar) around
+  one page at a time from `views/project/`: composer, live run, result, past
+  task, AI helpers. All state lives in `views/project/state.ts` and the pages
+  `inject` it. A page renders; it does not own logic.
+- The sidebar holds only destinations that exist: New task, the current run,
+  AI helpers, recent tasks, switch project. No entry for a feature that is not
+  wired up.
+- A status dot is green for done, `--err` for failed, `--warn` for checks that
+  did not pass, blue while running, and neutral otherwise.
+- A result shows what happened first; route, metrics, files and activity sit
+  one tab away. Git actions live in the top bar.
 
 ## Honesty (this one outranks looks)
 

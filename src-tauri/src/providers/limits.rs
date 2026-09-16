@@ -1,6 +1,7 @@
 //! How much of each plan's rolling allowance is already used, in the CLI's own
-//! words. Asked before a run and never paid for: `claude -p /usage` answers
-//! locally with a zero-token synthetic message, and `codex app-server` answers
+//! words. Asked before a run. `claude -p /usage` answered locally for free until
+//! 2.1.273, which sends it to the model instead: one small haiku call whose
+//! `rate_limit_event` carries the reading. `codex app-server` answers
 //! `account/rateLimits/read` without starting a thread. Both verified against
 //! claude 2.1.269 and codex-cli 0.154.0 on 2026-09-13.
 //!
@@ -52,6 +53,9 @@ const CLAUDE_ARGS: &[&str] = &[
     "--strict-mcp-config",
     "--max-turns",
     "1",
+    // Newer CLIs send `/usage` to the model; keep that call on the cheapest one.
+    "--model",
+    "haiku",
 ];
 
 pub async fn read(id: ProviderId) -> Limits {
@@ -92,8 +96,12 @@ async fn ask_claude(program: &str) -> Result<Vec<Window>, String> {
         proc::spawn(program, CLAUDE_ARGS, &std::env::temp_dir()).map_err(|e| e.to_string())?;
     run.close_stdin();
     let mut text = String::new();
+    let mut event = None;
     while let Some(line) = run.lines.recv().await {
         match line {
+            Line::Json(v) if v["type"] == "rate_limit_event" => {
+                event = parse_claude_event(&v).or(event);
+            }
             Line::Json(v) if v["type"] == "assistant" => {
                 if let Some(t) = v["message"]["content"][0]["text"].as_str() {
                     text.push_str(t);
@@ -103,7 +111,29 @@ async fn ask_claude(program: &str) -> Result<Vec<Window>, String> {
             _ => {}
         }
     }
-    parse_claude(&text)
+    // Since 2.1.273 `/usage` goes to the model, whose text is not a reading.
+    event.map_or_else(|| parse_claude(&text), Ok)
+}
+
+/// Reads a `rate_limit_event`'s `unifiedWindows`, which every model call carries.
+pub fn parse_claude_event(v: &Value) -> Option<Vec<Window>> {
+    let windows: Vec<Window> = v["rate_limit_info"]["unifiedWindows"]
+        .as_object()?
+        .iter()
+        .filter_map(|(key, w)| {
+            Some(Window {
+                label: match key.as_str() {
+                    "five_hour" => "session".into(),
+                    "seven_day" => "week".into(),
+                    k => k.replace('_', " "),
+                },
+                used_percent: (w["utilization"].as_f64()? * 100.0).round(),
+                resets_at: w["resetsAt"].as_i64(),
+                resets_text: None,
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then_some(windows)
 }
 
 async fn ask_codex(program: &str) -> Result<Vec<Window>, String> {
@@ -230,6 +260,27 @@ mod tests {
             parse_claude("").is_err(),
             "no text is no reading, not 0% used"
         );
+    }
+
+    /// Recorded from claude 2.1.273, 2026-09-16.
+    #[test]
+    fn claude_rate_limit_event_becomes_windows() {
+        let v = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed_warning",
+            "unifiedWindows": {"five_hour": {"utilization": 0.24, "resetsAt": 1789580400},
+                               "seven_day": {"utilization": 0.83, "resetsAt": 1789632000}}}});
+        let windows = parse_claude_event(&v).unwrap();
+        assert_eq!(
+            windows[0],
+            Window {
+                label: "session".into(),
+                used_percent: 24.0,
+                resets_at: Some(1789580400),
+                resets_text: None
+            }
+        );
+        assert_eq!(windows[1].label, "week");
+        assert_eq!(windows[1].used_percent, 83.0);
+        assert!(parse_claude_event(&json!({"type": "rate_limit_event"})).is_none());
     }
 
     /// Recorded from codex-cli 0.154.0 on a Plus plan, 2026-09-13.

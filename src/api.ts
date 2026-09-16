@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
@@ -15,6 +16,7 @@ import type {
   ProviderId,
   InstructionReceipt,
   Isolation,
+  Resume,
   TaskResult,
   TaskSummary,
   TaskDetail,
@@ -29,6 +31,27 @@ export async function pickFolder(): Promise<string | null> {
   const picked = await open({ directory: true, multiple: false });
   return typeof picked === "string" ? picked : null;
 }
+
+/** Native file or folder picker for attachments. Empty if the user cancelled. */
+export async function pickAttachments(directory: boolean): Promise<string[]> {
+  const picked = await open({ directory, multiple: true });
+  return picked === null ? [] : [picked].flat();
+}
+
+/** A pasted image has no file behind it; this writes one and returns its path. */
+export const savePastedImage = async (image: Blob, extension: string) =>
+  invoke<string>("save_pasted_image", {
+    // ponytail: bytes travel as a JSON array; fine for screenshots, raw IPC if big pastes lag.
+    bytes: Array.from(new Uint8Array(await image.arrayBuffer())),
+    extension,
+  });
+
+/** Files dragged over the window: `dragging` while held, `paths` once dropped. */
+export const onFileDrop = (fn: (dragging: boolean, paths: string[]) => void) =>
+  getCurrentWebview().onDragDropEvent(({ payload }) => {
+    const over = payload.type === "enter" || payload.type === "over";
+    fn(over, payload.type === "drop" ? payload.paths : []);
+  });
 
 export const openProject = (path: string) =>
   invoke<OpenedProject>("open_project", { path });
@@ -60,7 +83,11 @@ export const previewTask = (path: string, prompt: string, provider: ProviderId, 
 
 /** Deletes a finished run's copy folder. Git refuses while it holds uncommitted
  *  work; the branch always stays. */
-export const removeWorktree = (path: string, taskId: number) =>
+/** Opens a file a run touched with its default app, or shows it in Explorer. */
+export const openFile = (path: string, file: string, reveal: boolean) =>
+  invoke<void>("open_file", { path, file, reveal });
+
+export const removeWorktree =(path: string, taskId: number) =>
   invoke<void>("remove_worktree", { path, taskId });
 
 /** Runs one git command the user confirmed. `input` is the commit message or
@@ -85,8 +112,12 @@ export const startTask = (
   mode: Mode,
   headroom: number | null,
   isolation: Isolation,
+  attachments: string[],
   onEvent: (event: ProviderEvent) => void,
   onTask: (taskId: number) => void,
+  resume: (Resume & { reply: string }) | null = null,
+  // A reply that goes on in this task instead of opening a new one.
+  continueTask: number | null = null,
 ) => {
   const events = new Channel<ProviderEvent>();
   events.onmessage = onEvent;
@@ -94,7 +125,7 @@ export const startTask = (
   // Without it there is nothing for Stop to name.
   const task = new Channel<number>();
   task.onmessage = onTask;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, events, task });
+  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, events, task });
 };
 
 /**

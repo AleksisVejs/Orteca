@@ -1,0 +1,1118 @@
+// Everything the Project screen knows and does. The pages in this folder only
+// render it, and share one instance through provide/inject.
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import type { InjectionKey } from "vue";
+import {
+  pickAttachments,
+  savePastedImage,
+  cancelProviderOperation,
+  cancelTask,
+  detectProviders,
+  getTaskDetail,
+  gitAction,
+  installProvider,
+  isAppError,
+  onFileDrop,
+  onInstallEvent,
+  onSignInEvent,
+  openFile,
+  previewTask,
+  providerLimits,
+  recentTasks,
+  removeWorktree,
+  sendInstruction,
+  signInProvider,
+  startTask,
+} from "../../api";
+import type {
+  Auth,
+  Detected,
+  GitAction,
+  GitState,
+  Isolation,
+  LimitWindow,
+  Limits,
+  Mode,
+  OpenedProject,
+  ProviderEvent,
+  ProviderId,
+  Preflight,
+  Resume,
+  TaskDetail,
+  TaskResult,
+  TaskSummary,
+} from "../../types";
+
+/** A live update; `file` is the full path it is about, shown by name and openable. */
+export type Activity = { text: string; file: string | null };
+
+const EDIT_RE = /edit|write|patch|create|delete|move|rename|file_change|set-content|out-file|new-item|remove-item/;
+const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect/;
+
+export function useProject(opened: OpenedProject) {
+  const task = ref("");
+
+  // Absolute paths the run is told about. Kept after a run, like the prompt.
+  const attachments = ref<string[]>([]);
+  const attachError = ref<string | null>(null);
+  const dragging = ref(false);
+
+  function attach(paths: string[]) {
+    attachments.value = [...new Set([...attachments.value, ...paths])];
+  }
+
+  async function addAttachments(directory: boolean) {
+    attach(await pickAttachments(directory));
+  }
+
+  async function pasteImages(e: ClipboardEvent) {
+    const images = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (images.length === 0) return;
+    e.preventDefault();
+    attachError.value = null;
+    try {
+      for (const image of images) {
+        attach([await savePastedImage(image, image.type.split("/")[1] ?? "png")]);
+      }
+    } catch (err) {
+      attachError.value = isAppError(err) ? err.message : String(err);
+    }
+  }
+
+  function fileName(path: string): string {
+    return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  }
+
+  // Detected live on every open: a CLI can be installed or signed in behind us.
+  // A missing CLI is shown, not thrown - the app is useful with neither present.
+  const providers = ref<Detected[]>([]);
+  const providerError = ref(false);
+  const provider = ref<ProviderId>("codex");
+
+  // How readily the classifier takes the shorter route. Two modes, not three.
+  // The route itself is decided in Rust before any CLI starts and costs nothing.
+  const mode = ref<Mode>("balanced");
+  const MODES: Array<{ id: Mode; label: string; hint: string }> = [
+    { id: "balanced", label: "Careful", hint: "Let Orteca plan, build, and check the work" },
+    { id: "efficient", label: "Quick", hint: "Take the shortest safe path" },
+  ];
+
+  // Where the agent works. A copy is a git worktree beside the repository on a
+  // branch of its own; this folder is not touched until the user merges it.
+  const isolation = ref<Isolation>("currentTree");
+  const ISOLATIONS: Array<{ id: Isolation; label: string; hint: string }> = [
+    { id: "currentTree", label: "This folder", hint: "Change the files you have open" },
+    { id: "worktree", label: "Separate copy", hint: "Work in a copy on a new branch and leave this folder alone" },
+  ];
+
+  const installed = computed(() => providers.value.filter((p) => p.path));
+  const missing = computed(() => providers.value.filter((p) => !p.path));
+
+  // Asking a CLI what it is costs a process start each, so the answers take
+  // seconds and arrive out of order. The card lists every provider from the
+  // first frame and fills each row in as it replies, rather than showing an
+  // empty box until the slowest one is done. `providers` still holds only
+  // answers, so nothing downstream can mistake a pending row for a verdict.
+  const ORDER: ProviderId[] = ["claude", "codex"];
+  type Row = Detected & { pending?: true };
+  const rows = computed<Row[]>(() =>
+    ORDER.map(
+      (id) =>
+        providers.value.find((p) => p.id === id) ?? {
+          id,
+          program: id,
+          path: null,
+          version: null,
+          auth: "unknown",
+          costQuality: "unavailable",
+          // Nothing reads this on a pending row - `selected` only ever finds a
+          // real answer - but the cautious value is the one to stand in with.
+          steering: "checkpoint",
+          pending: true,
+        },
+    ),
+  );
+
+  // npm writes to one global folder, so two installs at once fight over it.
+  // One at a time, in order, and the button says which one is going.
+  const installing = ref<ProviderId | null>(null);
+  const installLine = ref("");
+  const installError = ref<string | null>(null);
+
+  async function install(ids: ProviderId[]) {
+    if (installing.value !== null || running.value) return;
+    installError.value = null;
+    for (const id of ids) {
+      installing.value = id;
+      installLine.value = "asking npm…";
+      try {
+        const fresh = await installProvider(id);
+        providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
+        provider.value = id;
+        void loadLimits();
+      } catch (e) {
+        installError.value = isAppError(e) ? e.message : String(e);
+        break;
+      }
+    }
+    installing.value = null;
+    installLine.value = "";
+  }
+
+  async function cancelProvider(id: ProviderId) {
+    try {
+      await cancelProviderOperation(id);
+    } catch {
+      // The operation may have completed between rendering and the click.
+    }
+  }
+
+  // Sign-in is the CLI's own browser flow. Orteca starts it and shows its output;
+  // it never renders a login form and never handles a credential.
+  const signingIn = ref<ProviderId | null>(null);
+  const signInLine = ref("");
+  const signInError = ref<string | null>(null);
+
+  async function signIn(id: ProviderId) {
+    if (signingIn.value !== null || installing.value !== null || running.value) return;
+    signInError.value = null;
+    signingIn.value = id;
+    signInLine.value = "starting sign-in…";
+    try {
+      const fresh = await signInProvider(id);
+      providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
+      // A signed-out CLI reports no limits, so the reading taken at open is stale
+      // the moment a sign-in succeeds. Not awaited: it takes seconds.
+      void loadLimits();
+    } catch (e) {
+      signInError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      signingIn.value = null;
+      signInLine.value = "";
+    }
+  }
+
+  const selected = computed(() => providers.value.find((p) => p.id === provider.value));
+
+  // What each plan has used, as its CLI reports it. Read on open and after every
+  // run; a reading costs no tokens but takes a few seconds.
+  const limits = ref<Limits[]>([]);
+  // Once the user picks a provider, headroom stops choosing for them.
+  const providerPicked = ref(false);
+  const pickedFor = ref<string | null>(null);
+
+  async function loadLimits() {
+    try {
+      limits.value = await providerLimits();
+    } catch {
+      limits.value = [];
+    }
+    pickByHeadroom();
+  }
+
+  /** The room left in this provider's tightest window, or null with no reading. */
+  function headroom(id: ProviderId): number | null {
+    const windows = limits.value.find((l) => l.id === id)?.windows ?? [];
+    return windows.length ? Math.min(...windows.map((w) => 100 - w.usedPercent)) : null;
+  }
+
+  /** Move to the runnable provider with the most room left. Only when every
+   *  runnable one has a reading: an unread limit is not an empty one. */
+  function pickByHeadroom() {
+    if (providerPicked.value) return;
+    const runnable = installed.value
+      .filter((p) => p.auth !== "signedOut")
+      .map((p) => ({ id: p.id, room: headroom(p.id) }));
+    if (runnable.length < 2 || runnable.some((r) => r.room === null)) return;
+    // A tie keeps the provider already selected.
+    const best = runnable.reduce((a, b) =>
+      b.room! > a.room! || (b.room === a.room && b.id === provider.value) ? b : a,
+    );
+    pickedFor.value = `Using ${best.id}: it has the most limit left (${runnable
+      .map((r) => `${r.id} ${Math.round(r.room!)}%`)
+      .join(", ")}).`;
+    if (best.id !== provider.value) {
+      provider.value = best.id;
+      schedulePreview();
+    }
+  }
+
+  function resetWhen(w: LimitWindow): string | null {
+    if (w.resetsText) return w.resetsText;
+    if (w.resetsAt === null) return null;
+    return new Date(w.resetsAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
+
+  /** A helper row's reading: every window with its label, or why there is none. */
+  function limitLine(id: ProviderId): string | null {
+    const reading = limits.value.find((l) => l.id === id);
+    if (!reading) return null;
+    if (!reading.windows.length) return `limits unavailable: ${reading.unavailable ?? "no reading"}`;
+    return reading.windows.map((w) => `${w.label} ${Math.round(w.usedPercent)}% used`).join(" · ");
+  }
+
+  // ponytail: a flat 5% of a window per agent call is a guess, not a measurement.
+  // Replace it with each route's measured draw once runs read limits before and after.
+  const PERCENT_PER_CALL = 5;
+
+  /** The fullest window that may not cover this route's stages. A check that
+   *  fails adds a fix and the check again on top. */
+  const limitWarning = computed(() => {
+    const p = preview.value;
+    if (!p) return null;
+    const calls = p.route.stages.length;
+    const windows = limits.value.find((l) => l.id === p.provider)?.windows ?? [];
+    const tight = windows
+      .filter((w) => 100 - w.usedPercent < calls * PERCENT_PER_CALL)
+      .sort((a, b) => b.usedPercent - a.usedPercent)[0];
+    return tight ? { window: tight, calls, resets: resetWhen(tight) } : null;
+  });
+
+  /** The other runnable CLI, and its room left (null when unread). */
+  function otherThan(id: ProviderId): { id: ProviderId; room: number | null } | null {
+    const other = installed.value.find((p) => p.id !== id && p.auth !== "signedOut");
+    return other ? { id: other.id, room: headroom(other.id) } : null;
+  }
+
+  /** Before a run: the other CLI, when it is known to have more room than this one. */
+  const alternative = computed(() => {
+    const p = preview.value;
+    if (!p || !limitWarning.value) return null;
+    const other = otherThan(p.provider);
+    const mine = headroom(p.provider);
+    return other && other.room !== null && (mine === null || other.room > mine) ? other.id : null;
+  });
+
+  /** After a run that stopped because its plan ran out: the CLI that could take over.
+   *  Offered, never taken: continuing is a fresh run the user starts. */
+  const fallback = computed(() => {
+    const r = result.value;
+    // A copy's work is on its branch; a fresh run would start from the commit without it.
+    if (r?.status !== "failed" || r.failureKind !== "usageLimit" || r.worktree) return null;
+    const other = otherThan(provider.value);
+    return other && (other.room === null || other.room > 0) ? other : null;
+  });
+
+  function switchTo(id: ProviderId) {
+    provider.value = id;
+    providerPicked.value = true;
+    pickedFor.value = null;
+    schedulePreview();
+  }
+
+  /** The same request on the other CLI. What the stopped run changed is still on disk. */
+  async function continueWith(id: ProviderId) {
+    provider.value = id;
+    providerPicked.value = true;
+    pickedFor.value = null;
+    await run();
+  }
+
+  /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
+  /// and refusing to run on a guess would be the same mistake in the other
+  /// direction. The run itself reports an auth failure honestly either way.
+  const canRun = computed(
+    () =>
+      !running.value &&
+      installing.value === null &&
+      signingIn.value === null &&
+      task.value.trim().length > 0 &&
+      !!selected.value?.path &&
+      selected.value.auth !== "signedOut",
+  );
+
+  // One run at a time. The stream and the result are the whole screen while it
+  // is going, and Stop is the only other thing worth doing.
+  const running = ref(false);
+  const stream = ref<Array<{ kind: string; text: string; file?: string | null }>>([]);
+  const result = ref<TaskResult | null>(null);
+  const runError = ref<string | null>(null);
+  const currentActivity = ref<Activity>({ text: "Getting ready", file: null });
+  const fileError = ref<string | null>(null);
+
+  async function openActivityFile(file: string, reveal: boolean) {
+    fileError.value = null;
+    try {
+      await openFile(opened.project.path, file, reveal);
+    } catch (e) {
+      fileError.value = isAppError(e) ? e.message : String(e);
+    }
+  }
+
+  // The backend sends this the moment the task row exists, which is what Stop
+  // names. Until it arrives there is a run on screen that cannot yet be stopped,
+  // so the button is disabled rather than lying about what it would do.
+  const taskId = ref<number | null>(null);
+  const stopping = ref(false);
+
+  // A mid-task instruction. Where it lands is the provider's business, and the
+  // card says which before the user types rather than after they have sent it.
+  const instruction = ref("");
+  const sending = ref(false);
+  const instructionError = ref<string | null>(null);
+  const steering = computed(() => selected.value?.steering ?? "checkpoint");
+
+  async function instruct(applyNow: boolean) {
+    const text = instruction.value.trim();
+    if (!running.value || taskId.value === null || sending.value || !text) return;
+    sending.value = true;
+    instructionError.value = null;
+    try {
+      const receipt = await sendInstruction(taskId.value, text, applyNow);
+      if (receipt.disposition === "tooLate") {
+        instructionError.value = "The run finished before it could take that instruction.";
+        return;
+      }
+      // Shown as the user's own words. Never pushed through `describe`, which
+      // would file them among the things the agent said.
+      stream.value.push({ kind: "instruction", text });
+      instruction.value = "";
+    } catch (e) {
+      instructionError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      sending.value = false;
+    }
+  }
+
+  async function stopRun() {
+    if (!running.value || taskId.value === null || stopping.value) return;
+    stopping.value = true;
+    try {
+      await cancelTask(taskId.value);
+    } catch {
+      // The run ended between the click and the call. There is nothing left to
+      // stop, and the result about to arrive already says what happened.
+    }
+  }
+
+  let stop: Array<() => void> = [];
+
+  // Past runs here, reloaded after each one. A history that cannot be read says
+  // so; it never blocks a run.
+  const history = ref<TaskSummary[]>([]);
+  const historyError = ref(false);
+  const historyDetail = ref<TaskDetail | null>(null);
+  const historyDetailLoading = ref(false);
+  const historyDetailError = ref(false);
+  let historyRequest = 0;
+
+  async function loadHistory() {
+    try {
+      history.value = await recentTasks(opened.project.path);
+      historyError.value = false;
+    } catch {
+      historyError.value = true;
+    }
+  }
+
+  async function openHistory(run: TaskSummary) {
+    const request = ++historyRequest;
+    historyDetailLoading.value = true;
+    historyDetailError.value = false;
+    try {
+      const detail = await getTaskDetail(opened.project.path, run.id);
+      if (request === historyRequest) historyDetail.value = detail;
+    } catch {
+      if (request === historyRequest) historyDetailError.value = true;
+    } finally {
+      if (request === historyRequest) historyDetailLoading.value = false;
+    }
+  }
+
+  // Removing a copy deletes a folder, so it takes a second click. The branch stays.
+  const confirmRemove = ref<number | null>(null);
+  const removedCopies = ref<number[]>([]);
+  const removeError = ref<string | null>(null);
+
+  async function removeCopy(id: number) {
+    if (confirmRemove.value !== id) {
+      confirmRemove.value = id;
+      removeError.value = null;
+      return;
+    }
+    try {
+      await removeWorktree(opened.project.path, id);
+      removedCopies.value = [...removedCopies.value, id];
+    } catch (e) {
+      removeError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      confirmRemove.value = null;
+    }
+  }
+
+  // Git without the AI. Every command waits for a second click that says
+  // exactly what it will do; none of them can force or reset anything.
+  const git = ref<GitState>(opened.git);
+  const gitAsk = ref<GitAction | null>(null);
+  const gitBusy = ref(false);
+  const gitError = ref<string | null>(null);
+  const commitMessage = ref("");
+  const mergeBranch = ref("");
+
+  function gitQuestion(action: GitAction): string {
+    const g = git.value;
+    const remote = g.upstream ?? "the remote";
+    const n = (count: number | null, word: string) => `${count ?? 0} ${word}${count === 1 ? "" : "s"}`;
+    switch (action) {
+      case "fetch":
+        return `Download what's new on ${remote}? Your files stay as they are.`;
+      case "pull":
+        return `Bring ${n(g.behind, "commit")} from ${remote} into your files? Git stops if that needs a merge.`;
+      case "commit":
+        return `Commit all ${n(g.dirtyCount, "changed file")} on ${g.branch ?? "this detached HEAD"}?`;
+      case "push":
+        return g.upstream
+          ? `Send ${n(g.ahead, "commit")} to ${remote}? Others will see them.`
+          : `Publish ${g.branch ?? "this branch"} to the remote for the first time? Others will see it.`;
+      case "merge":
+        return `Bring ${mergeBranch.value || "a branch"} into ${g.branch ?? "this detached HEAD"}? If they change the same lines, Orteca stops and changes nothing.`;
+    }
+  }
+
+  async function runGit(action: GitAction) {
+    if (gitAsk.value !== action) {
+      gitAsk.value = action;
+      gitError.value = null;
+      if (action === "merge") mergeBranch.value = git.value.branches[0] ?? "";
+      return;
+    }
+    gitBusy.value = true;
+    try {
+      const input = action === "merge" ? mergeBranch.value : commitMessage.value;
+      git.value = await gitAction(opened.project.path, action, input);
+      if (action === "commit") commitMessage.value = "";
+      gitAsk.value = null;
+    } catch (e) {
+      gitError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      gitBusy.value = false;
+    }
+  }
+
+  const preview = ref<Preflight | null>(null);
+  const previewing = ref(false);
+  const previewError = ref<string | null>(null);
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewRequest = 0;
+
+  function schedulePreview() {
+    previewRequest += 1;
+    if (previewTimer !== null) clearTimeout(previewTimer);
+    if (!task.value.trim() || !selected.value?.path || running.value) {
+      preview.value = null;
+      previewError.value = null;
+      return;
+    }
+    previewTimer = setTimeout(refreshPreview, 600);
+  }
+
+  async function refreshPreview() {
+    const request = ++previewRequest;
+    const chosen = selected.value;
+    if (!chosen?.path || !task.value.trim()) return;
+    previewing.value = true;
+    previewError.value = null;
+    try {
+      const planned = await previewTask(opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value);
+      if (request === previewRequest) {
+        preview.value = planned;
+        git.value = planned.git;
+      }
+    } catch (e) {
+      if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      if (request === previewRequest) previewing.value = false;
+    }
+  }
+
+  onMounted(async () => {
+    void loadHistory();
+    void loadLimits();
+    try {
+      providers.value = await detectProviders((one) => {
+        providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
+      });
+      // Prefer whatever is actually installed over the default.
+      const first = installed.value[0];
+      if (first && !installed.value.some((p) => p.id === provider.value)) {
+        provider.value = first.id;
+      }
+      // Limits may have landed first; both halves are needed to choose.
+      pickByHeadroom();
+    } catch {
+      providerError.value = true;
+    }
+
+    stop = await Promise.all([
+      onFileDrop((over, paths) => {
+        dragging.value = over;
+        if (!running.value) attach(paths);
+      }),
+      onInstallEvent((id, line) => {
+        if (installing.value === id) installLine.value = line;
+      }),
+      onSignInEvent((id, line) => {
+        if (signingIn.value === id) signInLine.value = line;
+      }),
+    ]);
+  });
+
+  onUnmounted(() => {
+    if (previewTimer !== null) clearTimeout(previewTimer);
+    stop.forEach((off) => off());
+  });
+
+  async function run() {
+    const resume = resumeWith;
+    const chained = following;
+    const continueTask = continuing;
+    resumeWith = null;
+    continuing = null;
+    following = false;
+    if (!canRun.value) return;
+    if (!chained) asked = [];
+    ranOn.value = provider.value;
+    stream.value = [];
+    result.value = null;
+    runError.value = null;
+    taskId.value = null;
+    stopping.value = false;
+    instruction.value = "";
+    instructionError.value = null;
+    currentActivity.value = { text: "Getting ready", file: null };
+    view.value = "task";
+    resultTab.value = "summary";
+    running.value = true;
+    try {
+      result.value = await startTask(
+        opened.project.path,
+        task.value,
+        provider.value,
+        mode.value,
+        // The same reading the preview was routed on, so the run matches it.
+        headroom(provider.value),
+        isolation.value,
+        attachments.value,
+        (event) => {
+          const activity = activityFor(event);
+          if (activity !== null) currentActivity.value = activity;
+          const text = describe(event);
+          if (text === null) return;
+          const file = event.kind === "toolUse" ? toolActivity(event.data.name, event.data.summary) : null;
+          stream.value.push(
+            file?.file
+              ? { kind: event.kind, ...file }
+              : { kind: event.kind, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text },
+          );
+          if (stream.value.length > 500) stream.value.shift();
+        },
+        (id) => {
+          taskId.value = id;
+        },
+        resume,
+        continueTask,
+      );
+    } catch (e) {
+      running.value = false;
+      runError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      running.value = false;
+      stopping.value = false;
+      taskId.value = null;
+      if (tick !== null) clearTimeout(tick);
+      tickWhileWarm();
+      await loadHistory();
+      // The run just spent some of a limit; the next pick should know.
+      void loadLimits();
+    }
+  }
+
+  /** Short, human words for the things a provider does behind the scenes. */
+  function actionTarget(summary: string): string {
+    const target = summary.replace(/\s+/g, " ").trim();
+    return target.length > 64 ? target.slice(0, 61) + "…" : target;
+  }
+
+  /** Codex wraps every command as `"...\powershell.exe" -Command "..."`; show the inner command. */
+  function unwrapShell(summary: string): string {
+    const m = summary.match(/^\s*"?[^"]*?\b(?:powershell|pwsh|cmd|bash|sh)(?:\.exe)?"?((?:\s+[-/]\w+)*)\s+([\s\S]*)$/i);
+    if (!m?.[1] || m[2] === undefined) return summary;
+    return m[2].trim().replace(/^(["'])([\s\S]*)\1$/, "$2");
+  }
+
+  /** The last thing in a summary that looks like one file (has an extension, no wildcard). */
+  function fileIn(name: string, summary: string): string | null {
+    // A Read/Edit tool's summary is the path itself, spaces and all.
+    const whole = summary.trim();
+    if (!/^(shell|bash|powershell)$/i.test(name) && /^[^*?<>|,]*[\w-]\.[A-Za-z0-9]{1,8}$/.test(whole)) return whole;
+    const tokens = summary.split(/[\s,]+/).map((t) => t.replace(/^["']|["']$/g, ""));
+    return tokens.reverse().find((t) => /^[^*?<>|]*[\w-]\.[A-Za-z0-9]{1,8}$/.test(t) && !/^-/.test(t)) ?? null;
+  }
+
+  /** What the live line and the log show: words, plus the file they are about when there is one. */
+  function toolActivity(name: string, rawSummary: string): Activity {
+    const summary = unwrapShell(rawSummary);
+    const head = `${name} ${summary.trim().split(/\s+/)[0] ?? ""}`.toLowerCase();
+    const kind = `${name} ${summary}`.toLowerCase();
+    const verb = EDIT_RE.test(head) ? "Editing" : READ_RE.test(kind) ? "Reading" : null;
+    const file = verb ? fileIn(name, summary) : null;
+    if (verb && file) return { text: verb, file };
+    return { text: friendlyToolUse(name, rawSummary), file: null };
+  }
+
+  function friendlyToolUse(name: string, rawSummary: string): string {
+    const summary = unwrapShell(rawSummary);
+    const kind = `${name} ${summary}`.toLowerCase();
+    const target = actionTarget(summary);
+    // Only the tool name and the command's first word decide "editing": a search
+    // that mentions "write" somewhere is still a read.
+    const head = `${name} ${summary.trim().split(/\s+/)[0] ?? ""}`.toLowerCase();
+    if (EDIT_RE.test(head)) {
+      return target ? `Editing ${target}` : "Editing files";
+    }
+    if (READ_RE.test(kind)) {
+      return target ? `Reading ${target}` : "Reading the project";
+    }
+    if (/test|check|lint|build|compile|typecheck|cargo|npm|phpunit|artisan/.test(kind)) {
+      return target ? `Testing: ${target}` : "Checking that it works";
+    }
+    if (/git diff|git status/.test(kind)) return "Checking what changed";
+    if (/shell|command|execute|bash|powershell/.test(kind)) return "Running a command";
+    return target ? `Working on ${target}` : "Working on it";
+  }
+
+  function activityFor(event: ProviderEvent): Activity | null {
+    const say = (text: string) => ({ text, file: null });
+    switch (event.kind) {
+      case "started":
+        return say("Getting ready");
+      case "text":
+        return say("Thinking through the request");
+      case "toolUse":
+        return toolActivity(event.data.name, event.data.summary);
+      case "done":
+        return say("Putting on the finishing touches");
+      case "failed":
+        return say(`Couldn’t finish: ${event.data.message}`);
+      default:
+        return null;
+    }
+  }
+
+  /** A checker's JSON verdict, in words. Null for anything that isn't one. */
+  function describeVerdict(text: string): string | null {
+    let v: { verdict?: string; checks?: Array<{ command: string; passed: boolean }>; findings?: Array<{ issue: string }> };
+    try {
+      v = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (typeof v !== "object" || v === null || typeof v.verdict !== "string") return null;
+    const ok = v.verdict === "pass";
+    if (v.findings) {
+      return ok
+        ? "Review passed"
+        : `Review asked for changes: ${v.findings.map((f) => f.issue).join("; ")}`;
+    }
+    const checks = v.checks ?? [];
+    if (!checks.length) return ok ? "Checks passed" : "Checks didn’t pass: nothing was run";
+    return checks.map((c) => `${c.command} ${c.passed ? "passed" : "didn’t pass"}`).join("\n");
+  }
+
+  /** One line per event. Usage and the final result have their own panel. */
+  function describe(event: ProviderEvent): string | null {
+    switch (event.kind) {
+      // The live activity line already says it; one per stage is just noise.
+      case "started":
+        return null;
+      case "text":
+        return describeVerdict(event.data) ?? event.data;
+      case "toolUse":
+        // Orteca's own checks report their result as the next line.
+        if (event.data.name === "orteca") return null;
+        return friendlyToolUse(event.data.name, event.data.summary);
+      case "failed":
+        return event.data.message;
+      default:
+        return null;
+    }
+  }
+
+  const lines = computed(() => stream.value);
+
+  /** Never a number without a label, and never a zero standing in for unknown. */
+  const tokens = computed(() => {
+    const usage = result.value?.usage;
+    if (!usage) return null;
+    return {
+      total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
+      uncached: usage.inputTokens + usage.outputTokens,
+      cached: usage.cachedInputTokens,
+      output: usage.outputTokens,
+      cost: usage.costUsd,
+      quality: usage.costQuality,
+      model: usage.model,
+      // The last stage a model ran; the reported model is the last one too.
+      effort: [...(result.value?.stages ?? [])].reverse().find((s) => s.effort)?.effort ?? null,
+    };
+  });
+
+  function formatCost(cost: number): string {
+    return cost > 0 && cost < 0.0001 ? "<$0.0001" : "$" + cost.toFixed(4);
+  }
+
+  /** Six-figure token counts are unreadable run together; group them. */
+  function formatTokens(count: number): string {
+    return count.toLocaleString("en-US");
+  }
+
+  function formatDuration(milliseconds: number | null | undefined): string {
+    if (milliseconds === null || milliseconds === undefined) return "duration unavailable";
+    const seconds = Math.round(milliseconds / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${seconds % 60}s`;
+  }
+
+  function formatPayload(payload: unknown): string {
+    if (typeof payload === "string") return payload;
+    try {
+      return JSON.stringify(payload, null, 2);
+    } catch {
+      return "unreadable event";
+    }
+  }
+
+  /** A stopped run is its own outcome, not a quieter kind of failure. Nor is a
+   *  run that reached the budget its route declared. */
+  const OUTCOME: Record<TaskResult["status"], string> = {
+    done: "Done",
+    cancelled: "Stopped",
+    failed: "Couldn’t finish",
+    budgetReached: "Stopped safely",
+    reviewRejected: "Needs another look",
+    verifyFailed: "Checks didn’t pass",
+  };
+
+  const STAGE_LABELS: Record<string, string> = {
+    plan: "Making a plan",
+    implement: "Making changes",
+    review: "Reviewing the work",
+    verify: "Checking that it works",
+    fix: "Fixing what didn’t pass",
+    answer: "Answering your question",
+  };
+
+  function stageLabel(stage: string): string {
+    return STAGE_LABELS[stage] ?? stage;
+  }
+
+  /** What the route spent. Exact: Orteca started every process itself. */
+  const calls = computed(() => {
+    const r = result.value;
+    if (!r) return null;
+    return {
+      used: r.callsUsed,
+      stages: r.route.stages,
+      ran: r.stages.map((s) => s.stage),
+    };
+  });
+
+  /** Every stage that ran, then the route's stages that did not. Stages run in
+   *  order, so the ones that ran are the front of the route — unless a Fix ran,
+   *  after which the run's own order is the whole story. */
+  const routeSteps = computed(() => {
+    const r = result.value;
+    if (!r) return [];
+    const ran = r.stages.map((s) => ({
+      stage: s.stage,
+      ran: true,
+      asked: s.model && s.effort ? `${s.model}, ${s.effort}` : null,
+    }));
+    if (ran.some((s) => s.stage === "fix")) return ran;
+    return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false, asked: null }))];
+  });
+
+  /** This run against the median of comparable finished runs here. Only for a
+   *  run that finished, only once the backend has a baseline, and always
+   *  labelled an estimate. `change` is positive when this run used fewer. */
+  const comparison = computed(() => {
+    const r = result.value;
+    const t = tokens.value;
+    if (!r?.baseline || r.status !== "done" || !t || r.baseline.medianTokens <= 0) return null;
+    // Cache reads excluded, as in the baseline: a warm cache is not less work.
+    const change = Math.round((1 - (t.total - t.cached) / r.baseline.medianTokens) * 100);
+    return { ...r.baseline, change, size: Math.abs(change) };
+  });
+
+  /** The diff split by whose change it is. A file untouched since before the
+   *  run is the user's, and is neither listed nor counted as this run's work. */
+  const changed = computed(() => {
+    const diff = result.value?.diff ?? [];
+    return {
+      byRun: diff.filter((f) => f.origin !== "beforeRun"),
+      beforeRun: diff.filter((f) => f.origin === "beforeRun"),
+      unknown: !!result.value?.dirtyAtStart && diff.some((f) => f.origin === null),
+    };
+  });
+
+  const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, running: "Running" };
+
+  /** A past run's metrics, each labelled, unknown spelled out rather than zeroed. */
+  function historyLine(t: TaskSummary): string {
+    // Keep old local rows readable while newer rows distinguish uncached work.
+    const legacy = t.uncachedTokens === undefined;
+    const measured = legacy ? t.tokens : t.uncachedTokens;
+    return [
+      t.routeKind,
+      t.callsUsed === null ? null : `${t.callsUsed} ${t.callsUsed === 1 ? "call" : "calls"}`,
+      measured == null
+        ? "tokens unavailable"
+        : `${formatTokens(measured)} ${legacy ? "tokens" : "uncached"}`,
+      t.model,
+      t.costUsd === null ? null : `${formatCost(t.costUsd)} ${t.costQuality}`,
+      t.durationMs == null ? null : formatDuration(t.durationMs),
+      t.unknownEvents ? `${t.unknownEvents} unknown event${t.unknownEvents === 1 ? "" : "s"}` : null,
+      `${t.startedAt.slice(0, 16)} UTC`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  const AUTH: Record<Auth, string> = {
+    subscription: "saved login",
+    apiKey: "API key",
+    signedOut: "not signed in",
+    unknown: "",
+  };
+
+  // The main pane shows one thing at a time; the sidebar picks which.
+  const view = ref<"task" | "history" | "helpers">("task");
+  const optionsOpen = ref(false);
+
+  type ResultTab = "summary" | "files" | "details" | "activity";
+  const resultTab = ref<ResultTab>("summary");
+  const TABS: Array<{ id: ResultTab; label: string }> = [
+    { id: "summary", label: "Summary" },
+    { id: "files", label: "Files" },
+    { id: "details", label: "Details" },
+    { id: "activity", label: "Activity" },
+  ];
+
+  /** Dot colour per status: green only for a finished run, blue only while one is going. */
+  const TONE: Partial<Record<TaskSummary["status"], string>> = {
+    done: "ok",
+    failed: "bad",
+    verifyFailed: "warn",
+    reviewRejected: "warn",
+    running: "live",
+  };
+
+  const helpersPending = computed(() => rows.value.some((r) => r.pending));
+  const helpersReady = computed(() => installed.value.filter((p) => p.auth !== "signedOut").length);
+
+  function focusTask() {
+    void nextTick(() => document.getElementById("task")?.focus());
+  }
+
+  function newTask() {
+    view.value = "task";
+    if (running.value) return;
+    result.value = null;
+    stream.value = [];
+    runError.value = null;
+    task.value = "";
+    attachments.value = [];
+    focusTask();
+  }
+
+  /** Back to the prompt with the same words, to tweak and run again. */
+  function editAgain() {
+    result.value = null;
+    focusTask();
+  }
+
+  // A follow-up. While the provider's prompt cache is warm it resumes the
+  // session, which already holds the files it read; after that it starts over.
+  // ponytail: one fixed window for both CLIs, since neither says when its cache cools.
+  const WARM_MS = 5 * 60_000;
+  const now = ref(Date.now());
+  // Ticks only while a session is warm, so a closed window leaves nothing running.
+  let tick: ReturnType<typeof setTimeout> | null = null;
+  function tickWhileWarm() {
+    now.value = Date.now();
+    const r = result.value?.resume;
+    tick = r && now.value < r.endedAt + WARM_MS ? setTimeout(tickWhileWarm, 1000) : null;
+  }
+  onUnmounted(() => {
+    if (tick !== null) clearTimeout(tick);
+  });
+
+  const reply = ref("");
+  const ranOn = ref<ProviderId | null>(null);
+  // The user's own words across a chain of follow-ups, oldest first.
+  let asked: string[] = [];
+  let following = false;
+  let resumeWith: (Resume & { reply: string }) | null = null;
+  let continuing: number | null = null;
+
+  /** Milliseconds a reply can still resume the session; 0 means it starts over. */
+  const warmLeft = computed(() => {
+    const r = result.value?.resume;
+    if (!r || ranOn.value !== provider.value || isolation.value !== "currentTree") return 0;
+    return Math.max(0, r.endedAt + WARM_MS - now.value);
+  });
+
+  async function sendReply() {
+    const r = result.value;
+    const answer = reply.value.trim();
+    if (!answer || !r?.summary || running.value) return;
+    asked = [...(asked.length ? asked : [task.value]), answer];
+    // What a fresh run needs, and no more: the requests, the last reply, and where the work is.
+    const files = r.diff.map((f) => f.path);
+    task.value = [
+      asked.slice(0, -1).join("\n\n"),
+      `You replied:\n${r.summary}`,
+      `My answer:\n${answer}`,
+      ...(files.length ? [`Files changed so far: ${files.join(", ")}`] : []),
+    ].join("\n\n");
+    // The resumed session already holds everything but the answer.
+    resumeWith = r.resume && warmLeft.value > 0 ? { ...r.resume, reply: answer } : null;
+    following = true;
+    // A copy folder is not where the task's work is; a reply there starts its own.
+    continuing = isolation.value === "currentTree" && !r.worktree ? r.taskId : null;
+    reply.value = "";
+    await run();
+  }
+
+  function showHistory(t: TaskSummary) {
+    view.value = "history";
+    if (historyDetail.value?.id !== t.id) void openHistory(t);
+  }
+
+  return {
+    opened,
+    task,
+    attachments,
+    attachError,
+    dragging,
+    attach,
+    addAttachments,
+    pasteImages,
+    fileName,
+    providers,
+    providerError,
+    provider,
+    mode,
+    MODES,
+    isolation,
+    ISOLATIONS,
+    installed,
+    missing,
+    rows,
+    installing,
+    installLine,
+    installError,
+    install,
+    cancelProvider,
+    signingIn,
+    signInLine,
+    signInError,
+    signIn,
+    selected,
+    limits,
+    providerPicked,
+    pickedFor,
+    loadLimits,
+    headroom,
+    pickByHeadroom,
+    resetWhen,
+    limitLine,
+    limitWarning,
+    otherThan,
+    alternative,
+    fallback,
+    switchTo,
+    continueWith,
+    canRun,
+    running,
+    stream,
+    result,
+    runError,
+    currentActivity,
+    fileError,
+    openActivityFile,
+    taskId,
+    stopping,
+    instruction,
+    sending,
+    instructionError,
+    steering,
+    instruct,
+    stopRun,
+    history,
+    historyError,
+    historyDetail,
+    historyDetailLoading,
+    historyDetailError,
+    loadHistory,
+    openHistory,
+    confirmRemove,
+    removedCopies,
+    removeError,
+    removeCopy,
+    git,
+    gitAsk,
+    gitBusy,
+    gitError,
+    commitMessage,
+    mergeBranch,
+    gitQuestion,
+    runGit,
+    preview,
+    previewing,
+    previewError,
+    schedulePreview,
+    refreshPreview,
+    run,
+    actionTarget,
+    unwrapShell,
+    friendlyToolUse,
+    toolActivity,
+    activityFor,
+    describeVerdict,
+    describe,
+    lines,
+    tokens,
+    formatCost,
+    formatTokens,
+    formatDuration,
+    formatPayload,
+    OUTCOME,
+    stageLabel,
+    calls,
+    routeSteps,
+    comparison,
+    changed,
+    HISTORY_STATUS,
+    historyLine,
+    AUTH,
+    view,
+    optionsOpen,
+    resultTab,
+    TABS,
+    TONE,
+    helpersPending,
+    helpersReady,
+    focusTask,
+    newTask,
+    editAgain,
+    reply,
+    sendReply,
+    warmLeft,
+    showHistory,
+  };
+}
+
+export type ProjectState = ReturnType<typeof useProject>;
+export const PROJECT: InjectionKey<ProjectState> = Symbol("project");

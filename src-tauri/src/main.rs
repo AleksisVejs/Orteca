@@ -179,9 +179,39 @@ async fn start_task(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    attachments: Vec<String>,
+    resume: Option<run::Resume>,
+    continue_task: Option<i64>,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
 ) -> Result<run::TaskResult> {
+    // A session id goes into argv, so it is an id and nothing else. A copy is
+    // a new folder, where neither CLI can find the session.
+    let resume = match resume {
+        Some(r) if isolation == Isolation::CurrentTree && !r.reply.trim().is_empty() => {
+            let id_like = !r.session.is_empty()
+                && !r.session.starts_with('-')
+                && r.session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !id_like {
+                return Err(AppError::new(ErrorKind::Invalid, "That session id is not one a CLI gave."));
+            }
+            Some(r)
+        }
+        _ => None,
+    };
+    // Checked before anything is recorded: a path that is gone would only
+    // surface as an agent failing to read it.
+    let attachments = attachments
+        .iter()
+        .map(|path| {
+            let p = std::path::PathBuf::from(path);
+            if p.is_absolute() && p.exists() {
+                Ok(p)
+            } else {
+                Err(AppError::new(ErrorKind::Invalid, format!("Attachment not found: {path}")))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     let prepare_app = app.clone();
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
@@ -209,11 +239,14 @@ async fn start_task(
             headroom,
             isolation,
             intent,
+            continue_task,
         )
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     request.classified = classified;
+    request.attachments = attachments;
+    request.resume = resume;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
     let _ = task.send(request.task_id);
@@ -396,6 +429,7 @@ fn prepare_run(
     headroom: Option<f64>,
     isolation: Isolation,
     intent: Option<intent::Intent>,
+    continue_task: Option<i64>,
 ) -> Result<run::Request> {
     let PlannedRun {
         dir,
@@ -421,15 +455,24 @@ fn prepare_run(
     // says what it was allowed to do.
     let route_json = serde_json::to_string(&route).ok();
 
-    let task_id = store.create_task(NewTask {
-        project_id: record.id,
-        prompt: &prompt,
-        mode: mode.name(),
-        route_json: route_json.as_deref(),
-        branch: git.branch.as_deref(),
-        base_commit: git.head.as_deref(),
-        dirty_at_start,
-    })?;
+    // A reply goes on in its own task, unless it runs in a copy: that folder
+    // is not where the task's work is.
+    let continued = continue_task.filter(|_| isolation == Isolation::CurrentTree);
+    let task_id = match continued {
+        Some(task_id) => {
+            store.reopen_task(record.id, task_id, route_json.as_deref())?;
+            task_id
+        }
+        None => store.create_task(NewTask {
+            project_id: record.id,
+            prompt: &prompt,
+            mode: mode.name(),
+            route_json: route_json.as_deref(),
+            branch: git.branch.as_deref(),
+            base_commit: git.head.as_deref(),
+            dirty_at_start,
+        })?,
+    };
 
     let worktree = match isolation {
         Isolation::CurrentTree => None,
@@ -462,7 +505,33 @@ fn prepare_run(
         recordings,
         worktree,
         classified: Vec::new(),
+        attachments: Vec::new(),
+        resume: None,
+        continued: continued.is_some(),
     })
+}
+
+/// Writes a pasted image where a run can read it, and returns its path. The
+/// clipboard has no file behind it, so there is nothing else to attach.
+#[tauri::command]
+fn save_pasted_image(app: AppHandle, bytes: Vec<u8>, extension: String) -> Result<String> {
+    let io = |e: std::io::Error| AppError::new(ErrorKind::Io, e.to_string());
+    if !["png", "jpg", "jpeg", "gif", "webp"].contains(&extension.as_str()) {
+        return Err(AppError::new(ErrorKind::Invalid, "Only images can be pasted."));
+    }
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?
+        .join("pasted");
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("pasted-{stamp}.{extension}"));
+    std::fs::write(&path, bytes).map_err(io)?;
+    Ok(path.display().to_string())
 }
 
 /// Make the copy a run works in, on a branch named for its task.
@@ -505,6 +574,56 @@ fn remove_worktree(path: String, task_id: i64, store: State<Store>) -> Result<()
     };
     project::remove_worktree(&dir, std::path::Path::new(&copy))?;
     store.clear_worktree(record.id, task_id)
+}
+
+/// Open a file a run read or edited, or show it in Explorer. Only files in the
+/// project or its run copies, and never a program: opening one would run it.
+#[tauri::command]
+fn open_file(path: String, file: String, reveal: bool, store: State<Store>) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let (dir, _) = trusted_dir(&store, &path)?;
+    let target = dir
+        .join(&file)
+        .canonicalize()
+        .ok()
+        .filter(|t| t.is_file())
+        .ok_or_else(|| AppError::new(ErrorKind::NotFound, format!("{file} is not there anymore.")))?;
+    let copies = dir.parent().map(|p| p.join(".orteca-worktrees"));
+    if !(target.starts_with(&dir) || copies.is_some_and(|c| target.starts_with(c))) {
+        return Err(AppError::new(ErrorKind::Invalid, "That file is outside this project."));
+    }
+    if !reveal && is_program(&target) {
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "That file is a program, so Orteca won't open it. Use Show in folder.",
+        ));
+    }
+    // Explorer does not understand the `\\?\` form canonicalize returns.
+    let shown = target.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+    let mut explorer = std::process::Command::new("explorer");
+    if reveal {
+        explorer.raw_arg(format!("/select,\"{shown}\""));
+    } else {
+        explorer.arg(shown);
+    }
+    // Explorer's exit code means nothing; a spawn failure is the only real error.
+    explorer.spawn()?;
+    Ok(())
+}
+
+/// Anything Windows would run rather than open: PATHEXT plus the usual extras.
+fn is_program(file: &std::path::Path) -> bool {
+    let Some(ext) = file.extension().map(|e| format!(".{}", e.to_string_lossy()).to_ascii_uppercase()) else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_default().to_ascii_uppercase();
+    pathext.split(';').any(|p| p.trim() == ext)
+        || [
+            ".EXE", ".COM", ".BAT", ".CMD", ".PS1", ".VBS", ".VBE", ".JS", ".JSE", ".WSF", ".WSH",
+            ".MSI", ".MSC", ".CPL", ".SCR", ".HTA", ".LNK", ".URL", ".REG", ".PIF", ".APPREF-MS",
+        ]
+        .contains(&ext.as_str())
 }
 
 /// Fetch, pull, commit, push or merge, after the user confirmed it. Trusted projects
@@ -813,6 +932,7 @@ fn main() {
             sign_in_provider,
             recent_projects,
             start_task,
+            save_pasted_image,
             cancel_task,
             send_instruction,
             trust_project,
@@ -822,6 +942,7 @@ fn main() {
             preview_task,
             provider_limits,
             remove_worktree,
+            open_file,
             git_action,
             cancel_provider_operation
         ])
@@ -832,6 +953,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn programs_are_not_opened() {
+        assert!(is_program(std::path::Path::new(r"C:\x\setup.EXE")));
+        assert!(is_program(std::path::Path::new("run.ps1")));
+        assert!(!is_program(std::path::Path::new("app/Models/User.php")));
+        assert!(!is_program(std::path::Path::new("Makefile")));
+    }
 
     #[tokio::test]
     async fn concurrent_install_requests_are_rejected_on_the_backend() {
@@ -925,6 +1054,7 @@ mod tests {
             json(var("BENCH_MODE")),
             None,
             Isolation::CurrentTree,
+            None,
             None,
         )
         .unwrap();

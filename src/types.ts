@@ -284,6 +284,13 @@ export interface Baseline {
   medianCalls: number;
 }
 
+export interface Resume {
+  session: string;
+  model: string;
+  /** Unix milliseconds. */
+  endedAt: number;
+}
+
 export interface TaskResult {
   taskId: number;
   /** `cancelled` is the user stopping the run, `budgetReached` a ceiling the
@@ -316,6 +323,8 @@ export interface TaskResult {
   baseline: Baseline | null;
   /** Set when the run worked in a separate copy. */
   worktree: Worktree | null;
+  /** The session a follow-up can pick back up, and when it last spoke. */
+  resume: Resume | null;
 }
 export interface TaskEvent {
   id: number;

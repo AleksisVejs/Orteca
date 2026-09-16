@@ -38,20 +38,21 @@ test('run history loads on open, refreshes after a run, and never shows a zero f
 });
 
 async function projectView(api = {}) {
-  const source = readFileSync(new URL('../src/views/Project.vue', import.meta.url), 'utf8')
-    .match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-    .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '');
+  const source = readFileSync(new URL('../src/views/project/state.ts', import.meta.url), 'utf8')
+    .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '')
+    .replace(/^export /gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return { run, stopRun, stopping, taskId, instruct, instruction, sending, instructionError, steering, task, running, result, runError, tokens, lines, currentActivity, activityFor, friendlyToolUse, providerError, install, installing, installError, signIn, signingIn, signInError, canRun, providers, mode, calls, changed, routeSteps, comparison, OUTCOME, history, historyError, historyLine, provider, providerPicked, pickedFor, limits, limitLine, limitWarning, preview, pickByHeadroom, alternative, fallback, continueWith, switchTo, isolation, removeCopy, confirmRemove, removedCopies, removeError, formatCost: typeof formatCost === 'function' ? formatCost : n => '$' + n.toFixed(4) }; })()`, {
-    ref, computed, setTimeout, clearTimeout,
-    defineProps: () => ({ opened: project }), defineEmits: () => () => {},
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return useProject(opened); })()`, {
+    ref, computed, nextTick: async () => {}, setTimeout, clearTimeout,
+    opened: project,
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
     detectProviders: async () => [{ id: 'codex', path: 'fake.exe' }],
     onTaskEvent: async fn => { listeners.event = fn; return () => {}; },
     onTaskDone: async fn => { listeners.done = fn; return () => {}; },
     onInstallEvent: async () => () => {},
     onSignInEvent: async () => () => {},
+    onFileDrop: async () => () => {},
     cancelTask: async () => {},
     recentTasks: async () => [],
     sendInstruction: async () => ({ disposition: 'live' }),
@@ -86,6 +87,22 @@ test('completion before invoke resolves never leaves the screen running', async 
   assert.equal(state.tokens.value, null);
 });
 
+test('a reply goes on in the same task, unless that task ran in a copy', async () => {
+  const calls = [];
+  const { state } = await projectView({ startTask: async (...args) => {
+    calls.push(args);
+    return { ...finished, taskId: 7, status: 'done', failure: null, summary: 'did it', worktree: calls.length === 2 ? {} : null };
+  } });
+  await state.run();
+  assert.equal(calls[0].at(-1), null, 'a first run opens its own task');
+  state.reply.value = 'also this';
+  await state.sendReply();
+  assert.equal(calls[1].at(-1), 7);
+  state.reply.value = 'and that';
+  await state.sendReply();
+  assert.equal(calls[2].at(-1), null, 'a copy folder is not where the task is');
+});
+
 test('activity is bounded even when a provider emits long messages', async () => {
   const { state, listeners } = await projectView({ startTask: async (...args) => {
     const progress = args.find(arg => typeof arg === 'function');
@@ -101,8 +118,20 @@ test('provider actions become plain-English live updates', async () => {
   const { state } = await projectView();
   assert.equal(state.friendlyToolUse('Read', 'src/App.vue'), 'Reading src/App.vue');
   assert.equal(state.friendlyToolUse('Edit', 'src/App.vue'), 'Editing src/App.vue');
-  assert.equal(state.friendlyToolUse('Shell', 'npm test'), 'Checking that it works');
-  assert.equal(state.activityFor({ kind: 'text', data: 'I found the issue.' }), 'Thinking through the request');
+  assert.equal(state.friendlyToolUse('Shell', 'npm test'), 'Testing: npm test');
+  const ps = '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n Write-Output app"';
+  assert.equal(state.friendlyToolUse('Shell', ps), 'Reading rg -n Write-Output app');
+  assert.equal(state.describe({ kind: 'started', data: {} }), null);
+  assert.equal(state.describeVerdict('{"checks":[],"verdict":"fail"}'), 'Checks didn’t pass: nothing was run');
+  assert.equal(state.describeVerdict('{"checks":[{"command":"npm test","passed":true,"output":"ok"}],"verdict":"pass"}'), 'npm test passed');
+  assert.equal(state.describeVerdict('plain words'), null);
+  assert.equal(state.activityFor({ kind: 'text', data: 'I found the issue.' }).text, 'Thinking through the request');
+  const file = 'C:\\Users\\me\\My App\\app\\Models\\User.php';
+  assert.deepEqual({ ...state.toolActivity('Read', file) }, { text: 'Reading', file });
+  assert.deepEqual({ ...state.toolActivity('Edit', 'src/App.vue') }, { text: 'Editing', file: 'src/App.vue' });
+  assert.deepEqual({ ...state.toolActivity('Shell', 'Get-Content -Raw "app/User.php"') }, { text: 'Reading', file: 'app/User.php' });
+  assert.deepEqual({ ...state.toolActivity('Shell', ps) }, { text: 'Reading rg -n Write-Output app', file: null });
+  assert.deepEqual({ ...state.toolActivity('Shell', 'npm test') }, { text: 'Testing: npm test', file: null });
 });
 
 test('detection errors and invoke failures are exposed', async () => {

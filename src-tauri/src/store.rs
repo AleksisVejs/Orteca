@@ -171,6 +171,21 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// A reply continues its task: the same row runs again on a new route. A
+    /// running task, a task in a copy folder or another project's is refused.
+    pub fn reopen_task(&self, project_id: i64, task_id: i64, route_json: Option<&str>) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        let changed = conn.execute(
+            "UPDATE tasks SET status = 'running', route_json = ?3, ended_at = NULL
+              WHERE id = ?1 AND project_id = ?2 AND status != 'running' AND worktree_path IS NULL",
+            params![task_id, project_id, route_json],
+        )?;
+        if changed == 0 {
+            return Err(AppError::new(ErrorKind::Invalid, "That task cannot be continued."));
+        }
+        Ok(())
+    }
+
     /// The copy a run works in, recorded the moment it exists, so a run that
     /// fails straight after can still have it removed.
     pub fn set_worktree(&self, task_id: i64, branch: &str, path: &str) -> Result<()> {
@@ -324,6 +339,52 @@ impl Store {
         Ok(())
     }
 
+    /// A continued task's usage: this turn added to what the task already
+    /// spent. Each turn is its own process, so costs add too. A turn with no
+    /// numbers leaves the total unavailable, never smaller than it was.
+    pub fn add_usage(
+        &self,
+        task_id: i64,
+        provider: &str,
+        usage: Option<&Usage>,
+    ) -> Result<()> {
+        type Row = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<f64>, String);
+        let before: Option<Row> = {
+            let conn = self.0.lock().expect("store poisoned");
+            match conn.query_row(
+                "SELECT input_tokens, cached_input_tokens, output_tokens, reasoning_tokens,
+                        cost_usd, cost_quality
+                   FROM usage WHERE task_id = ?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            ) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                other => Some(other?),
+            }
+        };
+        let total = match (before, usage) {
+            (None, usage) => usage.cloned(),
+            (Some((Some(i), Some(c), Some(o), Some(r), cost, quality)), Some(u)) => {
+                let cost_usd = cost.zip(u.cost_usd).map(|(a, b)| a + b);
+                Some(Usage {
+                    model: u.model.clone(),
+                    input_tokens: i as u64 + u.input_tokens,
+                    cached_input_tokens: c as u64 + u.cached_input_tokens,
+                    output_tokens: o as u64 + u.output_tokens,
+                    reasoning_tokens: r as u64 + u.reasoning_tokens,
+                    cost_usd,
+                    cost_quality: match (cost_usd, quality.as_str(), u.cost_quality) {
+                        (None, ..) => CostQuality::Unavailable,
+                        (_, "exact", CostQuality::Exact) => CostQuality::Exact,
+                        _ => CostQuality::Estimated,
+                    },
+                })
+            }
+            _ => None,
+        };
+        self.record_usage(task_id, None, provider, total.as_ref())
+    }
+
     #[cfg(test)]
     pub fn finish_task(
         &self,
@@ -360,8 +421,11 @@ impl Store {
         let conn = self.0.lock().expect("store poisoned");
         let changed = conn.execute(
             "UPDATE tasks
-                SET status = ?2, summary = ?3, diff_stat_json = ?4, calls_used = ?5,
-                    patch_text = ?6, unknown_events = ?7, duration_ms = ?8,
+                SET status = ?2, summary = ?3, diff_stat_json = ?4,
+                    calls_used = COALESCE(calls_used, 0) + ?5,
+                    patch_text = ?6, unknown_events = unknown_events + ?7,
+                    duration_ms = CASE WHEN ?8 IS NULL THEN duration_ms
+                                       ELSE COALESCE(duration_ms, 0) + ?8 END,
                     ended_at = datetime('now')
               WHERE id = ?1",
             params![
@@ -809,6 +873,49 @@ mod tests {
             (Some(115), Some(1), Some("estimated"))
         );
         assert_eq!((rows[1].tokens, rows[1].status.as_str()), (None, "running"));
+    }
+
+    #[test]
+    fn a_continued_task_adds_each_turn_to_its_totals() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let task = store
+            .create_task(new_task(project.id, "first", "balanced"))
+            .unwrap();
+        let turn = |input, cost, quality| Usage {
+            model: None,
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            cost_usd: cost,
+            cost_quality: quality,
+        };
+        store.add_usage(task, "claude", Some(&turn(10, Some(0.01), CostQuality::Exact))).unwrap();
+        store.finish_task_details(task, "verifyFailed", "one", "[]", None, 2, Some(1000), 3).unwrap();
+        assert!(
+            store.reopen_task(project.id + 1, task, None).is_err(),
+            "another project's task"
+        );
+        store.reopen_task(project.id, task, None).unwrap();
+        assert!(store.reopen_task(project.id, task, None).is_err(), "already running");
+        store.add_usage(task, "claude", Some(&turn(20, Some(0.02), CostQuality::Estimated))).unwrap();
+        store.finish_task_details(task, "done", "two", "[]", None, 1, Some(500), 2).unwrap();
+
+        let row = &store.recent_tasks(project.id, 20).unwrap()[0];
+        assert_eq!(
+            (row.prompt.as_str(), row.status.as_str(), row.summary.as_deref()),
+            ("first", "done", Some("two"))
+        );
+        assert_eq!((row.tokens, row.calls_used, row.unknown_events, row.duration_ms), (Some(32), Some(5), 3, Some(1500)));
+        assert_eq!(row.cost_quality.as_deref(), Some("estimated"));
+        assert!((row.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+
+        // A turn with no numbers leaves the total unknown, not smaller.
+        store.reopen_task(project.id, task, None).unwrap();
+        store.add_usage(task, "claude", None).unwrap();
+        let row = &store.recent_tasks(project.id, 20).unwrap()[0];
+        assert_eq!((row.tokens, row.cost_quality.as_deref()), (None, Some("unavailable")));
     }
 
     #[test]

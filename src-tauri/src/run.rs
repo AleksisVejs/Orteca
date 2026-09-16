@@ -627,6 +627,9 @@ pub struct Request {
     /// The separate copy `dir` points into, when the user asked for one. Its
     /// changes are committed to the copy's branch when the run ends.
     pub worktree: Option<project::Worktree>,
+    /// What the call that read the prompt reported, usage included. Empty when
+    /// no such call ran.
+    pub classified: Vec<ProviderEvent>,
 }
 
 /// The raw event stream of one run, kept so a paid run can be replayed free.
@@ -846,6 +849,7 @@ pub async fn stream(
         before_run,
         recordings,
         worktree,
+        classified,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -890,6 +894,24 @@ pub async fn stream(
     // to cost, and cannot tell a good route from a lucky one.
     if let Err(e) = note(store, &ctx, "routing", &routing_payload(&route)) {
         state.outcome.failure = Some(format!("could not record the route: {}", e.message));
+    }
+
+    // The call that read the prompt is part of what this run cost.
+    if !classified.is_empty() {
+        let mut classified = classified;
+        state.calls_used += 1;
+        if id == ProviderId::Codex {
+            price_codex(store, crate::intent::model(id), &mut state.outcome, &mut classified);
+        }
+        for event in &classified {
+            match event {
+                ProviderEvent::Usage(_) => state.outcome.absorb(event),
+                ProviderEvent::Done { turns, .. } => state.turns_used += turns,
+                _ => {}
+            }
+            let _ = record(store, task_id, "classify", id, event);
+        }
+        state.outcome.begin_process();
     }
 
     // The checks once before anything changes. A suite that already fails is
@@ -943,10 +965,13 @@ pub async fn stream(
             tier,
             model: choice.map(|choice| choice.model),
             effort: choice.map(|choice| choice.effort),
-            shell: !(stage == Stage::Implement
-                && stages[index + 1..].contains(&Stage::Verify)
-                && checks_locally(&ctx.dir)
-                && !routing::needs_shell(&prompt)),
+            // A question may only run `git diff`/`status` anyway; the two shell
+            // tool schemas cost more than that is worth on every question.
+            shell: stage != Stage::Answer
+                && !(stage == Stage::Implement
+                    && stages[index + 1..].contains(&Stage::Verify)
+                    && checks_locally(&ctx.dir)
+                    && !routing::needs_shell(&prompt)),
         };
         ctx.final_stage = index + 1 == stages.len();
         state.outcome.begin_stage();
@@ -1045,7 +1070,11 @@ Before any change, the project's checks already fail. This may be the task, or a
                 .notes
                 .last()
                 .is_some_and(|note| note.stage == Stage::Review);
-        let (note_for_stage, failed) = finish_stage(store, &ctx, &mut state, stage);
+        let (mut note_for_stage, failed) = finish_stage(store, &ctx, &mut state, stage);
+        if checked_locally {
+            // Orteca ran the tests itself; no model was asked anything.
+            (note_for_stage.model, note_for_stage.effort) = (None, None);
+        }
         state.notes.push(note_for_stage);
         // An Implement that changed nothing has nothing to check. Testing an
         // untouched tree only makes the user wait for the same answer.
@@ -1783,6 +1812,8 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
             stage,
             summary: state.outcome.summary(),
             artifact,
+            model: Some(ctx.plan.model(ctx.id).model.to_string()),
+            effort: Some(ctx.plan.model(ctx.id).effort.to_string()),
         },
         failed,
     )
@@ -2334,6 +2365,7 @@ mod tests {
             before_run: Some(Default::default()),
             recordings: None,
             worktree: None,
+            classified: Vec::new(),
         }
     }
 
@@ -3424,8 +3456,8 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_failed_verify_is_fixed_once_unless_it_failed_before_the_run() {
         let failing = serde_json::json!({"checks": [{"command": "npm test", "passed": false, "output": "no"}], "verdict": "fail"});
-        let verify = StageNote { stage: Stage::Verify, summary: String::new(), artifact: Some(failing.clone()) };
-        let fix = StageNote { stage: Stage::Fix, summary: String::new(), artifact: None };
+        let verify = StageNote { stage: Stage::Verify, model: None, effort: None, summary: String::new(), artifact: Some(failing.clone()) };
+        let fix = StageNote { stage: Stage::Fix, model: None, effort: None, summary: String::new(), artifact: None };
         let round = |notes, failing_before| Round {
             stage: Stage::Verify,
             failed: true,

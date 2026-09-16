@@ -455,7 +455,7 @@ function schedulePreview() {
     previewError.value = null;
     return;
   }
-  previewTimer = setTimeout(refreshPreview, 250);
+  previewTimer = setTimeout(refreshPreview, 600);
 }
 
 async function refreshPreview() {
@@ -567,7 +567,7 @@ function friendlyToolUse(name: string, summary: string): string {
   if (/edit|write|patch|create|delete|move|rename|file_change/.test(kind)) {
     return target ? `Editing ${target}` : "Editing files";
   }
-  if (/read|cat|head|tail|grep|rg|find|list|search|inspect/.test(kind)) {
+  if (/read|cat|head|tail|grep|glob|rg|find|list|search|inspect/.test(kind)) {
     return target ? `Reading ${target}` : "Reading the project";
   }
   if (/test|check|lint|build|compile|typecheck|cargo|npm/.test(kind)) {
@@ -625,6 +625,8 @@ const tokens = computed(() => {
     cost: usage.costUsd,
     quality: usage.costQuality,
     model: usage.model,
+    // The last stage a model ran; the reported model is the last one too.
+    effort: [...(result.value?.stages ?? [])].reverse().find((s) => s.effort)?.effort ?? null,
   };
 });
 
@@ -671,6 +673,7 @@ const STAGE_LABELS: Record<string, string> = {
   review: "Reviewing the work",
   verify: "Checking that it works",
   fix: "Fixing what didn’t pass",
+  answer: "Answering your question",
 };
 
 function stageLabel(stage: string): string {
@@ -694,9 +697,13 @@ const calls = computed(() => {
 const routeSteps = computed(() => {
   const r = result.value;
   if (!r) return [];
-  const ran = r.stages.map((s) => ({ stage: s.stage, ran: true }));
+  const ran = r.stages.map((s) => ({
+    stage: s.stage,
+    ran: true,
+    asked: s.model && s.effort ? `${s.model}, ${s.effort}` : null,
+  }));
   if (ran.some((s) => s.stage === "fix")) return ran;
-  return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false }))];
+  return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false, asked: null }))];
 });
 
 /** This run against the median of comparable finished runs here. Only for a
@@ -919,8 +926,7 @@ const AUTH: Record<Auth, string> = {
       </div>
       <div v-else-if="preview" class="preview" aria-live="polite">
         <span class="preview-title">Orteca will handle the rest</span>
-        <span class="route compact">{{ preview.route.stages.map(stageLabel).join(" → ") }}</span>
-        <span class="note">I’ll plan, make the changes, and check the result.</span>
+        <span class="note">A small model reads your request first: a question just gets an answer, and a change gets planned, made and checked.</span>
         <span v-if="isolation === 'worktree'" class="note caveat">
           I’ll work in a separate copy on a new branch and leave this folder alone.
           <template v-if="preview.git.dirty">
@@ -938,23 +944,6 @@ const AUTH: Record<Auth, string> = {
           <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
         </span>
         <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
-        <details class="preview-details">
-          <summary>Show the plan</summary>
-          <p class="note">{{ preview.route.reason }}</p>
-          <p class="note budget-line">
-            {{ preview.model.model }}, {{ preview.model.effort }} effort
-            <template v-if="preview.plan">
-              · plan at {{ preview.plan.effort }} effort
-            </template>
-            <template v-if="preview.review">
-              · review on {{ preview.review.model }}, {{ preview.review.effort }} effort
-            </template>
-            <template v-if="preview.route.stages.some((s) => s === 'verify' || s === 'review')">
-              · fixes and checks again until it passes
-            </template>
-          </p>
-          <p class="note">{{ preview.route.tierReason }}</p>
-        </details>
       </div>
       <p v-else-if="previewError" class="preview-error missing" role="status">
         Preview unavailable: {{ previewError }}
@@ -1033,7 +1022,7 @@ const AUTH: Record<Auth, string> = {
     </section>
 
     <section v-if="result" class="block">
-      <h2 class="label">{{ OUTCOME[result.status] }}</h2>
+      <h2 class="label">{{ result.route.kind === "answer" && result.status === "done" ? "Answered" : OUTCOME[result.status] }}</h2>
       <div class="card outcome">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
         <div v-if="fallback" class="fallback" role="status">
@@ -1094,7 +1083,7 @@ const AUTH: Record<Auth, string> = {
           <template v-for="(step, i) in routeSteps" :key="step.stage">
             <li v-if="i" class="arrow" aria-hidden="true">→</li>
             <li :class="{ ran: step.ran }">
-              {{ stageLabel(step.stage) }}<span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
+              {{ stageLabel(step.stage) }}<span v-if="step.asked" class="mono"> · {{ step.asked }}</span><span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
             </li>
           </template>
         </ol>
@@ -1144,7 +1133,9 @@ const AUTH: Record<Auth, string> = {
           </div>
           <div class="tile">
             <span class="figure model">{{ tokens?.model ?? "—" }}</span>
-            <span class="note">model reported by provider</span>
+            <span class="note">
+              model reported by provider{{ tokens?.effort ? ` · ${tokens.effort} effort` : "" }}
+            </span>
           </div>
           <div class="tile">
             <span class="figure">{{ changed.byRun.length }}</span>
@@ -1589,7 +1580,6 @@ textarea:disabled {
   padding: 0 12px;
 }
 .advanced-controls summary,
-.preview-details summary,
 .result-details summary {
   cursor: pointer;
   color: var(--text-faint);
@@ -1624,21 +1614,8 @@ textarea:disabled {
   font-weight: 600;
   color: var(--text);
 }
-.preview .route {
-  font-size: 12px;
-  color: var(--text-dim);
-}
 .preview .note {
   width: 100%;
-}
-.preview-details {
-  width: 100%;
-  margin-top: 4px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-}
-.preview-details p {
-  margin: 8px 0 0;
 }
 .preview-error {
   margin: 0 18px 12px;
@@ -1817,6 +1794,8 @@ textarea:disabled {
 }
 .summary {
   margin: 0 0 16px;
+  /* Agents answer in lines and paragraphs; keep them. */
+  white-space: pre-line;
 }
 
 .tiles {

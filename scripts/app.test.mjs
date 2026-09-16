@@ -448,13 +448,19 @@ test('the route shows what ran, and a saving is only claimed against a baseline'
   const done = {
     ...finished, status: 'done', failure: null, summary: 'ok', usage,
     route: { ...oneCall, kind: 'planned', stages: ['plan', 'implement', 'verify'] },
-    stages: [{ stage: 'plan', summary: '', artifact: null }, { stage: 'implement', summary: 'ok', artifact: null }],
+    stages: [
+      { stage: 'plan', summary: '', artifact: null, model: 'opus', effort: 'high' },
+      { stage: 'implement', summary: 'ok', artifact: null, model: 'sonnet', effort: 'medium' },
+    ],
   };
   const { state } = await projectView({ startTask: async () => done });
   await state.run();
   assert.deepEqual(JSON.parse(JSON.stringify(state.routeSteps.value)), [
-    { stage: 'plan', ran: true }, { stage: 'implement', ran: true }, { stage: 'verify', ran: false },
+    { stage: 'plan', ran: true, asked: 'opus, high' },
+    { stage: 'implement', ran: true, asked: 'sonnet, medium' },
+    { stage: 'verify', ran: false, asked: null },
   ]);
+  assert.equal(state.tokens.value.effort, 'medium', 'the effort beside the model is from the last stage');
   assert.equal(state.comparison.value, null, 'no baseline, no comparison');
 
   const measured = await projectView({ startTask: async () => ({ ...done, baseline: { runs: 5, medianTokens: 100, medianCalls: 3 } }) });

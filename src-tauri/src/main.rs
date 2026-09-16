@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod error;
+mod intent;
 mod proc;
 mod project;
 mod providers;
@@ -189,7 +190,15 @@ async fn start_task(
         .app_data_dir()
         .ok()
         .map(|dir| dir.join("recordings"));
-    let request = tauri::async_runtime::spawn_blocking(move || {
+    // Read before the route is chosen, on the provider the run will spend.
+    // Unreadable means the keyword router decides, never a failed run.
+    let (intent, classified) = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
+        (Some(text), Some(program)) => {
+            intent::read(provider, &program.to_string_lossy(), &text).await
+        }
+        _ => (None, Vec::new()),
+    };
+    let mut request = tauri::async_runtime::spawn_blocking(move || {
         prepare_run(
             &prepare_app.state::<Store>(),
             recordings,
@@ -199,10 +208,12 @@ async fn start_task(
             mode,
             headroom,
             isolation,
+            intent,
         )
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
+    request.classified = classified;
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
     let _ = task.send(request.task_id);
@@ -256,6 +267,7 @@ fn codex_acl_refusal() -> AppError {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_run(
     store: &Store,
     path: String,
@@ -264,6 +276,7 @@ fn plan_run(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    intent: Option<intent::Intent>,
 ) -> Result<PlannedRun> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(
@@ -306,6 +319,7 @@ fn plan_run(
             // must be routed on the same number.
             headroom: headroom.filter(|room| room.is_finite()),
             checks_locally: run::checks_locally(&dir),
+            intent,
         },
     );
     Ok(PlannedRun {
@@ -320,16 +334,23 @@ fn plan_run(
 
 /// Show the exact route and ceilings before a provider is started.
 #[tauri::command]
-fn preview_task(
+async fn preview_task(
+    app: AppHandle,
     path: String,
     prompt: String,
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
-    store: State<Store>,
 ) -> Result<Preflight> {
-    let planned = plan_run(&store, path, prompt, provider, mode, headroom, isolation)?;
+    // No classifier here: the preview refreshes as the user types, and a model
+    // call per pause would cost more than the runs it routes. Off the main
+    // thread: git, PATH and ACL probes froze the window on every pause.
+    let planned = tauri::async_runtime::spawn_blocking(move || {
+        plan_run(&app.state::<Store>(), path, prompt, provider, mode, headroom, isolation, None)
+    })
+    .await
+    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
     let model = planned
         .route
         .work_model(provider)
@@ -374,6 +395,7 @@ fn prepare_run(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    intent: Option<intent::Intent>,
 ) -> Result<run::Request> {
     let PlannedRun {
         dir,
@@ -382,7 +404,7 @@ fn prepare_run(
         git,
         prompt,
         route,
-    } = plan_run(store, path, prompt, provider, mode, headroom, isolation)?;
+    } = plan_run(store, path, prompt, provider, mode, headroom, isolation, intent)?;
 
     // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
     let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
@@ -439,6 +461,7 @@ fn prepare_run(
         // makes the next one free, and is the only honest source of fixtures.
         recordings,
         worktree,
+        classified: Vec::new(),
     })
 }
 
@@ -902,6 +925,7 @@ mod tests {
             json(var("BENCH_MODE")),
             None,
             Isolation::CurrentTree,
+            None,
         )
         .unwrap();
         let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;

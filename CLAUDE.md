@@ -46,6 +46,9 @@ Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens an
   cannot change, all before any CLI starts. The `Store` is Tauri managed state.
 - `routing.rs` — pure keyword classifier, route and tiers per route, stage
   briefs, artifact checks. No model call and no I/O beyond what `main.rs` hands it.
+- `intent.rs` — before a run, asks the provider's smallest model (no tools, temp dir)
+  whether the prompt is a question or easy/medium/hard work. Feeds `routing` as
+  `RepoSignals::intent`; a failed read falls back to keywords.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
   fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A quick
   check (one small Laravel test file) runs before the agent starts; a failed Verify gets one Fix (resuming

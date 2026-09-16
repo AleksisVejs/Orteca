@@ -158,9 +158,10 @@ export interface Worktree {
 }
 
 /** A stage of a route. A trivial task's route is `["implement"]` and nothing else. */
-export type Stage = "plan" | "implement" | "review" | "verify" | "fix";
+export type Stage = "plan" | "implement" | "review" | "verify" | "fix" | "answer";
 
 export type RouteKind =
+  | "answer"
   | "implementOnce"
   | "standard"
   | "planned"
@@ -177,8 +178,8 @@ export interface ModelChoice {
   effort: string;
 }
 
-/** What the deterministic classifier read out of the prompt and the repo. No
- *  model was called to produce any of it. */
+/** What the classifier read out of the prompt and the repo. Only `intent`
+ *  comes from a model: the provider's smallest, asked once when a run starts. */
 export interface Signals {
   complexity: number;
   risk: number;
@@ -191,6 +192,7 @@ export interface Signals {
   frontend: boolean;
   blastRadius: number;
   priorFailures: number;
+  intent?: "question" | "easy" | "medium" | "hard" | null;
 }
 
 /** The tiers a route runs on. There is no call, turn or token ceiling: a
@@ -224,6 +226,9 @@ export interface StageNote {
   stage: Stage;
   summary: string;
   artifact: unknown | null;
+  /** What Orteca asked the CLI for; null for checks Orteca ran itself. */
+  model?: string | null;
+  effort?: string | null;
 }
 
 /** Why a run stopped short of its route. Neither a win nor a fault: the work,

@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::intent::Intent;
 use crate::providers::ProviderId;
 
 /// Two modes, as decided in the architecture. `Efficient` shifts every route
@@ -145,6 +146,8 @@ pub enum Stage {
     /// Follows a Review or Verify that did not pass, on the route's own tier:
     /// it fixes what was found, and the check that failed runs again after it.
     Fix,
+    /// Answers a question about the project and changes nothing.
+    Answer,
 }
 
 impl Stage {
@@ -156,6 +159,7 @@ impl Stage {
             Self::Review => "review",
             Self::Verify => "verify",
             Self::Fix => "fix",
+            Self::Answer => "answer",
         }
     }
 
@@ -163,7 +167,7 @@ impl Stage {
         match self {
             Self::Plan => Capability::Deep,
             Self::Implement | Self::Verify | Self::Fix => Capability::Implement,
-            Self::Review => Capability::Review,
+            Self::Review | Self::Answer => Capability::Review,
         }
     }
 
@@ -177,7 +181,7 @@ impl Stage {
             Self::Plan => Some(PLAN_SCHEMA),
             Self::Review => Some(REVIEW_SCHEMA),
             Self::Verify | Self::Fix => Some(VERIFY_SCHEMA),
-            Self::Implement => None,
+            Self::Implement | Self::Answer => None,
         }
     }
 
@@ -244,7 +248,7 @@ pub fn artifact_is_valid(stage: Stage, value: &serde_json::Value) -> bool {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|v| v == "pass" || v == "fail")
         }
-        Stage::Implement => false,
+        Stage::Implement | Stage::Answer => false,
     }
 }
 
@@ -290,6 +294,10 @@ pub struct Signals {
     /// How many earlier runs of this same prompt in this project ended without
     /// finishing. Two is the architecture's escalation trigger.
     pub prior_failures: u32,
+    /// What the provider's smallest model read the prompt as. `None` when it
+    /// was not asked (the preview) or could not tell.
+    #[serde(default)]
+    pub intent: Option<Intent>,
 }
 
 /// The tiers a route runs on, chosen before any provider is started. There is
@@ -310,6 +318,8 @@ pub struct ExecutionBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RouteKind {
+    /// A question: one read-only call whose reply is the result.
+    Answer,
     /// One Implement call that inspects, edits and verifies itself, or leaves
     /// the tests to Orteca when it can run them. No Plan, no Review.
     ImplementOnce,
@@ -625,6 +635,8 @@ pub struct RepoSignals {
     /// The repository declares a test command Orteca can run itself, so a
     /// Verify costs no agent call.
     pub checks_locally: bool,
+    /// See `Signals::intent`.
+    pub intent: Option<Intent>,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -782,6 +794,7 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
         frontend: contains_any(&text, FRONTEND),
         blast_radius,
         prior_failures: repo.prior_failures,
+        intent: repo.intent,
     };
     (signals, hits)
 }
@@ -796,7 +809,15 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     let (signals, candidate_paths) = classify(prompt, repo);
     let shift = mode.shift();
 
-    let (kind, stages, reason) = if signals.prior_failures >= 2 {
+    let intent = signals.intent;
+    // A question changes nothing, so no gate below has anything to guard.
+    let (kind, stages, reason) = if intent == Some(Intent::Question) {
+        (
+            RouteKind::Answer,
+            vec![Stage::Answer],
+            "a question: one call answers it and changes no file",
+        )
+    } else if signals.prior_failures >= 2 {
         (
             RouteKind::Escalated,
             vec![Stage::Plan, Stage::Implement, Stage::Review],
@@ -844,18 +865,27 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
                 "schema work uses one strong session that implements, reviews and verifies itself"
             },
         )
-    } else if signals.architecture || signals.complexity >= 7u8.saturating_add(shift) {
+    } else if intent == Some(Intent::Hard)
+        || (intent.is_none()
+            && (signals.architecture || signals.complexity >= 7u8.saturating_add(shift)))
+    {
         (
             RouteKind::Planned,
             vec![Stage::Plan, Stage::Implement, Stage::Verify],
             "architectural or complex work is planned before it is implemented",
         )
-    } else if signals.complexity <= 3u8.saturating_add(shift)
-        && signals.risk <= 3u8.saturating_add(shift)
-        && signals.blast_radius <= 5usize.saturating_add(shift as usize)
-        // Narrow has to be shown, not assumed: a prompt that names no tracked
-        // file and no small-edit word is of unknown scope, not a small one.
-        && (signals.blast_radius > 0 || score(&prompt.to_ascii_lowercase(), TRIVIAL) > 0)
+    } else if signals.risk <= 3u8.saturating_add(shift)
+        && match intent {
+            Some(read) => read == Intent::Easy,
+            None => {
+                signals.complexity <= 3u8.saturating_add(shift)
+                    && signals.blast_radius <= 5usize.saturating_add(shift as usize)
+                    // Narrow has to be shown, not assumed: a prompt that names no
+                    // tracked file and no small-edit word is of unknown scope.
+                    && (signals.blast_radius > 0
+                        || score(&prompt.to_ascii_lowercase(), TRIVIAL) > 0)
+            }
+        }
     {
         // Tests Orteca runs itself cost no call, so the one call only edits and
         // they run after it; a failure buys the Fix, as on any checked route.
@@ -883,7 +913,9 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     let mut budget = budget_for(kind, mode);
     let mut tier_reason = "the tier this route is trusted with";
     let mut raised = false;
-    if signals.prior_failures >= 1 {
+    // A question that did not finish was usually stopped, not too hard: a
+    // higher tier would only make the retry dearer.
+    if signals.prior_failures >= 1 && kind != RouteKind::Answer {
         if let Some(up) = budget.preferred_tier.up() {
             budget.preferred_tier = up;
             raised = true;
@@ -938,8 +970,13 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         signals,
         reason,
         tier_reason,
-        // A brief names a handful of paths, not a directory listing.
-        candidate_paths: candidate_paths.into_iter().take(10).collect(),
+        // A brief names a handful of paths, not a directory listing. A question
+        // is about the code, so the tests paired beside it are only cost.
+        candidate_paths: candidate_paths
+            .into_iter()
+            .filter(|p| kind != RouteKind::Answer || !is_test(p))
+            .take(10)
+            .collect(),
         preferred_providers,
     }
 }
@@ -949,7 +986,9 @@ fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
     let efficient = mode == Mode::Efficient;
     ExecutionBudget {
         preferred_tier: match (kind, efficient) {
-            (RouteKind::ImplementOnce, _) | (RouteKind::Standard, true) => Tier::Cheapest,
+            (RouteKind::Answer | RouteKind::ImplementOnce, _) | (RouteKind::Standard, true) => {
+                Tier::Cheapest
+            }
             // Guarded builds on standard and reviews on deep: four deep calls
             // cost 6x the plain CLI for a one-function fix (§4.3.6).
             (RouteKind::Standard, false)
@@ -972,6 +1011,12 @@ pub struct StageNote {
     /// Present only when the provider returned a structured artifact that
     /// passed `artifact_is_valid`.
     pub artifact: Option<serde_json::Value>,
+    /// The model and reasoning effort Orteca asked for; none for a check
+    /// Orteca ran itself.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// The prompt one stage is given.
@@ -1030,6 +1075,14 @@ pub fn brief(
              printed. `pass` means at least one check ran and every check passed. The check \
              that failed runs again after this call.\n\n",
         ),
+        Stage::Answer => out.push_str(
+            "Answer the question below about this project. Read what you need, change no \
+             file, and reply in the language it was asked in. Stop reading as soon as you \
+             can answer; do not search again to double-check. Explain it like to a \
+             five-year-old: small words, short sentences, only what matters, a few short \
+             paragraphs at most. Lead with the answer. Plain text only: no markdown, no \
+             headings, no bold, no [[links]]; name a file only when the reader needs it.\n\n",
+        ),
         Stage::Implement => {}
     }
 
@@ -1038,10 +1091,17 @@ pub fn brief(
     out.push('\n');
 
     if !route.candidate_paths.is_empty() {
-        out.push_str(
+        out.push_str(if stage == Stage::Answer {
+            // Naming the files as the user's makes the model review them
+            // ("this file is about...") instead of answering. Saying what not to
+            // do primed the same thing, so this only says who sees what.
+            "\nOrteca matched these paths to the question's words; the user has not seen \
+             this list, so the answer stands on its own unless the question names a file. \
+             Open one only if it helps:\n"
+        } else {
             "\nStart here. These tracked paths match the task, most likely first; open the \
-             ones you need directly, with no search first, and ignore the rest:\n",
-        );
+             ones you need directly, with no search first, and ignore the rest:\n"
+        });
         for path in &route.candidate_paths {
             out.push_str("- ");
             out.push_str(path);
@@ -1076,7 +1136,7 @@ pub fn brief(
             .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix))
             .into_iter()
             .collect(),
-        Stage::Plan | Stage::Review | Stage::Verify => Vec::new(),
+        Stage::Plan | Stage::Review | Stage::Verify | Stage::Answer => Vec::new(),
     };
     for note in handoff {
         match &note.artifact {
@@ -1517,6 +1577,56 @@ mod tests {
         );
     }
 
+    /// The small model's reading picks the route in any language, and the
+    /// keyword gates still escalate what it calls easy or medium.
+    #[test]
+    fn the_read_intent_picks_the_route_and_gates_still_escalate() {
+        let read = |intent| RepoSignals {
+            intent: Some(intent),
+            ..repo(REPO)
+        };
+        let question = route(
+            "Ja lietotājs atcēla abonementu, vai man viņam rakstīt?",
+            Mode::Balanced,
+            &read(Intent::Question),
+        );
+        assert_eq!(question.kind, RouteKind::Answer);
+        assert_eq!(question.stages, [Stage::Answer]);
+        assert!(!Stage::Answer.writes());
+
+        // A question lists no tests and a failed one is not retried a tier up.
+        let asked = RepoSignals {
+            intent: Some(Intent::Question),
+            prior_failures: 1,
+            tracked_paths: vec!["app/Winback.php".into(), "tests/WinbackTest.php".into()],
+            ..repo(REPO)
+        };
+        let retried = route("how does winback work?", Mode::Balanced, &asked);
+        assert_eq!(retried.candidate_paths, ["app/Winback.php"]);
+        assert_eq!(
+            retried.budget.preferred_tier,
+            route("how does winback work?", Mode::Balanced, &RepoSignals { prior_failures: 0, ..asked })
+                .budget
+                .preferred_tier
+        );
+
+        let kind = |prompt, intent| route(prompt, Mode::Balanced, &read(intent)).kind;
+        assert_eq!(kind("pievieno pogu", Intent::Easy), RouteKind::ImplementOnce);
+        assert_eq!(kind("fix the typo", Intent::Medium), RouteKind::Standard);
+        assert_eq!(kind("fix the typo", Intent::Hard), RouteKind::Planned);
+        assert_eq!(
+            kind("add an authorization check to delete", Intent::Easy),
+            RouteKind::Guarded
+        );
+
+        let mut failed = read(Intent::Easy);
+        failed.prior_failures = 2;
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &failed).kind,
+            RouteKind::Escalated
+        );
+    }
+
     /// Efficient is the same table read two points further along, so work that
     /// Balanced plans, Efficient may implement directly. It can never add work.
     #[test]
@@ -1683,6 +1793,8 @@ mod tests {
         let r = balanced("redesign the storage subsystem", REPO);
         let note = StageNote {
             stage: Stage::Plan,
+            model: None,
+            effort: None,
             summary: "I think we should start with the store".into(),
             artifact: None,
         };
@@ -1705,6 +1817,8 @@ mod tests {
         let r = balanced("redesign the storage subsystem", REPO);
         let plan = StageNote {
             stage: Stage::Plan,
+            model: None,
+            effort: None,
             summary: "plan summary".into(),
             artifact: Some(serde_json::json!({
                 "objective": "private-plan-marker", "constraints": [], "affected_areas": [],
@@ -1713,11 +1827,15 @@ mod tests {
         };
         let implementation = StageNote {
             stage: Stage::Implement,
+            model: None,
+            effort: None,
             summary: "implementation-marker".into(),
             artifact: None,
         };
         let failed = StageNote {
             stage: Stage::Verify,
+            model: None,
+            effort: None,
             summary: "failed check".into(),
             artifact: Some(serde_json::json!({
                 "checks": [{"command": "npm test", "passed": false, "output": "boom"}],

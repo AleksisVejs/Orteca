@@ -27,7 +27,9 @@ What exists and works:
 - Mid-task instructions: Claude takes one live on stdin mid-turn, Codex holds
   one until asked to apply it and then resumes its own session with it
 - Installing a missing CLI from the project screen, via the user's own npm
-- Routing with no model call: a keyword classifier picks one of five routes,
+- Routing with one small model call: the provider's smallest model reads the
+  prompt as a question or easy/medium/hard work (`intent.rs`, any language),
+  and the keyword classifier picks one of six routes,
   each with its stages and tiers declared before a provider starts; a trivial
   task is one Implement call, which verifies itself unless Orteca can run the
   repository's tests after it (§4.3.7)
@@ -832,6 +834,7 @@ src-tauri/
       limits.rs    plan limits read from each CLI (§4.3.5)
       mock.rs      replays fixtures/*.jsonl through the real parsers
     run.rs         route runner: stages, argv, stream, fix rounds, event log, diff, result
+    intent.rs      one small-model call that reads what the prompt wants
     routing.rs     deterministic classifier + route builder + stage briefs
     orchestrator.rs *  folded into run.rs — see below
 src/
@@ -1002,6 +1005,8 @@ Migrations: plain numbered `.sql` files run in order. No ORM.
 ## 8. Routing model — deterministic, zero tokens
 
 Classifier scores the prompt plus cheap repo signals. Pure Rust, no LLM call.
+Since 2026-09-16 a run first asks the provider's smallest model (`haiku`,
+`gpt-5.6-luna`) what the prompt wants; see the as-built note below.
 
 ```
 signals: complexity 0-10, risk 0-10,
@@ -1035,6 +1040,18 @@ adaptive routing has training data without a schema change.
 **As built (Milestone 6).** `routing.rs` is pure and makes no model call of any
 kind: keyword tables over the prompt, plus one `git ls-files` for blast radius
 and one `COUNT(*)` for prior failures. Same inputs, same route, every time.
+
+**Intent (2026-09-16).** Keywords misrouted questions ("should I email a user
+who cancelled?") as implement work, and read only English. `start_task` now
+asks the selected provider's smallest model, with no tools and outside the
+project, for one word: `question`, `easy`, `medium` or `hard`. It arrives in
+`RepoSignals::intent`, so `route` stays pure. `question` is the `answer`
+route: one read-only `Answer` stage whose reply is the result. `hard` plans,
+`easy` is one call, `medium` is standard. Security, authorisation, schema and
+twice-failed gates still apply first, so the reading never lowers a gate. A
+call that fails or times out (45s) leaves `intent` empty and the keywords
+decide. Its usage counts toward the run as one call, logged as stage
+`classify`. The preview does not ask: it refreshes on every pause in typing.
 
 Rule order is not the table's order. The two escalating rules are tested first,
 because a prompt that scores trivially but touches authorisation is not a

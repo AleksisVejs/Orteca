@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_task_details.sql"),
     include_str!("../migrations/0005_worktree.sql"),
     include_str!("../migrations/0006_model_prices.sql"),
+    include_str!("../migrations/0007_task_titles.sql"),
 ];
 
 /// A published API rate, in USD per million tokens.
@@ -57,6 +58,7 @@ pub struct Project {
 pub struct NewTask<'a> {
     pub project_id: i64,
     pub prompt: &'a str,
+    pub title: &'a str,
     pub mode: &'a str,
     /// The route, serialised. Decided before any provider starts.
     pub route_json: Option<&'a str>,
@@ -155,12 +157,13 @@ impl Store {
         let conn = self.0.lock().expect("store poisoned");
         conn.execute(
             "INSERT INTO tasks
-                (project_id, prompt, mode, route_json, status, branch,
+                (project_id, prompt, title, mode, route_json, status, branch,
                  base_commit, dirty_at_start, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, datetime('now'))",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8, datetime('now'))",
             params![
                 task.project_id,
                 task.prompt,
+                task.title,
                 task.mode,
                 task.route_json,
                 task.branch,
@@ -566,7 +569,7 @@ impl Store {
     pub fn recent_tasks(&self, project_id: i64, limit: u32) -> Result<Vec<TaskSummary>> {
         let conn = self.0.lock().expect("store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.prompt, t.status, t.started_at, t.summary,
+            "SELECT t.id, t.prompt, t.title, t.status, t.started_at, t.summary,
                     json_extract(t.route_json, '$.kind'), t.calls_used, u.provider, u.model,
                     u.input_tokens + u.cached_input_tokens + u.output_tokens,
                     u.input_tokens + u.output_tokens, u.cached_input_tokens, u.cost_usd,
@@ -580,24 +583,44 @@ impl Store {
             Ok(TaskSummary {
                 id: r.get(0)?,
                 prompt: r.get(1)?,
-                status: r.get(2)?,
-                started_at: r.get(3)?,
-                summary: r.get(4)?,
-                route_kind: r.get(5)?,
-                calls_used: r.get(6)?,
-                provider: r.get(7)?,
-                model: r.get(8)?,
-                tokens: r.get(9)?,
-                uncached_tokens: r.get(10)?,
-                cached_tokens: r.get(11)?,
-                cost_usd: r.get(12)?,
-                cost_quality: r.get(13)?,
-                unknown_events: r.get(14)?,
-                duration_ms: r.get(15)?,
-                patch_available: r.get(16)?,
+                title: r.get(2)?, status: r.get(3)?, started_at: r.get(4)?, summary: r.get(5)?,
+                route_kind: r.get(6)?, calls_used: r.get(7)?, provider: r.get(8)?, model: r.get(9)?,
+                tokens: r.get(10)?, uncached_tokens: r.get(11)?, cached_tokens: r.get(12)?,
+                cost_usd: r.get(13)?, cost_quality: r.get(14)?, unknown_events: r.get(15)?,
+                duration_ms: r.get(16)?, patch_available: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn rename_task(&self, project_id: i64, task_id: i64, title: &str) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        let changed = conn.execute(
+            "UPDATE tasks SET title = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![title, project_id, task_id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::new(ErrorKind::NotFound, "That task is not in this project."));
+        }
+        Ok(())
+    }
+
+    /// Events and usage go with it. A running task, or one whose copy folder
+    /// still exists, stays: deleting the row would orphan the folder.
+    pub fn delete_task(&self, project_id: i64, task_id: i64) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        let changed = conn.execute(
+            "DELETE FROM tasks WHERE project_id = ?1 AND id = ?2
+                AND status != 'running' AND worktree_path IS NULL",
+            params![project_id, task_id],
+        )?;
+        if changed == 0 {
+            return Err(AppError::new(
+                ErrorKind::Invalid,
+                "That task is still running or still has a copy folder. Remove the copy first.",
+            ));
+        }
+        Ok(())
     }
 
     pub fn task_detail(&self, project_id: i64, task_id: i64) -> Result<TaskDetail> {
@@ -680,6 +703,7 @@ impl Store {
 #[serde(rename_all = "camelCase")]
 pub struct TaskSummary {
     pub id: i64,
+    pub title: String,
     pub prompt: String,
     pub status: String,
     /// SQLite `datetime('now')`: UTC, to the second.
@@ -797,6 +821,7 @@ mod tests {
         NewTask {
             project_id,
             prompt,
+            title: "",
             mode,
             route_json: None,
             branch: None,
@@ -916,6 +941,24 @@ mod tests {
         store.add_usage(task, "claude", None).unwrap();
         let row = &store.recent_tasks(project.id, 20).unwrap()[0];
         assert_eq!((row.tokens, row.cost_quality.as_deref()), (None, Some("unavailable")));
+    }
+
+    #[test]
+    fn tasks_rename_and_delete_only_in_their_project_and_once_settled() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let other = store.touch_project("b", "b").unwrap();
+        let task = store.create_task(new_task(project.id, "p", "balanced")).unwrap();
+
+        store.rename_task(project.id, task, "New name").unwrap();
+        assert_eq!(store.recent_tasks(project.id, 20).unwrap()[0].title, "New name");
+        assert!(store.rename_task(other.id, task, "x").is_err());
+
+        assert!(store.delete_task(project.id, task).is_err(), "still running");
+        store.finish_task_details(task, "done", "", "[]", None, 0, None, 0).unwrap();
+        assert!(store.delete_task(other.id, task).is_err());
+        store.delete_task(project.id, task).unwrap();
+        assert!(store.recent_tasks(project.id, 20).unwrap().is_empty());
     }
 
     #[test]

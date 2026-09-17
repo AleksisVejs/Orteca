@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { provide } from "vue";
+import { onMounted, onUnmounted, provide, ref, watch } from "vue";
 import VeloMark from "../components/VeloMark.vue";
 import AiHelpers from "./project/AiHelpers.vue";
 import PastTask from "./project/PastTask.vue";
@@ -17,10 +17,22 @@ defineEmits<{ close: [] }>();
 const state = useProject(props.opened);
 provide(PROJECT, state);
 const {
-  view, running, result, history, historyError, historyDetail, historyLine, showHistory, newTask,
+  view, running, result, history, historyError, historyDetail, historyLine, showHistory, newTask, taskName,
+  taskMenu, renameId, renaming, deleteAsk, askDelete, startRename, saveRename, removeTask, taskError,
   rows, helpersPending, helpersReady, TONE, HISTORY_STATUS,
   git, gitAsk, gitBusy, gitError, commitMessage, mergeBranch, gitQuestion, runGit,
 } = state;
+
+const vSelect = { mounted: (el: HTMLInputElement) => el.select() };
+
+// A click anywhere else closes the row menu.
+const closeMenu = () => (taskMenu.value = null);
+onMounted(() => document.addEventListener("click", closeMenu));
+onUnmounted(() => document.removeEventListener("click", closeMenu));
+
+// The native dialog brings focus trapping, Escape and a backdrop for free.
+const deleteDialog = ref<HTMLDialogElement | null>(null);
+watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.value?.close()));
 </script>
 
 <template>
@@ -61,17 +73,58 @@ const {
       <p v-else-if="!history.length" class="note side-note">Finished tasks show up here.</p>
       <ul v-else class="recent">
         <li v-for="t in history" :key="t.id">
+          <input
+            v-if="renameId === t.id"
+            v-model="renaming"
+            v-select
+            class="rename-input"
+            maxlength="60"
+            aria-label="Task name"
+            @keydown.enter="saveRename"
+            @keydown.esc="renameId = null"
+            @blur="saveRename"
+          />
           <button
+            v-else
             :class="{ on: view === 'history' && historyDetail?.id === t.id }"
-            :title="`${t.prompt}\n${historyLine(t)}`"
+            :title="`${t.title || t.prompt}\n${historyLine(t)}`"
             @click="showHistory(t)"
           >
             <span class="dot" :class="TONE[t.status]" aria-hidden="true"></span>
-            <span class="grow">{{ t.prompt }}</span>
+            <span class="grow">{{ taskName(t) }}</span>
             <span class="hidden-label">{{ HISTORY_STATUS[t.status] ?? t.status }}</span>
           </button>
+          <button
+            v-if="renameId !== t.id && t.status !== 'running'"
+            class="row-menu"
+            :class="{ open: taskMenu === t.id }"
+            title="Task options"
+            :aria-label="`Options for ${taskName(t)}`"
+            aria-haspopup="menu"
+            :aria-expanded="taskMenu === t.id"
+            @click.stop="taskMenu = taskMenu === t.id ? null : t.id"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <div v-if="taskMenu === t.id" class="menu" role="menu" @click.stop>
+            <button role="menuitem" @click="startRename(t)">Rename</button>
+            <button role="menuitem" class="danger" @click="askDelete(t)">Delete</button>
+          </div>
         </li>
       </ul>
+      <p v-if="taskError" class="note side-note" role="alert">{{ taskError }}</p>
+
+      <dialog ref="deleteDialog" class="confirm" aria-labelledby="delete-title" @close="deleteAsk = null">
+        <h2 id="delete-title">Delete this task?</h2>
+        <p>{{ deleteAsk && taskName(deleteAsk) }}</p>
+        <p class="note">Its log and numbers are removed for good. Your files are not touched.</p>
+        <footer>
+          <button class="btn" autofocus @click="deleteAsk = null">Cancel</button>
+          <button class="btn danger" @click="removeTask">Delete</button>
+        </footer>
+      </dialog>
 
       <div class="side-project">
         <span class="grow" :title="opened.project.path">{{ opened.project.name }}</span>
@@ -218,9 +271,100 @@ const {
 }
 .recent {
   flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  overflow-x: hidden;
   align-content: start;
   min-height: 0;
   overflow-y: auto;
+}
+.recent li {
+  position: relative;
+}
+.recent li:has(.row-menu) > button:first-child {
+  padding-right: 30px;
+}
+.recent .row-menu {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: auto;
+  padding: 4px;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  opacity: 0;
+}
+.recent li:hover .row-menu,
+.recent .row-menu:focus-visible,
+.recent .row-menu.open {
+  opacity: 1;
+}
+.recent .row-menu:hover,
+.recent .row-menu.open {
+  background: var(--surface);
+  color: var(--text);
+}
+.menu {
+  position: absolute;
+  top: calc(100% - 2px);
+  right: 4px;
+  z-index: 1;
+  display: grid;
+  min-width: 120px;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+}
+.recent .menu button {
+  padding: 6px 10px;
+}
+.recent .menu button:hover {
+  background: var(--surface);
+}
+.recent .menu .danger,
+.recent .menu .danger:hover {
+  color: var(--err);
+}
+.rename-input {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font: inherit;
+}
+.confirm {
+  width: min(420px, calc(100vw - 32px));
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+}
+.confirm::backdrop {
+  background: var(--overlay);
+}
+.confirm h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.confirm p {
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+}
+.confirm footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--gap);
+  margin-top: 20px;
+}
+.confirm .danger {
+  color: var(--err);
+}
+.confirm .danger:hover {
+  border-color: var(--err);
 }
 .side-project {
   display: flex;

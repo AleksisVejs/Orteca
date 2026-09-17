@@ -87,6 +87,12 @@ export const previewTask = (path: string, prompt: string, provider: ProviderId, 
 export const openFile = (path: string, file: string, reveal: boolean) =>
   invoke<void>("open_file", { path, file, reveal });
 
+export const renameTask = (path: string, taskId: number, title: string) =>
+  invoke<void>("rename_task", { path, taskId, title });
+
+export const deleteTask = (path: string, taskId: number) =>
+  invoke<void>("delete_task", { path, taskId });
+
 export const removeWorktree =(path: string, taskId: number) =>
   invoke<void>("remove_worktree", { path, taskId });
 

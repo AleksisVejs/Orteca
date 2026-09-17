@@ -1002,11 +1002,11 @@ separate `commands` / `artifacts` tables (they are `task_events` rows).
 
 Migrations: plain numbered `.sql` files run in order. No ORM.
 
-## 8. Routing model — deterministic, zero tokens
+## 8. Routing model — one cheap semantic classification
 
-Classifier scores the prompt plus cheap repo signals. Pure Rust, no LLM call.
-Since 2026-09-16 a run first asks the provider's smallest model (`haiku`,
-`gpt-5.6-luna`) what the prompt wants; see the as-built note below.
+Each run first asks the provider's smallest model (`haiku`, `gpt-5.6-luna`)
+what the prompt wants, then pure Rust combines that reading with cheap repo
+signals. See the as-built notes below.
 
 ```
 signals: complexity 0-10, risk 0-10,
@@ -1037,21 +1037,21 @@ DEEP/REVIEW → claude    IMPLEMENT → codex    fallback: whichever is detected
 Every decision writes a `routing_decision` event with the signal values, so future
 adaptive routing has training data without a schema change.
 
-**As built (Milestone 6).** `routing.rs` is pure and makes no model call of any
-kind: keyword tables over the prompt, plus one `git ls-files` for blast radius
-and one `COUNT(*)` for prior failures. Same inputs, same route, every time.
+**As built (Milestone 6).** `routing.rs` is pure and makes no model call itself:
+the semantic reading is an input beside one `git ls-files` for blast radius and
+one `COUNT(*)` for prior failures. Same inputs, same route, every time.
 
-**Intent (2026-09-16).** Keywords misrouted questions ("should I email a user
-who cancelled?") as implement work, and read only English. `start_task` now
-asks the selected provider's smallest model, with no tools and outside the
-project, for one word: `question`, `easy`, `medium` or `hard`. It arrives in
-`RepoSignals::intent`, so `route` stays pure. `question` is the `answer`
-route: one read-only `Answer` stage whose reply is the result. `hard` plans,
-`easy` is one call, `medium` is standard. Security, authorisation, schema and
-twice-failed gates still apply first, so the reading never lowers a gate. A
-call that fails or times out (45s) leaves `intent` empty and the keywords
-decide. Its usage counts toward the run as one call, logged as stage
-`classify`. The preview does not ask: it refreshes on every pause in typing.
+**Semantic job reading (2026-09-16).** Keywords misrouted questions ("should I
+email a user who cancelled?") and harmless names such as `auth.rememberMe`.
+`start_task` now asks the selected provider's smallest model, with no tools and
+outside the project, for difficulty, title, actual job boundaries (security,
+authentication/authorisation, schema or general), and explicitly requested
+build/test/lint actions. These arrive in `RepoSignals`, so `route` stays pure.
+The semantic job reading controls the guarded gates; keyword gates are only the
+fallback when the call fails or times out after 45 seconds. Twice-failed work
+still escalates independently. Classification usage counts toward the run as
+one call, logged as stage `classify`. The preview does not ask: it refreshes on
+every pause in typing.
 
 Rule order is not the table's order. The two escalating rules are tested first,
 because a prompt that scores trivially but touches authorisation is not a
@@ -1077,6 +1077,10 @@ identified by this run's changed paths execute; unknown-only changes keep the
 full set. Changed Laravel tests run first, and a failure skips the broad suite.
 On most repositories Verify is therefore no agent call.
 A root suite claims its ecosystem, so a workspace's packages are not run twice.
+A trusted repository's explicitly requested `build` and `lint` package scripts
+also run here, directly as the user through Orteca rather than inside the model
+sandbox. The classifier selects only the action; the command must exist in
+`package.json`, so a model cannot invent an executable or command line.
 A suite whose dependencies are not installed - a fresh clone, or every run's
 separate copy - gets its install (`npm ci`, `pnpm install --frozen-lockfile`,
 `composer install`, ...) first; a suite whose tools are not on PATH is reported

@@ -22,8 +22,28 @@ pub enum Intent {
     Hard,
 }
 
+/// What kind of work the small classifier read, and which repository-declared
+/// commands the user explicitly asked Orteca to run. `None` at the call site
+/// means classification failed and the deterministic fallback takes over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Job {
+    pub security: bool,
+    pub authz: bool,
+    pub schema_change: bool,
+    pub build: bool,
+    pub test: bool,
+    pub lint: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reading {
+    pub intent: Option<Intent>,
+    pub title: String,
+    pub job: Option<Job>,
+}
+
 // One line: it travels as an argument, and a Windows shim mangles newlines.
-const INSTRUCTION: &str = "You sort requests made to a coding agent working in a git repository. Reply with exactly one word and nothing else. question: it wants an answer, advice or an explanation, and no file changed. easy: a small, narrow change. medium: ordinary work across a few files. hard: large, cross-cutting or design-heavy work. A request that asks something and also asks for a change is not a question. The request may be in any language.";
+const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: question, easy, medium, or hard. question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. The request may be in any language.";
 
 /// A small model's first minute is mostly a Node shim starting. A classifier
 /// slower than this costs more waiting than it can save.
@@ -78,6 +98,9 @@ fn args(id: ProviderId) -> Vec<String> {
     fixed.into_iter().map(str::to_string).collect()
 }
 
+/// The longest title kept. The sidebar cuts it to fit with an ellipsis.
+pub const TITLE_CHARS: usize = 60;
+
 /// The first of the four words the reply contains, wherever it sits.
 pub fn parse(reply: &str) -> Option<Intent> {
     reply
@@ -92,16 +115,77 @@ pub fn parse(reply: &str) -> Option<Intent> {
         })
 }
 
-/// Ask the provider what `prompt` wants. `None` means "could not tell" and the
-/// keyword router decides; the events come back either way, so what the call
-/// cost is still counted.
-pub async fn read(id: ProviderId, program: &str, prompt: &str) -> (Option<Intent>, Vec<ProviderEvent>) {
+/// The reply's second line, stripped of markdown, quotes and a "Title:"
+/// label. Empty when the model gave none; the sidebar then shows the prompt.
+pub fn parse_title(reply: &str) -> String {
+    let line = reply.lines().map(str::trim).filter(|l| !l.is_empty()).nth(1).unwrap_or("");
+    let line = line.trim_start_matches(['#', '*', '-', '>', ' ']);
+    let line = line
+        .split_once(':')
+        .filter(|(label, _)| label.trim().eq_ignore_ascii_case("title"))
+        .map_or(line, |(_, rest)| rest);
+    let title = line.trim_matches(['*', '_', '`', '"', '\'', '“', '”', '.', ' ']);
+    title.chars().take(TITLE_CHARS).collect()
+}
+
+fn values(reply: &str, label: &str, allowed: &[&str]) -> Option<Vec<String>> {
+    let value = reply.lines().map(str::trim).find_map(|line| {
+        let (found, value) = line.split_once(':')?;
+        found.trim().eq_ignore_ascii_case(label).then_some(value)
+    })?;
+    let values: Vec<String> = value
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    (!values.is_empty()
+        && values
+            .iter()
+            .all(|value| value == "none" || allowed.contains(&value.as_str())))
+    .then_some(values)
+}
+
+pub fn parse_job(reply: &str) -> Option<Job> {
+    let kinds = values(
+        reply,
+        "job",
+        &["general", "security", "authentication", "authorization", "schema"],
+    )?;
+    let actions = values(reply, "run", &["build", "test", "lint"])?;
+    Some(Job {
+        security: kinds.iter().any(|value| value == "security"),
+        authz: kinds
+            .iter()
+            .any(|value| matches!(value.as_str(), "authentication" | "authorization")),
+        schema_change: kinds.iter().any(|value| value == "schema"),
+        build: actions.iter().any(|value| value == "build"),
+        test: actions.iter().any(|value| value == "test"),
+        lint: actions.iter().any(|value| value == "lint"),
+    })
+}
+
+/// Ask the provider what `prompt` wants and what to call it, in one call.
+/// `None` means "could not tell" and the keyword router decides; the events
+/// come back either way, so what the call cost is still counted.
+pub async fn read(
+    id: ProviderId,
+    program: &str,
+    prompt: &str,
+) -> (Reading, Vec<ProviderEvent>) {
     let mut events = Vec::new();
-    let intent = tokio::time::timeout(DEADLINE, ask(id, program, prompt, &mut events))
+    let reply = tokio::time::timeout(DEADLINE, ask(id, program, prompt, &mut events))
         .await
         .ok()
-        .flatten();
-    (intent, events)
+        .flatten()
+        .unwrap_or_default();
+    (
+        Reading {
+            intent: parse(&reply),
+            title: parse_title(&reply),
+            job: parse_job(&reply),
+        },
+        events,
+    )
 }
 
 async fn ask(
@@ -109,7 +193,7 @@ async fn ask(
     program: &str,
     prompt: &str,
     events: &mut Vec<ProviderEvent>,
-) -> Option<Intent> {
+) -> Option<String> {
     let argv = args(id);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Never in the user's project: nobody has consented to its settings for this.
@@ -139,7 +223,7 @@ async fn ask(
             _ => {}
         }
     }
-    parse(&reply)
+    Some(reply)
 }
 
 #[cfg(test)]
@@ -154,6 +238,38 @@ mod tests {
         assert_eq!(parse("It's medium, not hard"), Some(Intent::Medium));
         assert_eq!(parse("I cannot tell"), None);
         assert_eq!(parse("uneasy"), None);
+    }
+
+    #[test]
+    fn reads_the_title_from_the_second_line() {
+        assert_eq!(parse_title("easy\nFix login redirect"), "Fix login redirect");
+        assert_eq!(parse_title("**hard**\n\nTitle: \"Rework the router.\""), "Rework the router");
+        assert_eq!(parse_title("- medium\n# 2FA setup page"), "2FA setup page");
+        assert_eq!(parse_title("question"), "");
+        assert_eq!(parse_title(&format!("easy\n{}", "x".repeat(200))).len(), TITLE_CHARS);
+    }
+
+    #[test]
+    fn reads_job_risk_and_only_explicit_requested_actions() {
+        assert_eq!(
+            parse_job("easy\nFix login copy\njob: general\nrun: build"),
+            Some(Job {
+                build: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            parse_job("medium\nProtect delete\njob: security, authorization\nrun: test, lint"),
+            Some(Job {
+                security: true,
+                authz: true,
+                test: true,
+                lint: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(parse_job("easy\nFix copy"), None);
+        assert_eq!(parse_job("easy\nFix copy\njob: mystery\nrun: none"), None);
     }
 
     #[test]

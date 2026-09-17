@@ -222,11 +222,12 @@ async fn start_task(
         .map(|dir| dir.join("recordings"));
     // Read before the route is chosen, on the provider the run will spend.
     // Unreadable means the keyword router decides, never a failed run.
-    let (intent, classified) = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
+    // The same call names the task, so a title costs no extra call.
+    let (reading, classified) = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
         (Some(text), Some(program)) => {
             intent::read(provider, &program.to_string_lossy(), &text).await
         }
-        _ => (None, Vec::new()),
+        _ => (Default::default(), Vec::new()),
     };
     let mut request = tauri::async_runtime::spawn_blocking(move || {
         prepare_run(
@@ -238,7 +239,9 @@ async fn start_task(
             mode,
             headroom,
             isolation,
-            intent,
+            reading.intent,
+            reading.job,
+            &reading.title,
             continue_task,
         )
     })
@@ -310,6 +313,7 @@ fn plan_run(
     headroom: Option<f64>,
     isolation: Isolation,
     intent: Option<intent::Intent>,
+    job: Option<intent::Job>,
 ) -> Result<PlannedRun> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(
@@ -351,8 +355,9 @@ fn plan_run(
             // The frontend's reading, not a fresh one: the preview and the run
             // must be routed on the same number.
             headroom: headroom.filter(|room| room.is_finite()),
-            checks_locally: run::checks_locally(&dir),
+            checks_locally: run::checks_locally(&dir, job),
             intent,
+            job,
         },
     );
     Ok(PlannedRun {
@@ -380,7 +385,17 @@ async fn preview_task(
     // call per pause would cost more than the runs it routes. Off the main
     // thread: git, PATH and ACL probes froze the window on every pause.
     let planned = tauri::async_runtime::spawn_blocking(move || {
-        plan_run(&app.state::<Store>(), path, prompt, provider, mode, headroom, isolation, None)
+        plan_run(
+            &app.state::<Store>(),
+            path,
+            prompt,
+            provider,
+            mode,
+            headroom,
+            isolation,
+            None,
+            None,
+        )
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
@@ -429,6 +444,8 @@ fn prepare_run(
     headroom: Option<f64>,
     isolation: Isolation,
     intent: Option<intent::Intent>,
+    job: Option<intent::Job>,
+    title: &str,
     continue_task: Option<i64>,
 ) -> Result<run::Request> {
     let PlannedRun {
@@ -438,7 +455,9 @@ fn prepare_run(
         git,
         prompt,
         route,
-    } = plan_run(store, path, prompt, provider, mode, headroom, isolation, intent)?;
+    } = plan_run(
+        store, path, prompt, provider, mode, headroom, isolation, intent, job,
+    )?;
 
     // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
     let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
@@ -466,6 +485,7 @@ fn prepare_run(
         None => store.create_task(NewTask {
             project_id: record.id,
             prompt: &prompt,
+            title,
             mode: mode.name(),
             route_json: route_json.as_deref(),
             branch: git.branch.as_deref(),
@@ -887,6 +907,23 @@ fn recent_tasks(path: String, store: State<Store>) -> Result<Vec<store::TaskSumm
 }
 
 #[tauri::command]
+fn rename_task(path: String, task_id: i64, title: String, store: State<Store>) -> Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(AppError::new(ErrorKind::Invalid, "Type a name first."));
+    }
+    let title: String = title.chars().take(intent::TITLE_CHARS).collect();
+    let dir = project::validate_dir(&path)?;
+    store.rename_task(store.project(&dir.to_string_lossy())?.id, task_id, title.trim_end())
+}
+
+#[tauri::command]
+fn delete_task(path: String, task_id: i64, store: State<Store>) -> Result<()> {
+    let dir = project::validate_dir(&path)?;
+    store.delete_task(store.project(&dir.to_string_lossy())?.id, task_id)
+}
+
+#[tauri::command]
 fn task_detail(path: String, task_id: i64, store: State<Store>) -> Result<store::TaskDetail> {
     let dir = project::validate_dir(&path)?;
     store.task_detail(store.project(&dir.to_string_lossy())?.id, task_id)
@@ -938,6 +975,8 @@ fn main() {
             trust_project,
             forget_project,
             recent_tasks,
+            rename_task,
+            delete_task,
             task_detail,
             preview_task,
             provider_limits,
@@ -1055,6 +1094,8 @@ mod tests {
             None,
             Isolation::CurrentTree,
             None,
+            None,
+            "",
             None,
         )
         .unwrap();

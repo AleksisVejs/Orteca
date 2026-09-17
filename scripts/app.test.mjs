@@ -37,6 +37,34 @@ test('run history loads on open, refreshes after a run, and never shows a zero f
   assert.equal(broken.state.historyError.value, true);
 });
 
+test('task titles can be renamed and deletion takes confirmation', async () => {
+  const past = { id: 1, title: 'Generated title', prompt: 'long original prompt', status: 'done' };
+  let renamed;
+  let deleted = 0;
+  const { state } = await projectView({
+    recentTasks: async () => [past],
+    renameTask: async (_path, id, title) => { renamed = { id, title }; },
+    deleteTask: async () => { deleted += 1; },
+  });
+  await new Promise(r => setTimeout(r));
+  state.historyDetail.value = { id: past.id, status: 'done' };
+
+  assert.equal(state.taskName(past), 'Generated title');
+  state.startRename();
+  state.renaming.value = '  Better title  ';
+  await state.saveRename();
+  assert.deepEqual(renamed, { id: 1, title: 'Better title' });
+  assert.equal(past.title, 'Better title');
+
+  await state.removeTask(past.id);
+  assert.equal(deleted, 0);
+  assert.equal(state.confirmDelete.value, past.id);
+  await state.removeTask(past.id);
+  assert.equal(deleted, 1);
+  assert.equal(state.history.value.length, 0);
+  assert.equal(state.historyDetail.value, null);
+});
+
 async function projectView(api = {}) {
   const source = readFileSync(new URL('../src/views/project/state.ts', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '')

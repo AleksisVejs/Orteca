@@ -971,6 +971,8 @@ pub async fn stream(
             base_commit: base_commit.as_deref(),
             before_run: before_run.as_ref(),
             before_change: Some(&route.candidate_paths),
+            requested_build: false,
+            requested_lint: false,
         };
         if verify_locally(store, &ctx, &mut state, &mut control, &emit, scope).await == Some(false) {
             failing_before = state.structured.as_ref().map(failed_checks).unwrap_or_default();
@@ -1050,6 +1052,8 @@ pub async fn stream(
                     base_commit: base_commit.as_deref(),
                     before_run: before_run.as_ref(),
                     before_change: None,
+                    requested_build: route.signals.requested_build,
+                    requested_lint: route.signals.requested_lint,
                 },
             )
             .await
@@ -1333,8 +1337,14 @@ Before any change, the project's checks already fail. This may be the task, or a
 
 /// The repository declares a test command and it is on PATH, so a Verify costs
 /// no agent call.
-pub fn checks_locally(dir: &Path) -> bool {
-    project::check_commands(dir).iter().any(runnable)
+pub fn checks_locally(dir: &Path, job: Option<crate::intent::Job>) -> bool {
+    let requested = job
+        .map(|job| project::requested_check_commands(dir, job.build, job.lint))
+        .unwrap_or_default();
+    project::check_commands(dir)
+        .into_iter()
+        .chain(requested)
+        .any(|check| runnable(&check))
 }
 
 /// Every program a suite needs, its install included, is on PATH.
@@ -1409,6 +1419,8 @@ struct VerifyScope<'a> {
     /// Set for the check before any change: the paths the route expects to
     /// touch pick the suites, since nothing has changed yet.
     before_change: Option<&'a [String]>,
+    requested_build: bool,
+    requested_lint: bool,
 }
 
 /// Trees whose checks passed before a run, keyed by folder, commit, what was
@@ -1439,11 +1451,23 @@ async fn verify_locally(
                 .collect()
         }
     };
-    let (mut checks, missing): (Vec<_>, Vec<_>) =
-        project::relevant_check_commands(&ctx.dir, &changed_paths)
-        .into_iter()
-        .partition(runnable);
     let before_change = scope.before_change.is_some();
+    let mut candidates = project::relevant_check_commands(&ctx.dir, &changed_paths);
+    if !before_change {
+        let mut requested = project::requested_check_commands(
+            &ctx.dir,
+            scope.requested_build,
+            scope.requested_lint,
+        );
+        for command in &mut requested {
+            if candidates.iter().any(|check| check.dir == command.dir) {
+                command.install = None;
+            }
+        }
+        candidates.extend(requested);
+    }
+    let (mut checks, missing): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(runnable);
     if before_change {
         checks.retain(|check| quick_check(check).is_some());
     }
@@ -2503,6 +2527,7 @@ mod tests {
                 .create_task(NewTask {
                     project_id: project.id,
                     prompt: "test",
+                    title: "",
                     mode: "balanced",
                     route_json: None,
                     branch: None,

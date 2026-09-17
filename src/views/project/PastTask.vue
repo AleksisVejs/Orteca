@@ -7,7 +7,7 @@ import { PROJECT } from "./state";
 const {
   historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE,
   formatTokens, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
-  removeError, running,
+  removeError, running, historyRow,
 } = inject(PROJECT)!;
 </script>
 
@@ -20,6 +20,9 @@ const {
       <span class="dot" :class="TONE[historyDetail.status]" aria-hidden="true"></span>
       <h2 class="status">{{ HISTORY_STATUS[historyDetail.status] ?? historyDetail.status }}</h2>
       <span class="note">{{ historyDetail.startedAt.slice(0, 16) }} UTC</span>
+    </div>
+    <div v-if="historyRow?.title" class="name">
+      <span class="grow" :title="historyRow.title">{{ historyRow.title }}</span>
     </div>
     <p class="prompt">{{ historyDetail.prompt }}</p>
 
@@ -89,6 +92,14 @@ const {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
+}
+.name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
 }
 .prompt {
   margin: 8px 0 12px;

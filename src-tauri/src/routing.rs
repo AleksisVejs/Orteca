@@ -288,6 +288,17 @@ pub struct Signals {
     pub bug: bool,
     pub refactor: bool,
     pub frontend: bool,
+    /// The small model supplied the job/risk classification. When false, the
+    /// keyword classifier was the unavailable-model fallback.
+    #[serde(default)]
+    pub job_classified: bool,
+    /// Repository-declared commands the user explicitly asked Orteca to run.
+    #[serde(default)]
+    pub requested_build: bool,
+    #[serde(default)]
+    pub requested_test: bool,
+    #[serde(default)]
+    pub requested_lint: bool,
     /// Tracked files whose path matches a word in the prompt. A count, not a
     /// judgement: it says how much of the repository the prompt points at.
     pub blast_radius: usize,
@@ -510,15 +521,12 @@ const SECURITY: &[&str] = &[
 ];
 
 const AUTHZ: &[&str] = &[
-    "auth",
     "authoris",
     "authoriz",
     "authentic",
     "permission",
     "access control",
     "rbac",
-    "role",
-    "login",
     "session token",
     "oauth",
     "privilege",
@@ -609,6 +617,9 @@ pub struct RepoSignals {
     pub checks_locally: bool,
     /// See `Signals::intent`.
     pub intent: Option<Intent>,
+    /// The small model's semantic job classification. Keywords are used only
+    /// when this is absent because the call failed or was not made.
+    pub job: Option<crate::intent::Job>,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -741,11 +752,20 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
     }
     let complexity = complexity.saturating_sub(score(&text, TRIVIAL)).min(10);
 
-    let security = contains_any(&text, SECURITY);
-    let authz = contains_any(&text, AUTHZ);
-    let schema_change = contains_any(&text, SCHEMA);
+    let job_classified = repo.job.is_some();
+    let security = repo
+        .job
+        .map_or_else(|| contains_any(&text, SECURITY), |job| job.security);
+    let authz = repo
+        .job
+        .map_or_else(|| contains_any(&text, AUTHZ), |job| job.authz);
+    let schema_change = repo
+        .job
+        .map_or_else(|| contains_any(&text, SCHEMA), |job| job.schema_change);
 
-    let mut risk = score(&text, RISK);
+    // Once the semantic classifier answered, its job type is the risk signal.
+    // A translation key containing `auth` is not an authentication boundary.
+    let mut risk = if job_classified { 0 } else { score(&text, RISK) };
     // The three gates the architecture names are risky by definition, whatever
     // else the wording happened to score.
     if security || authz || schema_change {
@@ -764,6 +784,16 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
         bug: contains_any(&text, BUG),
         refactor: contains_any(&text, REFACTOR),
         frontend: contains_any(&text, FRONTEND),
+        job_classified,
+        requested_build: repo
+            .job
+            .map_or_else(|| text.contains("build"), |job| job.build),
+        requested_test: repo
+            .job
+            .map_or_else(|| text.contains("test"), |job| job.test),
+        requested_lint: repo
+            .job
+            .map_or_else(|| text.contains("lint"), |job| job.lint),
         blast_radius,
         prior_failures: repo.prior_failures,
         intent: repo.intent,
@@ -1157,8 +1187,9 @@ pub fn brief(
                 "Make the change described above and nothing beyond it. If it changes \
                  behaviour, add or update tests that pin every rule the task states, \
                  edge values included: the later checks only catch what a test covers. \
-                 A later stage runs the checks, so do not run tests or builds yourself; \
-                 stop when the change is complete.\n",
+                 A later stage runs the repository's checks and any build or lint action \
+                 the user requested, directly through Orteca. Do not run those commands \
+                 yourself; stop when the change is complete.\n",
             );
         } else {
             out.push_str(
@@ -1371,11 +1402,33 @@ mod tests {
             &[],
         );
         assert!(
-            text.contains("do not run tests")
+            text.contains("Do not run those commands")
                 && text.contains("pin every rule")
                 && !text.contains("one focused check"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn semantic_job_classification_overrides_auth_words_in_ui_copy() {
+        let local = RepoSignals {
+            checks_locally: true,
+            intent: Some(Intent::Easy),
+            job: Some(crate::intent::Job {
+                build: true,
+                ..Default::default()
+            }),
+            ..repo(&["resources/js/locales/en.js", "resources/js/pages/Login.vue"])
+        };
+        let r = route(
+            "fix auth.rememberMe on the login page and build the files",
+            Mode::Balanced,
+            &local,
+        );
+        assert_eq!(r.kind, RouteKind::ImplementOnce);
+        assert_eq!(r.stages, [Stage::Implement, Stage::Verify]);
+        assert!(r.signals.job_classified && r.signals.requested_build);
+        assert!(!r.signals.authz);
     }
 
     #[test]

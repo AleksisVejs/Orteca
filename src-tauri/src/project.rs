@@ -524,6 +524,52 @@ pub fn relevant_check_commands(root: &Path, changed_paths: &[String]) -> Vec<Che
         .collect()
 }
 
+/// Build and lint commands the user explicitly requested, limited to scripts
+/// the repository itself declares. They run as Orteca in a trusted project,
+/// never as an arbitrary command invented by a model.
+pub fn requested_check_commands(root: &Path, build: bool, lint: bool) -> Vec<Check> {
+    if !build && !lint {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(scripts) = manifest["scripts"].as_object() else {
+        return Vec::new();
+    };
+    let has_dependencies = ["dependencies", "devDependencies"]
+        .iter()
+        .any(|key| manifest[*key].as_object().is_some_and(|value| !value.is_empty()));
+    let missing = has_dependencies && !root.join("node_modules").is_dir();
+    let (program, install): (&'static str, Vec<&'static str>) =
+        if root.join("pnpm-lock.yaml").is_file() {
+            ("pnpm", vec!["pnpm", "install", "--frozen-lockfile"])
+        } else if root.join("yarn.lock").is_file() {
+            ("yarn", vec!["yarn", "install"])
+        } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+            ("bun", vec!["bun", "install"])
+        } else if root.join("package-lock.json").is_file() {
+            ("npm", vec!["npm", "ci"])
+        } else {
+            ("npm", vec!["npm", "install", "--no-package-lock"])
+        };
+    let mut commands = Vec::new();
+    for (asked, script) in [(build, "build"), (lint, "lint")] {
+        if asked && scripts.get(script).and_then(|value| value.as_str()).is_some() {
+            commands.push(Check {
+                kind: "js",
+                dir: root.to_path_buf(),
+                install: missing.then(|| install.clone()),
+                test: vec![program, "run", script],
+            });
+        }
+    }
+    commands
+}
+
 fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
     let has = |file: &str| dir.join(file).exists();
     let manifest = |file: &str| {
@@ -949,6 +995,25 @@ mod tests {
             2,
             "an unknown-only change guessed which suite could cover it"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requested_package_actions_use_only_declared_scripts() {
+        let dir = temp_dir("requested-checks");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"build":"vite build","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            requested_check_commands(&dir, true, true)
+                .into_iter()
+                .map(|check| check.test)
+                .collect::<Vec<_>>(),
+            [vec!["npm", "run", "build"], vec!["npm", "run", "lint"]]
+        );
+        assert!(requested_check_commands(&dir, false, false).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

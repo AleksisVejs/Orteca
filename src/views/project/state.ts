@@ -20,6 +20,8 @@ import {
   providerLimits,
   recentTasks,
   removeWorktree,
+  renameTask,
+  deleteTask,
   sendInstruction,
   signInProvider,
   startTask,
@@ -437,6 +439,61 @@ export function useProject(opened: OpenedProject) {
       removeError.value = isAppError(e) ? e.message : String(e);
     } finally {
       confirmRemove.value = null;
+    }
+  }
+
+  // A task goes by its title, or its prompt cut to the title limit until it has one.
+  const taskName = (t: TaskSummary) =>
+    t.title || (t.prompt.length > 60 ? `${t.prompt.slice(0, 59).trimEnd()}…` : t.prompt);
+  const historyRow = computed(() => history.value.find((t) => t.id === historyDetail.value?.id) ?? null);
+
+  // The sidebar row whose menu is open, the row being renamed, the task asked about.
+  const taskMenu = ref<number | null>(null);
+  const renameId = ref<number | null>(null);
+  const renaming = ref("");
+  const deleteAsk = ref<TaskSummary | null>(null);
+  const taskError = ref<string | null>(null);
+
+  function startRename(t: TaskSummary) {
+    taskMenu.value = null;
+    renameId.value = t.id;
+    renaming.value = t.title || t.prompt.slice(0, 60);
+    taskError.value = null;
+  }
+
+  async function saveRename() {
+    const row = history.value.find((t) => t.id === renameId.value);
+    const title = renaming.value.trim();
+    renameId.value = null;
+    if (!row || !title || title === row.title) return;
+    try {
+      await renameTask(opened.project.path, row.id, title);
+      row.title = title;
+    } catch (e) {
+      taskError.value = isAppError(e) ? e.message : String(e);
+    }
+  }
+
+  function askDelete(t: TaskSummary) {
+    taskMenu.value = null;
+    deleteAsk.value = t;
+    taskError.value = null;
+  }
+
+  // Deleting drops the task's log and numbers for good, so it asks first.
+  async function removeTask() {
+    const id = deleteAsk.value?.id;
+    deleteAsk.value = null;
+    if (id === undefined) return;
+    try {
+      await deleteTask(opened.project.path, id);
+      history.value = history.value.filter((t) => t.id !== id);
+      if (historyDetail.value?.id === id) {
+        historyDetail.value = null;
+        newTask();
+      }
+    } catch (e) {
+      taskError.value = isAppError(e) ? e.message : String(e);
     }
   }
 
@@ -1061,6 +1118,17 @@ export function useProject(opened: OpenedProject) {
     removedCopies,
     removeError,
     removeCopy,
+    taskName,
+    historyRow,
+    taskMenu,
+    renameId,
+    renaming,
+    deleteAsk,
+    askDelete,
+    taskError,
+    startRename,
+    saveRename,
+    removeTask,
     git,
     gitAsk,
     gitBusy,

@@ -3,6 +3,8 @@
 /** One past run. Token and cost fields are null where nothing was reported. */
 export interface TaskSummary {
   id: number;
+  /** Named by the classifier call, or by the user. Empty means none yet. */
+  title: string;
   prompt: string;
   status: TaskResult["status"] | "running";
   /** UTC, to the second. */

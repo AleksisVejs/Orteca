@@ -1,0 +1,2 @@
+I WAS BABYSITTING 4 AI AGENTS IN 4 TERMINALS.
+So I built Orteca: one prompt in, finished work out. It plans, checks its own homework, kills the whole process tree on Stop, and never lies about what it cost.

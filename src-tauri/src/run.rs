@@ -1121,6 +1121,9 @@ pub async fn stream(
                 brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
             }
             brief.push_str(&attached_note(&ctx.attachments));
+            if stage == Stage::Implement && resuming.is_none() && route.stages.contains(&Stage::Verify) {
+                brief.push_str(&focused_note(&ctx.dir, &route.candidate_paths));
+            }
             if stage == Stage::Review {
                 brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
             }
@@ -1841,6 +1844,23 @@ fn calls(text: &str, uri: &str) -> bool {
         text.match_indices(&format!("{quote}{uri}"))
             .any(|(at, found)| text[at + found.len()..].starts_with(['/', '?', '\'', '"']))
     })
+}
+
+/// The tests that cover the likeliest paths and the command Orteca runs them
+/// with, so the agent puts its tests there instead of searching for them.
+fn focused_note(dir: &Path, candidates: &[String]) -> String {
+    let Some(command) = project::check_commands(dir)
+        .iter()
+        .find_map(|check| focused_php_check(dir, check, candidates))
+    else {
+        return String::new();
+    };
+    format!(
+        "\nThese tests cover those paths, and after the change Orteca runs them first, then the \
+         whole suite: `{}`. Add or update tests in them where they fit rather than searching \
+         for where tests go.\n",
+        command.join(" ")
+    )
 }
 
 /// Whether the test files that just ran are everything this run changed. Every

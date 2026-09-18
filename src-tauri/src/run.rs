@@ -803,6 +803,7 @@ impl Launch {
 
 /// What a task is for as long as it runs. Separate from `State` because none
 /// of it changes when the provider is restarted.
+#[derive(Clone)]
 struct Context {
     task_id: i64,
     id: ProviderId,
@@ -878,6 +879,51 @@ struct State {
     timings: Vec<Timing>,
 }
 
+impl State {
+    fn new(recording: Recording, timings: Vec<Timing>) -> Self {
+        State {
+            outcome: Outcome::default(),
+            recording,
+            calls_used: 0,
+            turns_used: 0,
+            constraints: Vec::new(),
+            notes: Vec::new(),
+            structured: None,
+            budget_stop: None,
+            halt: false,
+            work_session: None,
+            fix_changed: None,
+            thread_totals: HashMap::new(),
+            noise: Vec::new(),
+            unknown_events: 0,
+            held: Vec::new(),
+            session: None,
+            apply_now_pending: false,
+            resume_point: None,
+            timings,
+        }
+    }
+
+    /// What a local check runs on while a model call has this one. It sees the
+    /// notes and usage so far, for the early result it may show.
+    fn beside(&self, ctx: &Context) -> Self {
+        let mut side = State::new(Recording::new(None, ctx.task_id, ctx.plan.stage, ctx.id), Vec::new());
+        side.notes = self.notes.clone();
+        side.outcome.usage = self.outcome.usage.clone();
+        side
+    }
+
+    /// Take back what a check beside the model call learned or was told.
+    fn absorb(&mut self, side: State) {
+        self.timings.extend(side.timings);
+        self.constraints.extend(side.constraints);
+        self.outcome.cancelled |= side.outcome.cancelled;
+        if let Some(failure) = side.outcome.failure {
+            self.outcome.failure.get_or_insert(failure);
+        }
+    }
+}
+
 /// What happens after one process ends.
 enum Next {
     /// The task is over, however it ended.
@@ -933,27 +979,7 @@ pub async fn stream(
         attachments,
         started: now_ms(),
     };
-    let mut state = State {
-        outcome: Outcome::default(),
-        recording: Recording::new(None, task_id, Stage::Implement, id),
-        calls_used: 0,
-        turns_used: 0,
-        constraints: Vec::new(),
-        notes: Vec::new(),
-        structured: None,
-        budget_stop: None,
-        halt: false,
-        work_session: None,
-        fix_changed: None,
-        thread_totals: HashMap::new(),
-        noise: Vec::new(),
-        unknown_events: 0,
-        held: Vec::new(),
-        session: None,
-        apply_now_pending: false,
-        resume_point: None,
-        timings,
-    };
+    let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
 
     // The whole decision, recorded before a single process starts. Without this
     // row a later milestone can see what a run cost but not what it was allowed
@@ -1026,8 +1052,12 @@ pub async fn stream(
     };
 
     // Filled only when a Verify fails: the failing checks that also fail at
-    // the base commit. Those buy no automatic Fix.
+    // the base commit. Those buy no automatic Fix; one already started is
+    // stopped.
     let mut failing_before = Vec::new();
+    // The first failed Verify's artifact, until the Fix it bought starts and
+    // the base commit is asked about it beside that Fix.
+    let mut ask_base: Option<serde_json::Value> = None;
 
     // Mutable because a failed check is followed by a Fix and the same check.
     // An independent Review runs at most once; its fix is judged by Verify.
@@ -1042,38 +1072,7 @@ pub async fn stream(
         {
             break;
         }
-        // A Fix stays on the tier that wrote the change: a resumed session on
-        // another model would re-read its whole history uncached.
-        let tier = match (stage, route.budget.review_tier) {
-            (Stage::Review, Some(review)) => review,
-            _ => route.budget.preferred_tier,
-        };
-        let choice = match stage {
-            Stage::Plan => route.plan_model(id),
-            Stage::Review => route.review_model(id),
-            Stage::Implement | Stage::Fix => route.work_model(id),
-            _ => None,
-        };
-        // A Claude Fix resumes the Implement session, and any change to the tool
-        // list re-bills that whole history uncached (~74k tokens on a real run).
-        // `--json-schema` adds a StructuredOutput tool Implement never had, so a
-        // Fix the next Verify judges goes without it.
-        let schema = write_schema(task_id, stage).filter(|_| {
-            !(id == ProviderId::Claude
-                && stage == Stage::Fix
-                && stages.get(index + 1) == Some(&Stage::Verify))
-        });
-        ctx.plan = StagePlan {
-            stage,
-            schema,
-            tier,
-            model: choice.map(|choice| choice.model),
-            effort: choice.map(|choice| choice.effort),
-            // A question may only run `git diff`/`status` anyway; the two shell
-            // tool schemas cost more than that is worth on every question.
-            // Implement keeps them so a resumed Fix sees the same tool list.
-            shell: stage != Stage::Answer,
-        };
+        ctx.plan = stage_plan(&route, id, task_id, &stages, index);
         ctx.final_stage = index + 1 == stages.len();
         state.outcome.begin_stage();
         let stage_started = now_ms();
@@ -1137,17 +1136,41 @@ pub async fn stream(
             // Usually one pass. A checkpoint provider told to apply an instruction
             // now ends its process and comes back through here resuming its own
             // session.
-            let mut launch = match (&resuming, state.work_session.as_deref()) {
+            let launch = match (&resuming, state.work_session.as_deref()) {
                 (Some(r), _) => Launch::fix(id, &r.session, &brief, &ctx.plan),
                 (None, Some(session)) if stage == Stage::Fix => {
                     Launch::fix(id, session, &brief, &ctx.plan)
                 }
                 _ => Launch::first(id, &brief, &ctx.plan),
             };
-            loop {
-                match attempt(store, &ctx, &mut state, &mut control, &emit, launch).await {
-                    Next::Ended => break,
-                    Next::Restart(again) => launch = again,
+            match ask_base.take().filter(|_| stage == Stage::Fix) {
+                None => call(store, &ctx, &mut state, &mut control, &emit, launch).await,
+                // The base copy and its tests take a minute or more. The Fix
+                // does not wait for them, and is stopped if they say the
+                // failure was already there.
+                Some(artifact) => {
+                    let base_ctx = Context {
+                        plan: StagePlan { stage: Stage::Verify, ..ctx.plan.clone() },
+                        ..ctx.clone()
+                    };
+                    let mut side = state.beside(&base_ctx);
+                    let (to_fix, mut fix_control) = mpsc::unbounded_channel();
+                    let (to_base, mut base_control) = mpsc::unbounded_channel();
+                    let (fixed, before) = side_by_side(
+                        &mut control,
+                        to_fix,
+                        call(store, &ctx, &mut state, &mut fix_control, &emit, launch),
+                        to_base,
+                        failed_before(store, &base_ctx, &mut side, &mut base_control, &emit, base_commit.as_deref(), Some(&artifact)),
+                        |before: &Vec<serde_json::Value>| !before.is_empty(),
+                    )
+                    .await;
+                    state.absorb(side);
+                    if fixed.is_none() {
+                        let event = ProviderEvent::Text("The fix was stopped: these tests already failed before the run. What it changed so far is kept.".into());
+                        let _ = record(store, task_id, ctx.stage(), id, &event).and_then(|()| emit(&event));
+                    }
+                    failing_before = before;
                 }
             }
             if stage.writes() && state.session.is_some() {
@@ -1194,17 +1217,7 @@ pub async fn stream(
             && state.outcome.failure.is_none()
             && !state.notes.iter().any(|n| n.stage == Stage::Fix)
         {
-            let artifact = state.notes.last().and_then(|n| n.artifact.clone());
-            failing_before = failed_before(
-                store,
-                &ctx,
-                &mut state,
-                &mut control,
-                &emit,
-                base_commit.as_deref(),
-                artifact.as_ref(),
-            )
-            .await;
+            ask_base = state.notes.last().and_then(|n| n.artifact.clone());
         }
         // An Implement that changed nothing has nothing to check. Testing an
         // untouched tree only makes the user wait for the same answer.
@@ -1386,6 +1399,43 @@ pub async fn stream(
         resume: state.resume_point.filter(|_| worktree.is_none()),
         worktree,
         timings: state.timings,
+    }
+}
+
+/// What `stages[index]` asks of the CLI.
+fn stage_plan(route: &Route, id: ProviderId, task_id: i64, stages: &[Stage], index: usize) -> StagePlan {
+    let stage = stages[index];
+    // A Fix stays on the tier that wrote the change: a resumed session on
+    // another model would re-read its whole history uncached.
+    let tier = match (stage, route.budget.review_tier) {
+        (Stage::Review, Some(review)) => review,
+        _ => route.budget.preferred_tier,
+    };
+    let choice = match stage {
+        Stage::Plan => route.plan_model(id),
+        Stage::Review => route.review_model(id),
+        Stage::Implement | Stage::Fix => route.work_model(id),
+        _ => None,
+    };
+    // A Claude Fix resumes the Implement session, and any change to the tool
+    // list re-bills that whole history uncached (~74k tokens on a real run).
+    // `--json-schema` adds a StructuredOutput tool Implement never had, so a
+    // Fix the next Verify judges goes without it.
+    let schema = write_schema(task_id, stage).filter(|_| {
+        !(id == ProviderId::Claude
+            && stage == Stage::Fix
+            && stages.get(index + 1) == Some(&Stage::Verify))
+    });
+    StagePlan {
+        stage,
+        schema,
+        tier,
+        model: choice.map(|choice| choice.model),
+        effort: choice.map(|choice| choice.effort),
+        // A question may only run `git diff`/`status` anyway; the two shell
+        // tool schemas cost more than that is worth on every question.
+        // Implement keeps them so a resumed Fix sees the same tool list.
+        shell: stage != Stage::Answer,
     }
 }
 
@@ -2294,6 +2344,11 @@ enum Then {
 /// hands back to the user; anything else that failed gets a Fix and its check.
 fn after_stage(round: Round<'_>) -> Then {
     let remaining = || round.remaining.to_vec();
+    // Asked beside this Fix: the checks it answers already failed at the base
+    // commit. The Verify it was to face goes with it.
+    if round.stage == Stage::Fix && !round.failing_before.is_empty() {
+        return Then::Stop(failed_before_run(round.remaining.get(1..).unwrap_or_default().to_vec()));
+    }
     if round.fixing_review && round.fix_changed == Some(false) {
         return Then::Stop(stuck(round.notes, remaining()));
     }
@@ -2610,6 +2665,60 @@ fn attachment_args(id: ProviderId, attachments: &[PathBuf]) -> Vec<String> {
 
 /// Run one process to its end. Says whether the task is finished or is being
 /// picked back up somewhere else.
+/// One stage's provider process, and any it is restarted as.
+async fn call(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    mut launch: Launch,
+) {
+    loop {
+        match attempt(store, ctx, state, control, emit, launch).await {
+            Next::Ended => break,
+            Next::Restart(again) => launch = again,
+        }
+    }
+}
+
+/// A model call and a local check at once, each reading its own channel. A
+/// Stop reaches both; an instruction goes to the model call while it runs and
+/// to the check after. When `moot` says the check's result makes the call
+/// pointless, the call is dropped, which kills its process tree, and `None`
+/// comes back for it. Either way this returns once both are over.
+async fn side_by_side<A, B>(
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    to_model: mpsc::UnboundedSender<Control>,
+    model: impl std::future::Future<Output = A>,
+    to_check: mpsc::UnboundedSender<Control>,
+    check: impl std::future::Future<Output = B>,
+    moot: impl Fn(&B) -> bool,
+) -> (Option<A>, B) {
+    tokio::pin!(model, check);
+    let (mut called, mut checked, mut dropped) = (None, None, false);
+    while !((called.is_some() || dropped) && checked.is_some()) {
+        let calling = called.is_none() && !dropped;
+        tokio::select! {
+            out = &mut model, if calling => called = Some(out),
+            out = &mut check, if checked.is_none() => {
+                dropped = calling && moot(&out);
+                checked = Some(out);
+            }
+            Some(action) = control.recv() => match action {
+                Control::Cancel => {
+                    let _ = to_model.send(Control::Cancel);
+                    let _ = to_check.send(Control::Cancel);
+                }
+                other => {
+                    let _ = if calling { to_model.send(other) } else { to_check.send(other) };
+                }
+            },
+        }
+    }
+    (called, checked.expect("the loop ends only once the check has"))
+}
+
 async fn attempt(
     store: &Store,
     ctx: &Context,
@@ -4188,6 +4297,10 @@ ping -n 60 127.0.0.1 >nul
         assert!(matches!(after_stage(round(&first, &before)), Then::Stop(stop) if stop.message.contains("already failed")));
         assert!(matches!(after_stage(round(&after_fix, &[])), Then::Stop(stop) if stop.message.contains("One automatic fix")));
         assert!(matches!(after_stage(Round { failed: false, ..round(&first, &before) }), Then::Continue));
+        // Asked beside the Fix: the Fix is the last stage, its Verify is dropped.
+        let fixing = Round { stage: Stage::Fix, failed: false, remaining: &[Stage::Verify, Stage::Review], ..round(&first, &before) };
+        assert!(matches!(after_stage(fixing), Then::Stop(stop) if stop.message.contains("already failed") && stop.remaining == [Stage::Review]));
+        assert!(matches!(after_stage(Round { stage: Stage::Fix, failed: false, ..round(&first, &[]) }), Then::Continue));
     }
 
     /// A `package.json` whose test fails the first time it runs, saying why,
@@ -4423,8 +4536,10 @@ ping -n 60 127.0.0.1 >nul
         assert!(php_warnings_only("composer test", "  \u{1b}[32;1mTests:\u{1b}[39;22m    3 passed\n", &[]));
     }
 
-    /// A test that already fails at the base commit buys no Fix; one the run
-    /// broke does. It is asked in a throwaway copy that is gone afterwards.
+    /// A test that already fails at the base commit stops the Fix started
+    /// beside that question and is not checked again; one the run broke gets
+    /// its Fix and its check. The base is asked in a throwaway copy that is
+    /// gone afterwards.
     #[tokio::test]
     async fn checks_that_failed_before_the_run_buy_no_fix() {
         for broken_at_base in [true, false] {
@@ -4462,14 +4577,17 @@ ping -n 60 127.0.0.1 >nul
 
             assert_eq!(result.status, "verifyFailed", "{:?}", result.failure);
             let stop = result.budget_stop.expect("the stop was not returned");
-            if broken_at_base {
-                assert_eq!(result.calls_used, 1, "a failure the run did not cause bought a Fix");
-                assert!(stop.message.contains("already failed"), "{}", stop.message);
-            } else {
-                assert_eq!(result.calls_used, 2, "a failure the run caused got no Fix");
-                assert!(!stop.message.contains("already failed"), "{}", stop.message);
-            }
+            // The Fix starts beside the base check either way, and counts.
+            assert_eq!(result.calls_used, 2, "the failure got no Fix");
             let log = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+            let suites = log.lines().filter(|l| l.contains("suite")).count();
+            if broken_at_base {
+                assert!(stop.message.contains("already failed"), "{}", stop.message);
+                assert_eq!(suites, 1, "a failure the run did not cause was checked again: {log}");
+            } else {
+                assert!(!stop.message.contains("already failed"), "{}", stop.message);
+                assert_eq!(suites, 2, "the Fix was not checked: {log}");
+            }
             assert!(!log.contains("test tests/Feature/SmallTest.php"), "the base ran in the user's tree: {log}");
             assert!(!copy.exists(), "the base copy was left behind");
             std::fs::remove_dir_all(dir).unwrap();

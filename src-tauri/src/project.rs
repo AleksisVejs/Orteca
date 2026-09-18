@@ -833,7 +833,8 @@ pub fn base_copy(repo: &Path, base: &str, copy: &Path, setup: &[&str]) -> Result
         "Git could not check out the base commit",
     )?;
     for path in setup {
-        let (from, to) = (repo.join(path), copy.join(path));
+        // robocopy takes no `\\?\` path, which is what a project folder canonicalizes to.
+        let (from, to) = (plain(&repo.join(path)), plain(&copy.join(path)));
         if from.is_dir() {
             // robocopy exits 0-7 on success; 8 and up is a failure.
             let code = Command::new("robocopy")
@@ -851,6 +852,12 @@ pub fn base_copy(repo: &Path, base: &str, copy: &Path, setup: &[&str]) -> Result
         }
     }
     Ok(())
+}
+
+/// `path` without the `\\?\` prefix `canonicalize` gives on Windows.
+pub fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
 }
 
 /// Deletes the folder itself, then has git forget it. Nothing in it is the

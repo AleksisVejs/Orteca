@@ -2042,8 +2042,9 @@ fn shards(check: &project::Check) -> Option<Vec<Vec<String>>> {
     Some(shards.into_iter().map(|(_, files)| files).collect())
 }
 
+/// `C:` for `C:\x`, and for the `\\?\C:\x` a project folder canonicalizes to.
 fn drive(path: &Path) -> Option<String> {
-    let text = path.to_string_lossy();
+    let text = project::plain(path).to_string_lossy().into_owned();
     (text.get(1..2) == Some(":")).then(|| text[..2].to_ascii_uppercase())
 }
 
@@ -4194,6 +4195,17 @@ ping -n 60 127.0.0.1 >nul
                 println!("SHARD {}", serde_json::json!(files));
             }
         }
+    }
+
+    /// Project folders are canonical (`\\?\C:\...`); the drive check must
+    /// still see the temp folder on the same drive, or nothing is sharded.
+    #[test]
+    fn a_canonical_project_path_is_on_the_same_drive() {
+        let temp = std::env::temp_dir();
+        let canonical = temp.canonicalize().unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"), "{canonical:?}");
+        assert!(drive(&temp).is_some());
+        assert_eq!(drive(&canonical), drive(&temp));
     }
 
     #[test]

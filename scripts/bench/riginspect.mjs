@@ -48,7 +48,8 @@ const TASKS = LIFTME ? (await import("./liftme.tasks.mjs")).TASKS : {
 };
 const ARMS = (process.env.ARMS ?? "orteca-claude,claude,orteca-codex,codex").split(",");
 
-const git = (...a) => execFileSync("git", a, { cwd: RIG, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+// A run that rebuilds public/build makes a patch far past Node's 1 MB default.
+const git = (...a) => execFileSync("git", a, { cwd: RIG, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256e6 });
 // vendor/ is copied whole. Junctioned packages made ParaTest's workers load the
 // real repo's autoloader next to the copy's ("Cannot redeclare class
 // ComposerAutoloaderInit..."), so `composer test` could never pass (2026-09-16).
@@ -99,6 +100,18 @@ async function loadPrice() {
   } catch {}
 }
 
+function ortecaRow(x) {
+  const u = x.usage ?? {};
+  return {
+    status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed,
+    budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
+    cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
+    stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
+    // From the prompt, classify included: when the change was shown, and when the suite said done.
+    resultMs: x.benchBeginMs + (x.timings?.find((t) => t.label === "result shown")?.ms ?? x.durationMs), doneMs: x.benchWallMs,
+  };
+}
+
 function runArm(arm, dir, prompt) {
   const t0 = Date.now();
   if (arm.startsWith("orteca-")) {
@@ -107,16 +120,7 @@ function runArm(arm, dir, prompt) {
     const env = { ...ENV, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out };
     const r = spawnSync("cargo", ["test", "bench_run", "--", "--ignored"], { cwd: TAURI, env, encoding: "utf8", shell: true, timeout: ARM_TIMEOUT });
     if (!existsSync(out)) return { status: "noResult", error: (r.stdout + r.stderr).slice(-400), ms: Date.now() - t0 };
-    const x = JSON.parse(readFileSync(out, "utf8"));
-    const u = x.usage ?? {};
-    return {
-      status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed,
-      budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
-      cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
-      stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
-      // From the prompt, classify included: when the change was shown, and when the suite said done.
-      resultMs: x.benchBeginMs + (x.timings?.find((t) => t.label === "result shown")?.ms ?? x.durationMs), doneMs: x.benchWallMs,
-    };
+    return ortecaRow(JSON.parse(readFileSync(out, "utf8")));
   }
   if (arm === "claude") {
     const r = spawnSync("claude", CLAUDE_ARGS, { cwd: dir, input: prompt, encoding: "utf8", shell: true, env: ENV, timeout: ARM_TIMEOUT, maxBuffer: 64e6 });
@@ -198,6 +202,18 @@ if (process.env.REGRADE) {
     }
     dropWorktree(dir);
   }
+  process.exit(0);
+}
+if (process.env.GRADE_WT) {
+  // Free: grade an Orteca run whose worktree and result file survived a crash, and add its row.
+  // GRADE_WT=tough OUT=orteca-claude-123.json RESULTS=results-x.json
+  const name = process.env.GRADE_WT, arm = "orteca-claude", dir = join(ROOT, "wt", `${name}-${arm}`);
+  const row = { task: name, arm, ...grade(dir, TASKS[name], name, arm), ...ortecaRow(JSON.parse(readFileSync(join(ROOT, "out", process.env.OUT), "utf8"))) };
+  dropWorktree(dir);
+  const results = existsSync(RESULTS) ? JSON.parse(readFileSync(RESULTS, "utf8")) : [];
+  results.push(row);
+  writeFileSync(RESULTS, JSON.stringify(results, null, 2));
+  console.log(JSON.stringify(row, null, 1));
   process.exit(0);
 }
 if (process.env.DIAG) {

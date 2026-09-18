@@ -2,7 +2,7 @@
 // on easy, medium, tough, graded by hidden/ tests the agents never see.
 // Each arm works in a detached git worktree of RigInspectBE with vendor/ copied
 // and node_modules/ junctioned from the real repo.
-// node scripts/bench/riginspect.mjs [task...]
+// node scripts/bench/riginspect.mjs [task...]   (trap-* tasks run only when named)
 //   BENCH=liftme                      LiftMe instead of RigInspectBE (tasks in liftme.tasks.mjs)
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
@@ -299,7 +299,7 @@ await loadPrice();
 const results = existsSync(RESULTS) ? JSON.parse(readFileSync(RESULTS, "utf8")) : [];
 const start = limits();
 console.log("limits at start", start);
-for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS)) {
+for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS).filter((n) => !TASKS[n].trap)) {
   for (const arm of ARMS) {
     if (results.some((r) => r.task === name && r.arm === arm)) continue;
     const dir = join(ROOT, "wt", `${name}-${arm}`);

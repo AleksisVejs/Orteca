@@ -974,32 +974,9 @@ pub async fn stream(
         state.outcome.begin_process();
     }
 
-    // The checks once before anything changes. A suite that already fails is
-    // the task itself or a setup problem, such as a database that is not
-    // running, and a failure afterwards cannot say which. So it buys no
-    // automatic Fix, and the agent is shown what failed.
+    // Filled only when a Verify fails: the failing checks that also fail at
+    // the base commit. Those buy no automatic Fix.
     let mut failing_before = Vec::new();
-    if route.stages.contains(&Stage::Verify) && state.outcome.failure.is_none() {
-        ctx.plan.stage = Stage::Verify;
-        let started = now_ms();
-        let scope = VerifyScope {
-            index: 0,
-            of: route.stages.len(),
-            base_commit: base_commit.as_deref(),
-            before_run: before_run.as_ref(),
-            before_change: Some(&route.candidate_paths),
-            requested_build: false,
-            requested_lint: false,
-        };
-        if verify_locally(store, &ctx, &mut state, &mut control, &emit, scope).await == Some(false) {
-            failing_before = state.structured.as_ref().map(failed_checks).unwrap_or_default();
-        }
-        state.structured = None;
-        state.timings.push(Timing {
-            label: "check before the change".into(),
-            ms: now_ms().saturating_sub(started),
-        });
-    }
 
     // Mutable because a failed check is followed by a Fix and the same check.
     // An independent Review runs at most once; its fix is judged by Verify.
@@ -1073,7 +1050,6 @@ pub async fn stream(
                     of: stages.len(),
                     base_commit: base_commit.as_deref(),
                     before_run: before_run.as_ref(),
-                    before_change: None,
                     requested_build: route.signals.requested_build,
                     requested_lint: route.signals.requested_lint,
                 },
@@ -1095,22 +1071,6 @@ pub async fn stream(
             brief.push_str(&attached_note(&ctx.attachments));
             if stage == Stage::Review {
                 brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
-            }
-            if stage == Stage::Implement && !failing_before.is_empty() {
-                let output: Vec<String> = failing_before
-                    .iter()
-                    .map(|check| format!("{}
-{}", check["command"].as_str().unwrap_or_default(), check["output"].as_str().unwrap_or_default()))
-                    .collect();
-                brief.push_str(&format!(
-                    "
-
-Before any change, the project's checks already fail. This may be the task, or a setup problem no edit can fix:
-{}",
-                    output.join("
-
-")
-                ));
             }
             if let Err(e) = note(
                 store,
@@ -1176,6 +1136,24 @@ Before any change, the project's checks already fail. This may be the task, or a
         }
         note_for_stage.duration_ms = Some(now_ms().saturating_sub(stage_started));
         state.notes.push(note_for_stage);
+        // Only the first failure asks: after a Fix the one-Fix limit decides.
+        if checked_locally
+            && failed
+            && state.outcome.failure.is_none()
+            && !state.notes.iter().any(|n| n.stage == Stage::Fix)
+        {
+            let artifact = state.notes.last().and_then(|n| n.artifact.clone());
+            failing_before = failed_before(
+                store,
+                &ctx,
+                &mut state,
+                &mut control,
+                &emit,
+                base_commit.as_deref(),
+                artifact.as_ref(),
+            )
+            .await;
+        }
         // An Implement that changed nothing has nothing to check. Testing an
         // untouched tree only makes the user wait for the same answer.
         if stage == Stage::Implement
@@ -1440,9 +1418,6 @@ struct VerifyScope<'a> {
     of: usize,
     base_commit: Option<&'a str>,
     before_run: Option<&'a project::Snapshot>,
-    /// Set for the check before any change: the paths the route expects to
-    /// touch pick the suites, since nothing has changed yet.
-    before_change: Option<&'a [String]>,
     requested_build: bool,
     requested_lint: bool,
 }
@@ -1457,39 +1432,23 @@ async fn verify_locally(
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     scope: VerifyScope<'_>,
 ) -> Option<bool> {
-    let changed_paths: Vec<String> = match scope.before_change {
-        Some(expected) => expected.to_vec(),
-        None => {
-            let mut changed =
-                project::diff_since(&ctx.dir, scope.base_commit).unwrap_or_default();
-            project::attribute(&ctx.dir, &mut changed, scope.before_run);
-            changed
-                .into_iter()
-                .filter(|file| file.origin != Some(project::Origin::BeforeRun))
-                .map(|file| file.path)
-                .collect()
-        }
-    };
-    let before_change = scope.before_change.is_some();
+    let mut changed = project::diff_since(&ctx.dir, scope.base_commit).unwrap_or_default();
+    project::attribute(&ctx.dir, &mut changed, scope.before_run);
+    let changed_paths: Vec<String> = changed
+        .into_iter()
+        .filter(|file| file.origin != Some(project::Origin::BeforeRun))
+        .map(|file| file.path)
+        .collect();
     let mut candidates = project::relevant_check_commands(&ctx.dir, &changed_paths);
-    if !before_change {
-        let mut requested = project::requested_check_commands(
-            &ctx.dir,
-            scope.requested_build,
-            scope.requested_lint,
-        );
-        for command in &mut requested {
-            if candidates.iter().any(|check| check.dir == command.dir) {
-                command.install = None;
-            }
+    let mut requested =
+        project::requested_check_commands(&ctx.dir, scope.requested_build, scope.requested_lint);
+    for command in &mut requested {
+        if candidates.iter().any(|check| check.dir == command.dir) {
+            command.install = None;
         }
-        candidates.extend(requested);
     }
-    let (mut checks, missing): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(runnable);
-    if before_change {
-        checks.retain(|check| quick_check(check).is_some());
-    }
+    candidates.extend(requested);
+    let (checks, missing): (Vec<_>, Vec<_>) = candidates.into_iter().partition(runnable);
     if checks.is_empty() {
         return None;
     }
@@ -1503,29 +1462,13 @@ async fn verify_locally(
     };
     let shown: Vec<String> = checks.iter().map(|c| label(c, &c.test)).collect();
 
-    let key = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (&ctx.dir, scope.base_commit, scope.before_run, &shown).hash(&mut hasher);
-        // DefaultHasher may change between Rust releases; that only costs one rerun.
-        format!("{:016x}", hasher.finish())
-    };
-    if before_change {
-        // Keyed by folder, commit, what was already dirty and which suites ran.
-        if store.checks_passed(&key) {
-            return Some(true);
-        }
-        let event = ProviderEvent::Text("Running the checks once before anything changes".into());
-        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
-    } else {
-        let stage = serde_json::json!({
-            "kind": "stage",
-            "data": { "stage": Stage::Verify, "index": scope.index, "of": scope.of, "writes": false, "schema": true, "runner": "orteca", "command": shown.join(", ") },
-        });
-        let _ = note(store, ctx, "stage", &stage.to_string());
-    }
+    let stage = serde_json::json!({
+        "kind": "stage",
+        "data": { "stage": Stage::Verify, "index": scope.index, "of": scope.of, "writes": false, "schema": true, "runner": "orteca", "command": shown.join(", ") },
+    });
+    let _ = note(store, ctx, "stage", &stage.to_string());
     // A suite with nothing on PATH to run it is said out loud, never passed.
-    for check in missing.iter().filter(|_| !before_change) {
+    for check in &missing {
         let event = ProviderEvent::Text(format!(
             "{} did not run: it is not on PATH",
             label(check, &check.test)
@@ -1544,7 +1487,7 @@ async fn verify_locally(
             ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
         }
         let mut covered = false;
-        if matches!(ran, Ran::Finished { passed: true, .. }) && !before_change {
+        if matches!(ran, Ran::Finished { passed: true, .. }) {
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
                 let args: Vec<&str> = focused.iter().map(String::as_str).collect();
                 let named = label(check, &args);
@@ -1572,20 +1515,8 @@ async fn verify_locally(
             let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
             continue;
         }
-        // Before the change the quick check stands in for the suite, and its
-        // result is recorded under the suite's name so a later Verify matches it.
         if matches!(ran, Ran::Finished { passed: true, .. }) {
-            ran = match quick_check(check).filter(|_| before_change) {
-                Some(quick) => {
-                    let args: Vec<&str> = quick.iter().map(String::as_str).collect();
-                    let named = label(check, &args);
-                    run_check(store, ctx, state, control, emit, &args, &check.dir, &named).await
-                }
-                None => {
-                    run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown)
-                        .await
-                }
-            };
+            ran = run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await;
         }
         match ran {
             Ran::Cancelled => return Some(false),
@@ -1600,7 +1531,6 @@ async fn verify_locally(
                     let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
                 }
                 if !passed
-                    && !before_change
                     && missing_program(&output)
                     && state.outcome.failure.is_none()
                 {
@@ -1618,15 +1548,114 @@ async fn verify_locally(
         return None;
     }
     let passed = results.iter().all(|check| check["passed"] == true);
-    // A tree git could not list has no fingerprint to remember a pass by.
-    if before_change && passed && scope.before_run.is_some() {
-        let _ = store.remember_checks_passed(&key);
-    }
     state.structured = Some(serde_json::json!({
         "checks": results,
         "verdict": if passed { "pass" } else { "fail" },
     }));
     Some(passed)
+}
+
+/// The failed checks that also fail at the base commit: the test files they
+/// name run again in a throwaway copy of it. A suite that already failed is the
+/// task itself or a setup problem, such as a database that is not running, so
+/// it buys no automatic Fix. Anything this cannot ask is treated as new.
+// ponytail: Laravel only, like the focused check; any failing file counts.
+async fn failed_before(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    base: Option<&str>,
+    artifact: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let failed = artifact.map(failed_checks).unwrap_or_default();
+    let Some(base) = base.filter(|_| !failed.is_empty()) else {
+        return Vec::new();
+    };
+    let Some(check) = project::check_commands(&ctx.dir)
+        .into_iter()
+        .find(|check| check.kind == "php" && check.dir.join("artisan").is_file())
+    else {
+        return Vec::new();
+    };
+    let sub = check.dir.strip_prefix(&ctx.dir).unwrap_or(Path::new("")).to_path_buf();
+    let text: String = failed
+        .iter()
+        .map(|c| format!("{}\n{}\n", c["command"].as_str().unwrap_or_default(), c["output"].as_str().unwrap_or_default()))
+        .collect();
+    let copy = std::env::temp_dir().join(format!("orteca-base-{}", ctx.task_id));
+    let files: Vec<String> = failing_test_files(&text)
+        .into_iter()
+        .filter(|file| check.dir.join(file).is_file())
+        .take(8)
+        .collect();
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let say = |text: String| {
+        let event = ProviderEvent::Text(text);
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    };
+    say("Checking whether these tests already failed before the run".into());
+    let started = now_ms();
+    let setup: Vec<String> = ["vendor", ".env", ".env.testing"]
+        .iter()
+        .map(|p| sub.join(p).to_string_lossy().into_owned())
+        .collect();
+    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+    let made = project::base_copy(&ctx.dir, base, &copy, &setup);
+    state.timings.push(Timing {
+        label: "copy at the base commit".into(),
+        ms: now_ms().saturating_sub(started),
+    });
+    let mut before = Vec::new();
+    match made {
+        Err(e) => say(format!("Could not ask the base commit: {}", e.message)),
+        // A test the run added has nothing to say about the base.
+        Ok(()) if files.iter().any(|f| copy.join(&sub).join(f).is_file()) => {
+            let mut args = vec!["php", "artisan", "test"];
+            args.extend(
+                files
+                    .iter()
+                    .filter(|f| copy.join(&sub).join(f).is_file())
+                    .map(String::as_str),
+            );
+            let shown = format!("before the change: {}", args.join(" "));
+            if let Ran::Finished { passed, output } =
+                run_check(store, ctx, state, control, emit, &args, &copy.join(&sub), &shown).await
+            {
+                if !passed && !php_warnings_only(&shown, &output, &[]) {
+                    before = failed;
+                }
+            }
+        }
+        Ok(()) => {}
+    }
+    project::drop_base_copy(&ctx.dir, &copy);
+    before
+}
+
+/// Test files a failed Laravel check names: outright in its argv, or as
+/// classes in its output (`FAILED  Tests\Feature\FooTest > it works`,
+/// `1) Tests\Unit\BarTest::test_x`), mapped the PSR-4 way to `tests/`.
+fn failing_test_files(text: &str) -> Vec<String> {
+    let text = strip_ansi(text);
+    let mut files: Vec<String> = text
+        .split_whitespace()
+        .filter(|word| word.starts_with("tests/") && word.ends_with(".php"))
+        .map(str::to_string)
+        .collect();
+    for (at, _) in text.match_indices("Tests\\") {
+        let class: String = text[at + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\\')
+            .collect();
+        files.push(format!("tests/{}.php", class.replace('\\', "/")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|file| seen.insert(file.clone()));
+    files
 }
 
 /// A changed Laravel test is the cheapest useful tripwire before a broad
@@ -1662,41 +1691,6 @@ fn focused_php_check(root: &Path, check: &project::Check, changed: &[String]) ->
     Some(command)
 }
 
-/// One small test file for the check before a change: it boots the app and,
-/// in a Laravel feature test, its database, so a broken setup shows in seconds
-/// instead of a full suite. A single file also keeps a flaky parallel test from
-/// marking the whole suite as failing. Other ecosystems have no generic small
-/// slice, so they skip the check before the change.
-// ponytail: Laravel only, smallest file by size; add an ecosystem when one has a cheap slice.
-fn quick_check(check: &project::Check) -> Option<Vec<String>> {
-    if check.kind != "php" || !check.dir.join("artisan").is_file() {
-        return None;
-    }
-    let file = ["tests/Feature", "tests/Unit"].iter().find_map(|sub| {
-        let mut files: Vec<(u64, String)> = std::fs::read_dir(check.dir.join(sub))
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
-            .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
-                name.ends_with("Test.php")
-                    .then_some((entry.metadata().ok()?.len(), name))
-            })
-            .collect();
-        files.sort();
-        // A stub with no test in it fails on its own ("Class X cannot be
-        // found"), which would mark every run's suite as broken before it began.
-        files
-            .into_iter()
-            .find(|(_, name)| {
-                std::fs::read_to_string(check.dir.join(sub).join(name))
-                    .is_ok_and(|text| has_php_test(&text))
-            })
-            .map(|(_, name)| format!("{sub}/{name}"))
-    })?;
-    Some(vec!["php".into(), "artisan".into(), "test".into(), file])
-}
-
 /// Whether the test files that just ran are everything this run changed. Every
 /// `.php` path ends with "php", so this matches whole file names, never suffixes.
 fn focused_covers(changed: &[String], files: &[String]) -> bool {
@@ -1704,10 +1698,6 @@ fn focused_covers(changed: &[String], files: &[String]) -> bool {
         && changed
             .iter()
             .all(|path| files.iter().any(|f| path == f || path.ends_with(&format!("/{f}"))))
-}
-
-fn has_php_test(text: &str) -> bool {
-    text.contains("function test") || text.contains("#[Test]") || text.contains("@test")
 }
 
 /// A PHPUnit or Artisan run that exited non-zero only for runner warnings:
@@ -3784,8 +3774,8 @@ ping -n 60 127.0.0.1 >nul
     /// and passes every time after.
     const FAILS_ONCE: &str = r#"{"scripts":{"test":"node -e \"const f=require('fs');if(f.existsSync('ran'))process.exit(0);f.writeFileSync('ran','');console.log('header is not bold');process.exit(1)\""}}"#;
 
-    /// A stand-in Laravel app: `composer test` runs the suite, the quick check
-    /// runs one test file, and both log what ran. A `broken` file fails both,
+    /// A stand-in Laravel app: `composer test` runs the suite, `artisan test`
+    /// runs test files, and both log what ran. A `broken` file fails both,
     /// the way a database that is not running would. `None` when PHP or
     /// Composer is not on PATH, so the caller can skip.
     fn fake_laravel(dir: &std::path::Path) -> Option<()> {
@@ -3799,7 +3789,7 @@ ping -n 60 127.0.0.1 >nul
         std::fs::write(
             dir.join("artisan"),
             "<?php\nfile_put_contents('runs.log', implode(' ', array_slice($argv, 1)) . \"\\n\", FILE_APPEND);\n\
-             if (file_exists('broken')) { echo \"SQLSTATE connection refused\\n\"; exit(1); }\n",
+             if (file_exists('broken')) { echo \"  FAILED  Tests\\\\Feature\\\\SmallTest > one\\nSQLSTATE connection refused\\n\"; exit(1); }\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
@@ -3809,29 +3799,13 @@ ping -n 60 127.0.0.1 >nul
     }
 
     #[test]
-    fn the_check_before_a_change_is_one_small_laravel_test() {
-        let dir = std::env::temp_dir().join(format!("orteca-quick-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
-        // Named like a test and smaller than SmallTest, but holds none: LiftMe
-        // has exactly this file, and running it fails with "cannot be found".
-        std::fs::write(dir.join("tests/Feature/ScratchDebugTest.php"), "<?php\n").unwrap();
-        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\nfunction test_one() {}\n").unwrap();
-        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\nfunction test_two() {}\n// more\n").unwrap();
-        std::fs::write(dir.join("tests/Feature/helpers.php"), "").unwrap();
-        let check = |kind| project::Check {
-            kind,
-            dir: dir.clone(),
-            install: None,
-            test: vec!["composer", "test"],
-        };
-        assert_eq!(quick_check(&check("php")), None, "no artisan, not Laravel");
-        std::fs::write(dir.join("artisan"), "").unwrap();
+    fn a_failed_laravel_check_names_its_test_files() {
+        let text = "php artisan test tests/Feature/NewTest.php\n\u{1b}[31m  FAILED  \u{1b}[39mTests\\Feature\\OrderTest > it ships\n\
+                    1) Tests\\Unit\\Money\\PriceTest::test_rounds\n  FAILED  Tests\\Feature\\OrderTest > again\n";
         assert_eq!(
-            quick_check(&check("php")),
-            Some(vec!["php".into(), "artisan".into(), "test".into(), "tests/Feature/SmallTest.php".into()])
+            failing_test_files(text),
+            ["tests/Feature/NewTest.php", "tests/Feature/OrderTest.php", "tests/Unit/Money/PriceTest.php"]
         );
-        assert_eq!(quick_check(&check("js")), None);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The suite is only skipped when the files that ran are the whole change.
@@ -3870,75 +3844,57 @@ ping -n 60 127.0.0.1 >nul
         assert!(php_warnings_only("composer test", "  \u{1b}[32;1mTests:\u{1b}[39;22m    3 passed\n", &[]));
     }
 
-    /// Checks that already failed before the change are shown to the agent,
-    /// and failing again buys no Fix: Orteca cannot tell a broken setup from
-    /// unfinished work.
+    /// A test that already fails at the base commit buys no Fix; one the run
+    /// broke does. It is asked in a throwaway copy that is gone afterwards.
     #[tokio::test]
     async fn checks_that_failed_before_the_run_buy_no_fix() {
-        let store = Store::in_memory().unwrap();
-        let route = routing::route(
-            "make the header bold",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        let mut request = routed(&store, "failed-before", route);
-        let dir = request.dir.clone();
-        if fake_laravel(&dir).is_none() {
-            eprintln!("skipped: php or composer is not on PATH");
-            return;
-        }
-        std::fs::write(dir.join("broken"), "").unwrap();
-        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
-        claude_shim(&mut request, &passing);
-
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-
-        assert_eq!(result.status, "verifyFailed", "{:?}", result.failure);
-        assert_eq!(result.calls_used, 1, "a failure the run did not cause bought a Fix");
-        assert_eq!(
-            result.stages.iter().map(|note| note.stage).collect::<Vec<_>>(),
-            [Stage::Implement, Stage::Verify]
-        );
-        let stop = result.budget_stop.expect("the stop was not returned");
-        assert!(stop.message.contains("already failed"), "{}", stop.message);
-        assert!(
-            briefs(&dir)[0].contains("SQLSTATE connection refused"),
-            "the agent was not shown what already fails"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A pass before the change is remembered for the same tree, so the next
-    /// run does not pay for the quick check twice.
-    #[tokio::test]
-    async fn a_passing_check_before_the_run_is_not_repeated_for_the_same_tree() {
-        let store = Store::in_memory().unwrap();
-        let route = routing::route(
-            "make the header bold",
-            Mode::Balanced,
-            &RepoSignals::default(),
-        );
-        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
-        let mut dir = None;
-        // The quick check, then Verify: the untracked test files count as
-        // changed, so their tripwire runs before the suite. The second run
-        // skips the quick check.
-        let verify = "test tests/Feature/LargerTest.php tests/Feature/SmallTest.php\nsuite\n";
-        let first = format!("test tests/Feature/SmallTest.php\n{verify}");
-        for runs in [first.clone(), format!("{first}{verify}")] {
-            let mut request = routed(&store, "passed-before", route.clone());
-            if fake_laravel(&request.dir).is_none() {
+        for broken_at_base in [true, false] {
+            let store = Store::in_memory().unwrap();
+            let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+            let mut request = routed(&store, &format!("failed-before-{broken_at_base}"), route);
+            let dir = request.dir.clone();
+            if fake_laravel(&dir).is_none() {
                 eprintln!("skipped: php or composer is not on PATH");
                 return;
             }
+            if broken_at_base {
+                std::fs::write(dir.join("broken"), "").unwrap();
+            }
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                    .args(args)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "base"]);
+            request.base_commit = Some(git(&["rev-parse", "HEAD"]));
+            // The run's work, and a suite that now fails either way.
+            std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
+            std::fs::write(dir.join("broken"), "").unwrap();
+            let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
             claude_shim(&mut request, &passing);
-            let here = request.dir.clone();
+            let copy = std::env::temp_dir().join(format!("orteca-base-{}", request.task_id));
+
             let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
-            assert_eq!(result.status, "done", "{:?}", result.budget_stop);
-            assert_eq!(std::fs::read_to_string(here.join("runs.log")).unwrap(), runs);
-            dir = Some(here);
+
+            assert_eq!(result.status, "verifyFailed", "{:?}", result.failure);
+            let stop = result.budget_stop.expect("the stop was not returned");
+            if broken_at_base {
+                assert_eq!(result.calls_used, 1, "a failure the run did not cause bought a Fix");
+                assert!(stop.message.contains("already failed"), "{}", stop.message);
+            } else {
+                assert_eq!(result.calls_used, 2, "a failure the run caused got no Fix");
+                assert!(!stop.message.contains("already failed"), "{}", stop.message);
+            }
+            let log = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+            assert!(!log.contains("test tests/Feature/SmallTest.php"), "the base ran in the user's tree: {log}");
+            assert!(!copy.exists(), "the base copy was left behind");
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        std::fs::remove_dir_all(dir.unwrap()).unwrap();
     }
 
     #[test]

@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_model_prices.sql"),
     include_str!("../migrations/0007_task_titles.sql"),
     include_str!("../migrations/0008_check_passes.sql"),
+    include_str!("../migrations/0009_drop_check_passes.sql"),
 ];
 
 /// A published API rate, in USD per million tokens.
@@ -288,22 +289,6 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    pub fn checks_passed(&self, key: &str) -> bool {
-        let conn = self.0.lock().expect("store poisoned");
-        conn.query_row("SELECT 1 FROM check_passes WHERE key = ?1", [key], |_| Ok(()))
-            .is_ok()
-    }
-
-    // ponytail: never pruned; a row is ~60 bytes, add a cap if a store ever grows large.
-    pub fn remember_checks_passed(&self, key: &str) -> Result<()> {
-        let conn = self.0.lock().expect("store poisoned");
-        conn.execute(
-            "INSERT OR REPLACE INTO check_passes (key, passed_at) VALUES (?1, datetime('now'))",
-            [key],
-        )?;
         Ok(())
     }
 

@@ -51,10 +51,11 @@ The Project screen is a shell plus pages in `src/views/project/`, sharing `state
   whether the prompt is a question or easy/medium/hard work. Feeds `routing` as
   `RepoSignals::intent`; a failed read falls back to keywords.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
-  fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A quick
-  check (one small Laravel test file) runs before the agent starts; a failed Verify gets one Fix (resuming
-  the session that wrote the change) and runs again, a Review runs once, and
-  checks that already failed before the run buy no Fix.
+  fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A failed
+  Verify gets one Fix (resuming the session that wrote the change) and runs
+  again, a Review runs once. Before that Fix, the failing Laravel test files
+  run again in a throwaway worktree at `base_commit`; ones that already failed
+  there buy no Fix.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the

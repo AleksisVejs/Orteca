@@ -818,6 +818,48 @@ pub fn remove_worktree(repo: &Path, copy: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A throwaway checkout of `base` for asking whether a test already failed
+/// before a run. The user's tree is only read. `setup` names untracked paths a
+/// suite needs (`vendor`, `.env`), copied in from `repo` when they exist: a
+/// junction would load the changed tree's classes, not the base's.
+// ponytail: `base` is the commit, so a run that started dirty is compared with
+// HEAD, not with the user's edits; snapshot the dirty patch if that misleads.
+pub fn base_copy(repo: &Path, base: &str, copy: &Path, setup: &[&str]) -> Result<()> {
+    drop_base_copy(repo, copy);
+    let hooks = no_hooks(copy);
+    git_run(
+        repo,
+        &["-c", &hooks, "worktree", "add", "-q", "--detach", &copy.to_string_lossy(), base],
+        "Git could not check out the base commit",
+    )?;
+    for path in setup {
+        let (from, to) = (repo.join(path), copy.join(path));
+        if from.is_dir() {
+            // robocopy exits 0-7 on success; 8 and up is a failure.
+            let code = Command::new("robocopy")
+                .arg(&from)
+                .arg(&to)
+                .args(["/E", "/MT:16", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()?
+                .code();
+            if !code.is_some_and(|c| c < 8) {
+                return Err(AppError::new(ErrorKind::Io, format!("Could not copy {path}")));
+            }
+        } else if from.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the folder itself, then has git forget it. Nothing in it is the
+/// user's, and `worktree remove` refuses a copy the tests left files in.
+pub fn drop_base_copy(repo: &Path, copy: &Path) {
+    let _ = std::fs::remove_dir_all(copy);
+    let _ = git_run(repo, &["worktree", "prune"], "");
+}
+
 /// Runs as the user, with their identity and their hooks: this is their
 /// commit, not a run's. `input` is the commit message or the branch to merge.
 pub fn git_action(dir: &Path, action: GitAction, input: &str) -> Result<()> {

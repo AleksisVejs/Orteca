@@ -1068,8 +1068,10 @@ pub fn brief(
         Stage::Review => {
             out.push_str(
                 "Review the change that is already in the working tree against the task below. \
-                 Do not edit any file. Return only the structured review. Ask for changes only \
-                 for a high or medium finding; report low ones, which do not hold the work up.",
+                 Do not edit any file. Return only the structured review. Check it against \
+                 every rule the task states: a rule that is missing or only partly met is a \
+                 finding. Ask for changes only for a high or medium finding; report low ones, \
+                 which do not hold the work up.",
             );
             // The latest check, not any: a pass before a later fix says nothing
             // about the tree as it is now.
@@ -1228,7 +1230,8 @@ pub fn brief(
                  behaviour, run one focused check that proves it works and stop as soon as \
                  it passes. A change with nothing to run - a comment, docs, wording - needs \
                  no check: stop once the edit is made. Do not broaden the task, refactor \
-                 around it, or run the whole suite.\n",
+                 around it, or run the whole suite. No other check follows this call, so \
+                 end by saying in one sentence what you checked and what you did not.\n",
             );
         } else if route.stages.contains(&Stage::Verify) {
             out.push_str(

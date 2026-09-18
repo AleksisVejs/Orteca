@@ -1137,7 +1137,6 @@ mod tests {
         let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
         let dir = std::path::PathBuf::from(var("BENCH_DIR")).canonicalize().unwrap();
         let key = dir.to_str().unwrap().to_string();
-        let t0 = std::time::Instant::now();
         let store = Store::in_memory().unwrap();
         store.touch_project(&key, "bench").unwrap();
         store.set_trusted(&key, true).unwrap();
@@ -1145,6 +1144,8 @@ mod tests {
         if let Some(prices) = providers::codex::fetch_prices() {
             store.save_prices(&prices).unwrap();
         }
+        // Started after the price fetch, which the app does once at startup.
+        let t0 = std::time::Instant::now();
         fn json<T: serde::de::DeserializeOwned>(s: String) -> T {
             serde_json::from_value(serde_json::Value::String(s)).unwrap()
         }

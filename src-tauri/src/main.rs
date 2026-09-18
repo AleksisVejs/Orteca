@@ -184,6 +184,7 @@ async fn start_task(
     continue_task: Option<i64>,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
+    checking: tauri::ipc::Channel<run::TaskResult>,
 ) -> Result<run::TaskResult> {
     // A session id goes into argv, so it is an id and nothing else. A copy is
     // a new folder, where neither CLI can find the session.
@@ -233,6 +234,9 @@ async fn start_task(
     .await?;
     request.attachments = attachments;
     request.resume = resume;
+    request.checking = Some(Box::new(move |result| {
+        let _ = checking.send(result.clone());
+    }));
     // A closed channel is the window going away, not a reason to abandon a run
     // that is already recorded; the result still comes back to whoever asked.
     let _ = task.send(request.task_id);
@@ -586,6 +590,7 @@ fn prepare_run(
         resume: None,
         continued: continued.is_some(),
         timings: Vec::new(),
+        checking: None,
     })
 }
 
@@ -1132,6 +1137,7 @@ mod tests {
         let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
         let dir = std::path::PathBuf::from(var("BENCH_DIR")).canonicalize().unwrap();
         let key = dir.to_str().unwrap().to_string();
+        let t0 = std::time::Instant::now();
         let store = Store::in_memory().unwrap();
         store.touch_project(&key, "bench").unwrap();
         store.set_trusted(&key, true).unwrap();
@@ -1155,8 +1161,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let begun = t0.elapsed().as_millis() as u64;
         let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
-        std::fs::write(var("BENCH_OUT"), serde_json::to_string_pretty(&result).unwrap()).unwrap();
+        // Wall time from the prompt, classify and scan included, which is what
+        // a plain CLI's time is compared with.
+        let mut out = serde_json::to_value(&result).unwrap();
+        out["benchBeginMs"] = begun.into();
+        out["benchWallMs"] = (t0.elapsed().as_millis() as u64).into();
+        std::fs::write(var("BENCH_OUT"), serde_json::to_string_pretty(&out).unwrap()).unwrap();
     }
 
     /// Free: prints both CLIs' rolling limits as JSON.

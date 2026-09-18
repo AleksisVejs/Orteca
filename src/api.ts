@@ -121,6 +121,8 @@ export const startTask = (
   attachments: string[],
   onEvent: (event: ProviderEvent) => void,
   onTask: (taskId: number) => void,
+  // The change, once its focused tests pass and while the full suite runs.
+  onChecking: (result: TaskResult) => void,
   resume: (Resume & { reply: string }) | null = null,
   // A reply that goes on in this task instead of opening a new one.
   continueTask: number | null = null,
@@ -131,7 +133,9 @@ export const startTask = (
   // Without it there is nothing for Stop to name.
   const task = new Channel<number>();
   task.onmessage = onTask;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, events, task });
+  const checking = new Channel<TaskResult>();
+  checking.onmessage = onChecking;
+  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, events, task, checking });
 };
 
 /**

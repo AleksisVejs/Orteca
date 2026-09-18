@@ -114,6 +114,8 @@ function runArm(arm, dir, prompt) {
       budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
       cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
       stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
+      // From the prompt, classify included: when the change was shown, and when the suite said done.
+      resultMs: x.benchBeginMs + (x.timings?.find((t) => t.label === "result shown")?.ms ?? x.durationMs), doneMs: x.benchWallMs,
     };
   }
   if (arm === "claude") {

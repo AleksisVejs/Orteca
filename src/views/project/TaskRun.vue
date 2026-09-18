@@ -7,7 +7,7 @@ import { PROJECT } from "./state";
 // The page while a run is going. Stop and steering are the only other things worth doing.
 const {
   task, attachments, currentActivity, fileError, taskId, stopping, stopRun,
-  instruction, sending, instructionError, steering, instruct,
+  instruction, sending, instructionError, steering, instruct, checking,
 } = inject(PROJECT)!;
 </script>
 
@@ -30,6 +30,25 @@ const {
     <p v-if="fileError" class="missing">{{ fileError }}</p>
     <!-- Blue means in flight, and only that. -->
     <div class="bar"><span></span></div>
+  </section>
+
+  <!-- Result first, proof after: readable now, never labelled done. -->
+  <section v-if="checking" class="block" aria-live="polite">
+    <h2 class="label">The change · still checking</h2>
+    <div class="card early">
+      <p class="note">Its focused tests passed. The full test suite is still running, and this is not done until it passes.</p>
+      <ul class="files">
+        <li v-for="f in checking.diff.filter((f) => f.origin !== 'beforeRun')" :key="f.path">
+          <span class="mono grow">{{ f.path }}</span>
+          <span v-if="f.added !== null" class="note">+{{ f.added }} &minus;{{ f.deleted }}</span>
+          <span v-else class="note">new or binary</span>
+        </li>
+      </ul>
+      <details v-if="checking.patchText" class="code-view">
+        <summary>View patch</summary>
+        <pre>{{ checking.patchText }}</pre>
+      </details>
+    </div>
   </section>
 
   <section class="block">
@@ -128,6 +147,34 @@ const {
 
 .block {
   margin-top: 32px;
+}
+
+.early {
+  padding: 16px 18px;
+}
+.early > .note {
+  margin: 0 0 12px;
+}
+.files {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+.files li {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+}
+.files li + li {
+  border-top: 1px solid var(--border);
+}
+.files .mono {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.files .note {
+  font-variant-numeric: tabular-nums;
 }
 
 .steer:focus-within {

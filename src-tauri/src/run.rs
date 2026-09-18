@@ -297,7 +297,8 @@ fn now_ms() -> u64 {
 pub struct TaskResult {
     pub task_id: i64,
     /// `done`, `cancelled`, `failed`, `budgetReached`, `reviewRejected` or
-    /// `verifyFailed`.
+    /// `verifyFailed`. `checking` only on the early result a run sends while
+    /// its full suite is still running; a run never ends on it.
     pub status: &'static str,
     /// The provider's final answer, or its last message if it reports no final
     /// field. Empty is possible and is not an error.
@@ -675,7 +676,12 @@ pub struct Request {
     pub continued: bool,
     /// What ran before this request existed, such as the classify call.
     pub timings: Vec<Timing>,
+    /// Handed the change, as a `checking` result, once its focused tests
+    /// pass and while the full suite still runs.
+    pub checking: Option<OnChecking>,
 }
+
+pub type OnChecking = Box<dyn Fn(&TaskResult) + Send + Sync>;
 
 /// The raw event stream of one run, kept so a paid run can be replayed free.
 ///
@@ -811,6 +817,8 @@ struct Context {
     /// same thing.
     final_stage: bool,
     attachments: Vec<PathBuf>,
+    /// When `stream` began, in Unix milliseconds.
+    started: u64,
 }
 
 impl Context {
@@ -903,6 +911,7 @@ pub async fn stream(
         mut resume,
         continued,
         timings,
+        checking,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -922,6 +931,7 @@ pub async fn stream(
         },
         final_stage: true,
         attachments,
+        started: now_ms(),
     };
     let mut state = State {
         outcome: Outcome::default(),
@@ -973,6 +983,47 @@ pub async fn stream(
         }
         state.outcome.begin_process();
     }
+
+    // The change so far, shown while its full suite still runs. Never `done`:
+    // only the suite passing makes it that.
+    let work_dir = ctx.dir.clone();
+    let show_checking = |state: &State| {
+        let Some(checking) = &checking else {
+            return;
+        };
+        let mut diff = project::diff_since(&work_dir, base_commit.as_deref()).unwrap_or_default();
+        project::attribute(&work_dir, &mut diff, before_run.as_ref());
+        checking(&TaskResult {
+            task_id,
+            status: "checking",
+            summary: state
+                .notes
+                .iter()
+                .rev()
+                .find(|n| n.stage.writes())
+                .map(|n| n.summary.clone())
+                .unwrap_or_default(),
+            failure: None,
+            failure_kind: None,
+            usage: state.outcome.usage.clone(),
+            diff,
+            patch_text: project::patch_since(&work_dir, base_commit.as_deref())
+                .ok()
+                .filter(|patch| !patch.is_empty()),
+            unknown_events: state.unknown_events,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            dirty_at_start,
+            route: route.clone(),
+            stages: state.notes.clone(),
+            calls_used: state.calls_used,
+            turns_used: state.turns_used,
+            budget_stop: None,
+            baseline: None,
+            worktree: worktree.clone(),
+            resume: None,
+            timings: state.timings.clone(),
+        });
+    };
 
     // Filled only when a Verify fails: the failing checks that also fail at
     // the base commit. Those buy no automatic Fix.
@@ -1053,6 +1104,7 @@ pub async fn stream(
                     requested_build: route.signals.requested_build,
                     requested_lint: route.signals.requested_lint,
                 },
+                &show_checking,
             )
             .await
             .is_some();
@@ -1431,6 +1483,7 @@ async fn verify_locally(
     control: &mut mpsc::UnboundedReceiver<Control>,
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     scope: VerifyScope<'_>,
+    show_checking: &(dyn Fn(&State) + Sync),
 ) -> Option<bool> {
     let mut changed = project::diff_since(&ctx.dir, scope.base_commit).unwrap_or_default();
     project::attribute(&ctx.dir, &mut changed, scope.before_run);
@@ -1487,6 +1540,7 @@ async fn verify_locally(
             ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
         }
         let mut covered = false;
+        let mut focused_passed = false;
         if matches!(ran, Ran::Finished { passed: true, .. }) {
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
                 let args: Vec<&str> = focused.iter().map(String::as_str).collect();
@@ -1502,6 +1556,7 @@ async fn verify_locally(
                     // the test files only: every `.php` path ends with "php",
                     // so the whole argv would call any change covered.
                     covered = focused_covers(&changed_paths, &focused[3..]);
+                    focused_passed = true;
                     results.push(serde_json::json!({
                         "command": named,
                         "passed": true,
@@ -1516,6 +1571,19 @@ async fn verify_locally(
             continue;
         }
         if matches!(ran, Ran::Finished { passed: true, .. }) {
+            // Result first, proof after: the change is worth reading now, and
+            // the suite still decides whether it is done.
+            if focused_passed {
+                let event = ProviderEvent::Text(format!(
+                    "Its focused tests passed, so the change is shown now; {shown} is still running"
+                ));
+                let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+                state.timings.push(Timing {
+                    label: "result shown".into(),
+                    ms: now_ms().saturating_sub(ctx.started),
+                });
+                show_checking(state);
+            }
             ran = match shards(check) {
                 Some(groups) => {
                     run_sharded(store, ctx, state, control, emit, &groups, &check.dir, &shown, &changed_paths).await
@@ -2911,6 +2979,7 @@ mod tests {
             resume: None,
             continued: false,
             timings: Vec::new(),
+            checking: None,
             id: ProviderId::Codex,
             program: dir.join("fake.cmd"),
             dir,
@@ -4189,6 +4258,42 @@ ping -n 60 127.0.0.1 >nul
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// Once its focused tests pass, the change is sent as `checking` before
+    /// the full suite runs; only the suite passing ends the run `done`.
+    #[tokio::test]
+    async fn the_change_is_shown_as_checking_before_the_suite_decides() {
+        let store = Store::in_memory().unwrap();
+        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let mut request = routed(&store, "checking", route);
+        let dir = request.dir.clone();
+        if fake_laravel(&dir).is_none() {
+            eprintln!("skipped: php or composer is not on PATH");
+            return;
+        }
+        std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, sent) = (dir.join("runs.log"), seen.clone());
+        request.checking = Some(Box::new(move |result| {
+            let ran = std::fs::read_to_string(&log).unwrap_or_default();
+            sent.lock().unwrap().push((result.status, result.diff.len(), ran));
+        }));
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (status, files, ran) = &seen[0];
+        assert_eq!(*status, "checking");
+        assert!(*files > 0, "the early result carries the diff");
+        assert!(ran.contains("test tests/Feature/") && !ran.contains("suite"), "shown after the focused tests, before the suite: {ran}");
+        assert!(std::fs::read_to_string(dir.join("runs.log")).unwrap().contains("suite"), "the suite still ran");
+        assert!(result.timings.iter().any(|t| t.label == "result shown"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The suite is only skipped when the files that ran are the whole change.

@@ -300,8 +300,9 @@ export interface TaskResult {
   /** `cancelled` is the user stopping the run, `budgetReached` a ceiling the
    *  route declared, `reviewRejected` an explicit review stop and
    *  `verifyFailed` checks that did not report a pass: none is a win, and none
-   *  is a provider fault. */
-  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed";
+   *  is a provider fault. `checking` is only the early result a run sends
+   *  while its full suite still runs; no run ends on it. */
+  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed" | "checking";
   summary: string;
   failure: string | null;
   /** Why it failed, when it did. `usageLimit` is what offers the other CLI. */

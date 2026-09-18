@@ -328,6 +328,8 @@ export function useProject(opened: OpenedProject) {
   const running = ref(false);
   const stream = ref<Array<{ kind: string; text: string; file?: string | null }>>([]);
   const result = ref<TaskResult | null>(null);
+  /** The change while its full suite still runs. Never a finished result. */
+  const checking = ref<TaskResult | null>(null);
   const runError = ref<string | null>(null);
   const currentActivity = ref<Activity>({ text: "Getting ready", file: null });
   const fileError = ref<string | null>(null);
@@ -631,6 +633,7 @@ export function useProject(opened: OpenedProject) {
     ranOn.value = provider.value;
     stream.value = [];
     result.value = null;
+    checking.value = null;
     runError.value = null;
     taskId.value = null;
     stopping.value = false;
@@ -666,6 +669,9 @@ export function useProject(opened: OpenedProject) {
         (id) => {
           taskId.value = id;
         },
+        (early) => {
+          checking.value = early;
+        },
         resume,
         continueTask,
       );
@@ -675,6 +681,7 @@ export function useProject(opened: OpenedProject) {
     } finally {
       running.value = false;
       stopping.value = false;
+      checking.value = null;
       taskId.value = null;
       if (tick !== null) clearTimeout(tick);
       tickWhileWarm();
@@ -849,6 +856,7 @@ export function useProject(opened: OpenedProject) {
     budgetReached: "Stopped safely",
     reviewRejected: "Needs another look",
     verifyFailed: "Checks didn’t pass",
+    checking: "Still checking",
   };
 
   const STAGE_LABELS: Record<string, string> = {
@@ -963,6 +971,7 @@ export function useProject(opened: OpenedProject) {
     verifyFailed: "warn",
     reviewRejected: "warn",
     running: "live",
+    checking: "live",
   };
 
   const helpersPending = computed(() => rows.value.some((r) => r.pending));
@@ -1095,6 +1104,7 @@ export function useProject(opened: OpenedProject) {
     running,
     stream,
     result,
+    checking,
     runError,
     currentActivity,
     fileError,

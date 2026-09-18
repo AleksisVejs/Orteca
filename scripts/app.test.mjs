@@ -115,6 +115,20 @@ test('completion before invoke resolves never leaves the screen running', async 
   assert.equal(state.tokens.value, null);
 });
 
+test('a change still being checked is shown while running and never becomes the result', async () => {
+  let seen;
+  const { state } = await projectView({ startTask: async (...args) => {
+    const onChecking = args.filter(arg => typeof arg === 'function')[2];
+    onChecking({ ...finished, status: 'checking', failure: null, diff: [{ path: 'a.php', added: 1, deleted: 0, origin: 'run' }] });
+    seen = { running: state.running.value, checking: state.checking.value?.status, result: state.result.value };
+    return { ...finished, status: 'verifyFailed', failure: null };
+  } });
+  await state.run();
+  assert.deepEqual(seen, { running: true, checking: 'checking', result: null });
+  assert.equal(state.checking.value, null, 'cleared once the run ends');
+  assert.equal(state.result.value.status, 'verifyFailed', 'the suite decides, not the early result');
+});
+
 test('a reply goes on in the same task, unless that task ran in a copy', async () => {
   const calls = [];
   const { state } = await projectView({ startTask: async (...args) => {

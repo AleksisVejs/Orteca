@@ -212,7 +212,6 @@ async fn start_task(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let prepare_app = app.clone();
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app
@@ -220,43 +219,18 @@ async fn start_task(
         .app_data_dir()
         .ok()
         .map(|dir| dir.join("recordings"));
-    // Read before the route is chosen, on the provider the run will spend.
-    // Unreadable means the keyword router decides, never a failed run.
-    // The same call names the task, so a title costs no extra call.
-    let started = std::time::Instant::now();
-    let (reading, classified) = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
-        (Some(text), Some(program)) => {
-            intent::read(provider, &program.to_string_lossy(), &text).await
-        }
-        _ => (Default::default(), Vec::new()),
-    };
-    let classify_ms = started.elapsed().as_millis() as u64;
-    let mut request = tauri::async_runtime::spawn_blocking(move || {
-        prepare_run(
-            &prepare_app.state::<Store>(),
-            recordings,
-            path,
-            prompt,
-            provider,
-            mode,
-            headroom,
-            isolation,
-            reading.intent,
-            reading.job,
-            &reading.title,
-            continue_task,
-        )
-    })
-    .await
-    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
-    request.timings = vec![
-        run::Timing { label: "classify".into(), ms: classify_ms },
-        run::Timing {
-            label: "prepare".into(),
-            ms: started.elapsed().as_millis() as u64 - classify_ms,
-        },
-    ];
-    request.classified = classified;
+    let mut request = begin(
+        &app.state::<Store>(),
+        recordings,
+        path,
+        prompt,
+        provider,
+        mode,
+        headroom,
+        isolation,
+        continue_task,
+    )
+    .await?;
     request.attachments = attachments;
     request.resume = resume;
     // A closed channel is the window going away, not a reason to abandon a run
@@ -312,8 +286,39 @@ fn codex_acl_refusal() -> AppError {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_run(
+/// Everything a route is chosen from except the reading of the prompt, so the
+/// classify call can run while this is gathered.
+struct Scanned {
+    dir: std::path::PathBuf,
+    project: Project,
+    program: std::path::PathBuf,
+    git: GitState,
+    prompt: String,
+    mode: Mode,
+    signals: routing::RepoSignals,
+}
+
+impl Scanned {
+    fn route(self, intent: Option<intent::Intent>, job: Option<intent::Job>) -> PlannedRun {
+        let signals = routing::RepoSignals {
+            checks_locally: run::checks_locally(&self.dir, job),
+            intent,
+            job,
+            ..self.signals
+        };
+        let route = routing::route(&self.prompt, self.mode, &signals);
+        PlannedRun {
+            dir: self.dir,
+            project: self.project,
+            program: self.program,
+            git: self.git,
+            prompt: self.prompt,
+            route,
+        }
+    }
+}
+
+fn scan_run(
     store: &Store,
     path: String,
     prompt: String,
@@ -321,9 +326,7 @@ fn plan_run(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
-    intent: Option<intent::Intent>,
-    job: Option<intent::Job>,
-) -> Result<PlannedRun> {
+) -> Result<Scanned> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(
             ErrorKind::Invalid,
@@ -353,30 +356,90 @@ fn plan_run(
             format!("{} is not installed or not on PATH.", provider.program()),
         )
     })?;
-    let route = routing::route(
-        &prompt,
-        mode,
-        &routing::RepoSignals {
-            tracked_paths: project::tracked_paths(&dir),
-            recent_paths: project::recent_paths(&dir),
-            prior_failures: store.prior_failures(project.id, &prompt)?,
-            stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
-            // The frontend's reading, not a fresh one: the preview and the run
-            // must be routed on the same number.
-            headroom: headroom.filter(|room| room.is_finite()),
-            checks_locally: run::checks_locally(&dir, job),
-            intent,
-            job,
-        },
-    );
-    Ok(PlannedRun {
+    let signals = routing::RepoSignals {
+        tracked_paths: project::tracked_paths(&dir),
+        recent_paths: project::recent_paths(&dir),
+        prior_failures: store.prior_failures(project.id, &prompt)?,
+        stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
+        // The frontend's reading, not a fresh one: the preview and the run
+        // must be routed on the same number.
+        headroom: headroom.filter(|room| room.is_finite()),
+        ..Default::default()
+    };
+    Ok(Scanned {
         dir,
         project,
         program,
         git,
         prompt,
-        route,
+        mode,
+        signals,
     })
+}
+
+/// Read the prompt and scan the repository at the same time, then route and
+/// record the run. No agent starts before the route exists. The benchmark
+/// calls this too, so it measures what the app does.
+#[allow(clippy::too_many_arguments)]
+async fn begin(
+    store: &Store,
+    recordings: Option<std::path::PathBuf>,
+    path: String,
+    prompt: String,
+    provider: ProviderId,
+    mode: Mode,
+    headroom: Option<f64>,
+    isolation: Isolation,
+    continue_task: Option<i64>,
+) -> Result<run::Request> {
+    let started = std::time::Instant::now();
+    let ms = |since: std::time::Instant| since.elapsed().as_millis() as u64;
+    // Read on the provider the run will spend. Unreadable means the keyword
+    // router decides, never a failed run. The same call names the task, so a
+    // title costs no extra call; a prompt keywords already read gets none.
+    let reading = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
+        (Some(text), Some(program)) if !routing::keywords_suffice(&text) => {
+            Some(tokio::spawn(async move {
+                let read = intent::read(provider, &program.to_string_lossy(), &text).await;
+                (read, ms(started))
+            }))
+        }
+        _ => None,
+    };
+    // Git, PATH and ACL probes, on this thread while the call runs elsewhere.
+    let scanned = tokio::task::block_in_place(|| {
+        scan_run(store, path, prompt, provider, mode, headroom, isolation)
+    });
+    let scan_ms = ms(started);
+    let scanned = match scanned {
+        Ok(scanned) => scanned,
+        Err(e) => {
+            // Dropping the call's process closes its job, which kills it.
+            if let Some(reading) = reading {
+                reading.abort();
+            }
+            return Err(e);
+        }
+    };
+    let ((reading, classified), classify) = match reading {
+        Some(handle) => match handle.await {
+            Ok((read, took)) => (read, run::Timing { label: "classify".into(), ms: took }),
+            Err(_) => (Default::default(), run::Timing { label: "classify".into(), ms: ms(started) }),
+        },
+        None => (Default::default(), run::Timing { label: "classify skipped".into(), ms: 0 }),
+    };
+    let planned = scanned.route(reading.intent, reading.job);
+    let routed = std::time::Instant::now();
+    let mut request = tokio::task::block_in_place(|| {
+        prepare_run(store, recordings, planned, provider, mode, isolation, &reading.title, continue_task)
+    })?;
+    request.classified = classified;
+    request.timings = vec![
+        classify,
+        run::Timing { label: "scan".into(), ms: scan_ms },
+        run::Timing { label: "prepare".into(), ms: ms(routed) },
+    ];
+    Ok(request)
 }
 
 /// Show the exact route and ceilings before a provider is started.
@@ -394,17 +457,8 @@ async fn preview_task(
     // call per pause would cost more than the runs it routes. Off the main
     // thread: git, PATH and ACL probes froze the window on every pause.
     let planned = tauri::async_runtime::spawn_blocking(move || {
-        plan_run(
-            &app.state::<Store>(),
-            path,
-            prompt,
-            provider,
-            mode,
-            headroom,
-            isolation,
-            None,
-            None,
-        )
+        scan_run(&app.state::<Store>(), path, prompt, provider, mode, headroom, isolation)
+            .map(|scanned| scanned.route(None, None))
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
@@ -446,14 +500,10 @@ async fn provider_limits() -> Vec<providers::limits::Limits> {
 fn prepare_run(
     store: &Store,
     recordings: Option<std::path::PathBuf>,
-    path: String,
-    prompt: String,
+    planned: PlannedRun,
     provider: ProviderId,
     mode: Mode,
-    headroom: Option<f64>,
     isolation: Isolation,
-    intent: Option<intent::Intent>,
-    job: Option<intent::Job>,
     title: &str,
     continue_task: Option<i64>,
 ) -> Result<run::Request> {
@@ -464,9 +514,7 @@ fn prepare_run(
         git,
         prompt,
         route,
-    } = plan_run(
-        store, path, prompt, provider, mode, headroom, isolation, intent, job,
-    )?;
+    } = planned;
 
     // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
     let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
@@ -1094,7 +1142,7 @@ mod tests {
         fn json<T: serde::de::DeserializeOwned>(s: String) -> T {
             serde_json::from_value(serde_json::Value::String(s)).unwrap()
         }
-        let request = prepare_run(
+        let request = begin(
             &store,
             None,
             key,
@@ -1104,10 +1152,8 @@ mod tests {
             None,
             Isolation::CurrentTree,
             None,
-            None,
-            "",
-            None,
         )
+        .await
         .unwrap();
         let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
         std::fs::write(var("BENCH_OUT"), serde_json::to_string_pretty(&result).unwrap()).unwrap();

@@ -801,6 +801,29 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
     (signals, hits)
 }
 
+/// A prompt the keyword router reads as well as the classify call would: short
+/// plain English, an order and not a question, a small-edit word, and nothing
+/// any gate or requested action looks at. Its classify call is skipped, and
+/// the sidebar shows the prompt for a title. Anything else is read.
+pub fn keywords_suffice(prompt: &str) -> bool {
+    let text = prompt.to_ascii_lowercase();
+    let first = text.split_whitespace().next().unwrap_or_default();
+    prompt.is_ascii()
+        && ["fix", "rename", "correct", "update", "change", "reword", "bump"].contains(&first)
+        && !prompt.contains('?')
+        && text.split_whitespace().count() <= 20
+        && score(&text, TRIVIAL) > 0
+        && score(&text, COMPLEXITY) == 0
+        && score(&text, RISK) == 0
+        && ![SECURITY, AUTHZ, SCHEMA, ARCHITECTURE]
+            .iter()
+            .any(|words| contains_any(&text, words))
+        && !contains_any(
+            &text,
+            &["build", "test", "lint", "how", "why", "what", "explain", "should", "could", "can you"],
+        )
+}
+
 /// Turn signals into a route, its stages and its ceilings.
 ///
 /// Rule order is not the order of the table in the architecture doc: the two
@@ -1345,6 +1368,25 @@ mod tests {
 
     /// The headline of the milestone: a small, low-risk, narrow task costs one
     /// agent call, and that call verifies itself.
+    #[test]
+    fn only_a_plain_small_order_skips_the_classify_call() {
+        assert!(keywords_suffice("fix the typo in README.md"));
+        assert!(keywords_suffice("Rename getUser to fetchUser in src/api.ts"));
+        for read in [
+            "fix the typo in README.md?",
+            "why is there a typo in the readme",
+            "fix the typo in the login password screen",
+            "rename the users table column",
+            "fix the typo and run the tests",
+            "fix the typo in the header component and redesign the page",
+            "corrige la faute de frappe dans le readme",
+            "make the header bold",
+            "corrige l'erreur — typo dans le README",
+        ] {
+            assert!(!keywords_suffice(read), "{read}");
+        }
+    }
+
     #[test]
     fn a_trivial_task_is_one_implement_call_with_no_plan_and_no_review() {
         let r = balanced("Fix the typo in the README heading", REPO);

@@ -6,7 +6,7 @@ import { PROJECT } from "./state";
 
 // The page after a run: what happened first, the rest one tab away.
 const {
-  task, result, running, provider, fallback, continueWith, describeVerdict, stageLabel,
+  task, result, running, provider, switchedFrom, describeVerdict, stageLabel,
   removedCopies, confirmRemove, removeCopy, removeError, routeSteps, calls, tokens,
   comparison, changed, OUTCOME, TONE, TABS, resultTab, formatTokens, formatCost,
   formatDuration, newTask, editAgain, reply, sendReply, warmLeft,
@@ -42,15 +42,10 @@ const {
     <div id="result-panel" class="panel" role="tabpanel" :aria-labelledby="`tab-${resultTab}`">
       <template v-if="resultTab === 'summary'">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
-        <div v-if="fallback" class="fallback" role="status">
-          <p class="note">
-            {{ provider }} is out of plan usage. {{ fallback.id }} can carry on with the same
-            request<template v-if="fallback.room !== null">, with {{ Math.round(fallback.room) }}% of its tightest limit left</template>.
-            Anything already changed stays on disk.
-          </p>
-          <button class="btn" :disabled="running" @click="continueWith(fallback.id)">Continue with {{ fallback.id }}</button>
-        </div>
-        <Markdown v-else-if="result.summary" class="summary" :text="describeVerdict(result.summary) ?? result.summary" />
+        <p v-if="switchedFrom" class="note switched" role="status">
+          {{ switchedFrom }} ran out of plan usage, so {{ provider }} carried on with the same request.
+        </p>
+        <Markdown v-if="result.summary" class="summary" :text="describeVerdict(result.summary) ?? result.summary" />
         <p v-else-if="!result.failure" class="note">No summary was reported.</p>
         <!-- A copy's committed work is on its branch; a fresh run would start without it. -->
         <div v-if="result.summary && !result.worktree?.commit" class="reply">
@@ -214,186 +209,4 @@ const {
   </section>
 </template>
 
-<style scoped>
-.outcome {
-  padding: 20px 24px;
-}
-.head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.status {
-  flex: 1;
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-}
-.prompt {
-  margin: 8px 0 16px;
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
-
-.tabs {
-  display: flex;
-  gap: 4px;
-  border-bottom: 1px solid var(--border);
-}
-.tabs button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: -1px;
-  padding: 8px 10px;
-  border-bottom: 1px solid transparent;
-  color: var(--text-faint);
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.tabs button:hover {
-  color: var(--text);
-}
-.tabs button.on {
-  color: var(--text);
-  border-bottom-color: var(--text);
-}
-.count {
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
-.panel {
-  min-height: 120px;
-  padding: 18px 0;
-}
-.panel > :first-child {
-  margin-top: 0;
-}
-
-.fallback {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin: 0 0 16px;
-}
-.reply {
-  display: flex;
-  gap: 8px;
-  margin: 12px 0 0;
-}
-.reply input {
-  flex: 1;
-  min-width: 0;
-  padding: 8px 12px;
-  background: none;
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  font: inherit;
-}
-.reply input:focus {
-  outline: none;
-  border-color: var(--info);
-}
-.reply-cost {
-  margin: 6px 0 0;
-  font-variant-numeric: tabular-nums;
-}
-.reply input::placeholder {
-  color: var(--text-faint);
-}
-.fallback .note {
-  flex: 1;
-  margin: 0;
-}
-
-.route {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: 12px;
-}
-.route li {
-  padding: 1px 9px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--text-faint);
-}
-.route li.ran {
-  border-color: var(--border-strong);
-  color: var(--text);
-}
-.route li.arrow {
-  padding: 0;
-  border: none;
-}
-.reason {
-  margin: 8px 0 16px;
-}
-
-.tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 1px;
-  margin: 0 0 16px;
-  background: var(--border);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  overflow: hidden;
-}
-.tiles > div {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  padding: 12px 14px;
-  background: var(--surface-2);
-}
-.tiles dt {
-  order: 2;
-}
-.tiles dd {
-  margin: 0;
-  order: 1;
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
-}
-.tiles dd.note {
-  order: 3;
-  font-size: 12px;
-  font-weight: 400;
-  letter-spacing: normal;
-}
-.tiles dd.model {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 30px;
-}
-.good {
-  color: var(--accent);
-}
-
-.actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-</style>
+<style scoped src="./result.css"></style>

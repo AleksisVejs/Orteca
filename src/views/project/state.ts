@@ -285,8 +285,8 @@ export function useProject(opened: OpenedProject) {
     return other && other.room !== null && (mine === null || other.room > mine) ? other.id : null;
   });
 
-  /** After a run that stopped because its plan ran out: the CLI that could take over.
-   *  Offered, never taken: continuing is a fresh run the user starts. */
+  /** After a run that stopped because its plan ran out: the CLI that takes over.
+   *  `run` continues there on its own, once. */
   const fallback = computed(() => {
     const r = result.value;
     // A copy's work is on its branch; a fresh run would start from the commit without it.
@@ -628,8 +628,11 @@ export function useProject(opened: OpenedProject) {
     resumeWith = null;
     continuing = null;
     following = false;
+    const auto = switching;
+    switching = false;
     if (!canRun.value) return;
     if (!chained) asked = [];
+    switchedFrom.value = auto ? ranOn.value : null;
     ranOn.value = provider.value;
     stream.value = [];
     result.value = null;
@@ -688,6 +691,12 @@ export function useProject(opened: OpenedProject) {
       await loadHistory();
       // The run just spent some of a limit; the next pick should know.
       void loadLimits();
+    }
+    // Out of plan usage: the other CLI carries on, once, so two spent plans cannot bounce.
+    const next = auto ? null : fallback.value;
+    if (next) {
+      switching = true;
+      await continueWith(next.id);
     }
   }
 
@@ -1016,6 +1025,9 @@ export function useProject(opened: OpenedProject) {
 
   const reply = ref("");
   const ranOn = ref<ProviderId | null>(null);
+  /** The CLI whose spent plan this run took over from, if it did. */
+  const switchedFrom = ref<ProviderId | null>(null);
+  let switching = false;
   // The user's own words across a chain of follow-ups, oldest first.
   let asked: string[] = [];
   let following = false;
@@ -1098,6 +1110,7 @@ export function useProject(opened: OpenedProject) {
     otherThan,
     alternative,
     fallback,
+    switchedFrom,
     switchTo,
     continueWith,
     canRun,

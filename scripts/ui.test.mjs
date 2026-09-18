@@ -11,7 +11,9 @@ for (const folder of ['views', 'views/project', 'components']) {
     const source = readFileSync(new URL(`../src/${folder}/${file}`, import.meta.url), 'utf8');
     const { descriptor } = parse(source);
     test(`${file} uses defined tokens and the documented font sizes`, () => {
-      for (const { content } of descriptor.styles) {
+      // A `<style src>` block is empty here; its file is read instead.
+      const styles = descriptor.styles.map(s => s.src ? readFileSync(new URL(`../src/${folder}/${s.src}`, import.meta.url), 'utf8') : s.content);
+      for (const content of styles) {
         assert.doesNotMatch(content, /#[0-9a-f]{3,8}\b|\brgba?\(/i);
         for (const [, token] of content.matchAll(/var\((--[\w-]+)/g)) assert.ok(tokens.includes(`${token}:`), token);
         for (const [, size] of content.matchAll(/font-size:\s*(\d+)px/g)) assert.ok(['11', '12', '14', '20', '30'].includes(size), size);

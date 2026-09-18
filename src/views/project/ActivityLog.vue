@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { inject } from "vue";
+import { computed, inject } from "vue";
 import FileLink from "./FileLink.vue";
 import { PROJECT } from "./state";
 
 // The live, plain-English view of a run. The full technical log is saved with the task.
-const { lines } = inject(PROJECT)!;
+// A past task passes its own lines, rebuilt from the saved log.
+const props = defineProps<{ items?: Array<{ kind: string; text: string; file?: string | null }> }>();
+const project = inject(PROJECT)!;
+const lines = computed(() => props.items ?? project.lines.value);
 </script>
 
 <template>

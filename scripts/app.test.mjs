@@ -50,16 +50,17 @@ test('task titles can be renamed and deletion takes confirmation', async () => {
   state.historyDetail.value = { id: past.id, status: 'done' };
 
   assert.equal(state.taskName(past), 'Generated title');
-  state.startRename();
+  state.startRename(past);
   state.renaming.value = '  Better title  ';
   await state.saveRename();
   assert.deepEqual(renamed, { id: 1, title: 'Better title' });
   assert.equal(past.title, 'Better title');
 
-  await state.removeTask(past.id);
-  assert.equal(deleted, 0);
-  assert.equal(state.confirmDelete.value, past.id);
-  await state.removeTask(past.id);
+  await state.removeTask();
+  assert.equal(deleted, 0, 'nothing is deleted before the user asks');
+  state.askDelete(past);
+  assert.equal(state.deleteAsk.value.id, past.id);
+  await state.removeTask();
   assert.equal(deleted, 1);
   assert.equal(state.history.value.length, 0);
   assert.equal(state.historyDetail.value, null);
@@ -592,28 +593,30 @@ test('a route that may not fit in the fullest window warns before it starts', as
   assert.equal(state.providerPicked.value, true, 'switching is the user choosing');
 });
 
-test('a run that ran out of plan usage offers the other CLI, and continuing is a fresh run there', async () => {
+test('a run that ran out of plan usage carries on with the other CLI by itself, once', async () => {
   const sent = [];
+  const spent = { ...finished, status: 'failed', failure: 'usage limit is used up.', failureKind: 'usageLimit' };
+  let outcomes = [spent, { ...finished, status: 'done', failure: null, failureKind: null }];
   const { state } = await projectView({
     detectProviders: bothInstalled,
     providerLimits: reading(100, 30),
     startTask: async (path, prompt, provider, mode, headroom) => {
       sent.push({ provider, headroom });
-      return sent.length === 1
-        ? { ...finished, status: 'failed', failure: "Claude's session usage limit is used up.", failureKind: 'usageLimit' }
-        : { ...finished, status: 'done', failure: null, failureKind: null };
+      return outcomes.shift();
     },
   });
   await settle();
   state.providerPicked.value = true;
   state.provider.value = 'claude';
   await state.run();
-  assert.deepEqual(JSON.parse(JSON.stringify(state.fallback.value)), { id: 'codex', room: 70 });
-  assert.equal(sent.length, 1, 'offered, never taken on the user’s behalf');
-
-  await state.continueWith('codex');
   assert.deepEqual(sent, [{ provider: 'claude', headroom: 0 }, { provider: 'codex', headroom: 70 }]);
-  assert.equal(state.fallback.value, null);
+  assert.equal(state.switchedFrom.value, 'claude');
+  assert.equal(state.result.value.status, 'done');
+
+  sent.length = 0;
+  outcomes = [spent, spent];
+  await state.run();
+  assert.deepEqual(sent.map((s) => s.provider), ['codex'], 'a plan read as spent is not tried');
 
   state.result.value = { ...finished, status: 'failed', failureKind: 'crashed' };
   assert.equal(state.fallback.value, null, 'a crash is not a reason to switch');

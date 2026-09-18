@@ -347,7 +347,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 }
 .confirm h2 {
   margin: 0 0 8px;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
 }
 .confirm p {

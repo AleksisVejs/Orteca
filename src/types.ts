@@ -231,6 +231,8 @@ export interface StageNote {
   /** What Orteca asked the CLI for; null for checks Orteca ran itself. */
   model?: string | null;
   effort?: string | null;
+  /** Wall time of the stage, Orteca's own checks included. */
+  durationMs?: number | null;
 }
 
 /** Why a run stopped short of its route. Neither a win nor a fault: the work,

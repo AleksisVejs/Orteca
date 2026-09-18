@@ -3,6 +3,7 @@
 // Each arm works in a detached git worktree of RigInspectBE with vendor/ copied
 // and node_modules/ junctioned from the real repo.
 // node scripts/bench/riginspect.mjs [task...]
+//   BENCH=liftme                      LiftMe instead of RigInspectBE (tasks in liftme.tasks.mjs)
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
 // Free modes: SUITE=1 (composer test on HEAD), DRY=1|<task>, REGRADE, DIAG.
@@ -12,8 +13,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const RIG = "C:\\Users\\User\\Projects\\RigInspectBE";
-const ROOT = "C:\\Users\\User\\Projects\\riginspect-bench";
+const LIFTME = process.env.BENCH === "liftme";
+const RIG = LIFTME ? "C:\\Users\\User\\Projects\\LiftMe" : "C:\\Users\\User\\Projects\\RigInspectBE";
+const ROOT = LIFTME ? "C:\\Users\\User\\Projects\\liftme-bench" : "C:\\Users\\User\\Projects\\riginspect-bench";
 const TAURI = join(here, "..", "..", "src-tauri");
 const RESULTS = join(ROOT, process.env.RESULTS ?? "results.json");
 const ENV = { ...process.env, PATH: `C:\\Program Files\\MySQL\\MySQL Server 9.4\\bin;${process.env.PATH}` };
@@ -25,7 +27,7 @@ const CLAUDE_ARGS = ["-p", "--output-format", "json", "--permission-mode", "acce
 const CODEX_MODEL = "gpt-5.6-terra";
 const CODEX_ARGS = ["exec", "--json", "--sandbox", "workspace-write", "-m", CODEX_MODEL, "-c", "model_reasoning_effort=medium", "-"];
 
-const TASKS = {
+const TASKS = LIFTME ? (await import("./liftme.tasks.mjs")).TASKS : {
   easy: {
     prompt: "GET /api/equipment (EquipmentController@show) returns the entire inventory when per_page is missing or 0. Make it always paginate: missing or 0 means 50 per page, and keep the 100 cap. Update any existing tests that relied on the unpaginated list.",
     hidden: ["BenchEasyPaginationTest.php"],
@@ -41,7 +43,7 @@ const TASKS = {
     hidden: ["BenchToughDeltaSyncTest.php"],
     also: ["tests/Feature/OfflineCheckupTest.php"],
     vitest: true,
-    grep: ["resources/js/src/offline/sync.js", /since/],
+    grep: [["resources/js/src/offline/sync.js", /since/]],
   },
 };
 const ARMS = (process.env.ARMS ?? "orteca-claude,claude,orteca-codex,codex").split(",");
@@ -63,7 +65,7 @@ function makeWorktree(dir) {
   for (const j of junctions(dir)) execFileSync("cmd", ["/c", "mklink", "/J", j, j.replace(dir, RIG)], { stdio: "ignore" });
   copyFileSync(join(RIG, ".env"), join(dir, ".env"));
   // Guard against grading the real repo's code again.
-  const loaded = execFileSync("php", ["-r", "require 'vendor/autoload.php'; echo (new ReflectionClass('App\\Http\\Controllers\\EquipmentController'))->getFileName();"], { cwd: dir, encoding: "utf8" });
+  const loaded = execFileSync("php", ["-r", "require 'vendor/autoload.php'; echo (new ReflectionClass('App\\Http\\Controllers\\Controller'))->getFileName();"], { cwd: dir, encoding: "utf8" });
   if (!loaded.toLowerCase().startsWith(dir.toLowerCase())) throw Error(`app classes load from ${loaded}, not ${dir}`);
 }
 
@@ -155,15 +157,20 @@ function grade(dir, task, name, arm) {
   const stat = git("-C", dir, "diff", "--cached", "--shortstat", "HEAD").trim();
   const checks = {};
   for (const h of task.hidden) {
-    copyFileSync(join(here, "hidden", h), join(dir, "tests", "Feature", h));
-    checks[h] = phpunit(dir, `tests/Feature/${h}`);
+    const file = `tests/Feature/${h.split("/").pop()}`;
+    copyFileSync(join(here, "hidden", h), join(dir, file));
+    checks[h] = phpunit(dir, file);
   }
   for (const f of task.also) checks[f] = phpunit(dir, f);
   if (task.vitest) {
     const r = spawnSync("npx", ["vitest", "run"], { cwd: dir, encoding: "utf8", shell: true, env: ENV, timeout: 10 * 60_000 });
     checks.vitest = r.status === 0 ? "pass" : "FAIL " + ((r.stdout ?? "").replace(/\x1b\[[0-9;]*m/g, "").match(/Tests\s+.*/)?.[0] ?? "");
   }
-  if (task.grep) checks[`grep ${task.grep[0]}`] = task.grep[1].test(readFileSync(join(dir, task.grep[0]), "utf8")) ? "pass" : "FAIL";
+  // Only the agent's added lines count, so text already on HEAD can't pass a check.
+  for (const [f, re] of task.grep ?? []) {
+    const added = git("-C", dir, "diff", "--cached", "HEAD", "--", f).split("\n").filter((l) => l.startsWith("+")).join("\n");
+    checks[`grep ${f}`] = re.test(added) ? "pass" : "FAIL";
+  }
   const passed = Object.values(checks).filter((c) => c === "pass").length;
   return { grade: `${passed}/${Object.keys(checks).length}`, checks, diff: stat };
 }
@@ -182,8 +189,9 @@ if (process.env.REGRADE) {
     if (extra.startsWith("tests/")) {
       console.log(name, arm, extra, phpunit(dir, extra), "| again:", phpunit(dir, extra));
     } else {
-      copyFileSync(join(here, "hidden", extra), join(dir, "tests", "Feature", extra));
-      console.log(name, arm, extra, phpunit(dir, `tests/Feature/${extra}`));
+      const file = `tests/Feature/${extra.split("/").pop()}`;
+      copyFileSync(join(here, "hidden", extra), join(dir, file));
+      console.log(name, arm, extra, phpunit(dir, file));
     }
     dropWorktree(dir);
   }
@@ -220,7 +228,7 @@ if (process.env.DRY) {
     const dir = join(ROOT, "dry", name);
     makeWorktree(dir);
     console.log(name, JSON.stringify(grade(dir, task, name, "dry"), null, 1));
-    if (name === "easy") {
+    if (name === "easy" && !LIFTME) {
       // Positive control: a correct fix must pass, or the grader is broken.
       const f = join(dir, "app", "Http", "Controllers", "EquipmentController.php");
       writeFileSync(f, readFileSync(f, "utf8")
@@ -252,7 +260,9 @@ for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object
     writeFileSync(RESULTS, JSON.stringify(results, null, 2));
     const now = limits();
     console.log("limits", now);
-    const over = Object.entries(now).find(([k, v]) => v >= (CAPS[k] ?? CAP_DEFAULT));
+    // Only the providers this run uses can stop it.
+    const used = new Set(ARMS.map((a) => a.replace("orteca-", "")));
+    const over = Object.entries(now).find(([k, v]) => used.has(k.split(" ")[0]) && v >= (CAPS[k] ?? CAP_DEFAULT));
     if (over) { console.log(`STOP: ${over[0]} at ${over[1]}% (started ${start[over[0]]}%)`); process.exit(2); }
   }
 }

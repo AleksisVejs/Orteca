@@ -1019,6 +1019,9 @@ pub struct StageNote {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Wall time of the stage, Orteca's own checks included.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// The prompt one stage is given.
@@ -1818,6 +1821,7 @@ mod tests {
             stage: Stage::Plan,
             model: None,
             effort: None,
+            duration_ms: None,
             summary: "I think we should start with the store".into(),
             artifact: None,
         };
@@ -1842,6 +1846,7 @@ mod tests {
             stage: Stage::Plan,
             model: None,
             effort: None,
+            duration_ms: None,
             summary: "plan summary".into(),
             artifact: Some(serde_json::json!({
                 "objective": "private-plan-marker", "constraints": [], "affected_areas": [],
@@ -1852,6 +1857,7 @@ mod tests {
             stage: Stage::Implement,
             model: None,
             effort: None,
+            duration_ms: None,
             summary: "implementation-marker".into(),
             artifact: None,
         };
@@ -1859,6 +1865,7 @@ mod tests {
             stage: Stage::Verify,
             model: None,
             effort: None,
+            duration_ms: None,
             summary: "failed check".into(),
             artifact: Some(serde_json::json!({
                 "checks": [{"command": "npm test", "passed": false, "output": "boom"}],

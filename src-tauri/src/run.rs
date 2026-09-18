@@ -1027,6 +1027,7 @@ pub async fn stream(
         };
         ctx.final_stage = index + 1 == stages.len();
         state.outcome.begin_stage();
+        let stage_started = now_ms();
         state.structured = None;
         state.session = None;
         state.recording = Recording::new(recordings.as_deref(), task_id, stage, id);
@@ -1152,6 +1153,7 @@ Before any change, the project's checks already fail. This may be the task, or a
                 note_for_stage.summary = failed_summary(note_for_stage.artifact.as_ref());
             }
         }
+        note_for_stage.duration_ms = Some(now_ms().saturating_sub(stage_started));
         state.notes.push(note_for_stage);
         // An Implement that changed nothing has nothing to check. Testing an
         // untouched tree only makes the user wait for the same answer.
@@ -1423,11 +1425,6 @@ struct VerifyScope<'a> {
     requested_lint: bool,
 }
 
-/// Trees whose checks passed before a run, keyed by folder, commit, what was
-/// already dirty and which suites ran. A pass is only as old as this launch.
-// ponytail: in memory, so a restart runs the suites again; a table if that hurts.
-static PASSED_BEFORE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-
 /// Returns `None` when Orteca cannot run the checks itself, otherwise whether
 /// they passed. A cancelled check is not a pass.
 async fn verify_locally(
@@ -1488,10 +1485,12 @@ async fn verify_locally(
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (&ctx.dir, scope.base_commit, scope.before_run, &shown).hash(&mut hasher);
-        hasher.finish()
+        // DefaultHasher may change between Rust releases; that only costs one rerun.
+        format!("{:016x}", hasher.finish())
     };
     if before_change {
-        if PASSED_BEFORE.lock().is_ok_and(|passed| passed.contains(&key)) {
+        // Keyed by folder, commit, what was already dirty and which suites ran.
+        if store.checks_passed(&key) {
             return Some(true);
         }
         let event = ProviderEvent::Text("Running the checks once before anything changes".into());
@@ -1522,6 +1521,7 @@ async fn verify_locally(
             let named = label(check, install);
             ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
         }
+        let mut covered = false;
         if matches!(ran, Ran::Finished { passed: true, .. }) && !before_change {
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
                 let args: Vec<&str> = focused.iter().map(String::as_str).collect();
@@ -1532,6 +1532,11 @@ async fn verify_locally(
                     output,
                 } = &ran
                 {
+                    // A change that is only tests, all of which just ran, can
+                    // break nothing else the suite would catch. Matched against
+                    // the test files only: every `.php` path ends with "php",
+                    // so the whole argv would call any change covered.
+                    covered = focused_covers(&changed_paths, &focused[3..]);
                     results.push(serde_json::json!({
                         "command": named,
                         "passed": true,
@@ -1539,6 +1544,11 @@ async fn verify_locally(
                     }));
                 }
             }
+        }
+        if covered {
+            let event = ProviderEvent::Text(format!("{shown} skipped: the change is only the tests that just passed"));
+            let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+            continue;
         }
         // Before the change the quick check stands in for the suite, and its
         // result is recorded under the suite's name so a later Verify matches it.
@@ -1559,7 +1569,14 @@ async fn verify_locally(
             Ran::Cancelled => return Some(false),
             Ran::NotStarted => {}
             // A failed install is reported under its suite, with what it printed.
-            Ran::Finished { passed, output } => {
+            Ran::Finished { mut passed, output } => {
+                if !passed && php_warnings_only(&shown, &output, &changed_paths) {
+                    passed = true;
+                    let event = ProviderEvent::Text(format!(
+                        "{shown} only printed runner warnings; every test passed, so it counts as passed"
+                    ));
+                    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+                }
                 if !passed
                     && !before_change
                     && missing_program(&output)
@@ -1581,9 +1598,7 @@ async fn verify_locally(
     let passed = results.iter().all(|check| check["passed"] == true);
     // A tree git could not list has no fingerprint to remember a pass by.
     if before_change && passed && scope.before_run.is_some() {
-        if let Ok(mut passed_before) = PASSED_BEFORE.lock() {
-            passed_before.push(key);
-        }
+        let _ = store.remember_checks_passed(&key);
     }
     state.structured = Some(serde_json::json!({
         "checks": results,
@@ -1636,7 +1651,7 @@ fn quick_check(check: &project::Check) -> Option<Vec<String>> {
         return None;
     }
     let file = ["tests/Feature", "tests/Unit"].iter().find_map(|sub| {
-        std::fs::read_dir(check.dir.join(sub))
+        let mut files: Vec<(u64, String)> = std::fs::read_dir(check.dir.join(sub))
             .ok()?
             .flatten()
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
@@ -1645,10 +1660,78 @@ fn quick_check(check: &project::Check) -> Option<Vec<String>> {
                 name.ends_with("Test.php")
                     .then_some((entry.metadata().ok()?.len(), name))
             })
-            .min()
+            .collect();
+        files.sort();
+        // A stub with no test in it fails on its own ("Class X cannot be
+        // found"), which would mark every run's suite as broken before it began.
+        files
+            .into_iter()
+            .find(|(_, name)| {
+                std::fs::read_to_string(check.dir.join(sub).join(name))
+                    .is_ok_and(|text| has_php_test(&text))
+            })
             .map(|(_, name)| format!("{sub}/{name}"))
     })?;
     Some(vec!["php".into(), "artisan".into(), "test".into(), file])
+}
+
+/// Whether the test files that just ran are everything this run changed. Every
+/// `.php` path ends with "php", so this matches whole file names, never suffixes.
+fn focused_covers(changed: &[String], files: &[String]) -> bool {
+    !changed.is_empty()
+        && changed
+            .iter()
+            .all(|path| files.iter().any(|f| path == f || path.ends_with(&format!("/{f}"))))
+}
+
+fn has_php_test(text: &str) -> bool {
+    text.contains("function test") || text.contains("#[Test]") || text.contains("@test")
+}
+
+/// A PHPUnit or Artisan run that exited non-zero only for runner warnings:
+/// every test passed and nothing failed. Not a pass when a warning names a
+/// file this run changed, since a broken new test is exactly such a warning.
+fn php_warnings_only(command: &str, output: &str, changed: &[String]) -> bool {
+    let program = command.rsplit(": ").next().unwrap_or(command);
+    if !(program.starts_with("php ") || program.starts_with("composer ")) {
+        return false;
+    }
+    let plain = strip_ansi(output);
+    let lower = plain.to_ascii_lowercase();
+    if lower.contains("failures!") || lower.contains("errors!") {
+        return false;
+    }
+    let clean_summary = plain.lines().map(str::trim).any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.starts_with("tests:") && line.contains(" passed") && !line.contains("fail") && !line.contains("error")
+    });
+    let clean = clean_summary || plain.contains("OK, but there were issues");
+    clean
+        && !changed.iter().any(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|name| name.ends_with(".php") && plain.contains(name))
+        })
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC [ params final-byte
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn missing_program(output: &str) -> bool {
@@ -1939,6 +2022,7 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
             artifact,
             model: Some(ctx.plan.model(ctx.id).model.to_string()),
             effort: Some(ctx.plan.model(ctx.id).effort.to_string()),
+            duration_ms: None,
         },
         failed,
     )
@@ -3644,8 +3728,8 @@ ping -n 60 127.0.0.1 >nul
     #[test]
     fn a_failed_verify_is_fixed_once_unless_it_failed_before_the_run() {
         let failing = serde_json::json!({"checks": [{"command": "npm test", "passed": false, "output": "no"}], "verdict": "fail"});
-        let verify = StageNote { stage: Stage::Verify, model: None, effort: None, summary: String::new(), artifact: Some(failing.clone()) };
-        let fix = StageNote { stage: Stage::Fix, model: None, effort: None, summary: String::new(), artifact: None };
+        let verify = StageNote { stage: Stage::Verify, model: None, effort: None, duration_ms: None, summary: String::new(), artifact: Some(failing.clone()) };
+        let fix = StageNote { stage: Stage::Fix, model: None, effort: None, duration_ms: None, summary: String::new(), artifact: None };
         let round = |notes, failing_before| Round {
             stage: Stage::Verify,
             failed: true,
@@ -3691,8 +3775,8 @@ ping -n 60 127.0.0.1 >nul
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
-        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\n").unwrap();
-        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\n// more\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\nfunction test_one() {}\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\nfunction test_two() {}\n// more\n").unwrap();
         Some(())
     }
 
@@ -3700,8 +3784,11 @@ ping -n 60 127.0.0.1 >nul
     fn the_check_before_a_change_is_one_small_laravel_test() {
         let dir = std::env::temp_dir().join(format!("orteca-quick-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
-        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\n").unwrap();
-        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\n// more\n").unwrap();
+        // Named like a test and smaller than SmallTest, but holds none: LiftMe
+        // has exactly this file, and running it fails with "cannot be found".
+        std::fs::write(dir.join("tests/Feature/ScratchDebugTest.php"), "<?php\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/SmallTest.php"), "<?php\nfunction test_one() {}\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/LargerTest.php"), "<?php\nfunction test_two() {}\n// more\n").unwrap();
         std::fs::write(dir.join("tests/Feature/helpers.php"), "").unwrap();
         let check = |kind| project::Check {
             kind,
@@ -3717,6 +3804,42 @@ ping -n 60 127.0.0.1 >nul
         );
         assert_eq!(quick_check(&check("js")), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The suite is only skipped when the files that ran are the whole change.
+    #[test]
+    fn only_a_test_only_change_skips_the_suite() {
+        let ran = ["tests/Feature/BlogApiTest.php".to_string()];
+        assert!(focused_covers(&ran, &ran));
+        assert!(focused_covers(&["app/tests/Feature/BlogApiTest.php".to_string()], &ran));
+        assert!(
+            !focused_covers(&["app/Http/Controllers/Api/BlogController.php".to_string()], &ran),
+            "a source file ends with \"php\" too; it is not covered"
+        );
+        assert!(!focused_covers(&[], &ran), "nothing changed is not a covered change");
+    }
+
+    /// A suite that exits non-zero while every test passed is a runner warning,
+    /// not a failure - unless the warning names a file this run changed.
+    #[test]
+    fn a_php_suite_that_only_warns_counts_as_passed() {
+        let passed = "  Tests:    360 passed (1206 assertions)\n  Duration: 101s\n";
+        let warned = "Class ScratchDebugTest cannot be found in tests/Feature/ScratchDebugTest.php\n";
+        let text = format!("{warned}{passed}");
+        let changed = ["app/Http/Controllers/Api/BlogController.php".to_string()];
+        assert!(php_warnings_only("composer test", &text, &changed));
+        assert!(php_warnings_only(
+            "api: php artisan test",
+            "OK, but there were issues!\nTests: 360, Assertions: 1206, PHPUnit Warnings: 1.",
+            &[]
+        ));
+        // The agent's own broken test file warns the same way; that is a failure.
+        assert!(!php_warnings_only("composer test", &text, &["tests/Feature/ScratchDebugTest.php".to_string()]));
+        assert!(!php_warnings_only("composer test", "  Tests:    2 failed, 358 passed\n", &[]));
+        assert!(!php_warnings_only("composer test", "FAILURES!\nTests: 360, Failures: 1.\n", &[]));
+        assert!(!php_warnings_only("npm test", passed, &[]), "only PHP suites warn this way");
+        // Colour codes must not hide the summary line.
+        assert!(php_warnings_only("composer test", "  \u{1b}[32;1mTests:\u{1b}[39;22m    3 passed\n", &[]));
     }
 
     /// Checks that already failed before the change are shown to the agent,

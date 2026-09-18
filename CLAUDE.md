@@ -55,7 +55,9 @@ The Project screen is a shell plus pages in `src/views/project/`, sharing `state
   Verify gets one Fix (resuming the session that wrote the change) and runs
   again, a Review runs once. Before that Fix, the failing Laravel test files
   run again in a throwaway worktree at `base_commit`; ones that already failed
-  there buy no Fix.
+  there buy no Fix. A PHPUnit suite on in-memory SQLite (no ParaTest) runs as
+  up to 8 parallel shards, each with its own Laravel manifests and `storage/`
+  tree; a failing shard's tests rerun in one process and that is the verdict.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the

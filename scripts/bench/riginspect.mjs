@@ -6,8 +6,8 @@
 //   BENCH=liftme                      LiftMe instead of RigInspectBE (tasks in liftme.tasks.mjs)
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
-// Free modes: SUITE=1 (composer test on HEAD), DRY=1|<task>, REGRADE, DIAG.
-import { execFileSync, spawnSync } from "node:child_process";
+// Free modes: SUITE=1 (composer test on HEAD), SUITE=shards (sharded vs serial), DRY=1|<task>, REGRADE, DIAG.
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -206,6 +206,33 @@ if (process.env.DIAG) {
   console.log("phpstan", tail(spawnSync("php", ["vendor/bin/phpstan", "analyse", "app/Services/GlobalSearchService.php", "--memory-limit=1G", "--no-progress"], { cwd: dir, encoding: "utf8", env: ENV })));
   // Same argv Orteca's verify_locally builds; TOML single quotes survive cmd.
   console.log("codex sandbox npm test", tail(spawnSync("codex", ["sandbox", "-c", "windows.sandbox='elevated'", "--", "npm.cmd", "test"], { cwd: dir, encoding: "utf8", env: ENV, shell: true, timeout: 300_000 })));
+  dropWorktree(dir);
+  process.exit(0);
+}
+if (process.env.SUITE === "shards") {
+  // Free: the phpunit shards Orteca's Verify would run, side by side, against serial `composer test`.
+  const dir = join(ROOT, "dry", "suite");
+  makeWorktree(dir);
+  const plain = (s) => (s ?? "").replace(/\x1b\[[0-9;]*m/g, "");
+  const r = spawnSync("cargo", ["test", "bench_shards", "--", "--ignored", "--nocapture"], { cwd: TAURI, env: { ...ENV, BENCH_DIR: dir }, encoding: "utf8", shell: true });
+  const shards = r.stdout.split("\n").filter((l) => l.startsWith("SHARD ")).map((l) => JSON.parse(l.slice(6)));
+  if (!shards.length) console.log("not sharded", r.stderr.slice(-300));
+  const t0 = Date.now();
+  // The same per-shard Laravel caches run::run_sharded sets.
+  const folders = (from, to) => { mkdirSync(to, { recursive: true }); for (const e of readdirSync(from, { withFileTypes: true })) if (e.isDirectory()) folders(join(from, e.name), join(to, e.name)); };
+  const own = (i) => { const d = join(ROOT, "dry", "shards", String(i)); folders(join(dir, "storage"), join(d, "storage")); return { APP_PACKAGES_CACHE: join(d, "packages.php").slice(2), APP_SERVICES_CACHE: join(d, "services.php").slice(2), LARAVEL_STORAGE_PATH: join(d, "storage") }; };
+  const ends = await Promise.all(shards.map((files, i) => new Promise((done) => {
+    const p = spawn("php", ["vendor/bin/phpunit", ...files], { cwd: dir, env: { ...ENV, ...own(i) } });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (out += d));
+    p.on("close", (code) => done({ code, files: files.length, tail: plain(out).trim().split("\n").slice(-2).join(" ") + (code ? " :: " + (plain(out).match(/\d\) [^\n]+\n[^\n]+\n[^\n]*/)?.[0] ?? "").replace(/\s+/g, " ") : "") }));
+  })));
+  console.log(`${shards.length} shards in ${Math.round((Date.now() - t0) / 1000)}s`);
+  for (const e of ends) console.log(`exit ${e.code} (${e.files} files) :: ${e.tail}`);
+  const t1 = Date.now();
+  const serial = spawnSync("composer test", { cwd: dir, encoding: "utf8", env: ENV, shell: true, timeout: 20 * 60_000 });
+  console.log(`composer test :: exit ${serial.status} in ${Math.round((Date.now() - t1) / 1000)}s ::`, plain(serial.stdout).match(/Tests: .*/)?.[0]);
   dropWorktree(dir);
   process.exit(0);
 }

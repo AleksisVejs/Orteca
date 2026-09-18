@@ -75,8 +75,13 @@ impl Run {
 
 /// Spawn `program` with `args` in `cwd`, inside a fresh Job Object.
 pub fn spawn(program: &str, args: &[&str], cwd: &Path) -> io::Result<Run> {
+    spawn_env(program, args, cwd, &[])
+}
+
+/// `spawn`, with these variables added to the inherited environment.
+pub fn spawn_env(program: &str, args: &[&str], cwd: &Path, env: &[(&str, PathBuf)]) -> io::Result<Run> {
     let job = Arc::new(Job::new()?);
-    let mut child = spawn_suspended(program, args, cwd)?;
+    let mut child = spawn_suspended(program, args, cwd, env)?;
 
     let pid = child
         .id()
@@ -182,10 +187,11 @@ pub fn can_change_acl(dir: &Path) -> bool {
         .is_ok()
 }
 
-fn spawn_suspended(program: &str, args: &[&str], cwd: &Path) -> io::Result<Child> {
+fn spawn_suspended(program: &str, args: &[&str], cwd: &Path, env: &[(&str, PathBuf)]) -> io::Result<Child> {
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -230,6 +236,7 @@ mod tests {
             "node",
             &["-e", "console.log('escaped')"],
             &std::env::temp_dir(),
+            &[],
         )
         .unwrap();
         let mut reader = BufReader::new(child.stdout.take().unwrap());

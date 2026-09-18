@@ -1516,7 +1516,12 @@ async fn verify_locally(
             continue;
         }
         if matches!(ran, Ran::Finished { passed: true, .. }) {
-            ran = run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await;
+            ran = match shards(check) {
+                Some(groups) => {
+                    run_sharded(store, ctx, state, control, emit, &groups, &check.dir, &shown, &changed_paths).await
+                }
+                None => run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await,
+            };
         }
         match ran {
             Ran::Cancelled => return Some(false),
@@ -1770,39 +1775,89 @@ async fn run_check(
     cwd: &Path,
     shown: &str,
 ) -> Ran {
+    match run_all(store, ctx, state, control, emit, &[command.to_vec()], &[], cwd, shown).await {
+        Ok(mut ended) => {
+            let (code, output) = ended.remove(0);
+            said_whether(store, ctx, emit, shown, code == Some(0));
+            Ran::Finished { passed: code == Some(0), output }
+        }
+        Err(ran) => ran,
+    }
+}
+
+/// Commands with the same program, side by side, each in its own Job Object
+/// and with its own added environment, if `envs` has one for it. Each ends
+/// with its exit code (`None` when killed or timed out) and the end of its
+/// output. A Stop or the timeout stops them all.
+#[allow(clippy::too_many_arguments)]
+async fn run_all(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    commands: &[Vec<&str>],
+    envs: &[Vec<(&str, PathBuf)>],
+    cwd: &Path,
+    shown: &str,
+) -> std::result::Result<Vec<(Option<i32>, String)>, Ran> {
     // ponytail: ten minutes per command is a guess at a slow suite; make it per project when one needs longer.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     let say = |event: ProviderEvent| {
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
-    let Some(program) = crate::providers::which(command[0]) else {
-        return Ran::NotStarted;
+    let Some(program) = crate::providers::which(commands[0][0]) else {
+        return Err(Ran::NotStarted);
     };
-    let Ok(mut run) = proc::spawn(&program.to_string_lossy(), &command[1..], cwd) else {
-        say(ProviderEvent::Text(format!("{shown} did not start")));
-        return Ran::NotStarted;
-    };
+    let mut runs = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        let env = envs.get(i).map_or(&[][..], Vec::as_slice);
+        // Dropping the ones already started kills them.
+        let Ok(run) = proc::spawn_env(&program.to_string_lossy(), &command[1..], cwd, env) else {
+            say(ProviderEvent::Text(format!("{shown} did not start")));
+            return Err(Ran::NotStarted);
+        };
+        runs.push(run);
+    }
     say(ProviderEvent::ToolUse {
         name: "orteca".into(),
         summary: shown.to_string(),
     });
     let started = now_ms();
 
-    let mut tail = std::collections::VecDeque::new();
-    let mut code = None;
+    // Every process's lines through one channel, tagged with whose they are.
+    let (tx, mut lines) = mpsc::unbounded_channel();
+    for (i, run) in runs.iter_mut().enumerate() {
+        let mut own = std::mem::replace(&mut run.lines, mpsc::unbounded_channel().1);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = own.recv().await {
+                if tx.send((i, line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut tails = vec![std::collections::VecDeque::new(); runs.len()];
+    let mut codes = vec![None; runs.len()];
     let mut timed_out = false;
     let deadline = tokio::time::sleep(TIMEOUT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            line = run.lines.recv() => match line {
-                Some(Line::Exit(exit)) => { code = exit; break; }
-                Some(Line::Text(text)) => tail.push_back(text),
-                Some(Line::Json(value)) => tail.push_back(value.to_string()),
+            line = lines.recv() => match line {
+                Some((i, Line::Exit(exit))) => codes[i] = exit,
+                Some((i, Line::Text(text))) => tails[i].push_back(text),
+                Some((i, Line::Json(value))) => tails[i].push_back(value.to_string()),
+                // Every process has exited and said everything it had.
                 None => break,
             },
             Some(action) = control.recv() => match action {
-                Control::Cancel => { answer(Control::Cancel, store, ctx, state, &mut run).await; }
+                Control::Cancel => {
+                    answer(Control::Cancel, store, ctx, state, &mut runs[0]).await;
+                    runs.iter().for_each(proc::Run::cancel);
+                }
                 // No agent is running to take it; the next brief carries it, as
                 // it carries any instruction that arrived between stages.
                 Control::Instruct { text, reply, .. } => {
@@ -1811,30 +1866,246 @@ async fn run_check(
                     let _ = reply.send(InstructionReceipt { disposition: InstructionDisposition::Held });
                 }
             },
-            () = &mut deadline, if !timed_out => { timed_out = true; run.cancel(); }
+            () = &mut deadline, if !timed_out => { timed_out = true; runs.iter().for_each(proc::Run::cancel); }
         }
         // The end of a suite's output is where it says what failed.
-        while tail.len() > 60 {
-            tail.pop_front();
+        for tail in &mut tails {
+            while tail.len() > 60 {
+                tail.pop_front();
+            }
         }
     }
     if state.outcome.cancelled {
-        return Ran::Cancelled;
+        return Err(Ran::Cancelled);
     }
-    let mut output = Vec::from(tail).join("\n");
-    if timed_out {
-        output.push_str("\nStopped by Orteca after 10 minutes.");
-    }
-    let passed = code == Some(0) && !timed_out;
     state.timings.push(Timing {
         label: shown.to_string(),
         ms: now_ms().saturating_sub(started),
     });
-    say(ProviderEvent::Text(format!(
-        "{shown} {}",
-        if passed { "passed" } else { "did not pass" }
-    )));
-    Ran::Finished { passed, output }
+    let ended: Vec<(Option<i32>, String)> = codes
+        .into_iter()
+        .zip(tails)
+        .map(|(code, tail)| {
+            let mut output = Vec::from(tail).join("\n");
+            if timed_out {
+                output.push_str("\nStopped by Orteca after 10 minutes.");
+            }
+            (code.filter(|_| !timed_out), output)
+        })
+        .collect();
+    Ok(ended)
+}
+
+/// Test files split into up to `min(cores, 8)` groups of similar size, when
+/// running them side by side cannot race: `phpunit.xml` gives every process
+/// its own in-memory SQLite database, ParaTest is not installed to do this
+/// already, no config cache overrides that environment, and the declared
+/// command is only PHPUnit or `artisan test`. Anything else runs as declared,
+/// which keeps a MySQL suite serial.
+fn shards(check: &project::Check) -> Option<Vec<Vec<String>>> {
+    let dir = &check.dir;
+    if check.kind != "php"
+        || !dir.join("vendor/bin/phpunit").is_file()
+        || dir.join("vendor/brianium/paratest").exists()
+        || dir.join("bootstrap/cache/config.php").exists()
+        // Each shard compiles views into its own folder through this variable;
+        // a config that fixes the path would have them race on one.
+        // The manifests' paths lose their drive (see `rootless`), so the temp
+        // folder has to be on the project's drive.
+        || drive(&std::env::temp_dir()) != drive(dir)
+    {
+        return None;
+    }
+    let plain = |entry: &str| {
+        let entry = entry.replace("--ansi", "");
+        ["@php artisan config:clear", "@php artisan test", "@php vendor/bin/phpunit", "phpunit", "vendor/bin/phpunit"]
+            .contains(&entry.trim())
+    };
+    let declared = match check.test.as_slice() {
+        ["composer", "test"] => {
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("composer.json")).ok()?).ok()?;
+            match &manifest["scripts"]["test"] {
+                serde_json::Value::String(one) => plain(one),
+                serde_json::Value::Array(all) => all.iter().all(|e| e.as_str().is_some_and(plain)),
+                _ => false,
+            }
+        }
+        ["php", "vendor/bin/phpunit"] => true,
+        _ => false,
+    };
+    let config = std::fs::read_to_string(dir.join("phpunit.xml"))
+        .or_else(|_| std::fs::read_to_string(dir.join("phpunit.xml.dist")))
+        .ok()?;
+    if !declared
+        || !config.contains(r#"name="DB_CONNECTION" value="sqlite""#)
+        || !config.contains(r#"name="DB_DATABASE" value=":memory:""#)
+    {
+        return None;
+    }
+    let suites = config.split_once("<testsuites>")?.1.split_once("</testsuites>")?.0;
+    if suites.contains("<exclude") || suites.contains("<file") {
+        return None;
+    }
+    let mut files: Vec<(u64, String)> = Vec::new();
+    for tag in suites.split("<directory").skip(1) {
+        let (attributes, rest) = tag.split_once('>')?;
+        if attributes.contains("suffix=") && !attributes.contains(r#"suffix="Test.php""#) {
+            return None;
+        }
+        let folder = rest.split_once("</directory>")?.0.trim().trim_start_matches("./");
+        collect_tests(dir, folder, &mut files);
+    }
+    let groups = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8)
+        .min(files.len());
+    if groups < 2 {
+        return None;
+    }
+    // Largest first, each to the lightest group so far.
+    files.sort_by(|a, b| b.cmp(a));
+    let mut shards = vec![(0u64, Vec::new()); groups];
+    for (size, file) in files {
+        let lightest = shards.iter_mut().min_by_key(|(total, _)| *total)?;
+        lightest.0 += size;
+        lightest.1.push(file);
+    }
+    Some(shards.into_iter().map(|(_, files)| files).collect())
+}
+
+fn drive(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    (text.get(1..2) == Some(":")).then(|| text[..2].to_ascii_uppercase())
+}
+
+/// Laravel reads a manifest path as absolute only when it starts with a slash,
+/// and joins anything else, `C:\...` included, onto the app's own folder.
+/// Without its drive the path is absolute on the project's drive.
+fn rootless(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    PathBuf::from(if drive(path).is_some() { &text[2..] } else { &text[..] })
+}
+
+/// Every `*Test.php` under `folder` that declares its own class. PHPUnit skips
+/// a file without one when it reads a folder, but refuses the whole command
+/// when the file is named outright, so leaving it out loses no test.
+fn collect_tests(root: &Path, folder: &str, files: &mut Vec<(u64, String)>) {
+    let Ok(entries) = std::fs::read_dir(root.join(folder)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = format!("{folder}/{name}");
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_tests(root, &path, files);
+        } else if let Some(class) = name.strip_suffix(".php").filter(|c| c.ends_with("Test")) {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let declared = text.match_indices(&format!("class {class}")).any(|(at, found)| {
+                !text[at + found.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    && !text[..at].ends_with("abstract ")
+            });
+            if declared {
+                files.push((text.len() as u64, path));
+            }
+        }
+    }
+}
+
+/// The suite as its shards. It passes when every shard does; a shard that
+/// only printed runner warnings counts as passed, the way a whole run does.
+/// When one fails, its tests run again in one process and that output, which
+/// names the failing tests, is the verdict.
+#[allow(clippy::too_many_arguments)]
+async fn run_sharded(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    shards: &[Vec<String>],
+    cwd: &Path,
+    shown: &str,
+    changed: &[String],
+) -> Ran {
+    let phpunit = |files: &[String]| -> Vec<String> {
+        ["php", "vendor/bin/phpunit"].into_iter().map(String::from).chain(files.iter().cloned()).collect()
+    };
+    let argvs: Vec<Vec<String>> = shards.iter().map(|files| phpunit(files)).collect();
+    let commands: Vec<Vec<&str>> = argvs.iter().map(|a| a.iter().map(String::as_str).collect()).collect();
+    // Laravel writes its manifests, compiled views, facade cache and fake
+    // disks by renaming or deleting files that another process may hold open,
+    // which Windows refuses. Each shard gets its own manifests and its own
+    // copy of the `storage/` folder tree.
+    let scratch = std::env::temp_dir().join(format!("orteca-shards-{}", ctx.task_id));
+    let envs: Vec<Vec<(&str, PathBuf)>> = (0..shards.len())
+        .map(|i| {
+            let own = scratch.join(i.to_string());
+            copy_folders(&cwd.join("storage"), &own.join("storage"));
+            vec![
+                ("APP_PACKAGES_CACHE", rootless(&own.join("packages.php"))),
+                ("APP_SERVICES_CACHE", rootless(&own.join("services.php"))),
+                ("LARAVEL_STORAGE_PATH", own.join("storage")),
+            ]
+        })
+        .collect();
+    let named = format!("{shown}, as {} parallel phpunit shards", shards.len());
+    let ran = run_all(store, ctx, state, control, emit, &commands, &envs, cwd, &named).await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let ended = match ran {
+        Ok(ended) => ended,
+        Err(ran) => return ran,
+    };
+    let failing: Vec<usize> = (0..ended.len())
+        .filter(|&i| {
+            let (code, output) = &ended[i];
+            *code != Some(0) && !(code.is_some() && php_warnings_only("php vendor/bin/phpunit", output, changed))
+        })
+        .collect();
+    said_whether(store, ctx, emit, &named, failing.is_empty());
+    if failing.is_empty() {
+        return Ran::Finished { passed: true, output: String::new() };
+    }
+    // A failure that only running side by side causes is Orteca's, not the
+    // change's: the failing shards' files run again together in one plain
+    // process, as the declared suite would, and that is the verdict.
+    let files: Vec<String> = failing.iter().flat_map(|&i| shards[i].iter().cloned()).collect();
+    let again = phpunit(&files);
+    let args: Vec<&str> = again.iter().map(String::as_str).collect();
+    let named = format!("{shown}: the failing shards' tests again, in one process");
+    match run_check(store, ctx, state, control, emit, &args, cwd, &named).await {
+        Ran::Finished { passed, output } => Ran::Finished {
+            passed: passed || php_warnings_only("php vendor/bin/phpunit", &output, changed),
+            output,
+        },
+        other => other,
+    }
+}
+
+/// The folder tree under `from`, without its files, recreated under `to`.
+fn copy_folders(from: &Path, to: &Path) {
+    let _ = std::fs::create_dir_all(to);
+    for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            copy_folders(&entry.path(), &to.join(entry.file_name()));
+        }
+    }
+}
+
+fn said_whether(
+    store: &Store,
+    ctx: &Context,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    shown: &str,
+    passed: bool,
+) {
+    let event = ProviderEvent::Text(format!("{shown} {}", if passed { "passed" } else { "did not pass" }));
+    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
 }
 
 fn commit_message(task_id: i64, prompt: &str) -> String {
@@ -3806,6 +4077,118 @@ ping -n 60 127.0.0.1 >nul
             failing_test_files(text),
             ["tests/Feature/NewTest.php", "tests/Feature/OrderTest.php", "tests/Unit/Money/PriceTest.php"]
         );
+    }
+
+    /// A PHPUnit suite on in-memory SQLite, declared as `composer test`: two
+    /// test classes, a class-less file PHPUnit would refuse, and a fake
+    /// `vendor/bin/phpunit` that fails any file containing `FAIL`, and one
+    /// containing `RACE` only inside a shard.
+    fn fake_sqlite_suite(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
+        std::fs::create_dir_all(dir.join("tests/Unit/Money")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor/bin")).unwrap();
+        std::fs::write(
+            dir.join("phpunit.xml"),
+            r#"<phpunit><testsuites><testsuite name="Unit"><directory>tests/Unit</directory></testsuite>
+               <testsuite name="Feature"><directory suffix="Test.php">./tests/Feature</directory></testsuite></testsuites>
+               <php><env name="DB_CONNECTION" value="sqlite"/><env name="DB_DATABASE" value=":memory:"/></php></phpunit>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("composer.json"),
+            r#"{"scripts":{"test":["@php artisan config:clear --ansi","@php artisan test"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("vendor/bin/phpunit"),
+            "<?php\nforeach (array_slice($argv, 1) as $f) { $t = file_get_contents($f); if (str_contains($t, 'FAIL') || (str_contains($t, 'RACE') && getenv('LARAVEL_STORAGE_PATH'))) { echo \"1) Tests\\\\\" . basename($f, '.php') . \"::test_it\\nFAILURES!\\n\"; exit(1); } }\necho \"OK\\n\";\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("tests/Feature/OrderTest.php"), "<?php\nclass OrderTest {}\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/ScratchDebugTest.php"), "<?php\n").unwrap();
+        std::fs::write(dir.join("tests/Feature/BaseTest.php"), "<?php\nabstract class BaseTest {}\n").unwrap();
+        std::fs::write(dir.join("tests/Unit/Money/PriceTest.php"), "<?php\nclass PriceTest {}\n").unwrap();
+    }
+
+    fn fake_laravel_tools_missing() -> bool {
+        crate::providers::which("php").is_none() || crate::providers::which("composer").is_none()
+    }
+
+    /// Free: prints the shards Verify would run for `BENCH_DIR`, for the
+    /// benchmark's `SUITE=shards` to run side by side against `composer test`.
+    #[test]
+    #[ignore]
+    fn bench_shards() {
+        let dir = std::path::PathBuf::from(std::env::var("BENCH_DIR").unwrap());
+        for check in project::check_commands(&dir) {
+            for files in shards(&check).unwrap_or_default() {
+                println!("SHARD {}", serde_json::json!(files));
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_in_memory_sqlite_phpunit_suite_is_sharded() {
+        if std::thread::available_parallelism().map_or(1, usize::from) < 2 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("orteca-shards-{}", std::process::id()));
+        fake_sqlite_suite(&dir);
+        let check = |test| project::Check { kind: "php", dir: dir.clone(), install: None, test };
+        let mut all: Vec<String> = shards(&check(vec!["composer", "test"])).expect("not sharded").concat();
+        all.sort();
+        assert_eq!(all, ["tests/Feature/OrderTest.php", "tests/Unit/Money/PriceTest.php"]);
+        assert!(shards(&check(vec!["php", "vendor/bin/phpunit"])).is_some());
+        assert!(shards(&check(vec!["npm", "test"])).is_none());
+
+        let refused = |setup: &dyn Fn(), undo: &dyn Fn()| {
+            setup();
+            let none = shards(&check(vec!["composer", "test"])).is_none();
+            undo();
+            none
+        };
+        let xml = std::fs::read_to_string(dir.join("phpunit.xml")).unwrap();
+        let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
+        assert!(refused(&|| write("phpunit.xml", &xml.replace("sqlite", "mysql")), &|| write("phpunit.xml", &xml)), "MySQL shares one database");
+        assert!(refused(&|| std::fs::create_dir_all(dir.join("vendor/brianium/paratest")).unwrap(), &|| std::fs::remove_dir_all(dir.join("vendor/brianium")).unwrap()));
+        assert!(refused(&|| { std::fs::create_dir_all(dir.join("bootstrap/cache")).unwrap(); write("bootstrap/cache/config.php", "") }, &|| std::fs::remove_dir_all(dir.join("bootstrap")).unwrap()));
+        let composer = std::fs::read_to_string(dir.join("composer.json")).unwrap();
+        assert!(refused(&|| write("composer.json", &composer.replace("\"@php artisan test\"", "\"@php artisan test\",\"phpstan\"")), &|| write("composer.json", &composer)), "the script does more than test");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Any failing shard fails the suite, and its output names the test.
+    #[tokio::test]
+    async fn a_failing_shard_fails_the_suite_and_names_its_test() {
+        if fake_laravel_tools_missing() || std::thread::available_parallelism().map_or(1, usize::from) < 2 {
+            eprintln!("skipped: php or composer is not on PATH, or one core");
+            return;
+        }
+        // A real failure fails the suite; one only running side by side
+        // causes passes its rerun in one process.
+        for (mark, status) in [("FAIL", "verifyFailed"), ("RACE", "done")] {
+            let store = Store::in_memory().unwrap();
+            let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+            let mut request = routed(&store, &format!("shards-{mark}"), route);
+            let dir = request.dir.clone();
+            fake_sqlite_suite(&dir);
+            std::fs::write(dir.join("tests/Unit/Money/PriceTest.php"), format!("<?php\nclass PriceTest {{}} // {mark}\n")).unwrap();
+            std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
+            let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+            claude_shim(&mut request, &passing);
+
+            let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+            assert_eq!(result.status, status, "{mark}: {:?}", result.failure);
+            assert!(result.timings.iter().any(|t| t.label.contains("parallel phpunit shards")), "{:?}", result.timings);
+            if mark == "FAIL" {
+                let verify = result.stages.iter().find(|n| n.stage == Stage::Verify).unwrap();
+                let output = failed_summary(verify.artifact.as_ref());
+                assert!(output.contains("Tests\\PriceTest::test_it"), "{output}");
+                assert!(!output.contains("OK"), "a passing shard's output is noise: {output}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// The suite is only skipped when the files that ran are the whole change.

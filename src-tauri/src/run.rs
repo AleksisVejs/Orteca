@@ -1743,7 +1743,7 @@ fn focused_php_check(root: &Path, check: &project::Check, changed: &[String]) ->
         .ok()?
         .to_string_lossy()
         .replace('\\', "/");
-    let mut tests: Vec<String> = changed
+    let relative: Vec<String> = changed
         .iter()
         .filter_map(|path| {
             let relative = if prefix.is_empty() {
@@ -1751,17 +1751,96 @@ fn focused_php_check(root: &Path, check: &project::Check, changed: &[String]) ->
             } else {
                 path.strip_prefix(&format!("{prefix}/"))?
             };
-            (relative.starts_with("tests/") && relative.ends_with(".php"))
-                .then(|| relative.replace('\\', "/"))
+            Some(relative.replace('\\', "/"))
         })
-        .take(8)
         .collect();
+    // The run's own tests first, then the ones its change reaches.
+    let mut tests: Vec<String> = relative
+        .iter()
+        .filter(|path| path.starts_with("tests/") && path.ends_with(".php") && check.dir.join(path).is_file())
+        .cloned()
+        .collect();
+    for test in affected_tests(&check.dir, &relative) {
+        if !tests.contains(&test) {
+            tests.push(test);
+        }
+    }
+    tests.truncate(8);
     if tests.is_empty() {
         return None;
     }
     let mut command = vec!["php".into(), "artisan".into(), "test".into()];
     command.append(&mut tests);
     Some(command)
+}
+
+/// Test files a change under `app/` reaches, by plain text: ones that name a
+/// changed class, or that call a URI `routes/*.php` sends to a changed
+/// controller. This only picks what runs first; the full suite still runs.
+// ponytail: literal URIs only; route groups' prefixes and named routes are
+// missed, and a miss only means the suite finds it instead.
+fn affected_tests(dir: &Path, changed: &[String]) -> Vec<String> {
+    let classes: Vec<String> = changed
+        .iter()
+        .filter(|path| path.starts_with("app/") && path.ends_with(".php"))
+        .filter_map(|path| Some(Path::new(path).file_stem()?.to_str()?.to_string()))
+        .collect();
+    if classes.is_empty() {
+        return Vec::new();
+    }
+    let mut uris = Vec::new();
+    for entry in std::fs::read_dir(dir.join("routes")).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        // Laravel mounts routes/api.php under /api.
+        let mount = if name == "api.php" { "/api" } else { "" };
+        for line in text.lines().filter(|line| classes.iter().any(|class| names(line, class))) {
+            if let Some(uri) = route_uri(line) {
+                uris.push(format!("{mount}/{uri}").replace("//", "/"));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect_tests(dir, "tests", &mut files);
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    files
+        .into_iter()
+        .filter(|(_, path)| {
+            std::fs::read_to_string(dir.join(path)).is_ok_and(|text| {
+                classes.iter().any(|class| names(&text, class))
+                    || uris.iter().any(|uri| calls(&text, uri) || calls(&text, &uri[1..]))
+            })
+        })
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// `word` appears in `text` as a whole identifier.
+fn names(text: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        !text[..at].ends_with(ident) && !text[at + word.len()..].starts_with(ident)
+    })
+}
+
+/// The literal URI a route line declares, up to its first parameter:
+/// `Route::get('/blog/{post}', ...)` is `blog`.
+fn route_uri(line: &str) -> Option<String> {
+    let args = line.split_once("Route::")?.1.split_once('(')?.1.trim_start();
+    let quote = args.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let uri = args[1..].split(quote).next()?;
+    let uri = uri.split('{').next()?.trim_matches('/');
+    (!uri.is_empty()).then(|| uri.to_string())
+}
+
+/// A test calls `uri` when it quotes it whole or as the start of a longer path.
+fn calls(text: &str, uri: &str) -> bool {
+    ['\'', '"'].iter().any(|quote| {
+        text.match_indices(&format!("{quote}{uri}"))
+            .any(|(at, found)| text[at + found.len()..].starts_with(['/', '?', '\'', '"']))
+    })
 }
 
 /// Whether the test files that just ran are everything this run changed. Every
@@ -4397,6 +4476,36 @@ ping -n 60 127.0.0.1 >nul
         }
     }
 
+    /// A controller change reaches a test that only names its URI; a service
+    /// change reaches a test that names the class; nothing else is picked.
+    #[test]
+    fn a_change_under_app_picks_the_tests_it_reaches() {
+        let dir = std::env::temp_dir().join(format!("orteca-affected-{}", std::process::id()));
+        for folder in ["tests/Feature", "tests/Unit", "routes", "app/Http/Controllers/Api", "app/Services"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
+        write("artisan", "");
+        write(
+            "routes/api.php",
+            "<?php\nuse App\\Http\\Controllers\\Api\\BlogController;\nRoute::get('/blog/{post}', [BlogController::class, 'show']);\nRoute::get('/shop', [ShopController::class, 'index']);\n",
+        );
+        write("tests/Feature/BlogApiTest.php", "<?php\nclass BlogApiTest { function test_it() { $this->getJson('/api/blog/1'); } }\n");
+        write("tests/Feature/ShopTest.php", "<?php\nclass ShopTest { function test_it() { $this->getJson('/api/shop'); } }\n");
+        write("tests/Feature/BloggerTest.php", "<?php\nclass BloggerTest { function test_it() { $this->getJson('/api/blogger'); } }\n");
+        write("tests/Unit/SearchTest.php", "<?php\nclass SearchTest { function test_it() { new GlobalSearchService(); } }\n");
+        let check = project::Check { kind: "php", dir: dir.clone(), install: None, test: vec!["composer", "test"] };
+        let picked = |changed: &str| {
+            focused_php_check(&dir, &check, &[changed.to_string()]).map(|argv| argv[3..].to_vec())
+        };
+
+        assert_eq!(picked("app/Http/Controllers/Api/BlogController.php"), Some(vec!["tests/Feature/BlogApiTest.php".to_string()]));
+        assert_eq!(picked("app/Services/GlobalSearchService.php"), Some(vec!["tests/Unit/SearchTest.php".to_string()]));
+        assert_eq!(picked("app/Services/Unrelated.php"), None);
+        assert_eq!(picked("resources/css/app.css"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn changed_laravel_tests_become_the_early_tripwire() {
         let dir = std::env::temp_dir().join(format!(
@@ -4405,6 +4514,7 @@ ping -n 60 127.0.0.1 >nul
         ));
         std::fs::create_dir_all(dir.join("tests/Feature")).unwrap();
         std::fs::write(dir.join("artisan"), "").unwrap();
+        std::fs::write(dir.join("tests/Feature/ReminderTest.php"), "<?php\nclass ReminderTest {}\n").unwrap();
         let check = project::Check {
             kind: "php",
             dir: dir.clone(),

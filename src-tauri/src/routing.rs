@@ -928,10 +928,17 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             },
         )
     } else {
+        // The Review is what beat the plain CLI on LiftMe, and its one loss there
+        // was a Standard run without one (2026-09-18). Checks Orteca runs go first,
+        // as on guarded work, so the Review reads passing work.
+        let mut stages = vec![Stage::Implement, Stage::Review, Stage::Verify];
+        if repo.checks_locally {
+            stages.swap(1, 2);
+        }
         (
             RouteKind::Standard,
-            vec![Stage::Implement, Stage::Verify],
-            "ordinary work: implement, then verify",
+            stages,
+            "ordinary work: implement, review and verify",
         )
     };
 
@@ -1022,7 +1029,9 @@ fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
             | (RouteKind::Guarded, _) => Tier::Standard,
             _ => Tier::Deep,
         },
-        review_tier: (kind == RouteKind::Guarded).then_some(Tier::Deep),
+        // Standard reviews on deep too: Sonnet missed a seeded regression Opus
+        // medium caught, for no saving (§4.3.6). Schema Standard has no Review.
+        review_tier: matches!(kind, RouteKind::Guarded | RouteKind::Standard).then_some(Tier::Deep),
     }
 }
 
@@ -1323,6 +1332,23 @@ mod tests {
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {
         route(prompt, Mode::Balanced, &repo(paths))
+    }
+
+    /// Ordinary work is reviewed on deep, after the checks Orteca runs itself.
+    #[test]
+    fn standard_work_is_reviewed_after_local_checks() {
+        let medium = |checks_locally| RepoSignals {
+            intent: Some(Intent::Medium),
+            checks_locally,
+            ..RepoSignals::default()
+        };
+        let r = route("make the header bold", Mode::Efficient, &medium(true));
+        assert_eq!(r.kind, RouteKind::Standard);
+        assert_eq!(r.stages, [Stage::Implement, Stage::Verify, Stage::Review]);
+        assert_eq!(r.budget.review_tier, Some(Tier::Deep));
+        assert_eq!(r.review_model(ProviderId::Claude).map(|m| m.effort), Some("medium"));
+        let r = route("make the header bold", Mode::Balanced, &medium(false));
+        assert_eq!(r.stages, [Stage::Implement, Stage::Review, Stage::Verify]);
     }
 
     /// Short on allowance, a checked route runs one tier down. Never where

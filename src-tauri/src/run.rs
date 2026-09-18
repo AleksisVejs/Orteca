@@ -1680,7 +1680,7 @@ async fn verify_locally(
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
                 let args: Vec<&str> = focused.iter().map(String::as_str).collect();
                 let named = label(check, &args);
-                ran = run_check(store, ctx, state, control, emit, &args, &check.dir, &named).await;
+                ran = run_check_twice(store, ctx, state, control, emit, &args, &check.dir, &named).await;
                 if let Ran::Finished {
                     passed: true,
                     output,
@@ -1723,7 +1723,7 @@ async fn verify_locally(
                 Some(groups) => {
                     run_sharded(store, ctx, state, control, emit, &groups, &check.dir, &shown, &changed_paths).await
                 }
-                None => run_check(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await,
+                None => run_check_twice(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await,
             };
         }
         match ran {
@@ -2045,6 +2045,37 @@ enum Ran {
     Cancelled,
 }
 
+const TIMED_OUT: &str = "\nStopped by Orteca after 10 minutes.";
+
+/// `run_check`, and once more when it fails. A check that fails and then passes
+/// on the same tree is a flaky test, not a broken change: the rerun costs one
+/// check, a Fix costs a model round (LiftMe's QuoteFlowTest failed once and
+/// passed again on the same patch, 2026-09-18). A timeout is not rerun.
+#[allow(clippy::too_many_arguments)]
+async fn run_check_twice(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    command: &[&str],
+    cwd: &Path,
+    shown: &str,
+) -> Ran {
+    let first = run_check(store, ctx, state, control, emit, command, cwd, shown).await;
+    if !matches!(&first, Ran::Finished { passed: false, output } if !output.ends_with(TIMED_OUT)) {
+        return first;
+    }
+    let again = run_check(store, ctx, state, control, emit, command, cwd, &format!("{shown}, again")).await;
+    if matches!(again, Ran::Finished { passed: true, .. }) {
+        let event = ProviderEvent::Text(format!(
+            "{shown} failed, then passed unchanged: a flaky test, so it counts as passed and buys no Fix"
+        ));
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    }
+    again
+}
+
 /// One command to its end, streamed into the run as Orteca's own tool use.
 #[allow(clippy::too_many_arguments)]
 async fn run_check(
@@ -2170,7 +2201,7 @@ async fn run_all(
         .map(|(code, tail)| {
             let mut output = Vec::from(tail).join("\n");
             if timed_out {
-                output.push_str("\nStopped by Orteca after 10 minutes.");
+                output.push_str(TIMED_OUT);
             }
             (code.filter(|_| !timed_out), output)
         })
@@ -4390,7 +4421,43 @@ ping -n 60 127.0.0.1 >nul
 
     /// A `package.json` whose test fails the first time it runs, saying why,
     /// and passes every time after.
+    /// Orteca reruns a failed check once, so this is a flaky test, not a broken change.
     const FAILS_ONCE: &str = r#"{"scripts":{"test":"node -e \"const f=require('fs');if(f.existsSync('ran'))process.exit(0);f.writeFileSync('ran','');console.log('header is not bold');process.exit(1)\""}}"#;
+
+    /// Fails its first run and Orteca's rerun of it, and passes every time
+    /// after: a failure only a Fix round gets past.
+    const FAILS_TWICE: &str = r#"{"scripts":{"test":"node -e \"const f=require('fs');const n=f.existsSync('ran')?+f.readFileSync('ran','utf8'):0;f.writeFileSync('ran',String(n+1));if(n>=2)process.exit(0);console.log('header is not bold');process.exit(1)\""}}"#;
+
+    /// A check that fails and then passes unchanged is flaky: it buys no Fix.
+    #[tokio::test]
+    async fn a_flaky_check_is_rerun_instead_of_fixed() {
+        let store = Store::in_memory().unwrap();
+        let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let mut request = routed(&store, "flaky-check", route);
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        claude_shim(&mut request, &serde_json::json!({}));
+        let said = std::sync::Mutex::new(Vec::new());
+        let result = stream(&store, &Live::default(), request, |e| {
+            if let ProviderEvent::Text(t) = e {
+                said.lock().unwrap().push(t.clone());
+            }
+            Ok(())
+        })
+        .await;
+        let said = said.into_inner().unwrap();
+        assert_eq!(result.status, "done", "{:?}", result.budget_stop);
+        assert_eq!(result.calls_used, 1, "a flaky test bought a Fix");
+        assert!(said.iter().any(|t| t.contains("a flaky test")), "{said:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Standard work without its Review, for tests about the checks and the Fix.
+    fn unreviewed(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
+        let mut route = routing::route(prompt, mode, repo);
+        route.stages.retain(|s| *s != Stage::Review);
+        route
+    }
 
     /// A stand-in Laravel app: `composer test` runs the suite, `artisan test`
     /// runs test files, and both log what ran. A `broken` file fails both,
@@ -4526,7 +4593,7 @@ ping -n 60 127.0.0.1 >nul
         // causes passes its rerun in one process.
         for (mark, status) in [("FAIL", "verifyFailed"), ("RACE", "done")] {
             let store = Store::in_memory().unwrap();
-            let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+            let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
             let mut request = routed(&store, &format!("shards-{mark}"), route);
             let dir = request.dir.clone();
             fake_sqlite_suite(&dir);
@@ -4554,7 +4621,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn the_change_is_shown_as_checking_before_the_suite_decides() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
         let mut request = routed(&store, "checking", route);
         let dir = request.dir.clone();
         if fake_laravel(&dir).is_none() {
@@ -4629,7 +4696,7 @@ ping -n 60 127.0.0.1 >nul
     async fn checks_that_failed_before_the_run_buy_no_fix() {
         for broken_at_base in [true, false] {
             let store = Store::in_memory().unwrap();
-            let route = routing::route("make the header bold", Mode::Balanced, &RepoSignals::default());
+            let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
             let mut request = routed(&store, &format!("failed-before-{broken_at_base}"), route);
             let dir = request.dir.clone();
             if fake_laravel(&dir).is_none() {
@@ -4665,13 +4732,14 @@ ping -n 60 127.0.0.1 >nul
             // The Fix starts beside the base check either way, and counts.
             assert_eq!(result.calls_used, 2, "the failure got no Fix");
             let log = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+            // Each failing suite run is run once more before it counts.
             let suites = log.lines().filter(|l| l.contains("suite")).count();
             if broken_at_base {
                 assert!(stop.message.contains("already failed"), "{}", stop.message);
-                assert_eq!(suites, 1, "a failure the run did not cause was checked again: {log}");
+                assert_eq!(suites, 2, "a failure the run did not cause was checked again: {log}");
             } else {
                 assert!(!stop.message.contains("already failed"), "{}", stop.message);
-                assert_eq!(suites, 2, "the Fix was not checked: {log}");
+                assert_eq!(suites, 4, "the Fix was not checked: {log}");
             }
             assert!(!log.contains("test tests/Feature/SmallTest.php"), "the base ran in the user's tree: {log}");
             assert!(!copy.exists(), "the base copy was left behind");
@@ -4971,7 +5039,7 @@ ping -n 60 127.0.0.1 >nul
         };
         let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
 
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5007,7 +5075,7 @@ ping -n 60 127.0.0.1 >nul
 
         let mut request = routed(&store, "local-verify-fail", route);
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         claude_shim(&mut request, &passing);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done");
@@ -5032,7 +5100,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_missing_test_dependency_never_buys_an_agent_fix() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5113,7 +5181,7 @@ ping -n 60 127.0.0.1 >nul
         // passing Review, and the Review is not asked again.
         let mut request = routed(&store, "guarded-tests-fail", route.clone());
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         claude_shim_answers(&mut request, &[implemented.clone(), review.clone(), fixed.clone()]);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
@@ -5131,7 +5199,7 @@ ping -n 60 127.0.0.1 >nul
         // Both fail: exactly one Fix, and its brief carries both.
         let mut request = routed(&store, "guarded-both-fail", route);
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         claude_shim_answers(&mut request, &[implemented, changes, fixed]);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         // This Fix edits nothing, so the Review still stands and the run stops.
@@ -5310,7 +5378,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn checks_a_fix_cannot_move_end_the_route_as_verify_failed() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5378,7 +5446,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_changed_fix_gets_no_second_paid_attempt_when_verify_still_fails() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5417,7 +5485,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_fix_that_passes_its_check_again_finishes_the_task() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5524,14 +5592,14 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_codex_fix_resumes_the_session_that_wrote_the_change() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
         );
         let request = routed(&store, "fix-resumes", route);
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         std::fs::write(
             &request.program,
             "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",
@@ -5584,7 +5652,7 @@ ping -n 60 127.0.0.1 >nul
     #[tokio::test]
     async fn a_claude_fix_resumes_the_session_that_wrote_the_change() {
         let store = Store::in_memory().unwrap();
-        let route = routing::route(
+        let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
@@ -5592,7 +5660,7 @@ ping -n 60 127.0.0.1 >nul
         let mut request = routed(&store, "claude-fix-resumes", route);
         request.id = ProviderId::Claude;
         let dir = request.dir.clone();
-        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         std::fs::write(
             &request.program,
             "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n",

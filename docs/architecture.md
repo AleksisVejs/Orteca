@@ -1057,12 +1057,12 @@ Rule order is not the table's order. The two escalating rules are tested first,
 because a prompt that scores trivially but touches authorisation is not a
 trivial task, and one that has already failed twice is not a candidate for the
 route that just failed it. The table also had no default row; there is now a
-`Standard` route — Implement → Verify — for everything in the middle.
+`Standard` route — Implement → Review → Verify — for everything in the middle.
 
 | Route | Stages | Calls |
 |---|---|---|
 | `ImplementOnce` | Implement, then Verify when Orteca can run it | 1 |
-| `Standard` | Implement → Verify; schema-only work omits Verify when no local check exists | 1 or 2 |
+| `Standard` | Implement → Review → Verify, checks Orteca runs before the Review, the Review on `deep` (2026-09-18: it was the Review that beat the plain CLI on LiftMe, and a Standard run without one lost); schema work is one Implement, then Verify when Orteca can run it | 1 to 3 |
 | `Planned` | Plan → Implement → Verify | 3 |
 | `Escalated` | Plan → Implement → Review | 3 |
 | `Guarded` | Implement → Review → Verify, Plan first when large | 3 or 4 |

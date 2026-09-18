@@ -8,7 +8,7 @@
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
 // Free modes: SUITE=1 (composer test on HEAD), SUITE=shards (sharded vs serial), DRY=1|<task>, REGRADE, DIAG.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -68,6 +68,13 @@ function makeWorktree(dir) {
   // Guard against grading the real repo's code again.
   const loaded = execFileSync("php", ["-r", "require 'vendor/autoload.php'; echo (new ReflectionClass('App\\Http\\Controllers\\Controller'))->getFileName();"], { cwd: dir, encoding: "utf8" });
   if (!loaded.toLowerCase().startsWith(dir.toLowerCase())) throw Error(`app classes load from ${loaded}, not ${dir}`);
+  // A fresh copy's first `php artisan test` took 50-95s, warm ~10s. Pay that here,
+  // on the smallest test that has a test in it, so a run starts like a real checkout.
+  const feature = join(dir, "tests", "Feature");
+  const warm = readdirSync(feature).filter((f) => f.endsWith(".php")).map((f) => join(feature, f))
+    .filter((f) => /function test|#\[Test\]|@test/.test(readFileSync(f, "utf8")))
+    .sort((a, b) => statSync(a).size - statSync(b).size)[0];
+  if (warm) spawnSync("php", ["artisan", "test", warm.slice(dir.length + 1)], { cwd: dir, env: ENV, stdio: "ignore", timeout: 5 * 60_000 });
 }
 
 function dropWorktree(dir) {

@@ -1085,6 +1085,91 @@ pub async fn stream(
             .then(|| project::patch_since(&ctx.dir, base_commit.as_deref()).ok())
             .flatten();
 
+        // The tests and a Review both only read, so on a guarded route the
+        // Review runs while the suite does, and one Fix answers both.
+        if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
+            let review_ctx = Context {
+                plan: stage_plan(&route, id, task_id, &stages, index + 1),
+                final_stage: index + 2 == stages.len(),
+                ..ctx.clone()
+            };
+            let mut brief =
+                routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes);
+            brief.push_str(&attached_note(&ctx.attachments));
+            brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
+            let payload = stage_payload(Stage::Review, index + 1, stages.len(), &review_ctx.plan, id);
+            if let Err(e) = note(store, &review_ctx, "stage", &payload) {
+                state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
+                break;
+            }
+            state.recording = Recording::new(recordings.as_deref(), task_id, Stage::Review, id);
+            let launch = Launch::first(id, &brief, &review_ctx.plan);
+            let scope = VerifyScope {
+                index,
+                of: stages.len(),
+                base_commit: base_commit.as_deref(),
+                before_run: before_run.as_ref(),
+                requested_build: route.signals.requested_build,
+                requested_lint: route.signals.requested_lint,
+            };
+            let mut side = state.beside(&ctx);
+            let (to_review, mut review_control) = mpsc::unbounded_channel();
+            let (to_suite, mut suite_control) = mpsc::unbounded_channel();
+            let (reviewed_at, (checked, checked_at)) = side_by_side(
+                &mut control,
+                to_review,
+                async {
+                    call(store, &review_ctx, &mut state, &mut review_control, &emit, launch).await;
+                    now_ms()
+                },
+                to_suite,
+                async {
+                    let checked = verify_locally(store, &ctx, &mut side, &mut suite_control, &emit, scope, &show_checking).await;
+                    (checked, now_ms())
+                },
+                |_| false,
+            )
+            .await;
+            let verified = checked.map(|_| finish_stage(store, &ctx, &mut side, Stage::Verify));
+            state.absorb(side);
+            let (mut review_note, review_failed) = finish_stage(store, &review_ctx, &mut state, Stage::Review);
+            review_note.duration_ms = reviewed_at.map(|at| at.saturating_sub(stage_started));
+            state.held.clear();
+            let going = state.outcome.failure.is_none() && !state.outcome.cancelled;
+            let Some((mut verify_note, verify_failed)) = verified else {
+                // Nothing here Orteca can run. The Review stands first, as on
+                // a route without local checks, and a model Verify follows.
+                stages.swap(index, index + 1);
+                state.notes.push(review_note);
+                if review_failed && going {
+                    stages.insert(index + 1, Stage::Fix);
+                }
+                index += 1;
+                continue;
+            };
+            (verify_note.model, verify_note.effort) = (None, None);
+            if verify_failed {
+                verify_note.summary = failed_summary(verify_note.artifact.as_ref());
+                if going {
+                    ask_base = verify_note.artifact.clone();
+                }
+            }
+            verify_note.duration_ms = Some(checked_at.saturating_sub(stage_started));
+            // The one that failed goes last: a Fix that changes nothing is
+            // judged by what the last note asked for.
+            if review_failed || !verify_failed {
+                state.notes.extend([verify_note, review_note]);
+            } else {
+                state.notes.extend([review_note, verify_note]);
+            }
+            stages.remove(index + 1);
+            if (verify_failed || review_failed) && going {
+                stages.splice(index + 1..index + 1, [Stage::Fix, Stage::Verify]);
+            }
+            index += 1;
+            continue;
+        }
+
         // A Verify is a test command and a pass or a fail. When the repository
         // names its command Orteca runs it: no model call, no false failure
         // from an agent's shell, and a failure still buys the Fix call.
@@ -4979,16 +5064,18 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Guarded work in a repository with a test command runs the tests before
-    /// the deep Review. Passing work is reviewed knowing the tests pass; a
-    /// failure is fixed and tested again, and the Review reads the fix.
+    /// Guarded work in a repository with a test command runs the tests beside
+    /// the deep Review. Passing work is done after both; whatever fails is
+    /// answered by one Fix that carries every finding, then tested again.
     #[tokio::test]
-    async fn guarded_work_runs_its_tests_before_the_review() {
+    async fn guarded_work_runs_its_tests_beside_the_review() {
         let store = Store::in_memory().unwrap();
         let script =
             |code: u8| format!(r#"{{"scripts":{{"test":"node -e \"process.exit({code})\""}}}}"#);
         let review = serde_json::json!({"findings": [], "verdict": "pass"});
+        let changes = serde_json::json!({"findings": [{"severity": "high", "summary": "owner check is missing"}], "verdict": "changes_requested"});
         let fixed = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        let implemented = serde_json::json!({});
         let signals = RepoSignals {
             checks_locally: true,
             ..RepoSignals::default()
@@ -5013,43 +5100,75 @@ ping -n 60 127.0.0.1 >nul
         );
         assert_eq!(result.calls_used, 2);
         assert!(
-            briefs(&dir)[1].contains("tests already pass"),
-            "the review was not told the tests pass"
+            briefs(&dir)[1].contains("tests are running on it now"),
+            "the review was not told the tests run beside it"
+        );
+        assert!(
+            briefs(&dir)[1].contains("The change under review"),
+            "the review was not handed the patch"
         );
         std::fs::remove_dir_all(dir).unwrap();
 
-        let mut request = routed(&store, "guarded-tests-fail", route);
+        // Only the tests fail: the Fix is handed their output and not the
+        // passing Review, and the Review is not asked again.
+        let mut request = routed(&store, "guarded-tests-fail", route.clone());
         let dir = request.dir.clone();
         std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
-        claude_shim_answers(&mut request, &[review.clone(), fixed, review]);
+        claude_shim_answers(&mut request, &[implemented.clone(), review.clone(), fixed.clone()]);
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(
             stages(&result),
-            [
-                Stage::Implement,
-                Stage::Verify,
-                Stage::Fix,
-                Stage::Verify,
-                Stage::Review
-            ]
+            [Stage::Implement, Stage::Review, Stage::Verify, Stage::Fix, Stage::Verify]
         );
         assert_eq!(result.calls_used, 3);
         let calls = briefs(&dir);
-        assert!(
-            calls[1].contains("runs again after this call"),
-            "{}",
-            calls[1]
-        );
-        assert!(
-            calls[2].contains("tests already pass"),
-            "the review was not told the fix passed its tests"
-        );
-        assert!(
-            calls[2].contains("The change under review"),
-            "the review was not handed the patch"
-        );
+        assert!(calls[2].contains("runs again after this call"), "{}", calls[2]);
+        assert!(calls[2].contains("header is not bold"), "{}", calls[2]);
+        assert!(!calls[2].contains("Validated review artifact"), "{}", calls[2]);
         std::fs::remove_dir_all(dir).unwrap();
+
+        // Both fail: exactly one Fix, and its brief carries both.
+        let mut request = routed(&store, "guarded-both-fail", route);
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("package.json"), FAILS_ONCE).unwrap();
+        claude_shim_answers(&mut request, &[implemented, changes, fixed]);
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        // This Fix edits nothing, so the Review still stands and the run stops.
+        assert_eq!(result.status, "reviewRejected", "{:?}", result.budget_stop);
+        assert_eq!(
+            stages(&result),
+            [Stage::Implement, Stage::Verify, Stage::Review, Stage::Fix]
+        );
+        assert_eq!(result.calls_used, 3, "one Fix answers both");
+        let calls = briefs(&dir);
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].contains("header is not bold"), "the Fix lost the failing tests: {}", calls[2]);
+        assert!(calls[2].contains("owner check is missing"), "the Fix lost the review: {}", calls[2]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// One Stop ends the model call and the check beside it; a check result
+    /// that makes the call moot ends the call alone.
+    #[tokio::test]
+    async fn a_stop_reaches_both_sides() {
+        let stopped = |mut rx: mpsc::UnboundedReceiver<Control>| async move {
+            matches!(rx.recv().await, Some(Control::Cancel))
+        };
+        let (tx, mut control) = mpsc::unbounded_channel();
+        let (to_model, model_rx) = mpsc::unbounded_channel();
+        let (to_check, check_rx) = mpsc::unbounded_channel();
+        tx.send(Control::Cancel).unwrap();
+        let (model, check) =
+            side_by_side(&mut control, to_model, stopped(model_rx), to_check, stopped(check_rx), |_| false).await;
+        assert_eq!((model, check), (Some(true), true));
+
+        let (_tx, mut control) = mpsc::unbounded_channel();
+        let (to_model, model_rx) = mpsc::unbounded_channel();
+        let (to_check, _) = mpsc::unbounded_channel();
+        let (model, check) =
+            side_by_side(&mut control, to_model, stopped(model_rx), to_check, async { true }, |moot| *moot).await;
+        assert_eq!((model, check), (None, true), "a moot call was waited for");
     }
 
     #[tokio::test]

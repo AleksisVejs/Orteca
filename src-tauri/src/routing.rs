@@ -1082,9 +1082,17 @@ pub fn brief(
                         .as_ref()
                         .is_some_and(|a| stage_passed(n.stage, a))
                 });
+            let running = route.verifies_before_review()
+                && !carried.iter().any(|n| matches!(n.stage, Stage::Verify | Stage::Fix));
             if tested {
                 out.push_str(
                     " The repository's tests already pass on it; spend the review on the \
+                     inputs and paths they do not cover.",
+                );
+            } else if running {
+                // Orteca runs them beside this Review.
+                out.push_str(
+                    " The repository's tests are running on it now; spend the review on the \
                      inputs and paths they do not cover.",
                 );
             }
@@ -1158,12 +1166,26 @@ pub fn brief(
             .find(|n| n.stage == Stage::Plan)
             .into_iter()
             .collect(),
-        Stage::Fix => carried
-            .iter()
-            .rev()
-            .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix))
-            .into_iter()
-            .collect(),
+        Stage::Fix => {
+            // A Review and a Verify that ran side by side each hand on what
+            // they found.
+            let mut failed: Vec<&StageNote> = carried
+                .iter()
+                .rev()
+                .take_while(|n| matches!(n.stage, Stage::Review | Stage::Verify))
+                .filter(|n| !n.artifact.as_ref().is_some_and(|a| stage_passed(n.stage, a)))
+                .collect();
+            if failed.is_empty() {
+                failed.extend(
+                    carried
+                        .iter()
+                        .rev()
+                        .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix)),
+                );
+            }
+            failed.reverse();
+            failed
+        }
         Stage::Plan | Stage::Review | Stage::Verify | Stage::Answer => Vec::new(),
     };
     for note in handoff {

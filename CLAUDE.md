@@ -53,9 +53,10 @@ The Project screen is a shell plus pages in `src/views/project/`, sharing `state
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
   fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A failed
   Verify gets one Fix (resuming the session that wrote the change) and runs
-  again, a Review runs once. Before that Fix, the failing Laravel test files
-  run again in a throwaway worktree at `base_commit`; ones that already failed
-  there buy no Fix. A PHPUnit suite on in-memory SQLite (no ParaTest) runs as
+  again, a Review runs once; on a guarded route it runs beside the local
+  suite and one Fix answers both. Beside that Fix, the failing Laravel test
+  files run again in a throwaway worktree at `base_commit`; if they already
+  failed there the Fix is stopped and the run ends `verifyFailed`. A PHPUnit suite on in-memory SQLite (no ParaTest) runs as
   up to 8 parallel shards, each with its own Laravel manifests and `storage/`
   tree; a failing shard's tests rerun in one process and that is the verdict.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads

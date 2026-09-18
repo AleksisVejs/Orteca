@@ -276,6 +276,15 @@ pub struct Resume {
     pub reply: String,
 }
 
+/// How long one step outside the agent took: the classify call, the check
+/// before the change, each check command. Stages carry their own.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Timing {
+    pub label: String,
+    pub ms: u64,
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -326,6 +335,8 @@ pub struct TaskResult {
     /// What a follow-up would resume. `None` for a copy, whose folder a
     /// follow-up does not run in.
     pub resume: Option<Resume>,
+    /// Steps outside the agent, in the order they ran.
+    pub timings: Vec<Timing>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -662,6 +673,8 @@ pub struct Request {
     /// A reply that continues `task_id` rather than opening a task of its own:
     /// its usage adds to the task's, and its prompt is logged as a new turn.
     pub continued: bool,
+    /// What ran before this request existed, such as the classify call.
+    pub timings: Vec<Timing>,
 }
 
 /// The raw event stream of one run, kept so a paid run can be replayed free.
@@ -854,6 +867,7 @@ struct State {
     apply_now_pending: bool,
     /// The last writing or answering session, for a follow-up.
     resume_point: Option<Resume>,
+    timings: Vec<Timing>,
 }
 
 /// What happens after one process ends.
@@ -888,6 +902,7 @@ pub async fn stream(
         attachments,
         mut resume,
         continued,
+        timings,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -927,6 +942,7 @@ pub async fn stream(
         session: None,
         apply_now_pending: false,
         resume_point: None,
+        timings,
     };
 
     // The whole decision, recorded before a single process starts. Without this
@@ -965,6 +981,7 @@ pub async fn stream(
     let mut failing_before = Vec::new();
     if route.stages.contains(&Stage::Verify) && state.outcome.failure.is_none() {
         ctx.plan.stage = Stage::Verify;
+        let started = now_ms();
         let scope = VerifyScope {
             index: 0,
             of: route.stages.len(),
@@ -978,6 +995,10 @@ pub async fn stream(
             failing_before = state.structured.as_ref().map(failed_checks).unwrap_or_default();
         }
         state.structured = None;
+        state.timings.push(Timing {
+            label: "check before the change".into(),
+            ms: now_ms().saturating_sub(started),
+        });
     }
 
     // Mutable because a failed check is followed by a Fix and the same check.
@@ -1334,6 +1355,7 @@ Before any change, the project's checks already fail. This may be the task, or a
         baseline,
         resume: state.resume_point.filter(|_| worktree.is_none()),
         worktree,
+        timings: state.timings,
     }
 }
 
@@ -1774,6 +1796,7 @@ async fn run_check(
         name: "orteca".into(),
         summary: shown.to_string(),
     });
+    let started = now_ms();
 
     let mut tail = std::collections::VecDeque::new();
     let mut code = None;
@@ -1813,6 +1836,10 @@ async fn run_check(
         output.push_str("\nStopped by Orteca after 10 minutes.");
     }
     let passed = code == Some(0) && !timed_out;
+    state.timings.push(Timing {
+        label: shown.to_string(),
+        ms: now_ms().saturating_sub(started),
+    });
     say(ProviderEvent::Text(format!(
         "{shown} {}",
         if passed { "passed" } else { "did not pass" }
@@ -2622,6 +2649,7 @@ mod tests {
             attachments: Vec::new(),
             resume: None,
             continued: false,
+            timings: Vec::new(),
             id: ProviderId::Codex,
             program: dir.join("fake.cmd"),
             dir,

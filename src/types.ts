@@ -329,6 +329,8 @@ export interface TaskResult {
   worktree: Worktree | null;
   /** The session a follow-up can pick back up, and when it last spoke. */
   resume: Resume | null;
+  /** Steps outside the agent (classify, each check command), in order. */
+  timings: { label: string; ms: number }[];
 }
 export interface TaskEvent {
   id: number;

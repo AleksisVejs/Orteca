@@ -223,12 +223,14 @@ async fn start_task(
     // Read before the route is chosen, on the provider the run will spend.
     // Unreadable means the keyword router decides, never a failed run.
     // The same call names the task, so a title costs no extra call.
+    let started = std::time::Instant::now();
     let (reading, classified) = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
         (Some(text), Some(program)) => {
             intent::read(provider, &program.to_string_lossy(), &text).await
         }
         _ => (Default::default(), Vec::new()),
     };
+    let classify_ms = started.elapsed().as_millis() as u64;
     let mut request = tauri::async_runtime::spawn_blocking(move || {
         prepare_run(
             &prepare_app.state::<Store>(),
@@ -247,6 +249,13 @@ async fn start_task(
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
+    request.timings = vec![
+        run::Timing { label: "classify".into(), ms: classify_ms },
+        run::Timing {
+            label: "prepare".into(),
+            ms: started.elapsed().as_millis() as u64 - classify_ms,
+        },
+    ];
     request.classified = classified;
     request.attachments = attachments;
     request.resume = resume;
@@ -528,6 +537,7 @@ fn prepare_run(
         attachments: Vec::new(),
         resume: None,
         continued: continued.is_some(),
+        timings: Vec::new(),
     })
 }
 

@@ -113,6 +113,7 @@ function runArm(arm, dir, prompt) {
       status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed,
       budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
       cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
+      stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
     };
   }
   if (arm === "claude") {

@@ -1138,6 +1138,37 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Free. The Start here list for each recorded prompt, for
+    /// `scripts/bench/navstats.mjs --recall`: NAV_REPO (a checkout at the
+    /// prompts' base), NAV_CASES (a JSON array of prompts). Prints one
+    /// `NAV <json list>` line per prompt, in order.
+    #[test]
+    #[ignore]
+    fn nav_recall() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let dir = std::path::PathBuf::from(var("NAV_REPO"));
+        let prompts: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(var("NAV_CASES")).unwrap()).unwrap();
+        let store = Store::in_memory().unwrap();
+        let record = store.touch_project("nav", "nav").unwrap();
+        let tracked = project::tracked_paths(&dir);
+        store.scan_map(record.id, &dir, &tracked).unwrap();
+        let signals = routing::RepoSignals {
+            tracked_paths: tracked,
+            recent_paths: project::recent_paths(&dir),
+            // NAV_NOMAP ranks as before the map, for the before number.
+            code_map: match std::env::var("NAV_NOMAP") {
+                Ok(_) => Vec::new(),
+                Err(_) => store.code_map(record.id).unwrap(),
+            },
+            ..Default::default()
+        };
+        for prompt in prompts {
+            let route = routing::route(&prompt, Mode::Balanced, &signals);
+            println!("NAV {}", serde_json::to_string(&route.candidate_paths).unwrap());
+        }
+    }
+
     /// Spends real usage. One Orteca run for a benchmark driver:
     /// BENCH_DIR, BENCH_PROMPT, BENCH_PROVIDER (claude|codex), BENCH_MODE
     /// (efficient|balanced), BENCH_OUT (TaskResult JSON).

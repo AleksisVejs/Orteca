@@ -2,12 +2,14 @@
 // (~/.claude/projects/*liftme-bench-wt-*). Free: reads logs, runs nothing.
 //
 //   node scripts/bench/navstats.mjs
+//   node scripts/bench/navstats.mjs --recall   (NOMAP=1 for the old ranking, VERBOSE=1 for lists)
 //
 // Cost uses Sonnet price ratios: fresh input 1, cache read 0.1, cache write
 // 1.25, output 5. A session's first turn is left out, because it pays the
 // one-time system prompt whatever tool it calls. "Start here" recall counts
 // edited files that were on the brief's list, over every edited file.
 
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -126,7 +128,70 @@ export function stats(all) {
   return { rows, recall: { hit, edited } };
 }
 
-if (process.argv[1]?.endsWith('navstats.mjs')) {
+// The prompt a brief was built from.
+export function taskOf(prompt) {
+  const m = /^Task:\n([\s\S]*?)\n\nStart here\./.exec(prompt);
+  return m ? m[1].trim() : null;
+}
+
+// Offline recall: rank each recorded prompt again on a throwaway worktree of
+// LiftMe at HEAD (every bench run's base), and count the edited files that
+// existed there which the new list holds. NOMAP=1 ranks without the map.
+function recall() {
+  const repo = process.env.LIFTME ?? 'C:/Users/User/Projects/LiftMe';
+  const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+  const cases = sessions()
+    .filter((s) => s.arm === 'orteca' && taskOf(s.prompt))
+    .map((s) => ({ task: taskOf(s.prompt), edited: [...s.edited] }));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orteca-nav-'));
+  const wt = path.join(tmp, 'wt');
+  git('worktree', 'add', '--detach', wt, 'HEAD');
+  try {
+    const existed = new Set(execFileSync('git', ['-C', wt, 'ls-files'], { encoding: 'utf8' }).split('\n'));
+    const prompts = [...new Set(cases.map((c) => c.task))];
+    fs.writeFileSync(path.join(tmp, 'cases.json'), JSON.stringify(prompts));
+    const out = execFileSync('cargo', ['test', '-q', 'nav_recall', '--', '--ignored', '--nocapture'], {
+      cwd: new URL('../../src-tauri', import.meta.url),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit'],
+      env: {
+        ...process.env,
+        NAV_REPO: wt,
+        NAV_CASES: path.join(tmp, 'cases.json'),
+        ...(process.env.NOMAP ? { NAV_NOMAP: '1' } : {}),
+      },
+    });
+    const lists = out.split('\n').filter((l) => l.startsWith('NAV ')).map((l) => JSON.parse(l.slice(4)));
+    const listOf = new Map(prompts.map((p, i) => [p, new Set(lists[i])]));
+    let hit = 0;
+    let total = 0;
+    const missed = {};
+    for (const c of cases) {
+      for (const f of c.edited.filter((f) => existed.has(f))) {
+        total++;
+        if (listOf.get(c.task).has(f)) hit++;
+        else missed[f] = (missed[f] ?? 0) + 1;
+      }
+    }
+    console.log(`recall: ${hit} of ${total} edited files that existed at base (${Math.round((100 * hit) / total)}%)`);
+    const top = Object.entries(missed).sort((a, b) => b[1] - a[1]).slice(0, 12);
+    console.log('most missed:', top.map(([f, n]) => `${f} x${n}`).join(', '));
+    if (process.env.VERBOSE) {
+      for (const [i, p] of prompts.entries()) {
+        const edited = new Set(cases.filter((c) => c.task === p).flatMap((c) => c.edited).filter((f) => existed.has(f)));
+        const miss = [...edited].filter((f) => !listOf.get(p).has(f));
+        console.log(`\n${p.slice(0, 100)}\n  ${lists[i].map((f) => (edited.has(f) ? '* ' : '  ') + f).join('\n  ')}\n  missed: ${miss.join(', ')}`);
+      }
+    }
+  } finally {
+    git('worktree', 'remove', '--force', wt);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1]?.endsWith('navstats.mjs') && process.argv.includes('--recall')) {
+  recall();
+} else if (process.argv[1]?.endsWith('navstats.mjs')) {
   const { rows, recall } = stats(sessions());
   const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : '-');
   console.log('arm     sessions  turns  search  search cost  nav before first edit');

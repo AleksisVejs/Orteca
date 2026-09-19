@@ -43,11 +43,34 @@ pub struct Reading {
 }
 
 // One line: it travels as an argument, and a Windows shim mangles newlines.
-const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: question, easy, medium, or hard. question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. The request may be in any language.";
+const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: question, easy, medium, or hard. question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Input validation, pagination or page-size limits, rate limits, and other resource bounds are general unless the request is about an authentication or permission boundary. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. The request may be in any language.";
 
-/// A small model's first minute is mostly a Node shim starting. A classifier
-/// slower than this costs more waiting than it can save.
+/// A classifier slower than this costs more waiting than it can save. The
+/// wait is the model, not the shim: the CLI itself starts in ~0.3s, and an
+/// unbounded haiku spent 22-61s and up to 6.2k tokens on one classification
+/// (2026-09-19). `THINKING` is what keeps the call inside this.
 const DEADLINE: Duration = Duration::from_secs(45);
+
+/// The ceiling a Claude classifier call reasons under.
+///
+/// Codex has always had one, as `model_reasoning_effort` in `args`. Claude
+/// had none, so haiku reasoned without a ceiling and the whole route waited:
+/// on one prompt 22s, 37s and 61s on three runs, the last past `DEADLINE`.
+/// Bounded, the same three ran 12-15s and returned the same label every time.
+/// `--effort low` is not this bound - a run under it still reached 4.7k
+/// tokens. Removing the reasoning is not either: at zero, one prompt read as
+/// `easy`, `security`, `hard` and `medium` on four runs.
+// ponytail: 1024 is the first value tried, on two prompts and one machine.
+const THINKING: &str = "1024";
+
+/// The environment a classifier call needs on top of the inherited one.
+fn env(id: ProviderId) -> Vec<(&'static str, std::path::PathBuf)> {
+    match id {
+        ProviderId::Claude => vec![("MAX_THINKING_TOKENS", THINKING.into())],
+        // Bounded by `model_reasoning_effort` on the command line instead.
+        ProviderId::Codex => Vec::new(),
+    }
+}
 
 /// The model and effort each CLI is asked for.
 pub fn model(id: ProviderId) -> &'static str {
@@ -197,7 +220,7 @@ async fn ask(
     let argv = args(id);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Never in the user's project: nobody has consented to its settings for this.
-    let mut run = proc::spawn(program, &borrowed, &std::env::temp_dir()).ok()?;
+    let mut run = proc::spawn_env(program, &borrowed, &std::env::temp_dir(), &env(id)).ok()?;
     let request = match id {
         ProviderId::Claude => format!("Request:\n{prompt}"),
         ProviderId::Codex => format!("{INSTRUCTION}\n\nRequest:\n{prompt}"),
@@ -280,5 +303,15 @@ mod tests {
         let codex = args(ProviderId::Codex).join(" ");
         assert!(codex.contains("--sandbox read-only"));
         assert!(!codex.contains("danger-full-access"));
+    }
+
+    /// Both providers bound the reasoning, by the means each one has. Without
+    /// it the call runs past `DEADLINE` and the route waits for nothing.
+    #[test]
+    fn every_classifier_call_bounds_its_reasoning() {
+        let claude = env(ProviderId::Claude);
+        assert_eq!(claude, vec![("MAX_THINKING_TOKENS", THINKING.into())]);
+        assert!(env(ProviderId::Codex).is_empty());
+        assert!(args(ProviderId::Codex).join(" ").contains("model_reasoning_effort=\"low\""));
     }
 }

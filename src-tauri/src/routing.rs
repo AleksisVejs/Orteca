@@ -398,13 +398,20 @@ impl Route {
     /// Sol family; lower-consumption challengers can be benchmarked later
     /// without putting Astra on the user's allowance.
     pub fn work_model(&self, id: ProviderId) -> Option<ModelChoice> {
-        if id != ProviderId::Codex || !self.signals.schema_change {
-            return None;
-        }
-        Some(ModelChoice {
+        let schema = (id == ProviderId::Codex && self.signals.schema_change).then_some(ModelChoice {
             model: "gpt-5.6-sol",
             effort: "medium",
-        })
+        });
+        // NAV_EFFORT runs Implement and Fix at another effort, for the
+        // benchmark's arms. It moves the effort and never the model, and the
+        // Review keeps its own tier either way, so what it measures is the
+        // writing effort alone.
+        let Some(effort) = bench_effort() else {
+            return schema;
+        };
+        let mut choice = schema.unwrap_or_else(|| self.budget.preferred_tier.model(id));
+        choice.effort = effort;
+        Some(choice)
     }
 
     /// What the Review runs on when that is not the route's tier.
@@ -423,6 +430,21 @@ impl Route {
             }
         }
         Some(choice)
+    }
+}
+
+/// The effort `NAV_EFFORT` asks Implement and Fix for. An unset or unknown
+/// value leaves the route alone: a typo must never quietly reroute a run.
+///
+/// It *sets* the effort and does not cap it, so on a tier that already asks
+/// for less it raises. Point it at a task that lands on the tier being
+/// measured, or the arm measures the opposite of what it meant to.
+fn bench_effort() -> Option<&'static str> {
+    match std::env::var("NAV_EFFORT").ok()?.as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
     }
 }
 
@@ -1408,6 +1430,58 @@ pub struct StageNote {
     pub duration_ms: Option<u64>,
 }
 
+/// How much of one failing check's output a Fix brief carries.
+// ponytail: 4 KB a check, no total cap; add one if a run ever fails many
+// checks at once.
+const CHECK_OUTPUT: usize = 4096;
+
+/// The nearest character boundary at or below `at`, or above it when `up`.
+fn boundary(text: &str, at: usize, up: bool) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at = if up { at + 1 } else { at - 1 };
+    }
+    at
+}
+
+/// A long string's head and tail, with a line naming what was cut. Both ends,
+/// because a compiler names the first error and a test suite the last.
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let head = boundary(text, limit / 2, false);
+    let tail = boundary(text, text.len() - limit / 2, true);
+    format!("{}
+[{} bytes cut]
+{}", &text[..head], tail - head, &text[tail..])
+}
+
+/// One stage's artifact as the next one should see it.
+///
+/// A Verify or Fix artifact carries every check's whole stdout, and a passing
+/// suite's is the bulk of it. The Fix is bought to repair what failed, so a
+/// passing check hands on its command and its verdict - enough to say what
+/// must not break - and not its output, and a failing one is cut to
+/// `CHECK_OUTPUT`. The whole log is in the event log either way.
+fn forwarded(stage: Stage, artifact: &serde_json::Value) -> String {
+    if !matches!(stage, Stage::Verify | Stage::Fix) {
+        return artifact.to_string();
+    }
+    let mut artifact = artifact.clone();
+    if let Some(checks) = artifact.get_mut("checks").and_then(serde_json::Value::as_array_mut) {
+        for check in checks {
+            let passed = check["passed"] == true;
+            let Some(output) = check["output"].as_str() else {
+                continue;
+            };
+            let kept = if passed { String::new() } else { clip(output, CHECK_OUTPUT) };
+            check["output"] = serde_json::Value::String(kept);
+        }
+    }
+    artifact.to_string()
+}
+
 /// The prompt one stage is given.
 ///
 /// A brief names paths and states the contract. It never pastes file contents,
@@ -1561,7 +1635,7 @@ pub fn brief(
                 out.push_str("\nValidated ");
                 out.push_str(note.stage.name());
                 out.push_str(" artifact:\n");
-                out.push_str(&artifact.to_string());
+                out.push_str(&forwarded(note.stage, artifact));
                 out.push('\n');
             }
             // No artifact came back, so nothing here claims one did. The
@@ -2304,6 +2378,42 @@ mod tests {
             route(prompt, Mode::Balanced, &repo(REPO)),
             route(prompt, Mode::Balanced, &repo(REPO))
         );
+    }
+
+    #[test]
+    fn a_fix_carries_the_failure_and_not_the_suite_that_passed() {
+        let r = balanced("make the header bold", REPO);
+        let noise = "x".repeat(CHECK_OUTPUT * 2);
+        let failed = StageNote {
+            stage: Stage::Verify,
+            model: None,
+            effort: None,
+            duration_ms: None,
+            summary: "failed check".into(),
+            artifact: Some(serde_json::json!({
+                "checks": [
+                    {"command": "cargo test", "passed": true, "output": "passing-suite-noise"},
+                    {"command": "npm test", "passed": false,
+                     "output": format!("first-error\n{noise}\nlast-error")},
+                ],
+                "verdict": "fail"
+            })),
+        };
+        let fix = brief(&r, Stage::Fix, "task", &[], &[failed]);
+        // The command a passing check ran still says what must not break.
+        assert!(fix.contains("cargo test") && !fix.contains("passing-suite-noise"));
+        // Both ends of the failure survive; the middle does not.
+        assert!(fix.contains("first-error") && fix.contains("last-error"));
+        assert!(fix.contains("bytes cut") && !fix.contains(&noise));
+    }
+
+    #[test]
+    fn clipping_cuts_on_character_boundaries() {
+        let text = "é".repeat(200);
+        let cut = clip(&text, 64);
+        assert!(cut.len() < text.len() && cut.contains("bytes cut"));
+        assert!(cut.starts_with('é') && cut.ends_with('é'));
+        assert_eq!(clip("short", 64), "short");
     }
 
     /// The brief names paths so the agent stops hunting. It must never carry

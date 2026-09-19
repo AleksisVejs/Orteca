@@ -6,6 +6,7 @@
 //   BENCH=liftme                      LiftMe instead of RigInspectBE (tasks in liftme.tasks.mjs)
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
+//   NOEDITLOCK=1                      Claude may still edit through a shell, for the before arm
 // Free modes: SUITE=1 (composer test on HEAD), SUITE=shards (sharded vs serial), DRY=1|<task>, REGRADE, DIAG.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -128,7 +129,8 @@ function runArm(arm, dir, prompt) {
   if (arm.startsWith("orteca-")) {
     const out = join(ROOT, "out", `${arm}-${Date.now()}.json`);
     mkdirSync(dirname(out), { recursive: true });
-    const env = { ...ENV, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out };
+    const env = { ...ENV, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out,
+      ...(process.env.NOEDITLOCK ? { NAV_NOEDITLOCK: "1" } : {}) };
     const r = spawnSync("cargo", ["test", "bench_run", "--", "--ignored"], { cwd: TAURI, env, encoding: "utf8", shell: true, timeout: ARM_TIMEOUT });
     if (!existsSync(out)) return { status: "noResult", error: (r.stdout + r.stderr).slice(-400), ms: Date.now() - t0 };
     return ortecaRow(JSON.parse(readFileSync(out, "utf8")));

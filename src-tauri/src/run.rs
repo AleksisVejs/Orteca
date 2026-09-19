@@ -68,6 +68,20 @@ const CLAUDE_DENY_COMMANDS: &[&str] = &[
     "Set-ExecutionPolicy:*",
 ];
 
+/// Editing through a shell instead of the edit tools. `sed -i` exits 0 having
+/// changed nothing when its pattern misses, so the agent believes the edit landed
+/// and the run pays to discover otherwise turns later; Edit and Write refuse a bad
+/// match loudly and at once. Range reads (`sed -n`) go with them, which costs
+/// nothing: Read is the better tool for that anyway. This catches command
+/// spelling, not `cat x > y` or `python -c`, which a Verify legitimately needs.
+const CLAUDE_SHELL_EDIT_COMMANDS: &[&str] = &[
+    "sed:*",
+    "awk:*",
+    "Set-Content:*",
+    "Out-File:*",
+    "Add-Content:*",
+];
+
 /// Tools that edit files. A stage that is not meant to write is denied them
 /// outright rather than merely asked not to: Claude has no read-only mode to
 /// set, and a Plan stage that edited the code would have skipped the Review the
@@ -78,8 +92,13 @@ const CLAUDE_EDIT_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "MultiEdit
 /// cannot simply be rerun through the other one. A non-writing stage also loses
 /// the edit tools.
 fn claude_deny(writes: bool) -> Vec<String> {
+    // NAV_NOEDITLOCK leaves shell editing allowed, for the benchmark's before arm.
+    let shell_edits = CLAUDE_SHELL_EDIT_COMMANDS
+        .iter()
+        .filter(|_| std::env::var("NAV_NOEDITLOCK").is_err());
     let commands = CLAUDE_DENY_COMMANDS
         .iter()
+        .chain(shell_edits)
         .flat_map(|cmd| [format!("Bash({cmd})"), format!("PowerShell({cmd})")]);
     if writes {
         commands.collect()
@@ -3242,6 +3261,10 @@ mod tests {
         for tool in ["Bash", "PowerShell"] {
             for command in ["push", "reset", "clean"] {
                 assert!(argv.contains(&format!("{tool}(git {command}:*)")));
+            }
+            // A write stage keeps its shells; what it loses is editing with them.
+            for command in ["sed", "awk", "Set-Content"] {
+                assert!(argv.contains(&format!("{tool}({command}:*)")));
             }
         }
     }

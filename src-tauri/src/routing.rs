@@ -14,8 +14,9 @@
 //! can buy one fix, then deterministic verification is the completion gate.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::codemap::FileFacts;
 use crate::intent::Intent;
 use crate::providers::ProviderId;
 
@@ -604,6 +605,9 @@ pub struct RepoSignals {
     /// Paths touched by the last 50 commits. A ranking signal, never a match
     /// on its own.
     pub recent_paths: Vec<String>,
+    /// What each mapped source file defines and uses. Ranking only, never
+    /// the blast radius.
+    pub code_map: Vec<(String, FileFacts)>,
     pub prior_failures: u32,
     /// Route kinds and tiers that stalled in this project's recent runs on the
     /// selected provider. See `Store::stalled_tiers`.
@@ -634,16 +638,27 @@ fn score(haystack: &str, table: &[(&str, u8)]) -> u8 {
         .fold(0u8, u8::saturating_add)
 }
 
-/// The words in a prompt worth matching a path against.
+/// The words in a prompt worth matching a path against. A word starting with
+/// `/` is a URL, not a repository path: its segments count, down to three
+/// letters, so `/api/orders` reaches `routes/api.php`.
 fn nouns(prompt: &str) -> Vec<String> {
     let mut words: Vec<String> = prompt
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.' && c != '/')
-        .filter(|w| w.len() >= 4)
-        .map(|w| w.to_ascii_lowercase())
-        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .flat_map(|w| {
+            if w.starts_with('/') {
+                w.split(|c: char| !c.is_alphanumeric()).filter(|s| s.len() >= 3).collect::<Vec<_>>()
+            } else {
+                vec![w].into_iter().filter(|w| w.len() >= 4).collect::<Vec<_>>()
+            }
+        })
+        .map(|w| w.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|w| !w.is_empty() && !STOPWORDS.contains(&w.as_str()))
         .collect();
     words.sort();
     words.dedup();
+    // One concept, one word: "orders" goes when "order" is there.
+    let all = words.clone();
+    words.retain(|w| !all.iter().any(|base| base != w && names_word(w, base)));
     words
 }
 
@@ -671,69 +686,338 @@ fn is_test(path: &str) -> bool {
         .any(|w| TEST_WORDS.contains(&w))
 }
 
+/// The lowercase words of an identifier: `QuoteController` and
+/// `quote_controller` both give `quote`, `controller`.
+fn ident_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            prev_lower = false;
+            words.push(std::mem::take(&mut word));
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        word.extend(c.to_lowercase());
+    }
+    words.push(word);
+    words.retain(|w| !w.is_empty());
+    words
+}
+
+/// The URL paths a prompt names, keyed as `codemap::url_key` keys strings.
+fn prompt_urls(prompt: &str) -> Vec<String> {
+    prompt
+        .split_whitespace()
+        .map(|w| w.trim_start_matches(['(', '`', '"', '\'']).trim_end_matches([')', '`', '"', '\'', ',', '.', ':', ';']))
+        .filter_map(crate::codemap::url_key)
+        .map(|key| format!("url:{key}"))
+        .collect()
+}
+
+/// How well a URL a file mentions matches one the prompt names: the same
+/// path, or one the tail of the other (a client's base URL drops `/api`),
+/// scores 3; two leading segments in common, a sibling endpoint, 1.
+fn url_match(prompt: &str, file: &str) -> u32 {
+    let a: Vec<&str> = prompt.split('/').collect();
+    let b: Vec<&str> = file.split('/').collect();
+    let same = |x: &[&str], y: &[&str]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p == q || *p == "*" || *q == "*");
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if same(&a, &b) || (short.len() >= 2 && same(short, &long[long.len() - short.len()..])) {
+        return 3;
+    }
+    let common = a.iter().zip(&b).take_while(|(p, q)| p == q && **p != "*").count();
+    if common >= 2 { 1 } else { 0 }
+}
+
+/// A prompt word names an identifier word, allowing a plural.
+fn names_word(noun: &str, word: &str) -> bool {
+    noun.strip_prefix(word)
+        .is_some_and(|rest| matches!(rest, "" | "s" | "es"))
+}
+
+/// The words of what a file defines: types, then functions and methods.
+struct Defined {
+    types: HashSet<String>,
+    functions: HashSet<String>,
+}
+
+fn defined_words(facts: &FileFacts) -> Defined {
+    let mut defined = Defined { types: HashSet::new(), functions: HashSet::new() };
+    for symbol in &facts.defines {
+        let into = if matches!(symbol.kind.as_str(), "function" | "method") {
+            &mut defined.functions
+        } else {
+            &mut defined.types
+        };
+        into.extend(ident_words(&symbol.name));
+    }
+    defined
+}
+
+/// Names defined by more files than this are too common to link through.
+const MAX_DEFINERS: usize = 3;
+
+/// Which mapped files point at which, in either direction: a file that uses
+/// a name is linked to the files that define it, and a path spec is linked
+/// to the tracked file it resolves to.
+fn links(repo: &RepoSignals) -> HashMap<&str, HashSet<&str>> {
+    let tracked: HashSet<&str> = repo.tracked_paths.iter().map(String::as_str).collect();
+    let mut definers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (path, facts) in &repo.code_map {
+        for symbol in facts.defines.iter().filter(|s| s.kind != "method") {
+            definers.entry(symbol.name.as_str()).or_default().push(path.as_str());
+        }
+    }
+    let mut links: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (path, facts) in &repo.code_map {
+        for name in &facts.uses {
+            let targets = if name.starts_with("url:") {
+                Vec::new()
+            } else if name.contains('/') {
+                resolve(path, name, &tracked, &repo.tracked_paths)
+            } else {
+                definers
+                    .get(name.as_str())
+                    .filter(|d| d.len() <= MAX_DEFINERS)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            for target in targets.into_iter().filter(|t| *t != path.as_str()) {
+                links.entry(path.as_str()).or_default().insert(target);
+                links.entry(target).or_default().insert(path.as_str());
+            }
+        }
+    }
+    links
+}
+
+/// The tracked files a path spec from `from` points at.
+fn resolve<'a>(from: &str, spec: &str, tracked: &HashSet<&'a str>, all: &'a [String]) -> Vec<&'a str> {
+    if let Some(file) = spec.strip_prefix("lang/*/") {
+        return all
+            .iter()
+            .map(String::as_str)
+            .filter(|p| p.starts_with("lang/") && p.ends_with(file) && p.matches('/').count() == 2)
+            .collect();
+    }
+    let bases: Vec<String> = if spec.starts_with("./") || spec.starts_with("../") {
+        let mut parts: Vec<&str> = from.split('/').collect();
+        parts.pop();
+        for part in spec.split('/') {
+            match part {
+                "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        vec![parts.join("/")]
+    } else if let Some(rest) = spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/")) {
+        // ponytail: the two usual aliases, not the bundler's config.
+        vec![format!("resources/js/{rest}"), format!("src/{rest}")]
+    } else {
+        vec![spec.to_string()]
+    };
+    const ENDINGS: &[&str] = &["", ".ts", ".js", ".vue", ".tsx", ".jsx", "/index.ts", "/index.js"];
+    bases
+        .iter()
+        .flat_map(|base| ENDINGS.iter().map(move |end| format!("{base}{end}")))
+        .filter_map(|p| tracked.get(p.as_str()).copied())
+        .take(1)
+        .collect()
+}
+
+/// How many paths a brief names, and how many of them are kept for tests.
+const LISTED: usize = 10;
+const TEST_SLOTS: usize = 2;
+
+/// Seeds whose linked files are pulled into the list, and what each link to
+/// one is worth in units of the prompt's rarest word. Tuned on recorded bench
+/// runs with `scripts/bench/navstats.mjs --recall`.
+const SEEDS: usize = 4;
+const HOP: f64 = 3.0;
+
 /// Tracked paths the prompt is about, most likely first, and how many of them
-/// matched a word of the prompt. Path text and git history only: no file is
-/// opened, hashed or read.
+/// matched a word of the prompt. Path text, git history and the code map: no
+/// file is opened here.
 ///
 /// A file named for a prompt word scores 3, a path merely containing one 1.
-/// Being touched in the last 50 commits adds 2. A test named like a hit is
-/// listed beside it even when the prompt never mentioned it, but does not
-/// count towards the blast radius, which measures what the prompt points at.
+/// A file defining a type named for the word scores 3 too, a function or
+/// method 1; per word the better of the path and the symbols counts. A URL
+/// the prompt names counts as a word, matched against URLs in the code. Each
+/// word is weighted by how rare it is among tracked files, so "quote" in a
+/// quoting app counts less than "resend". Being touched in the last 50
+/// commits adds 2, and each link to a top seed through the map `HOP`, both in
+/// units of the rarest word. A path the prompt spells out goes first. A test
+/// named like a hit is listed beside it even when the prompt never mentioned
+/// it. The blast radius, which measures what the prompt points at, counts
+/// path matches only, as it always has.
 fn candidates(prompt: &str, repo: &RepoSignals) -> (usize, Vec<String>) {
-    let nouns = nouns(prompt);
+    let mut nouns = nouns(prompt);
     if nouns.is_empty() {
         return (0, Vec::new());
     }
-    let mut scored: Vec<(u32, &String)> = repo
+    if !repo.code_map.is_empty() {
+        nouns.extend(prompt_urls(prompt));
+    }
+    let urls: HashMap<&str, Vec<&str>> = repo
+        .code_map
+        .iter()
+        .map(|(path, facts)| {
+            let urls = facts.uses.iter().filter_map(|u| u.strip_prefix("url:")).collect();
+            (path.as_str(), urls)
+        })
+        .collect();
+    let defined: HashMap<&str, Defined> = repo
+        .code_map
+        .iter()
+        .map(|(path, facts)| (path.as_str(), defined_words(facts)))
+        .collect();
+    // Per matched file, per noun: (by path or symbols, by path alone).
+    let matched: Vec<(&String, Vec<(u32, u32)>)> = repo
         .tracked_paths
         .iter()
         .filter_map(|path| {
             let lower = path.to_ascii_lowercase();
             let name = lower.rsplit('/').next();
             let stem = stem(path);
-            let score: u32 = nouns
+            // A test's method names describe behaviour in the prompt's own
+            // words, so they would outrank the code under test.
+            let defined = defined.get(path.as_str()).filter(|_| !is_test(path));
+            let per_noun: Vec<(u32, u32)> = nouns
                 .iter()
                 .map(|noun| {
-                    if name == Some(noun.as_str()) || stem.as_deref() == Some(noun.as_str()) {
+                    if let Some(url) = noun.strip_prefix("url:") {
+                        let files = urls.get(path.as_str()).map_or(&[][..], Vec::as_slice);
+                        return (files.iter().map(|f| url_match(url, f)).max().unwrap_or(0), 0);
+                    }
+                    let by_path = if name == Some(noun.as_str()) || stem.as_deref().is_some_and(|s| names_word(noun, s)) {
                         3
                     } else if lower.contains(noun.as_str()) {
                         1
                     } else {
                         0
-                    }
+                    };
+                    let names = |words: &HashSet<String>| words.iter().any(|w| names_word(noun, w));
+                    let by_symbol = match defined {
+                        Some(d) if names(&d.types) => 3,
+                        Some(d) if names(&d.functions) => 1,
+                        _ => 0,
+                    };
+                    (by_path.max(by_symbol), by_path)
                 })
-                .sum();
-            (score > 0).then_some((score, path))
+                .collect();
+            per_noun.iter().any(|(s, _)| *s > 0).then_some((path, per_noun))
         })
         .collect();
-    let stems: HashSet<String> = scored
-        .iter()
-        .filter(|(_, p)| !is_test(p))
-        .filter_map(|(_, p)| stem(p))
-        .collect();
-    let paired = |path: &str| is_test(path) && stem(path).is_some_and(|s| stems.contains(&s));
+    let stems = |by_path_only: bool| -> HashSet<String> {
+        matched
+            .iter()
+            .filter(|(path, m)| !is_test(path) && (!by_path_only || m.iter().any(|(_, p)| *p > 0)))
+            .filter_map(|(path, _)| stem(path))
+            .collect()
+    };
+    let paired_to = |stems: &HashSet<String>, path: &str| is_test(path) && stem(path).is_some_and(|s| stems.contains(&s));
     // A paired test never widens the blast radius, even one the prompt named.
-    let hits = scored.iter().filter(|(_, p)| !paired(p)).count();
-    let listed: HashSet<&String> = scored.iter().map(|(_, p)| *p).collect();
-    let tests: Vec<&String> = repo
+    let path_stems = stems(true);
+    let hits = matched
+        .iter()
+        .filter(|(path, m)| m.iter().any(|(_, p)| *p > 0) && !paired_to(&path_stems, path))
+        .count();
+
+    let total = repo.tracked_paths.len() as f64;
+    let weights: Vec<f64> = (0..nouns.len())
+        .map(|i| {
+            let df = matched.iter().filter(|(_, m)| m[i].0 > 0).count().max(1) as f64;
+            (1.0 + total / df).ln()
+        })
+        .collect();
+    let unit = weights.iter().copied().fold(0.0, f64::max);
+    let recent: HashSet<&String> = repo.recent_paths.iter().collect();
+    let mut scored: Vec<(f64, &String)> = matched
+        .iter()
+        .map(|(path, m)| (m.iter().zip(&weights).map(|((s, _), w)| *s as f64 * w).sum(), *path))
+        .collect();
+    fn add<'a>(scored: &mut Vec<(f64, &'a String)>, extra: Vec<(f64, &'a String)>) {
+        let listed: HashSet<&String> = scored.iter().map(|(_, p)| *p).collect();
+        scored.extend(extra.into_iter().filter(|(_, p)| !listed.contains(p)));
+    }
+
+    if !repo.code_map.is_empty() {
+        let bonus = |p: &String| if recent.contains(p) { 2.0 * unit } else { 0.0 };
+        let mut seeds: Vec<(f64, &String)> = scored
+            .iter()
+            .filter(|(_, p)| !is_test(p))
+            .map(|(s, p)| (s + bonus(p), *p))
+            .collect();
+        seeds.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let links = links(repo);
+        let by_path: HashMap<&str, &String> = repo.tracked_paths.iter().map(|p| (p.as_str(), p)).collect();
+        // A file linked to several seeds is likelier than one linked to one.
+        let mut linked: HashMap<&str, f64> = HashMap::new();
+        for seed in seeds.iter().take(SEEDS).filter_map(|(_, seed)| links.get(seed.as_str())) {
+            for path in seed {
+                *linked.entry(path).or_default() += HOP * unit;
+            }
+        }
+        for (score, path) in &mut scored {
+            *score += linked.get(path.as_str()).copied().unwrap_or_default();
+        }
+        let extra = linked.iter().filter_map(|(p, s)| by_path.get(p).map(|p| (*s, *p))).collect();
+        add(&mut scored, extra);
+    }
+
+    let all_stems = stems(false);
+    let tests = repo
         .tracked_paths
         .iter()
-        .filter(|path| paired(path) && !listed.contains(path))
+        .filter(|path| paired_to(&all_stems, path))
+        .map(|path| (unit, path))
         .collect();
-    scored.extend(tests.into_iter().map(|path| (1, path)));
-    let recent: HashSet<&String> = repo.recent_paths.iter().collect();
+    add(&mut scored, tests);
     for (score, path) in &mut scored {
         if recent.contains(path) {
-            *score += 2;
+            *score += 2.0 * unit;
+        }
+        // A path the prompt spells out is listed first.
+        if path.contains('/') && nouns.contains(&path.to_ascii_lowercase()) {
+            *score += 1000.0 * unit;
         }
     }
-    // Ties go shallowest and shortest first: `src/run.rs` is a likelier
-    // subject than `src/deep/nested/run_helpers_generated.rs`.
+    // Rounded, so sums of the same weights in another order still tie. Ties
+    // go shallowest and shortest first: `src/run.rs` is a likelier subject
+    // than `src/deep/nested/run_helpers_generated.rs`.
+    let key = |s: f64| (s * 1e6).round() as i64;
     scored.sort_by(|(a, pa), (b, pb)| {
-        b.cmp(a).then_with(|| {
+        key(*b).cmp(&key(*a)).then_with(|| {
             (pa.matches('/').count(), pa.len(), pa).cmp(&(pb.matches('/').count(), pb.len(), pb))
         })
     });
+    // The brief lists `LISTED` paths. Tests and code compete for them
+    // separately, so a pile of weak code matches cannot crowd out the test
+    // that exercises the endpoint, nor tests the code.
+    let n_tests = scored.iter().filter(|(_, p)| is_test(p)).count();
+    let test_slots = TEST_SLOTS.max(LISTED.saturating_sub(scored.len() - n_tests));
+    let code_slots = (LISTED - TEST_SLOTS).max(LISTED.saturating_sub(n_tests));
+    let (mut head, mut rest) = (Vec::new(), Vec::new());
+    let (mut tests_in, mut code_in) = (0, 0);
+    for item in scored {
+        let slot = if is_test(item.1) { &mut tests_in } else { &mut code_in };
+        let room = if is_test(item.1) { test_slots } else { code_slots };
+        if head.len() < LISTED && *slot < room {
+            *slot += 1;
+            head.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    let scored: Vec<(f64, &String)> = head.into_iter().chain(rest).collect();
     (hits, scored.into_iter().map(|(_, p)| p.clone()).collect())
 }
 
@@ -1007,7 +1291,7 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         candidate_paths: candidate_paths
             .into_iter()
             .filter(|p| kind != RouteKind::Answer || !is_test(p))
-            .take(10)
+            .take(LISTED)
             .collect(),
         preferred_providers,
     }
@@ -1328,6 +1612,49 @@ mod tests {
             r.signals.blast_radius, 1,
             "a named paired test widened the blast radius"
         );
+    }
+
+    #[test]
+    fn the_code_map_finds_files_the_prompt_never_names() {
+        let facts = |defines: &[(&str, &str)], uses: &[&str]| FileFacts {
+            defines: defines
+                .iter()
+                .map(|(name, kind)| crate::codemap::Symbol { name: name.to_string(), kind: kind.to_string(), line: 1 })
+                .collect(),
+            uses: uses.iter().map(|u| u.to_string()).collect(),
+        };
+        let map = vec![
+            ("routes/api.php".to_string(), facts(&[], &["QuoteController"])),
+            (
+                "app/Http/Controllers/Api/OfferController.php".to_string(),
+                facts(&[("OfferController", "class"), ("store", "method")], &["Quote"]),
+            ),
+            ("app/Models/Quote.php".to_string(), facts(&[("Quote", "class")], &[])),
+            ("app/Models/Invoice.php".to_string(), facts(&[("Invoice", "class")], &[])),
+            (
+                "app/Http/Controllers/QuoteController.php".to_string(),
+                facts(&[("QuoteController", "class")], &["Quote"]),
+            ),
+            ("tests/Feature/EditingTest.php".to_string(), facts(&[], &["url:api/quotes/*"])),
+        ];
+        let signals = RepoSignals {
+            tracked_paths: map.iter().map(|(p, _)| p.clone()).chain(["resources/js/stores/chat.js".to_string()]).collect(),
+            code_map: map,
+            ..Default::default()
+        };
+        let r = route("Customers can edit quotes they sent", Mode::Balanced, &signals);
+        let listed = &r.candidate_paths;
+        assert_eq!(listed[..2], ["app/Models/Quote.php", "app/Http/Controllers/QuoteController.php"]);
+        assert!(listed.contains(&"routes/api.php".to_string()), "linked to a seed: {listed:?}");
+        assert!(listed.contains(&"app/Http/Controllers/Api/OfferController.php".to_string()));
+        assert!(!listed.contains(&"app/Models/Invoice.php".to_string()));
+        assert_eq!(r.signals.blast_radius, 2, "only path matches widen the blast radius");
+
+        let r = route("PATCH /api/quotes/{quote} must refuse a priced one", Mode::Balanced, &signals);
+        assert!(r.candidate_paths.contains(&"tests/Feature/EditingTest.php".to_string()), "calls the endpoint");
+
+        let r = route("Add an archive action to resources/js/stores/chat.js for a quote", Mode::Balanced, &signals);
+        assert_eq!(r.candidate_paths[0], "resources/js/stores/chat.js", "a named path goes first");
     }
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {

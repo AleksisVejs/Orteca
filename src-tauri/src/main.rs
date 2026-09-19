@@ -369,6 +369,7 @@ fn scan_run(
     let signals = routing::RepoSignals {
         tracked_paths: project::tracked_paths(&dir),
         recent_paths: project::recent_paths(&dir),
+        code_map: store.code_map(project.id).unwrap_or_default(),
         prior_failures: store.prior_failures(project.id, &prompt)?,
         stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
         // The frontend's reading, not a fresh one: the preview and the run

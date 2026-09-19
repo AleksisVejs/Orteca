@@ -647,7 +647,6 @@ impl Store {
     }
 
     /// Every mapped file of a project, by path.
-    #[cfg(test)]
     pub fn code_map(&self, project_id: i64) -> Result<Vec<(String, codemap::FileFacts)>> {
         let conn = self.0.lock().expect("store poisoned");
         let mut files: Vec<(i64, String, codemap::FileFacts)> = conn

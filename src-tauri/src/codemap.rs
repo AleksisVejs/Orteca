@@ -102,6 +102,8 @@ const JS: &str = r#"
   name: (identifier) @function
   value: [(arrow_function) (function_expression)])
 
+(string (string_fragment) @str)
+(template_string (string_fragment) @str)
 (import_statement source: (string (string_fragment) @use))
 (import_specifier name: (identifier) @use)
 (import_clause (identifier) @use)
@@ -214,6 +216,9 @@ fn collect(lang: Lang, source: &str, line_offset: u32, facts: &mut FileFacts) {
                     if let Some(controller) = controller_action(text) {
                         facts.uses.push(controller.to_string());
                     }
+                    if let Some(url) = url_key(text) {
+                        facts.uses.push(format!("url:{url}"));
+                    }
                 }
                 "fn" => call = Some(text),
                 "arg" => arg = Some(text),
@@ -274,6 +279,24 @@ fn rust_use(node: Node, bytes: &[u8], uses: &mut Vec<String>) {
     for child in node.children(&mut cursor) {
         rust_use(child, bytes, uses);
     }
+}
+
+/// A URL path in a string, as `api/quotes/*`: query dropped, placeholders
+/// (`{quote}`, `:id`, `$id`, numbers) as `*`. Tests and clients call the
+/// endpoints a prompt names, so this is how they are found.
+pub fn url_key(text: &str) -> Option<String> {
+    let path = text.strip_prefix('/')?.split(['?', '#']).next()?;
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let dynamic = s.starts_with(['{', ':', '$']) || s.chars().all(|c| c.is_ascii_digit());
+            if dynamic { "*".to_string() } else { s.to_ascii_lowercase() }
+        })
+        .collect();
+    let plain = |s: &String| s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '*'));
+    (!segments.is_empty() && segments.iter().any(|s| s != "*") && segments.iter().all(plain))
+        .then(|| segments.join("/"))
 }
 
 /// `'App\Http\Controllers\QuoteController@show'` names `QuoteController`.
@@ -385,8 +408,24 @@ Route::post('/orders', 'App\Http\Controllers\OrderController@store');
 Route::get('/x', 'not a controller@all');
 "#;
         let facts = parse(Lang::Php, src);
-        assert_eq!(facts.uses, vec!["OrderController", "QuoteController", "Route"]);
+        assert_eq!(
+            facts.uses,
+            vec!["OrderController", "QuoteController", "Route", "url:orders", "url:quotes", "url:x"]
+        );
         assert!(facts.defines.is_empty());
+    }
+
+    #[test]
+    fn url_strings_are_keyed_without_their_placeholders() {
+        assert_eq!(url_key("/api/quotes/{quote}/cancel?x=1").as_deref(), Some("api/quotes/*/cancel"));
+        assert_eq!(url_key("/api/orders/42").as_deref(), Some("api/orders/*"));
+        assert_eq!(url_key("/api/conversations/").as_deref(), Some("api/conversations"));
+        assert_eq!(url_key("/"), None);
+        assert_eq!(url_key("/{id}"), None);
+        assert_eq!(url_key("api/quotes"), None, "not a path without its slash");
+        assert_eq!(url_key("/usr/bin and more"), None);
+        let js = parse(Lang::Js, "api.get(`/quotes/${id}`); fetch('/api/blog/posts');");
+        assert_eq!(js.uses, vec!["url:api/blog/posts", "url:quotes"]);
     }
 
     #[test]

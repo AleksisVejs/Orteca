@@ -2,6 +2,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// Wired into the store by the next commit.
+#[allow(dead_code)]
+mod codemap;
 mod error;
 mod intent;
 mod proc;

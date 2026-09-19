@@ -11,7 +11,7 @@ token/cost metrics.
 
 `docs/architecture.md` is the source of truth — verified CLI flags, the routing model,
 the full SQLite schema, and the 8-milestone plan. Read it before designing anything.
-Milestones 1-6 are done. 7 is built except the file cache, which is deferred;
+Milestones 1-7 are done — the deferred file cache shipped as the code map;
 8 has an unsigned NSIS installer and waits on a signing certificate. CI
 (`.github/workflows/ci.yml`) runs `npm test`, `npm run build` and `cargo test`
 on Windows.
@@ -47,6 +47,11 @@ The Project screen is a shell plus pages in `src/views/project/`, sharing `state
   cannot change, all before any CLI starts. The `Store` is Tauri managed state.
 - `routing.rs` — pure keyword classifier, route and tiers per route, stage
   briefs, artifact checks. No model call and no I/O beyond what `main.rs` hands it.
+- `codemap.rs` — pure tree-sitter parse of one source file (PHP, TS, JS, Rust; a
+  `.vue` file's `<script>` block as TypeScript) into `FileFacts { defines, uses }`,
+  plus the Laravel strings that name a file. `store.rs` keeps a map per project,
+  rescanned on open and before a run, reparsing only what moved; `routing` ranks
+  with it. `NAV_NOMAP=1` withholds it from a run, for the benchmark's before arm.
 - `intent.rs` — before a run, asks the provider's smallest model (no tools, temp dir)
   whether the prompt is a question or easy/medium/hard work. Feeds `routing` as
   `RepoSignals::intent`; a failed read falls back to keywords.

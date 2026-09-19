@@ -6,8 +6,8 @@ Integration surfaces verified against Claude Code and Codex docs, Sept 2026.
 
 ## 1. Current state
 
-Milestones 1 to 6 are implemented, and 7 is built except the deferred file
-cache (see §14). The
+Milestones 1 to 7 are implemented; the deferred file cache shipped as the code
+map (§12). The
 acceptance checks for 1 and 2 are documented in `docs/m1-m2-verification.md`.
 Milestone 8 is in progress: the NSIS installer builds unsigned (see §16).
 
@@ -948,9 +948,9 @@ Detection resolves the program against PATH x PATHEXT itself. `CreateProcess`
 only ever appends `.exe`, so `claude.cmd` — how both CLIs install on Windows —
 is invisible to a bare program name. The resolved path is what `run.rs` spawns.
 
-## 7. SQLite schema — 7 tables
+## 7. SQLite schema — 9 tables
 
-Migrations 0001 to 0006 are shipped; `file_cache` is deferred.
+Migrations 0001 to 0010 are shipped; `file_cache` shipped as the code map (§12).
 
 ```sql
 -- 0001 and 0002, shipped
@@ -988,10 +988,18 @@ model_prices(model, input, output, cache_read, fetched_at)
   -- USD per million tokens from models.dev, replaced whole on each fetch;
   -- an empty or failed fetch keeps the last list (§4.3.4).
 
--- deferred
-file_cache(project_id, path, sha256, size, lang, indexed_at)
-  -- nothing reads a hash yet: ranking uses path text and git history, and
-  -- git's own index already knows which tracked files changed.
+-- 0007 to 0009, shipped
+tasks.title                          -- 0007, the sidebar's label for a run
+check_passes(key, passed_at)         -- 0008, dropped again by 0009: a failed
+  -- Verify asks the base commit instead, so there is no pass to remember.
+
+-- 0010, shipped: the code map that replaced the deferred file_cache (§12)
+map_files(id, project_id, path, mtime, size, lang)   -- UNIQUE (project_id, path)
+map_symbols(file_id, name, kind, line)
+map_uses(file_id, name)
+  -- No hash: mtime and size decide what to reparse, and a use is a bare name
+  -- resolved through map_symbols when read, so a changed file rewrites only
+  -- its own rows.
 
 -- not a table: baselines are a query over tasks + usage (see §12), because a
 -- stored median is a second copy of rows that already exist.
@@ -1268,12 +1276,36 @@ worktree gives a branch without it.
 Ranking for a task brief: ripgrep the prompt's nouns → score by path match, name
 match, `git log -n 50` recency, test-file adjacency. Top ~10 paths go in the brief.
 
-**As built (Milestone 7).** No file cache yet — see §7. Ranking is pure
-(`routing::candidates`) over `git ls-files` and `git log -n 50 --name-only`:
-a file named for a prompt word scores 3, a path containing one scores 1, a path
-in recent history gets +2, and a test named like a matched file (`test_slug.py`
-beside `slug.rs`) is listed with it without counting towards blast radius.
-Ties go shallowest and shortest first. The top 10 go in the brief, ranked.
+**As built (Milestone 7).** Ranking is pure (`routing::candidates`) over
+`git ls-files` and `git log -n 50 --name-only`: a file named for a prompt word
+scores 3, a path containing one scores 1, a path in recent history gets +2, and
+a test named like a matched file (`test_slug.py` beside `slug.rs`) is listed
+with it without counting towards blast radius. Ties go shallowest and shortest
+first. The top 10 go in the brief, ranked.
+
+**The code map (2026-09-19).** The deferred `file_cache` shipped as
+`codemap.rs` plus the `map_files` / `map_symbols` / `map_uses` tables, because
+path matching alone held only a quarter of the files a run went on to edit:
+"Let a customer edit a sent quote" never names a controller or the routes file.
+`codemap::parse` reads each tracked source file with tree-sitter (PHP,
+TypeScript, JavaScript, Rust; a `.vue` file's `<script>` block as TypeScript)
+into `FileFacts { defines, uses }`, plus the Laravel strings that point at a
+file (`'Controller@method'`, `view()`, `__()`). `store.rs` rescans on
+`open_project` and before `start_task`, reparsing only files whose mtime or
+size moved. Names resolve to files at query time, so a changed file rewrites
+only its own rows.
+
+`routing::candidates` then scores a prompt word that matches a symbol name
+(camelCase and snake_case split) like a file-name match, and gives one hop from
+the top seeds in either direction a small score — `routes/api.php` uses
+`QuoteController`, so a controller seed pulls the routes file in. The brief
+adds one capped line per top-five path saying what it defines and uses; it
+still never pastes file contents. Recall of the files a run edited that existed
+at its base commit went **29% → 73%** offline, and on the LiftMe bench the
+navigation share of cost went 27% → 18% with grades held; on the one task where
+route and model matched both sides, cost fell 20% and wall time 32%. Method and
+caveats in `docs/code-map-plan.md`. `NAV_NOMAP=1` withholds the map from a run,
+which is how the before arm is measured.
 
 Baselines: the median tokens and calls of the last 20 runs in the project that
 finished `done` on the same route kind and provider and reported usage. Fewer
@@ -1337,7 +1369,7 @@ comes back, the stage's own closing words are forwarded to the next brief
 | 4 | Single-stage run: prompt → Codex → stream → diff → result screen | one real task end to end | done |
 | 5 | Cancel + mid-task instruction (both paths) | can steer and stop safely | done |
 | 6 | Classifier + budgeted routes + structured artifacts + verify | classifier adds no model call; a trivial task has a one-call route; every route has explicit call/turn ceilings and never auto-escalates after a budget stop | done |
-| 7 | file_cache, path ranking, usage + baselines, route visual | brief names ranked paths without file contents; cumulative provider usage enforces the inter-turn token guard; comparable-task baselines make savings estimates honest | ranking, token guard, baselines, route visual built; file_cache deferred |
+| 7 | file_cache, path ranking, usage + baselines, route visual | brief names ranked paths without file contents; cumulative provider usage enforces the inter-turn token guard; comparable-task baselines make savings estimates honest | all built; file_cache shipped as the code map (§12) |
 | 8 | MSI/NSIS installer, signing, first-run | installable Windows app | NSIS installer, single instance and missing-git first-run message built; signing waits on a certificate |
 
 Spec's 17 collapsed: detection folds into one slice, metrics into one, route visual

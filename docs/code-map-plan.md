@@ -98,6 +98,37 @@ and reverted the same way.
    share drops, grades hold, and cost is not higher. Otherwise revert step 4
    first (the brief lines), then step 3.
 
+   **Done (2026-09-19). Kept.** Those two baselines were on the machine the
+   earlier benches ran on, which this is not, so both sides were run here
+   instead: `NAV_NOMAP=1` empties the map on the real run path, so the before
+   arm is the same build with the map withheld. One run per cell, not two.
+
+   | task       | grade | cost off → on   | wall off → on | turns | search share |
+   |------------|-------|-----------------|---------------|-------|--------------|
+   | easy       | 2/2   | $0.310 → $0.085 | 92s → 80s     | 10→11 | 14% → 0%     |
+   | medium     | 4/4   | $0.563 → $0.114 | 158s → 102s   | 20→12 | 26% → 7%     |
+   | blind-edit | 3/3   | $1.404 → $1.126 | 398s → 270s   | 29→21 | 29% → 24%    |
+
+   Grades held at 9/9 on both sides, and the search share fell on all three.
+   Only **blind-edit** is a clean cost reading: easy and medium routed
+   `guarded`/`standard` on Opus without the map and `implementOnce` on Sonnet
+   with it. `intent::read` is handed the prompt and nothing else — no repo
+   signals, no map — so that is classifier variance at n=1, not the map, and
+   their cost drops are not the map's to claim. On blind-edit, same route,
+   same model, same four calls: **cost −20%, wall −32%**.
+
+   Pooled over the three tasks the search share went 27% → 18%; the 27%
+   reproduces the 26% this plan measured from the other machine's logs, which
+   is the main reason to trust the before arm.
+
+   Two things this run does not show. The live "Start here" recall was 4/10
+   then 3/10 — too few files to read, and it counts files the agent created,
+   which no list can hold; the 73% of step 5 is the number with meaning.
+   And every run ended `verifyFailed`: `tests/Feature/TrustedProxyTest.php`
+   already fails at the base commit on this machine, so no side ever bought
+   a Fix round. It hits both arms alike, but a bench that exercises Fix needs
+   that test looked at first.
+
 7. **Docs.** Update `architecture.md` §12 "As built" and the `CLAUDE.md`
    module list (`codemap.rs`).
 

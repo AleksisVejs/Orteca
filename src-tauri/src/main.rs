@@ -2,8 +2,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-// Wired into the store by the next commit.
-#[allow(dead_code)]
 mod codemap;
 mod error;
 mod intent;
@@ -106,7 +104,7 @@ impl ProviderOperations {
 }
 
 #[tauri::command]
-fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
+fn open_project(app: AppHandle, path: String, store: State<Store>) -> Result<OpenedProject> {
     let dir = project::validate_dir(&path)?;
     let git = project::git_state(&dir);
 
@@ -128,6 +126,11 @@ fn open_project(path: String, store: State<Store>) -> Result<OpenedProject> {
     let root = root_path.to_string_lossy().into_owned();
 
     let record = store.touch_project(&root, &project::display_name(&root_path))?;
+    // A first scan of a large repository takes seconds; the screen must not wait.
+    let (id, dir) = (record.id, root_path.clone());
+    std::thread::spawn(move || {
+        let _ = app.state::<Store>().scan_map(id, &dir, &project::tracked_paths(&dir));
+    });
     Ok(OpenedProject {
         trust_findings: project::trust_scan(&root_path),
         git,
@@ -414,7 +417,11 @@ async fn begin(
         _ => None,
     };
     // Git, PATH and ACL probes, on this thread while the call runs elsewhere.
+    // A map that fails to refresh only weakens the file list, never the run.
     let scanned = tokio::task::block_in_place(|| {
+        if let Ok((dir, record)) = trusted_dir(store, &path) {
+            let _ = store.scan_map(record.id, &dir, &project::tracked_paths(&dir));
+        }
         scan_run(store, path, prompt, provider, mode, headroom, isolation)
     });
     let scan_ms = ms(started);

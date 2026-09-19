@@ -1,6 +1,7 @@
 //! SQLite. Migrations are numbered SQL files applied in order, tracked with
 //! `PRAGMA user_version`. No ORM, no query builder.
 
+use std::collections::{HashMap, HashSet};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -8,6 +9,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+use crate::codemap;
 use crate::error::{AppError, ErrorKind, Result};
 use crate::project::FileStat;
 use crate::providers::{CostQuality, Usage};
@@ -23,7 +25,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_task_titles.sql"),
     include_str!("../migrations/0008_check_passes.sql"),
     include_str!("../migrations/0009_drop_check_passes.sql"),
+    include_str!("../migrations/0010_code_map.sql"),
 ];
+
+/// Files past this are minified or generated, not something a task edits.
+const MAP_MAX_BYTES: u64 = 256 * 1024;
 
 /// A published API rate, in USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -564,6 +570,110 @@ impl Store {
         let conn = self.0.lock().expect("store poisoned");
         conn.execute("DELETE FROM projects WHERE path = ?1", params![path])?;
         Ok(())
+    }
+
+    /// Bring a project's code map up to date with its tracked files. Only a
+    /// file whose mtime or size moved is read and parsed again, and a file no
+    /// longer tracked loses its rows. Parsing happens outside the lock. Returns
+    /// how many files were parsed.
+    pub fn scan_map(&self, project_id: i64, dir: &Path, tracked: &[String]) -> Result<usize> {
+        let known: HashMap<String, (i64, i64)> = {
+            let conn = self.0.lock().expect("store poisoned");
+            let mut stmt = conn.prepare("SELECT path, mtime, size FROM map_files WHERE project_id = ?1")?;
+            let rows = stmt.query_map([project_id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut kept: HashSet<&str> = HashSet::new();
+        let mut parsed = Vec::new();
+        for path in tracked {
+            let Some(lang) = codemap::Lang::of(path) else { continue };
+            if path.contains(".min.") || path.split('/').any(|d| d == "vendor" || d == "node_modules") {
+                continue;
+            }
+            let full = dir.join(path);
+            let Ok(meta) = std::fs::metadata(&full) else { continue };
+            if !meta.is_file() || meta.len() > MAP_MAX_BYTES {
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as i64);
+            let stamp = (mtime, meta.len() as i64);
+            kept.insert(path);
+            if known.get(path) == Some(&stamp) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&full) else { continue };
+            let facts = codemap::parse(lang, &String::from_utf8_lossy(&bytes));
+            parsed.push((path, lang, stamp, facts));
+        }
+
+        let mut conn = self.0.lock().expect("store poisoned");
+        let tx = conn.transaction()?;
+        let clear = |path: &str| -> rusqlite::Result<()> {
+            let file = "SELECT id FROM map_files WHERE project_id = ?1 AND path = ?2";
+            tx.execute(&format!("DELETE FROM map_symbols WHERE file_id IN ({file})"), params![project_id, path])?;
+            tx.execute(&format!("DELETE FROM map_uses WHERE file_id IN ({file})"), params![project_id, path])?;
+            Ok(())
+        };
+        for gone in known.keys().filter(|p| !kept.contains(p.as_str())) {
+            clear(gone)?;
+            tx.execute("DELETE FROM map_files WHERE project_id = ?1 AND path = ?2", params![project_id, gone])?;
+        }
+        for (path, lang, (mtime, size), facts) in &parsed {
+            clear(path)?;
+            let id: i64 = tx.query_row(
+                "INSERT INTO map_files (project_id, path, mtime, size, lang) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project_id, path) DO UPDATE SET
+                   mtime = excluded.mtime, size = excluded.size, lang = excluded.lang
+                 RETURNING id",
+                params![project_id, path, mtime, size, lang.name()],
+                |r| r.get(0),
+            )?;
+            for s in &facts.defines {
+                tx.execute(
+                    "INSERT INTO map_symbols (file_id, name, kind, line) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, s.name, s.kind, s.line],
+                )?;
+            }
+            for name in &facts.uses {
+                tx.execute("INSERT INTO map_uses (file_id, name) VALUES (?1, ?2)", params![id, name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(parsed.len())
+    }
+
+    /// Every mapped file of a project, by path.
+    #[cfg(test)]
+    pub fn code_map(&self, project_id: i64) -> Result<Vec<(String, codemap::FileFacts)>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut files: Vec<(i64, String, codemap::FileFacts)> = conn
+            .prepare("SELECT id, path FROM map_files WHERE project_id = ?1 ORDER BY path")?
+            .query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?, Default::default())))?
+            .collect::<rusqlite::Result<_>>()?;
+        let at: HashMap<i64, usize> = files.iter().enumerate().map(|(i, f)| (f.0, i)).collect();
+        let mut stmt = conn.prepare(
+            "SELECT s.file_id, s.name, s.kind, s.line FROM map_symbols s
+               JOIN map_files f ON f.id = s.file_id WHERE f.project_id = ?1 ORDER BY s.file_id, s.line",
+        )?;
+        for row in stmt.query_map([project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, codemap::Symbol { name: r.get(1)?, kind: r.get(2)?, line: r.get(3)? }))
+        })? {
+            let (file, symbol) = row?;
+            files[at[&file]].2.defines.push(symbol);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT u.file_id, u.name FROM map_uses u
+               JOIN map_files f ON f.id = u.file_id WHERE f.project_id = ?1 ORDER BY u.file_id, u.name",
+        )?;
+        for row in stmt.query_map([project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (file, name) = row?;
+            files[at[&file]].2.uses.push(name);
+        }
+        Ok(files.into_iter().map(|(_, path, facts)| (path, facts)).collect())
     }
 
     /// A project's runs, newest first. Token counts stay NULL where the
@@ -1351,5 +1461,53 @@ mod tests {
 
         store.set_trusted("C:/a", true).unwrap();
         assert!(store.recent_projects(1).unwrap()[0].trusted);
+    }
+
+    #[test]
+    fn code_map_rescans_only_what_changed() {
+        let dir = std::env::temp_dir().join(format!("orteca-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
+        write("app/Quote.php", "<?php class Quote {}");
+        write("app/QuoteController.php", "<?php class QuoteController { function show() { Quote::find(1); } }");
+        write("README.md", "not code");
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let tracked = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let all = tracked(&["app/Quote.php", "app/QuoteController.php", "README.md"]);
+
+        assert_eq!(store.scan_map(project.id, &dir, &all).unwrap(), 2);
+        let map = store.code_map(project.id).unwrap();
+        assert_eq!(map.len(), 2);
+        let (path, facts) = &map[1];
+        assert_eq!(path, "app/QuoteController.php");
+        assert_eq!(facts.defines[0].name, "QuoteController");
+        assert_eq!(facts.defines[1].kind, "method");
+        assert_eq!(facts.uses, vec!["Quote"]);
+
+        assert_eq!(store.scan_map(project.id, &dir, &all).unwrap(), 0, "nothing changed");
+
+        write("app/Quote.php", "<?php class Quote { function total() {} }");
+        assert_eq!(store.scan_map(project.id, &dir, &all).unwrap(), 1, "an edit is parsed again");
+        assert_eq!(store.code_map(project.id).unwrap()[0].1.defines.len(), 2);
+
+        // A rename is the old path gone and a new one tracked.
+        std::fs::rename(dir.join("app/Quote.php"), dir.join("app/Offer.php")).unwrap();
+        let renamed = tracked(&["app/Offer.php", "app/QuoteController.php"]);
+        assert_eq!(store.scan_map(project.id, &dir, &renamed).unwrap(), 1);
+        let paths: Vec<String> = store.code_map(project.id).unwrap().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["app/Offer.php", "app/QuoteController.php"]);
+
+        assert_eq!(store.scan_map(project.id, &dir, &tracked(&["app/Offer.php"])).unwrap(), 0);
+        assert_eq!(store.code_map(project.id).unwrap().len(), 1, "a deleted file loses its rows");
+        let orphans: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM map_uses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "the deleted file's uses went with it");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,5 +1,7 @@
 .outcome {
-  padding: 20px 24px;
+  padding: 0;
+  background: none;
+  border: none;
 }
 .head {
   display: flex;
@@ -13,7 +15,7 @@
   font-weight: 600;
 }
 .prompt {
-  margin: 8px 0 16px;
+  margin: 16px 0 24px;
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.02em;
@@ -23,21 +25,27 @@
 
 .tabs {
   display: flex;
-  gap: 4px;
+  gap: 20px;
+  overflow-x: auto;
+  padding-top: 4px;
   border-bottom: 1px solid var(--border);
 }
 .tabs button {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 6px;
-  margin-bottom: -1px;
-  padding: 8px 10px;
+  padding: 12px 4px;
+  font-size: 12px;
   border-bottom: 1px solid transparent;
   color: var(--text-faint);
   transition: color 120ms ease, border-color 120ms ease;
 }
 .tabs button:hover {
   color: var(--text);
+}
+.tabs button:focus-visible {
+  outline-offset: -2px;
 }
 .tabs button.on {
   color: var(--text);
@@ -53,7 +61,7 @@
 
 .panel {
   min-height: 120px;
-  padding: 18px 0;
+  padding: 24px 0;
 }
 .panel > :first-child {
   margin-top: 0;
@@ -79,7 +87,7 @@
 }
 .reply input:focus {
   outline: none;
-  border-color: var(--info);
+  border-color: var(--focus);
 }
 .reply-cost {
   margin: 6px 0 0;
@@ -132,7 +140,7 @@
   gap: 2px;
   min-width: 0;
   padding: 12px 14px;
-  background: var(--surface-2);
+  background: var(--surface);
 }
 .tiles dt {
   order: 2;

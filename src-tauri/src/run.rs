@@ -370,9 +370,9 @@ pub struct StagePlan {
     pub tier: routing::Tier,
     /// Stage-specific model override. Efficient Review can use a different
     /// provider tier when the benchmark says it is enough.
-    pub model: Option<&'static str>,
+    pub model: Option<String>,
     /// Replaces the tier's effort for a benchmarked Plan or Review.
-    pub effort: Option<&'static str>,
+    pub effort: Option<String>,
     /// False for an Implement that Orteca's own tests follow: Claude then gets
     /// no Bash or PowerShell, two fewer tool schemas on every turn. Codex's only
     /// tool is its shell, so it ignores this.
@@ -380,15 +380,52 @@ pub struct StagePlan {
 }
 
 impl StagePlan {
-    fn model(&self, id: ProviderId) -> routing::ModelChoice {
-        let mut choice = self.tier.model(id);
-        if let Some(model) = self.model {
-            choice.model = model;
+    fn model(&self, id: ProviderId) -> ModelOverride {
+        let choice = self.tier.model(id);
+        ModelOverride {
+            model: self.model.clone().unwrap_or_else(|| choice.model.into()),
+            effort: self.effort.clone().unwrap_or_else(|| choice.effort.into()),
         }
-        if let Some(effort) = self.effort {
-            choice.effort = effort;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverride {
+    pub model: String,
+    pub effort: String,
+}
+
+impl ModelOverride {
+    pub fn validate(self, id: ProviderId) -> crate::error::Result<Self> {
+        let effort = self.effort.as_str();
+        let standard = ["low", "medium", "high", "xhigh", "max"];
+        let valid = match (id, self.model.as_str()) {
+            (ProviderId::Claude, "sonnet" | "opus" | "fable") => standard.contains(&effort),
+            (ProviderId::Claude, "haiku") => ["low", "medium", "high"].contains(&effort),
+            (ProviderId::Codex, "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra") => {
+                ["low", "medium", "high", "xhigh", "max", "ultra"].contains(&effort)
+            }
+            (ProviderId::Codex, "gpt-5.6-luna") => standard.contains(&effort),
+            (ProviderId::Codex, "gpt-5.5") => ["low", "medium", "high", "xhigh"].contains(&effort),
+            _ => false,
+        };
+        if !valid {
+            return Err(crate::error::AppError::new(
+                crate::error::ErrorKind::Invalid,
+                "That model or reasoning level is not available for this provider.",
+            ));
         }
-        choice
+        Ok(self)
+    }
+}
+
+impl From<routing::ModelChoice> for ModelOverride {
+    fn from(choice: routing::ModelChoice) -> Self {
+        Self {
+            model: choice.model.into(),
+            effort: choice.effort.into(),
+        }
     }
 }
 
@@ -492,13 +529,13 @@ fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
     match id {
         ProviderId::Claude => vec![
             "--model".into(),
-            choice.model.into(),
+            choice.model,
             "--effort".into(),
-            choice.effort.into(),
+            choice.effort,
         ],
         ProviderId::Codex => vec![
             "--model".into(),
-            choice.model.into(),
+            choice.model,
             "-c".into(),
             format!("model_reasoning_effort=\"{}\"", choice.effort),
         ],
@@ -670,6 +707,8 @@ pub struct Request {
     /// What the user typed. Each stage gets a brief built from it, never this.
     pub prompt: String,
     pub route: Route,
+    /// A user-picked model and effort. None keeps Orteca's per-stage routing.
+    pub model: Option<ModelOverride>,
     pub base_commit: Option<String>,
     pub dirty_at_start: bool,
     /// What was already changed before the run, so its diff can say which
@@ -966,6 +1005,7 @@ pub async fn stream(
         dir,
         prompt,
         route,
+        model,
         base_commit,
         dirty_at_start,
         before_run,
@@ -990,8 +1030,8 @@ pub async fn stream(
             stage: Stage::Implement,
             schema: None,
             tier: route.budget.preferred_tier,
-            model: None,
-            effort: None,
+            model: model.as_ref().map(|choice| choice.model.clone()),
+            effort: model.as_ref().map(|choice| choice.effort.clone()),
             shell: true,
         },
         final_stage: true,
@@ -1091,7 +1131,7 @@ pub async fn stream(
         {
             break;
         }
-        ctx.plan = stage_plan(&route, id, task_id, &stages, index);
+        ctx.plan = stage_plan(&route, model.as_ref(), id, task_id, &stages, index);
         ctx.final_stage = index + 1 == stages.len();
         state.outcome.begin_stage();
         let stage_started = now_ms();
@@ -1108,7 +1148,7 @@ pub async fn stream(
         // Review runs while the suite does, and one Fix answers both.
         if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
             let review_ctx = Context {
-                plan: stage_plan(&route, id, task_id, &stages, index + 1),
+                plan: stage_plan(&route, model.as_ref(), id, task_id, &stages, index + 1),
                 final_stage: index + 2 == stages.len(),
                 ..ctx.clone()
             };
@@ -1283,7 +1323,7 @@ pub async fn stream(
             if let Some(session) = state.session.clone().filter(|_| stage.writes() || stage == Stage::Answer) {
                 state.resume_point = Some(Resume {
                     session,
-                    model: ctx.plan.model(id).model.into(),
+                    model: ctx.plan.model(id).model,
                     ended_at: now_ms(),
                     reply: String::new(),
                 });
@@ -1507,7 +1547,14 @@ pub async fn stream(
 }
 
 /// What `stages[index]` asks of the CLI.
-fn stage_plan(route: &Route, id: ProviderId, task_id: i64, stages: &[Stage], index: usize) -> StagePlan {
+fn stage_plan(
+    route: &Route,
+    selected: Option<&ModelOverride>,
+    id: ProviderId,
+    task_id: i64,
+    stages: &[Stage],
+    index: usize,
+) -> StagePlan {
     let stage = stages[index];
     // A Fix stays on the tier that wrote the change: a resumed session on
     // another model would re-read its whole history uncached.
@@ -1534,8 +1581,12 @@ fn stage_plan(route: &Route, id: ProviderId, task_id: i64, stages: &[Stage], ind
         stage,
         schema,
         tier,
-        model: choice.map(|choice| choice.model),
-        effort: choice.map(|choice| choice.effort),
+        model: selected
+            .map(|choice| choice.model.clone())
+            .or_else(|| choice.map(|choice| choice.model.into())),
+        effort: selected
+            .map(|choice| choice.effort.clone())
+            .or_else(|| choice.map(|choice| choice.effort.into())),
         // A question may only run `git diff`/`status` anyway; the two shell
         // tool schemas cost more than that is worth on every question.
         // Implement keeps them so a resumed Fix sees the same tool list.
@@ -2646,8 +2697,8 @@ fn finish_stage(store: &Store, ctx: &Context, state: &mut State, stage: Stage) -
             stage,
             summary: state.outcome.summary(),
             artifact,
-            model: Some(ctx.plan.model(ctx.id).model.to_string()),
-            effort: Some(ctx.plan.model(ctx.id).effort.to_string()),
+            model: Some(ctx.plan.model(ctx.id).model),
+            effort: Some(ctx.plan.model(ctx.id).effort),
             duration_ms: None,
         },
         failed,
@@ -2923,7 +2974,7 @@ async fn attempt(
                 let mut events = ctx.id.parse_line(&value);
                 if ctx.id == ProviderId::Codex {
                     added_since(&mut state.thread_totals, state.session.as_deref(), &mut events);
-                    price_codex(store, ctx.plan.model(ctx.id).model, &mut state.outcome, &mut events);
+                    price_codex(store, &ctx.plan.model(ctx.id).model, &mut state.outcome, &mut events);
                 }
                 // Each parser understands a subset of its CLI's event types and
                 // silently drops the rest. Harmless for the stream, fatal for
@@ -3319,6 +3370,7 @@ mod tests {
             recordings: None,
             worktree: None,
             classified: Vec::new(),
+            model: None,
         }
     }
 
@@ -4322,8 +4374,8 @@ ping -n 60 127.0.0.1 >nul
         assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-5.6-sol"]));
 
         let efficient_review = StagePlan {
-            model: Some("gpt-5.6-terra"),
-            effort: Some("high"),
+            model: Some("gpt-5.6-terra".into()),
+            effort: Some("high".into()),
             ..plan_for(Stage::Review)
         };
         assert!(args(ProviderId::Codex, &efficient_review)
@@ -4335,6 +4387,25 @@ ping -n 60 127.0.0.1 >nul
                     "-c",
                     "model_reasoning_effort=\"high\""
                 ]));
+    }
+
+    #[test]
+    fn model_overrides_accept_only_provider_supported_combinations() {
+        let selected = ModelOverride {
+            model: "gpt-6-astra".into(),
+            effort: "ultra".into(),
+        };
+        assert!(selected.validate(ProviderId::Codex).is_ok());
+        let wrong_provider = ModelOverride {
+            model: "opus".into(),
+            effort: "high".into(),
+        };
+        assert!(wrong_provider.validate(ProviderId::Codex).is_err());
+        let unsupported_effort = ModelOverride {
+            model: "gpt-5.5".into(),
+            effort: "ultra".into(),
+        };
+        assert!(unsupported_effort.validate(ProviderId::Codex).is_err());
     }
 
     /// A shim that answers every call, logs the brief it was given, and exits.

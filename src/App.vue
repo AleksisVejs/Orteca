@@ -60,7 +60,7 @@ function close() {
 </script>
 
 <template>
-  <ProjectView v-if="opened" :opened="opened" @close="close" />
+  <ProjectView v-if="opened" :key="opened.project.path" :opened="opened" @close="close" />
   <Launch v-else :open-error="openError" @open="open" />
 
   <TrustPrompt

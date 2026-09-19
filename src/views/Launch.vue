@@ -35,31 +35,35 @@ async function forget(path: string) {
 
 <template>
   <main class="launch">
+    <div class="brand"><VeloMark :size="32" /><span>Orteca</span></div>
     <div class="hero">
-      <div class="tile"><VeloMark :size="64" /></div>
-      <h1>Orteca</h1>
-      <p class="tagline">The efficient way to run coding agents.</p>
+      <h1>Let’s get to work.</h1>
+      <p class="tagline">Open a project. Give your coding agents a task.</p>
 
-      <button class="btn primary open" @click="choose">Choose a project <span aria-hidden="true">→</span></button>
-      <p v-if="error" class="error">{{ error }}</p>
+      <button class="btn primary open" @click="choose">
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M3 6v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-6L8 4H4a1 1 0 0 0-1 1v1Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /></svg>
+        Open a project
+        <svg class="open-arrow" viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <p v-if="error" class="error" role="alert">{{ error }}</p>
     </div>
 
     <section v-if="recents.length" class="recents">
       <h2 class="label">Recent projects</h2>
-      <ul class="card">
+      <ul>
         <li v-for="p in recents" :key="p.path">
           <button class="entry" @click="emit('open', p.path)">
             <span class="name">{{ p.name }}</span>
-            <span class="mono path">{{ p.path }}</span>
+            <span class="mono path" :title="p.path">{{ p.path }}</span>
           </button>
-          <button class="forget" title="Remove from list" @click="forget(p.path)">
-            &times;
+          <button class="forget" title="Remove from list" :aria-label="`Remove ${p.name} from recent projects`" @click="forget(p.path)">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
           </button>
         </li>
       </ul>
     </section>
 
-    <p class="foot">One prompt in. Finished work out.</p>
+    <p class="foot">Choose a folder on your computer to get started.</p>
   </main>
 </template>
 
@@ -69,41 +73,46 @@ async function forget(path: string) {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  max-width: 620px;
+  max-width: 560px;
   margin: 0 auto;
   padding: 48px var(--pad);
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 32px;
+  font-weight: 600;
+}
 .hero {
   text-align: center;
 }
 
-/* The one place a glow is allowed: it is the product mark. */
-.tile {
-  display: inline-grid;
-  place-items: center;
-  width: 88px;
-  height: 88px;
-}
-
 h1 {
-  margin: 20px 0 0;
+  margin: 0;
   font-size: 30px;
   font-weight: 600;
   letter-spacing: -0.03em;
 }
 
 .tagline {
-  margin: 6px 0 36px;
+  margin: 10px 0 32px;
   color: var(--text-dim);
 }
 
 .open {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 16px 18px;
+  justify-content: flex-start;
+  min-width: 240px;
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 10px 16px;
+}
+.open-arrow {
+  margin-left: 16px;
 }
 
 .error {
@@ -119,12 +128,13 @@ h1 {
   list-style: none;
   margin: 0;
   padding: 0;
-  overflow: hidden;
+  border-top: 1px solid var(--border);
 }
 .recents li {
   display: flex;
   align-items: center;
-  padding-right: 8px;
+  padding-right: 4px;
+  border-radius: var(--r-sm);
   transition: background 120ms ease;
 }
 .recents li + li {
@@ -133,11 +143,6 @@ h1 {
 .recents li:hover {
   background: var(--surface-2);
 }
-.recents li:hover .forget,
-.recents li:focus-within .forget {
-  opacity: 1;
-}
-
 .entry {
   flex: 1;
   min-width: 0;
@@ -145,7 +150,7 @@ h1 {
   flex-direction: column;
   align-items: flex-start;
   gap: 1px;
-  padding: 12px 16px;
+  padding: 16px 12px;
   text-align: left;
 }
 .path {
@@ -156,18 +161,21 @@ h1 {
 }
 
 .forget {
-  opacity: 0.65;
-  padding: 4px 8px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
   border-radius: var(--r-sm);
   color: var(--text-faint);
-  transition: opacity 120ms ease, color 120ms ease;
+  transition: background 120ms ease, color 120ms ease;
 }
 .forget:hover {
+  background: var(--surface-2);
   color: var(--text);
 }
 
 .foot {
-  margin: 40px 0 0;
+  margin: 24px 0 0;
   text-align: center;
   font-size: 12px;
   color: var(--text-faint);

@@ -836,17 +836,55 @@ src-tauri/
     run.rs         route runner: stages, argv, stream, fix rounds, event log, diff, result
     intent.rs      one small-model call that reads what the prompt wants
     routing.rs     deterministic classifier + route builder + stage briefs
+    dock.rs        ConPTY terminals, directory listing, one text file in and out
     orchestrator.rs *  folded into run.rs — see below
 src/
   main.ts  App.vue  api.ts  types.ts
   views/      Launch.vue  Project.vue
+  views/project/  the workspace pages, state.ts, and the dock (dock.ts + Dock*.vue)
   components/ VeloMark.vue  TrustPrompt.vue
   styles/     tokens.css
-scripts/make-icon.mjs  make-sandbox.mjs  app.test.mjs  ui.test.mjs
+scripts/make-icon.mjs  make-sandbox.mjs  app.test.mjs  ui.test.mjs  dock.test.mjs
 ```
 
 `git.rs` never happened: baseline snapshot and diff capture are four functions
 next to `git_state`, and `project.rs` already owns every git call.
+
+### 5.1 The dock
+
+`dock.rs` is the workspace's other half: terminals, the file tree, a file being
+edited and the dev server's own page, beside or below whatever screen the
+sidebar picked. It is deliberately outside the run path — nothing here routes,
+classifies or spends tokens.
+
+- Each terminal is a real ConPTY through `portable-pty`, spawned inside the
+  same `proc::job::Job` the agent runner uses. A shell spawns `npm -> node ->
+  vite`; closing a tab has to take that whole tree, and `Child::kill()` does
+  not. `pump` reads the master and emits `pty:<id>`, holding back the trailing
+  bytes of a character a read stopped inside.
+- Every command goes through `inside()`: `trusted_dir` first, then
+  `canonicalize` and a `starts_with` on the project root, so `..` and a symlink
+  are both refused. The dock reaches nothing outside a consented repository.
+- The shell is the user's preference, parsed with `shell-words` so a quoted
+  path keeps its spaces. Blank means `pwsh` if `providers::which` finds it,
+  else `powershell.exe`.
+- `read_text` refuses anything over 4 MB or anything that is not UTF-8;
+  `write_text` refuses a path that is not already a file. The code tab edits,
+  it does not create, and it never renders a binary as noise.
+- The preview is an `<iframe>`, which is why the CSP names `frame-src` for
+  loopback only. Orteca starts no dev server: a terminal does, and the address
+  it printed is picked out of the stream by `noteOutput` in `dock.ts`.
+- The history tab is `project::git_log`, `project::commit_patch` and
+  `project::working_patch`, which is `patch_since` against HEAD (or the empty
+  tree, before the first commit) so the uncommitted work reads as one more
+  entry — git logic
+  belongs beside every other git call, and `dock.rs` only holds the commands.
+  The log format uses `%x1f`/`%x1e` separators so a subject carrying a tab or a
+  newline still parses, and `commit_patch` refuses any name that is not
+  hexadecimal so nothing from the frontend can arrive at git as an option.
+- Tabs and settings live in `localStorage`, not SQLite. They are window state,
+  the store is for what a run measured, and a blocked store costs a preference
+  rather than a session.
 
 `orchestrator.rs` never happened either. Milestone 6 turned `run.rs` from a
 single-stage runner into a route runner, and that cost a loop: the process
@@ -1231,8 +1269,10 @@ Orteca never runs a destructive git command. Diff captured with
 screen's git bar runs fetch, `pull --ff-only`, `add -A` + commit, a plain
 push (`push -u <origin or first remote> HEAD` when nothing is tracked yet) and
 `merge --no-edit <local branch>` on a clean tree only, aborted on any clash so
-it lands whole or not at all. Each runs only after a second click that says what it will do, and only on a
-trusted project (a commit runs the repo's hooks). The header shows the
+it lands whole or not at all. Fetch runs on request; the other actions require
+submission of an inline confirmation that says what they will do. All require a
+trusted project (a commit runs the repo's hooks). A separate trusted `git_status`
+command refreshes local state without a task preview or a network fetch. The header shows the
 upstream and ahead/behind from `rev-list --left-right --count HEAD...@{u}`.
 
 **As built.** A tree that is dirty at start is snapshotted before the first

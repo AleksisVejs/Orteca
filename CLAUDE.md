@@ -78,9 +78,19 @@ The Project screen is a shell plus pages in `src/views/project/`, sharing `state
   same parsers. No trait yet — one enum, two parsers, nothing to dispatch on.
 - `error.rs` — `AppError { kind, message }`, the only error shape the frontend sees;
   `src/api.ts` mirrors it with `isAppError`.
+- `dock.rs` — the workspace's other half, outside the run path: real ConPTY
+  terminals (`portable-pty`, each in a `proc::job::Job` so a tab takes its whole
+  tree with it), a directory listing, and one text file in and out for the code
+  tab. Every command goes through `inside()` — `trusted_dir`, then canonicalize
+  and `starts_with` the root — so nothing reaches outside a consented repo. Its
+  history tab calls `project::git_log` / `project::commit_patch` /
+  `project::working_patch`; git logic stays
+  in `project.rs`, which owns every git call.
 
 Frontend: `src/api.ts` is the single `invoke` wrapper — add commands there, mirror types
-in `src/types.ts`. No Pinia. Colors and spacing come from `src/styles/tokens.css`, and
+in `src/types.ts`. No Pinia. The dock (`views/project/dock.ts` plus `Dock*.vue`) is its
+own `provide`d state beside `state.ts`; its tabs and settings live in `localStorage`,
+never the store. Colors and spacing come from `src/styles/tokens.css`, and
 `docs/ui.md` is the binding rulebook for anything visual — read it before touching UI.
 
 ## Rules this codebase runs on

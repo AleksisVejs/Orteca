@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod codemap;
+mod dock;
 mod error;
 mod intent;
 mod proc;
@@ -39,11 +40,11 @@ struct Preflight {
     git: GitState,
     route: Route,
     /// What the implementation asks this provider for, including route overrides.
-    model: routing::ModelChoice,
+    model: run::ModelOverride,
     /// What Plan runs on when Efficient mode lowers its reasoning effort.
-    plan: Option<routing::ModelChoice>,
+    plan: Option<run::ModelOverride>,
     /// What the Review runs on, when that is not the route's tier.
-    review: Option<routing::ModelChoice>,
+    review: Option<run::ModelOverride>,
 }
 
 struct PlannedRun {
@@ -185,6 +186,7 @@ async fn start_task(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    model: Option<run::ModelOverride>,
     attachments: Vec<String>,
     resume: Option<run::Resume>,
     continue_task: Option<i64>,
@@ -192,6 +194,7 @@ async fn start_task(
     task: tauri::ipc::Channel<i64>,
     checking: tauri::ipc::Channel<run::TaskResult>,
 ) -> Result<run::TaskResult> {
+    let model = model.map(|choice| choice.validate(provider)).transpose()?;
     // A session id goes into argv, so it is an id and nothing else. A copy is
     // a new folder, where neither CLI can find the session.
     let resume = match resume {
@@ -235,6 +238,7 @@ async fn start_task(
         mode,
         headroom,
         isolation,
+        model,
         continue_task,
     )
     .await?;
@@ -405,6 +409,7 @@ async fn begin(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    model: Option<run::ModelOverride>,
     continue_task: Option<i64>,
 ) -> Result<run::Request> {
     let started = std::time::Instant::now();
@@ -450,7 +455,7 @@ async fn begin(
     let planned = scanned.route(reading.intent, reading.job);
     let routed = std::time::Instant::now();
     let mut request = tokio::task::block_in_place(|| {
-        prepare_run(store, recordings, planned, provider, mode, isolation, &reading.title, continue_task)
+        prepare_run(store, recordings, planned, provider, mode, isolation, model, &reading.title, continue_task)
     })?;
     request.classified = classified;
     request.timings = vec![
@@ -463,6 +468,7 @@ async fn begin(
 
 /// Show the exact route and ceilings before a provider is started.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn preview_task(
     app: AppHandle,
     path: String,
@@ -471,7 +477,9 @@ async fn preview_task(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    model: Option<run::ModelOverride>,
 ) -> Result<Preflight> {
+    let model = model.map(|choice| choice.validate(provider)).transpose()?;
     // No classifier here: the preview refreshes as the user types, and a model
     // call per pause would cost more than the runs it routes. Off the main
     // thread: git, PATH and ACL probes froze the window on every pause.
@@ -481,17 +489,26 @@ async fn preview_task(
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
-    let model = planned
+    let routed_model = planned
         .route
         .work_model(provider)
         .unwrap_or_else(|| planned.route.budget.preferred_tier.model(provider));
-    let plan = planned.route.plan_model(provider);
-    let review = planned.route.review_model(provider);
+    let plan = if model.is_none() {
+        planned.route.plan_model(provider).map(Into::into)
+    } else {
+        None
+    };
+    let review = if model.is_none() {
+        planned.route.review_model(provider).map(Into::into)
+    } else {
+        None
+    };
+    let routed_model = model.unwrap_or_else(|| routed_model.into());
     Ok(Preflight {
         provider,
         git: planned.git,
         route: planned.route,
-        model,
+        model: routed_model,
         plan,
         review,
     })
@@ -523,6 +540,7 @@ fn prepare_run(
     provider: ProviderId,
     mode: Mode,
     isolation: Isolation,
+    model: Option<run::ModelOverride>,
     title: &str,
     continue_task: Option<i64>,
 ) -> Result<run::Request> {
@@ -593,6 +611,7 @@ fn prepare_run(
             .map_or(dir, |copy| copy.path.clone().into()),
         prompt,
         route,
+        model,
         base_commit: git.head,
         dirty_at_start,
         before_run,
@@ -724,7 +743,16 @@ fn is_program(file: &std::path::Path) -> bool {
         .contains(&ext.as_str())
 }
 
-/// Fetch, pull, commit, push or merge, after the user confirmed it. Trusted projects
+/// Local inspection only; shares the same trust boundary as Git actions.
+#[tauri::command]
+async fn git_status(path: String, store: State<'_, Store>) -> Result<GitState> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    tauri::async_runtime::spawn_blocking(move || project::git_state(&dir))
+        .await
+        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))
+}
+
+/// Fetch, pull, commit, push or merge, at the user's request. Trusted projects
 /// only: a commit runs the repository's own hooks. Returns the state after.
 #[tauri::command]
 async fn git_action(
@@ -742,7 +770,7 @@ async fn git_action(
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?
 }
 
-fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
+pub(crate) fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
     let dir = project::validate_dir(path)?;
     let record = store.project(&dir.to_string_lossy())?;
     if !record.trusted {
@@ -1025,12 +1053,23 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        // The plugin writes the file only on a clean exit, and a run killed
+        // with its terminal never gets one. Write it while the window is
+        // still there to read the size off.
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                let _ = window.app_handle().save_window_state(StateFlags::all());
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("orteca.db");
             app.manage(Store::open(&db).map_err(|e| e.message)?);
             app.manage(run::Live::default());
             app.manage(ProviderOperations::default());
+            app.manage(dock::Terminals::default());
             // Codex runs are priced from this list. Offline keeps the last one.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -1061,7 +1100,18 @@ fn main() {
             remove_worktree,
             open_file,
             git_action,
-            cancel_provider_operation
+            git_status,
+            cancel_provider_operation,
+            dock::pty_open,
+            dock::pty_write,
+            dock::pty_resize,
+            dock::pty_close,
+            dock::list_dir,
+            dock::read_text,
+            dock::write_text,
+            dock::git_log,
+            dock::commit_patch,
+            dock::working_patch
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Orteca");
@@ -1205,6 +1255,7 @@ mod tests {
             json(var("BENCH_MODE")),
             None,
             Isolation::CurrentTree,
+            None,
             None,
         )
         .await

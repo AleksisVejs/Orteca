@@ -10,6 +10,7 @@ import {
   detectProviders,
   getTaskDetail,
   gitAction,
+  gitStatus,
   installProvider,
   isAppError,
   onFileDrop,
@@ -34,6 +35,7 @@ import type {
   Isolation,
   LimitWindow,
   Limits,
+  ModelOverride,
   Mode,
   OpenedProject,
   ProviderEvent,
@@ -90,6 +92,26 @@ export function useProject(opened: OpenedProject) {
   const providers = ref<Detected[]>([]);
   const providerError = ref(false);
   const provider = ref<ProviderId>("codex");
+
+  const MODELS: Record<ProviderId, Array<{ id: string; label: string; efforts: string[] }>> = {
+    claude: [
+      { id: "sonnet", label: "Sonnet", efforts: ["low", "medium", "high", "xhigh", "max"] },
+      { id: "opus", label: "Opus", efforts: ["low", "medium", "high", "xhigh", "max"] },
+      { id: "fable", label: "Fable", efforts: ["low", "medium", "high", "xhigh", "max"] },
+      { id: "haiku", label: "Haiku", efforts: ["low", "medium", "high"] },
+    ],
+    codex: [
+      { id: "gpt-6-astra", label: "GPT-6 Astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
+      { id: "gpt-5.5", label: "GPT-5.5", efforts: ["low", "medium", "high", "xhigh"] },
+    ],
+  };
+  const modelChoices = ref<Record<ProviderId, ModelOverride>>({
+    claude: { model: "sonnet", effort: "high" },
+    codex: { model: "gpt-5.6-terra", effort: "medium" },
+  });
 
   // How readily the classifier takes the shorter route. Two modes, not three.
   // The route itself is decided in Rust before any CLI starts and costs nothing.
@@ -199,15 +221,32 @@ export function useProject(opened: OpenedProject) {
   // What each plan has used, as its CLI reports it. Read on open and after every
   // run; a reading costs no tokens but takes a few seconds.
   const limits = ref<Limits[]>([]);
+  const limitsLoading = ref(false);
+  const limitsError = ref<string | null>(null);
+  const limitsCheckedAt = ref<number | null>(null);
+  let limitsRequest = 0;
+  let limitsTimer: ReturnType<typeof setInterval> | null = null;
   // Once the user picks a provider, headroom stops choosing for them.
   const providerPicked = ref(false);
   const pickedFor = ref<string | null>(null);
 
   async function loadLimits() {
+    const request = ++limitsRequest;
+    limitsLoading.value = true;
     try {
-      limits.value = await providerLimits();
-    } catch {
+      const fresh = await providerLimits();
+      if (request !== limitsRequest) return;
+      limits.value = fresh;
+      limitsError.value = null;
+    } catch (e) {
+      if (request !== limitsRequest) return;
       limits.value = [];
+      limitsError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      if (request === limitsRequest) {
+        limitsLoading.value = false;
+        limitsCheckedAt.value = Date.now();
+      }
     }
     pickByHeadroom();
   }
@@ -215,13 +254,15 @@ export function useProject(opened: OpenedProject) {
   /** The room left in this provider's tightest window, or null with no reading. */
   function headroom(id: ProviderId): number | null {
     const windows = limits.value.find((l) => l.id === id)?.windows ?? [];
-    return windows.length ? Math.min(...windows.map((w) => 100 - w.usedPercent)) : null;
+    return windows.length && windows.every((w) => Number.isFinite(w.usedPercent))
+      ? Math.min(...windows.map((w) => Math.max(0, Math.min(100, 100 - w.usedPercent))))
+      : null;
   }
 
   /** Move to the runnable provider with the most room left. Only when every
    *  runnable one has a reading: an unread limit is not an empty one. */
   function pickByHeadroom() {
-    if (providerPicked.value) return;
+    if (providerPicked.value || running.value) return;
     const runnable = installed.value
       .filter((p) => p.auth !== "signedOut")
       .map((p) => ({ id: p.id, room: headroom(p.id) }));
@@ -242,8 +283,38 @@ export function useProject(opened: OpenedProject) {
   function resetWhen(w: LimitWindow): string | null {
     if (w.resetsText) return w.resetsText;
     if (w.resetsAt === null) return null;
-    return new Date(w.resetsAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    const date = new Date(w.resetsAt * 1000);
+    return Number.isFinite(date.getTime())
+      ? date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+      : null;
   }
+
+  const usageCounters = computed(() => rows.value.map((p) => {
+    const reading = limits.value.find((l) => l.id === p.id);
+    const status = p.pending
+      ? providerError.value ? "Unavailable" : "Checking helper…"
+      : !p.path ? "Not installed"
+      : p.auth === "signedOut" ? "Sign in required"
+      : !reading && limitsLoading.value ? "Checking usage…"
+      : !reading?.windows.length ? "Unavailable" : null;
+    const windows = status ? [] : reading!.windows.map((w) => {
+      const left = Number.isFinite(w.usedPercent) ? Math.max(0, Math.min(100, 100 - w.usedPercent)) : null;
+      return {
+        label: w.label,
+        shortLabel: w.label === "5-hour" ? "5h" : w.label === "week (all models)" ? "week" : w.label,
+        left,
+        leftLabel: left === null ? "—" : left > 0 && left < 1 ? "<1%" : `${Math.floor(left)}%`,
+        resets: resetWhen(w),
+      };
+    });
+    return {
+      id: p.id,
+      name: p.id === "codex" ? "Codex" : "Claude",
+      status,
+      windows,
+      reason: limitsError.value ?? reading?.unavailable ?? "No plan usage reading is available yet.",
+    };
+  }));
 
   /** A helper row's reading: every window with its label, or why there is none. */
   function limitLine(id: ProviderId): string | null {
@@ -302,6 +373,26 @@ export function useProject(opened: OpenedProject) {
     schedulePreview();
   }
 
+  function chooseProvider(id: ProviderId | "auto") {
+    providerPicked.value = id !== "auto";
+    pickedFor.value = null;
+    if (id === "auto") pickByHeadroom();
+    else provider.value = id;
+    schedulePreview();
+  }
+
+  function chooseModel(model: string) {
+    const choice = modelChoices.value[provider.value];
+    choice.model = model;
+    const efforts = MODELS[provider.value].find((item) => item.id === model)?.efforts ?? [];
+    if (!efforts.includes(choice.effort)) choice.effort = efforts[0] ?? "medium";
+    schedulePreview();
+  }
+
+  const modelOverride = computed<ModelOverride | null>(() =>
+    providerPicked.value ? { ...modelChoices.value[provider.value] } : null,
+  );
+
   /** The same request on the other CLI. What the stopped run changed is still on disk. */
   async function continueWith(id: ProviderId) {
     provider.value = id;
@@ -316,6 +407,7 @@ export function useProject(opened: OpenedProject) {
   const canRun = computed(
     () =>
       !running.value &&
+      !gitBusy.value &&
       installing.value === null &&
       signingIn.value === null &&
       task.value.trim().length > 0 &&
@@ -499,19 +591,67 @@ export function useProject(opened: OpenedProject) {
     }
   }
 
-  // Git without the AI. Every command waits for a second click that says
-  // exactly what it will do; none of them can force or reset anything.
+  // Fetch is immediate. Actions that change files or publish work are reviewed
+  // in the same panel before submission; opening a form never executes it.
   const git = ref<GitState>(opened.git);
+  const gitOpen = ref(false);
   const gitAsk = ref<GitAction | null>(null);
-  const gitBusy = ref(false);
+  const gitBusy = ref<GitAction | null>(null);
+  const gitLoading = ref(false);
+  const gitRefreshError = ref<string | null>(null);
   const gitError = ref<string | null>(null);
+  const gitNotice = ref<string | null>(null);
   const commitMessage = ref("");
   const mergeBranch = ref("");
+  let gitRequest = 0;
+
+  async function refreshGit() {
+    if (running.value || gitBusy.value) return;
+    const request = ++gitRequest;
+    gitLoading.value = true;
+    gitRefreshError.value = null;
+    try {
+      const current = await gitStatus(opened.project.path);
+      if (request === gitRequest) git.value = current;
+    } catch (e) {
+      if (request === gitRequest) gitRefreshError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      if (request === gitRequest) {
+        ++gitRequest;
+        gitLoading.value = false;
+      }
+    }
+  }
+
+  function gitDisabledReason(action: GitAction): string {
+    const g = git.value;
+    if (running.value) return "Available when the task finishes.";
+    if (gitBusy.value) return "Wait for the current Git action to finish.";
+    if (gitLoading.value) return "Refreshing Git status…";
+    if (!g.isRepo) return "This folder is no longer a Git repository.";
+    if (action === "commit" && !g.dirty) return "No changes to commit.";
+    if (action === "pull" && !g.upstream) return "Publish this branch before pulling.";
+    if (action === "pull" && g.behind === 0) return "No incoming commits at the last fetch.";
+    if (action === "push" && !g.branch) return "Check out a branch before pushing.";
+    if (action === "push" && g.ahead === 0) return "No outgoing commits.";
+    if (action === "merge" && g.dirty) return "Commit your changes before merging.";
+    if (action === "merge" && !g.branches.length) return "No other local branches to merge.";
+    return "";
+  }
+
+  function openGit(action: GitAction | null = null, branch = "") {
+    gitOpen.value = true;
+    if (gitBusy.value || running.value) return;
+    gitAsk.value = action;
+    gitError.value = null;
+    gitNotice.value = null;
+    if (action === "merge") mergeBranch.value = branch || git.value.branches[0] || "";
+  }
 
   function gitQuestion(action: GitAction): string {
     const g = git.value;
     const remote = g.upstream ?? "the remote";
-    const n = (count: number | null, word: string) => `${count ?? 0} ${word}${count === 1 ? "" : "s"}`;
+    const n = (count: number | null, word: string) => count === null ? `${word}s` : `${count} ${word}${count === 1 ? "" : "s"}`;
     switch (action) {
       case "fetch":
         return `Download what's new on ${remote}? Your files stay as they are.`;
@@ -529,22 +669,32 @@ export function useProject(opened: OpenedProject) {
   }
 
   async function runGit(action: GitAction) {
-    if (gitAsk.value !== action) {
-      gitAsk.value = action;
-      gitError.value = null;
-      if (action === "merge") mergeBranch.value = git.value.branches[0] ?? "";
-      return;
-    }
-    gitBusy.value = true;
+    if (gitDisabledReason(action) || (action !== "fetch" && gitAsk.value !== action)) return;
+    const input = action === "merge" ? mergeBranch.value : action === "commit" ? commitMessage.value.trim() : "";
+    if (action === "commit" && !input) return;
+    if (action === "merge" && !git.value.branches.includes(input)) return;
+    ++gitRequest;
+    gitBusy.value = action;
+    gitError.value = null;
+    gitNotice.value = null;
     try {
-      const input = action === "merge" ? mergeBranch.value : commitMessage.value;
       git.value = await gitAction(opened.project.path, action, input);
       if (action === "commit") commitMessage.value = "";
-      gitAsk.value = null;
+      if (action !== "fetch") gitAsk.value = null;
+      gitNotice.value = {
+        fetch: "Fetched. Remote status is up to date.",
+        pull: "Pulled. Your files are up to date.",
+        commit: "Changes committed.",
+        push: "Pushed to the remote.",
+        merge: `Merged ${input}.`,
+      }[action];
     } catch (e) {
       gitError.value = isAppError(e) ? e.message : String(e);
     } finally {
-      gitBusy.value = false;
+      ++gitRequest;
+      gitBusy.value = null;
+      // A rejected hook or pull can still have changed repository state.
+      if (gitError.value) await refreshGit();
     }
   }
 
@@ -567,15 +717,16 @@ export function useProject(opened: OpenedProject) {
 
   async function refreshPreview() {
     const request = ++previewRequest;
+    const gitVersion = gitRequest;
     const chosen = selected.value;
     if (!chosen?.path || !task.value.trim()) return;
     previewing.value = true;
     previewError.value = null;
     try {
-      const planned = await previewTask(opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value);
+      const planned = await previewTask(opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value, modelOverride.value);
       if (request === previewRequest) {
         preview.value = planned;
-        git.value = planned.git;
+        if (gitVersion === gitRequest && !gitBusy.value && !gitLoading.value && !running.value) git.value = planned.git;
       }
     } catch (e) {
       if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
@@ -587,6 +738,9 @@ export function useProject(opened: OpenedProject) {
   onMounted(async () => {
     void loadHistory();
     void loadLimits();
+    limitsTimer = setInterval(() => {
+      if (!limitsLoading.value) void loadLimits();
+    }, 60_000);
     try {
       providers.value = await detectProviders((one) => {
         providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
@@ -617,6 +771,9 @@ export function useProject(opened: OpenedProject) {
   });
 
   onUnmounted(() => {
+    ++gitRequest;
+    ++limitsRequest;
+    if (limitsTimer !== null) clearInterval(limitsTimer);
     if (previewTimer !== null) clearTimeout(previewTimer);
     stop.forEach((off) => off());
   });
@@ -631,6 +788,9 @@ export function useProject(opened: OpenedProject) {
     const auto = switching;
     switching = false;
     if (!canRun.value) return;
+    ++gitRequest;
+    gitLoading.value = false;
+    gitAsk.value = null;
     if (!chained) asked = [];
     switchedFrom.value = auto ? ranOn.value : null;
     ranOn.value = provider.value;
@@ -656,6 +816,7 @@ export function useProject(opened: OpenedProject) {
         headroom(provider.value),
         isolation.value,
         attachments.value,
+        modelOverride.value,
         (event) => {
           const activity = activityFor(event);
           if (activity !== null) currentActivity.value = activity;
@@ -689,6 +850,7 @@ export function useProject(opened: OpenedProject) {
       if (tick !== null) clearTimeout(tick);
       tickWhileWarm();
       await loadHistory();
+      void refreshGit();
       // The run just spent some of a limit; the next pick should know.
       void loadLimits();
     }
@@ -1099,7 +1261,16 @@ export function useProject(opened: OpenedProject) {
     signIn,
     selected,
     limits,
+    limitsLoading,
+    limitsError,
+    limitsCheckedAt,
+    usageCounters,
     providerPicked,
+    MODELS,
+    modelChoices,
+    modelOverride,
+    chooseProvider,
+    chooseModel,
     pickedFor,
     loadLimits,
     headroom,
@@ -1153,12 +1324,19 @@ export function useProject(opened: OpenedProject) {
     saveRename,
     removeTask,
     git,
+    gitOpen,
     gitAsk,
     gitBusy,
+    gitLoading,
+    gitRefreshError,
     gitError,
+    gitNotice,
     commitMessage,
     mergeBranch,
     gitQuestion,
+    gitDisabledReason,
+    openGit,
+    refreshGit,
     runGit,
     preview,
     previewing,

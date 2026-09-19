@@ -1,7 +1,8 @@
 # UI rules
 
-The look is set by the Orteca mock set and the Velo icon: a cool near-black
-desktop app, near-white text, one green for outcomes, one blue for work in
+The look takes inspiration from [Orca’s desktop workspace](https://www.onorca.dev/):
+neutral black panels, compact navigation, fine dividers and a slim status bar.
+It retains the Velo icon, near-white text, green for outcomes and blue for work in
 flight. Everything below is a rule, not a suggestion. `src/styles/tokens.css`
 is the only place colour, radius and spacing are defined.
 
@@ -23,9 +24,8 @@ is the only place colour, radius and spacing are defined.
 - `--warn` is for consent, risk and missing prerequisites (untrusted project,
   CLI not installed, uncommitted changes). `--err` is for a failure that
   already happened.
-- Backgrounds are flat. No gradients, no glass, no blur. The single exception
-  is the logo tile on the launch screen, which gets a rim and a drop shadow
-  because it is the product mark.
+- Backgrounds are flat. No gradients, no glass, no blur. Primary actions use
+  `--button` with dark text; neutral `--focus` rings identify keyboard focus.
 
 ## The mark
 
@@ -33,9 +33,9 @@ is the only place colour, radius and spacing are defined.
   and `scripts/make-icon.mjs` builds every file in `src-tauri/icons/` from it —
   `icon.ico` plus the PNG set Tauri bundles. Never hand-draw a second version of
   the fox, and never commit a separate cropped or recoloured file.
-- The app icon is the fox on the dark rounded tile, never the bare fox. The tile
-  colour tracks `--surface`; if that token changes, change `TILE` in the script
-  and regenerate.
+- The native app icon is the fox on its own dark rounded tile, never the bare
+  fox. Its fixed tile colour is set by `TILE` in the icon script independently
+  of the workspace theme.
 - The art is white on transparent with roughly 20% padding, so it only ever
   sits on a dark surface, and the `size` prop is the image box, not the fox.
   The fox fills about 70% of it; size the box accordingly.
@@ -44,21 +44,22 @@ is the only place colour, radius and spacing are defined.
 
 ## Shape and spacing
 
-- `--r` (10px) for cards, panels and the logo tile. `--r-sm` (6px) for
+- `--r` (8px) for cards and panels. `--r-sm` (5px) for
   buttons, chips and inner groups. `999px` for status pills. Nothing else.
 - Borders are 1px hairlines. Never 2px, never doubled.
-- Content columns are capped: 560px on Launch, 760px in the Project main pane.
-  Full-bleed layouts are not part of this app.
+- Launch is capped at 560px and the task composer at 680px. Working views use
+  the available pane width; summary prose is capped at 75ch for readability.
 - Vertical rhythm: 32px between sections, 16–18px inside a card.
 
 ## Type
 
 - One sans (`--font`) and one mono (`--mono`). No third family, no webfont
   download — the app ships offline.
-- Sizes: 30px hero, 20px screen title, 14px body, 12px metadata, 11px label.
+- Sizes: 30px launch hero, 20px screen title, 14px body, 12px navigation and
+  metadata, 11px task captions and status-bar text.
   Nothing in between.
-- `.label` (11px, uppercase, tracked, faint) heads every section. Section
-  headings are not styled as body text and vice versa.
+- `.label` (12px, medium weight, sentence case) heads secondary sections.
+  Use spacing and type hierarchy instead of uppercase or decorative labels.
 - Mono is for machine strings only: paths, versions, branch names, commands.
   Prose is never mono.
 - Numbers use `font-variant-numeric: tabular-nums` so they do not jitter while
@@ -88,7 +89,74 @@ is the only place colour, radius and spacing are defined.
 - A status dot is green for done, `--err` for failed, `--warn` for checks that
   did not pass, blue while running, and neutral otherwise.
 - A result shows what happened first; route, metrics, files and activity sit
-  one tab away. Git actions live in the top bar.
+  one tab away. Results sit directly on the page, with horizontally scrollable
+  tabs when space is tight. The header's branch control combines change and
+  sync status with a native Git popover. Forms, progress, errors and success
+  stay in that popover without moving the workspace. Fetch runs on one click;
+  actions that change files or publish work show their scope before submission.
+  Results link directly to Commit or Merge with the task's branch selected.
+  Git status refreshes when the popover opens, after tasks and on demand;
+  incoming and outgoing counts explicitly reflect the last fetch.
+- The composer separates writing and attachments from task settings. The AI,
+  approach and working location stay visible while the settings are collapsed.
+  “Run task” is the primary action, with a Ctrl+Enter hint on wider windows.
+- Launch uses a centered wordmark, one project action, and a simple recent
+  project list. The workspace has a 240px sidebar (208px in smaller desktop
+  windows), a 44px pane header and a compact status bar. Task history nests
+  under the current project and shows each task’s status and provider.
+- The pane header identifies the current screen with a tab-like treatment.
+  It is a heading, not a tab control. The footer reports the real project path,
+  provider allowances and running state. Do not add decorative terminal panes,
+  fake resource readings or destinations for features that do not exist.
+- Claude and Codex usage counters show percentage **remaining**, labelled by
+  window. Small neutral bars become amber at 20% or less. Each counter opens a
+  native popover with every reported window, reset times and the last check.
+  Missing readings, missing CLIs and signed-out accounts are explicit states.
+  Refresh is manual or follows project opening, sign-in, installation and tasks;
+  the UI never implies a live feed. A newer check supersedes any older response.
+- The main pane and task history scroll independently. Activity and results
+  sit on the page with simple dividers instead of nested cards.
+
+## The dock
+
+The dock is the half of the window that is not the conversation: real
+terminals, the project's files, a file being edited and the dev server's own
+page. It shares the workspace pane with the current screen, split by a
+draggable divider, and `Ctrl+\`` shows and hides it.
+
+- **Nothing in the dock is a picture of a tool.** Every terminal is a ConPTY
+  running the user's own shell, the tree lists files that exist, and the
+  preview frames an address a dev server actually answered on. The rule
+  against decorative terminal panes stands — this is the real one.
+- Tabs stay mounted while another is on top. A build keeps running, a file
+  keeps its unsaved text, and a scrolled-back terminal keeps its place.
+- A tab carries one mark at most: `•` in `--warn` for unsaved text, `□` for a
+  shell that exited. Neither is an error colour, because neither is a failure.
+- The dock's position (beside or below), its share of the pane, the shell, the
+  mono face, type size, cursor and scrollback are the user's, saved across
+  projects. Open tabs are saved per project. A blocked or full store loses the
+  preference, never the session.
+- **Type size inside the dock is a user setting, not the type scale.** It is
+  applied in script, so the scale in this document keeps governing every
+  `font-size` a component's stylesheet declares.
+- **Terminal content colours belong to the programs printing them.** Orteca
+  sets only the background, the resting text, the cursor and the selection from
+  tokens, and leaves xterm's ANSI palette alone. Syntax highlighting is the one
+  exception: it gets its own `--syntax-*` tokens rather than borrowing green
+  and blue, which already mean outcome and in-flight.
+- The working tree sits at the top of the history as its own row, opening the
+  same patch view as a commit. It appears only when there is something
+  uncommitted, and says it is not committed rather than borrowing a hash.
+- History is a list or one commit, never both at once — the dock is too narrow
+  to read a patch beside the thing it came from. Relative times are git's own
+  wording (`3 hours ago`), never recomputed here, so they cannot disagree with
+  what every other git tool says; the exact timestamp is the row's title.
+- A patch is read, not decorated. Only added and removed lines are coloured,
+  and they use the `--syntax-*` tokens — never outcome green, which would claim
+  a commit succeeded at something.
+- The preview frames nothing until it is given an address. It does not start a
+  dev server, and it never claims a server is running — an empty frame says to
+  start one in a terminal.
 
 ## Honesty (this one outranks looks)
 

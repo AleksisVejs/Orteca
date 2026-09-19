@@ -11,6 +11,7 @@ const {
   formatTokens, formatCost, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
   removeError, running, historyRow, describeVerdict, describe, toolActivity, stageLabel,
   task, result, view, focusTask, newTask,
+  git, openGit,
 } = inject(PROJECT)!;
 
 const tab = ref<(typeof TABS)[number]["id"]>("summary");
@@ -100,6 +101,7 @@ function editAgain() {
         </p>
         <div v-if="d.worktreePath" class="copy" role="status">
           <p class="note">Worked in a separate copy on branch <span class="mono">{{ d.branch }}</span>.</p>
+          <button v-if="d.branch && git.branches.includes(d.branch)" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('merge', d.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
           <template v-if="!removedCopies.includes(d.id)">
             <p class="note mono">{{ d.worktreePath }}</p>
             <button

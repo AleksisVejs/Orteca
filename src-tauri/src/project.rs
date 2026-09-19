@@ -344,6 +344,87 @@ pub fn diff_since(dir: &Path, base: Option<&str>) -> Result<Vec<FileStat>> {
     Ok(stats)
 }
 
+/// One commit as the dock's history tab lists it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commit {
+    /// Abbreviated, which is what a person reads and what `commit_patch` takes.
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    /// Git's own wording - "3 hours ago". Not computed here, so it cannot drift.
+    pub relative: String,
+    /// ISO 8601, for the exact time behind the relative one.
+    pub when: String,
+}
+
+/// `count` commits from `skip` back, newest first. A repository with no commits
+/// yet has no HEAD to log, which is a normal state and reads as an empty list
+/// rather than a failure.
+pub fn git_log(dir: &Path, skip: u32, count: u32) -> Result<Vec<Commit>> {
+    // Separators no commit message can contain, so a subject carrying a tab or
+    // a newline still parses into the right field.
+    let text = match git_output(
+        dir,
+        &[
+            "log",
+            "--no-show-signature",
+            &format!("--skip={skip}"),
+            &format!("--max-count={count}"),
+            "--format=%h%x1f%an%x1f%ar%x1f%aI%x1f%s%x1e",
+        ],
+    ) {
+        Ok(text) => text,
+        Err(_) if git(dir, &["rev-parse", "--verify", "HEAD"]).is_none() => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(parse_log(&text))
+}
+
+fn parse_log(text: &str) -> Vec<Commit> {
+    text.split('\u{1e}')
+        .map(str::trim_start)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let mut fields = record.split('\u{1f}');
+            Some(Commit {
+                hash: fields.next()?.to_string(),
+                author: fields.next()?.to_string(),
+                relative: fields.next()?.to_string(),
+                when: fields.next()?.to_string(),
+                subject: fields.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// What one commit changed. `hash` is checked to be a hexadecimal name before
+/// it reaches git, so nothing the frontend sends can arrive as an option.
+pub fn commit_patch(dir: &Path, hash: &str) -> Result<String> {
+    const MAX_PATCH_BYTES: usize = 512 * 1024;
+    if hash.len() < 4 || hash.len() > 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::new(ErrorKind::Invalid, "That is not a commit name."));
+    }
+    // `show`, not `diff`: the first commit in a repository has no parent.
+    let mut patch = git_output(
+        dir,
+        &["show", "--no-ext-diff", "--no-textconv", "--format=", hash],
+    )?;
+    if patch.len() > MAX_PATCH_BYTES {
+        truncate_utf8(&mut patch, MAX_PATCH_BYTES);
+        patch.push_str("\n… patch truncated\n");
+    }
+    Ok(patch)
+}
+
+/// What the working tree holds that HEAD does not - the changes no commit owns
+/// yet. Before the first commit there is no HEAD, and everything in the tree is
+/// the uncommitted change.
+pub fn working_patch(dir: &Path) -> Result<String> {
+    let head = git(dir, &["rev-parse", "--verify", "HEAD"]).is_some();
+    patch_since(dir, head.then_some("HEAD"))
+}
+
 /// The reviewable patch for the same comparison as `diff_since`.
 ///
 /// Git does not include untracked files in `git diff`, so small text files are
@@ -416,12 +497,21 @@ fn new_file_patch(path: &str, text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let count = lines.len();
     let mut patch = format!(
-        "\ndiff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +{count} @@\n"
+        "\ndiff --git a/{path} b/{path}\nnew file mode 100644\n"
     );
+    if count == 0 {
+        return patch;
+    }
+    patch.push_str(&format!(
+        "--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{count} @@\n"
+    ));
     for line in lines {
         patch.push('+');
         patch.push_str(line);
         patch.push('\n');
+    }
+    if !text.ends_with('\n') {
+        patch.push_str("\\ No newline at end of file\n");
     }
     patch
 }
@@ -964,6 +1054,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_commit_subject_carrying_a_tab_or_a_newline_still_parses() {
+        // Exactly what the `--format` in `git_log` writes, for two commits.
+        let text = "4dbd4fc\u{1f}Aleksis\u{1f}2 hours ago\u{1f}2026-09-19T21:04:00+03:00\u{1f}Name the\tstub\u{1e}\nbaaa5ad\u{1f}Aleksis\u{1f}5 hours ago\u{1f}2026-09-19T18:00:00+03:00\u{1f}Bound what\nthe classifier reasons\u{1e}\n";
+        let log = parse_log(text);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].hash, "4dbd4fc");
+        assert_eq!(log[0].author, "Aleksis");
+        assert_eq!(log[0].relative, "2 hours ago");
+        assert_eq!(log[0].subject, "Name the\tstub");
+        assert_eq!(log[1].subject, "Bound what\nthe classifier reasons");
+        assert!(parse_log("").is_empty());
+    }
+
+    #[test]
+    fn a_commit_name_that_is_not_hexadecimal_never_reaches_git() {
+        let dir = std::env::current_dir().unwrap();
+        for bad in ["--upload-pack=calc", "HEAD", "abc", "../etc", ""] {
+            assert!(commit_patch(&dir, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_mixed_repository_declares_every_suite() {
         let dir = temp_dir("check-commands");
         let found = |dir: &Path| {
@@ -1218,6 +1330,52 @@ mod tests {
             stats.iter().find(|f| f.path == "binary.dat").unwrap().added,
             None
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_file_patch_uses_real_line_ranges_and_preserves_the_missing_newline() {
+        let patch = new_file_patch("new.txt", "first\nsecond");
+        assert!(patch.contains("@@ -0,0 +1,2 @@\n+first\n+second\n"));
+        assert!(patch.ends_with("\\ No newline at end of file\n"));
+        assert!(!new_file_patch("new.txt", "first\n").contains("No newline"));
+        let empty = new_file_patch("empty.txt", "");
+        assert!(empty.contains("new file mode 100644"));
+        assert!(!empty.contains("@@"));
+    }
+
+    #[test]
+    fn the_working_patch_holds_what_no_commit_does_yet() {
+        let dir = temp_dir("working-patch");
+        let command = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        command(&["init", "-q"]);
+        command(&["config", "user.name", "test"]);
+        command(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("tracked.txt"), "before
+").unwrap();
+        // Before the first commit there is no HEAD, and the whole tree is new.
+        assert!(working_patch(&dir).unwrap().contains("+before"));
+        command(&["add", "."]);
+        command(&["commit", "-qm", "initial"]);
+        assert_eq!(working_patch(&dir).unwrap().trim(), "");
+        std::fs::write(dir.join("tracked.txt"), "after
+").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "new
+").unwrap();
+        let patch = working_patch(&dir).unwrap();
+        assert!(patch.contains("-before") && patch.contains("+after"), "{patch}");
+        assert!(patch.contains("b/untracked.txt"), "{patch}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

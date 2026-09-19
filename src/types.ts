@@ -180,6 +180,13 @@ export interface ModelChoice {
   effort: string;
 }
 
+/** A provider/model combination explicitly chosen by the user. `null` lets
+ * Orteca choose a model and effort for each stage. */
+export interface ModelOverride {
+  model: string;
+  effort: string;
+}
+
 /** What the classifier read out of the prompt and the repo. Only `intent`
  *  comes from a model: the provider's smallest, asked once when a run starts. */
 export interface Signals {
@@ -369,3 +376,15 @@ export interface TaskDetail {
   worktreePath: string | null;
   events: TaskEvent[];
 }
+
+/** One child of a directory in the dock's file tree. */
+export type DirEntry = { name: string; dir: boolean };
+
+/** One commit in the dock's history tab. `relative` is git's own wording. */
+export type Commit = {
+  hash: string;
+  subject: string;
+  author: string;
+  relative: string;
+  when: string;
+};

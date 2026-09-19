@@ -10,6 +10,7 @@ const {
   removedCopies, confirmRemove, removeCopy, removeError, routeSteps, calls, tokens,
   comparison, changed, OUTCOME, TONE, TABS, resultTab, formatTokens, formatCost,
   formatDuration, newTask, editAgain, reply, sendReply, warmLeft,
+  git, openGit,
 } = inject(PROJECT)!;
 </script>
 
@@ -85,13 +86,13 @@ const {
             Worked in a separate copy on branch <span class="mono">{{ result.worktree.branch }}</span>.
             <template v-if="result.worktree.commit">
               Its changes are committed there as <span class="mono">{{ result.worktree.commit.slice(0, 7) }}</span>.
-              Merge the branch when you’re happy with it.
             </template>
             <template v-else-if="result.worktree.commitError">
               The changes are in the copy but not committed: {{ result.worktree.commitError }}
             </template>
             <template v-else>Nothing changed, so there is nothing to merge.</template>
           </p>
+          <button v-if="result.worktree.commit" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('merge', result.worktree.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
           <template v-if="!removedCopies.includes(result.taskId)">
             <p class="note mono">{{ result.worktree.path }}</p>
             <button
@@ -113,6 +114,7 @@ const {
       </template>
 
       <template v-else-if="resultTab === 'files'">
+        <button v-if="!result.worktree && git.dirty" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('commit')">Commit changes…</button>
         <ul class="diff">
           <li v-for="f in changed.byRun" :key="f.path">
             <span class="mono grow">{{ f.path }}</span>

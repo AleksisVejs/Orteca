@@ -1,22 +1,21 @@
-/* Orteca design language.
-   Cool near-black, near-white text, one green accent for outcomes and one blue
-   for work in progress. Flat surfaces, soft corners, thin hairline borders.
-   No gradients, no glass, no glow except the logo tile itself. */
+/* Orca-inspired workspace: neutral blacks, compact controls and quiet dividers.
+   Green marks outcomes; blue marks work in progress. */
 
 :root {
   /* surfaces: four steps, bg -> raised -> hover */
-  --bg: #0a0e11;
-  --surface: #10161a;
-  --surface-2: #1c242d;
-  --border: #222c34;
-  --border-strong: #414e5b;
-  --button: #465366;
-  --button-hover: #56657c;
+  --bg: #101010;
+  --surface: #181818;
+  --surface-2: #272727;
+  --border: #2a2a2a;
+  --border-strong: #484848;
+  --button: #ededed;
+  --button-hover: #ffffff;
+  --focus: #c7c7c7;
 
   /* text: three steps, never more */
-  --text: #e8eaed;
-  --text-dim: #b1bdcc;
-  --text-faint: #8e9baa;
+  --text: #eeeeee;
+  --text-dim: #bcbcbc;
+  --text-faint: #989898;
 
   /* accent: green means an outcome (done, saved, measured). Used sparingly. */
   --accent: #3ecf8e;
@@ -30,14 +29,24 @@
   --mark-shadow: rgb(0 0 0 / 0.5);
   --mark-rim: rgb(255 255 255 / 0.04);
 
+  /* syntax: the code tab only. The workspace palette describes outcomes and
+     state, which say nothing about a keyword, so code gets its own muted five
+     rather than borrowing green and blue from meanings they already carry. */
+  --syntax-keyword: #b08cd8;
+  --syntax-string: #96b67a;
+  --syntax-comment: #6f6f6f;
+  --syntax-number: #d09a6a;
+  --syntax-name: #7aa7cf;
+  --syntax-attr: #c9bd7a;
+
   /* type */
-  --font: ui-sans-serif, "Inter", "Segoe UI Variable Text", "Segoe UI",
+  --font: "Segoe UI Variable Text", "Segoe UI", ui-sans-serif,
     system-ui, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "Consolas", monospace;
 
   /* rhythm */
-  --r: 10px;
-  --r-sm: 6px;
+  --r: 8px;
+  --r-sm: 5px;
   --pad: 24px;
   --gap: 12px;
 
@@ -63,6 +72,7 @@ body {
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  font-variant-numeric: tabular-nums;
 }
 
 button {
@@ -82,9 +92,14 @@ button {
 }
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 32px;
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
-  padding: 8px 16px;
+  padding: 6px 12px;
   color: var(--text);
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
@@ -98,16 +113,16 @@ button {
   cursor: default;
 }
 
-/* Slate actions keep green reserved for measured outcomes. */
+/* One light action anchors each screen. Green stays reserved for outcomes. */
 .btn.primary {
   background: var(--button);
-  border-color: var(--button-hover);
-  color: var(--text);
-  font-weight: 500;
+  border-color: var(--button);
+  color: var(--bg);
+  font-weight: 600;
 }
 .btn.primary:hover:not(:disabled) {
   background: var(--button-hover);
-  border-color: var(--text-faint);
+  border-color: var(--button-hover);
 }
 .btn.primary:disabled {
   background: var(--surface-2);
@@ -131,7 +146,7 @@ button {
 
 .chip {
   padding: 2px 9px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   border-radius: 999px;
   font-size: 12px;
   color: var(--text-dim);
@@ -155,6 +170,7 @@ button {
 }
 .summary {
   margin: 0 0 16px;
+  max-width: 75ch;
 }
 
 /* Quiet inline action. Not green: green is for outcomes. */
@@ -207,17 +223,6 @@ button {
 }
 .dot.live {
   background: var(--info);
-  animation: dot-pulse 1.6s ease-in-out infinite;
-}
-@keyframes dot-pulse {
-  50% {
-    opacity: 0.45;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .dot.live {
-    animation: none;
-  }
 }
 
 /* Changed-file list, shared by the result and past tasks. */
@@ -280,13 +285,13 @@ button {
 }
 
 :focus-visible {
-  outline: 2px solid var(--info);
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
 ::selection {
   background: var(--button);
-  color: var(--text);
+  color: var(--bg);
 }
 
 * {

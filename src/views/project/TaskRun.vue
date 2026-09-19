@@ -62,6 +62,7 @@ const {
       <input
         v-model="instruction"
         type="text"
+        aria-label="Additional instructions for this task"
         spellcheck="false"
         :placeholder="steering === 'live' ? 'Say something to it…' : 'Something for the next step…'"
         :disabled="taskId === null || sending"
@@ -93,7 +94,10 @@ const {
 .head {
   position: relative;
   overflow: hidden;
-  padding: 18px 18px 20px;
+  padding: 0 0 20px;
+  background: none;
+  border: none;
+  border-radius: 0;
 }
 .prompt {
   margin: 0 0 4px;
@@ -178,7 +182,7 @@ const {
 }
 
 .steer:focus-within {
-  border-color: var(--info);
+  border-color: var(--focus);
 }
 .steer input {
   display: block;

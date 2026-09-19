@@ -17,7 +17,8 @@ function app(api = {}) {
   });
 }
 
-const project = { project: { path: 'C:/repo', trusted: false }, trustFindings: [{}] };
+const gitState = { isRepo: true, root: 'C:/repo', branch: 'main', head: 'abc123', dirty: false, dirtyCount: 0, upstream: 'origin/main', ahead: 0, behind: 0, branches: ['feature'] };
+const project = { project: { path: 'C:/repo', trusted: false }, git: gitState, trustFindings: [{}] };
 
 test('run history loads on open, refreshes after a run, and never shows a zero for unknown tokens', async () => {
   const past = { id: 1, prompt: 'old', status: 'failed', startedAt: '2026-09-12 10:00:00', summary: null, routeKind: 'implementOnce', callsUsed: 1, provider: 'codex', tokens: null, cachedTokens: null, costUsd: null, costQuality: 'unavailable' };
@@ -73,7 +74,7 @@ async function projectView(api = {}) {
   let mounted;
   const listeners = {};
   const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return useProject(opened); })()`, {
-    ref, computed, nextTick: async () => {}, setTimeout, clearTimeout,
+    ref, computed, nextTick: async () => {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
     opened: project,
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
     detectProviders: async () => [{ id: 'codex', path: 'fake.exe' }],
@@ -84,6 +85,7 @@ async function projectView(api = {}) {
     onFileDrop: async () => () => {},
     cancelTask: async () => {},
     recentTasks: async () => [],
+    gitStatus: async () => ({ ...gitState }),
     sendInstruction: async () => ({ disposition: 'live' }),
     isAppError: e => !!e?.message,
     ...api,
@@ -100,6 +102,153 @@ const oneCall = {
 };
 
 const finished = { taskId: 1, status: 'failed', failure: 'spawn failed', summary: '', usage: null, diff: [], dirtyAtStart: false, route: oneCall, stages: [], callsUsed: 1, turnsUsed: 1, budgetStop: null, baseline: null };
+
+test('Git forms require submission, preserve drafts, and reject invalid input', async () => {
+  const sent = [];
+  const { state } = await projectView({ gitAction: async (...args) => { sent.push(args); return { ...gitState }; } });
+  state.git.value = { ...gitState, dirty: true, dirtyCount: 2 };
+  state.commitMessage.value = '  Save my changes  ';
+  await state.runGit('commit');
+  assert.equal(sent.length, 0, 'an action cannot execute without its form');
+  state.openGit('commit');
+  state.openGit();
+  state.openGit('commit');
+  assert.equal(state.commitMessage.value, '  Save my changes  ');
+  assert.equal(sent.length, 0, 'reopening the form never confirms it');
+  state.commitMessage.value = '  ';
+  await state.runGit('commit');
+  assert.equal(sent.length, 0);
+  state.commitMessage.value = '  Save my changes  ';
+  await state.runGit('commit');
+  assert.deepEqual(sent, [['C:/repo', 'commit', 'Save my changes']]);
+  assert.equal(state.commitMessage.value, '');
+  assert.equal(state.gitAsk.value, null);
+  assert.equal(state.gitNotice.value, 'Changes committed.');
+
+  state.openGit('merge', 'missing-branch');
+  await state.runGit('merge');
+  assert.equal(sent.length, 1, 'a missing source branch cannot be merged');
+  state.openGit('merge', 'feature');
+  state.openGit('merge', 'feature');
+  assert.equal(sent.length, 1);
+  await state.runGit('merge');
+  assert.deepEqual(sent[1], ['C:/repo', 'merge', 'feature']);
+});
+
+test('Fetch runs immediately without tracking and keeps an open commit draft', async () => {
+  const sent = [];
+  const { state } = await projectView({ gitAction: async (...args) => { sent.push(args); return { ...gitState, behind: 2 }; } });
+  state.git.value = { ...gitState, upstream: null, ahead: null, behind: null, dirty: true, dirtyCount: 1 };
+  state.openGit('commit');
+  state.commitMessage.value = 'Still writing';
+  await state.runGit('fetch');
+  assert.deepEqual(sent, [['C:/repo', 'fetch', '']]);
+  assert.equal(state.git.value.behind, 2);
+  assert.equal(state.gitAsk.value, 'commit');
+  assert.equal(state.commitMessage.value, 'Still writing');
+  assert.match(state.gitNotice.value, /Fetched/);
+});
+
+test('Git submissions cannot overlap each other or an AI task', async () => {
+  let finish;
+  let calls = 0;
+  let tasks = 0;
+  const { state } = await projectView({
+    gitAction: () => { calls++; return new Promise(resolve => { finish = resolve; }); },
+    startTask: async () => { tasks++; return finished; },
+  });
+  state.git.value = { ...gitState, dirty: true, dirtyCount: 1 };
+  state.openGit('commit');
+  state.commitMessage.value = 'Save';
+  const pending = state.runGit('commit');
+  assert.equal(state.gitBusy.value, 'commit');
+  assert.equal(state.canRun.value, false);
+  await state.runGit('commit');
+  await state.runGit('fetch');
+  await state.run();
+  assert.equal(calls, 1);
+  assert.equal(tasks, 0);
+  finish({ ...gitState, ahead: 1 });
+  await pending;
+  assert.equal(state.gitBusy.value, null);
+  assert.equal(state.git.value.ahead, 1);
+  state.running.value = true;
+  await state.runGit('fetch');
+  assert.equal(calls, 1);
+});
+
+test('a failed Git command refreshes status, keeps its error and draft, and can be retried', async () => {
+  let attempts = 0;
+  let refreshed = 0;
+  const dirty = { ...gitState, dirty: true, dirtyCount: 1 };
+  const { state } = await projectView({
+    gitAction: async () => { if (++attempts === 1) throw new Error('Commit hook failed'); return { ...gitState, ahead: 1 }; },
+    gitStatus: async () => { refreshed++; return dirty; },
+  });
+  state.git.value = dirty;
+  state.openGit('commit');
+  state.commitMessage.value = 'Keep this message';
+  await state.runGit('commit');
+  assert.equal(state.gitError.value, 'Commit hook failed');
+  assert.equal(state.gitAsk.value, 'commit');
+  assert.equal(state.commitMessage.value, 'Keep this message');
+  assert.equal(refreshed, 1);
+  await state.runGit('commit');
+  assert.equal(state.gitError.value, null);
+  assert.equal(state.git.value.ahead, 1);
+});
+
+test('new Git status wins over older refreshes and task previews', async () => {
+  const pending = [];
+  let finishPreview;
+  let finishFetch;
+  const { state } = await projectView({
+    gitStatus: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+    gitAction: () => new Promise(resolve => { finishFetch = resolve; }),
+    previewTask: () => new Promise(resolve => { finishPreview = resolve; }),
+  });
+  const older = state.refreshGit();
+  const newer = state.refreshGit();
+  pending[1].resolve({ ...gitState, ahead: 2 });
+  await newer;
+  pending[0].reject(new Error('Old request failed'));
+  await older;
+  assert.equal(state.git.value.ahead, 2);
+  assert.equal(state.gitRefreshError.value, null);
+  assert.equal(state.gitLoading.value, false);
+
+  const fetch = state.runGit('fetch');
+  const preview = state.refreshPreview();
+  finishFetch({ ...gitState, behind: 3 });
+  await fetch;
+  finishPreview({ git: gitState });
+  await preview;
+  assert.equal(state.git.value.behind, 3, 'a preview started during Fetch cannot overwrite its result');
+
+  const refresh = state.refreshGit();
+  const stalePreview = state.refreshPreview();
+  pending[2].resolve({ ...gitState, dirty: true, dirtyCount: 3 });
+  await refresh;
+  finishPreview({ git: gitState });
+  await stalePreview;
+  assert.equal(state.git.value.dirtyCount, 3);
+});
+
+test('task completion refreshes Git and invalidates status requested before the run', async () => {
+  let oldStatus;
+  let requests = 0;
+  const { state } = await projectView({
+    gitStatus: () => ++requests === 1 ? new Promise(resolve => { oldStatus = resolve; }) : Promise.resolve({ ...gitState, branches: ['orteca/task-1'] }),
+    startTask: async () => ({ ...finished, status: 'done' }),
+  });
+  const pending = state.refreshGit();
+  await state.run();
+  oldStatus({ ...gitState, dirty: true, dirtyCount: 9 });
+  await pending;
+  assert.equal(requests, 2);
+  assert.deepEqual([...state.git.value.branches], ['orteca/task-1']);
+  assert.equal(state.git.value.dirty, false);
+});
 
 test('completion before invoke resolves never leaves the screen running', async () => {
   const { state, listeners } = await projectView({ startTask: async (...args) => {
@@ -564,6 +713,35 @@ test('the provider with the most limit left is picked, until the user picks one'
   state.limits.value = await reading(95, 10)();
   state.pickByHeadroom();
   assert.equal(state.provider.value, 'codex', 'a choice the user made is never overridden');
+
+  state.providerPicked.value = false;
+  state.running.value = true;
+  await state.loadLimits();
+  assert.equal(state.provider.value, 'codex', 'refreshing usage cannot change the provider during a run');
+});
+
+test('auto routes the model while a provider choice sends its model and reasoning', async () => {
+  let selected;
+  const { state } = await projectView({
+    detectProviders: bothInstalled,
+    providerLimits: reading(35, 90),
+    startTask: async (...args) => {
+      selected = args[7];
+      return { ...finished, status: 'done', failure: null };
+    },
+  });
+  await settle();
+  assert.equal(state.modelOverride.value, null);
+
+  state.chooseProvider('claude');
+  state.chooseModel('opus');
+  state.modelChoices.value.claude.effort = 'max';
+  await state.run();
+  assert.equal(selected.model, 'opus');
+  assert.equal(selected.effort, 'max');
+
+  state.chooseProvider('auto');
+  assert.equal(state.modelOverride.value, null);
 });
 
 test('an unread limit is not an empty one, and says why', async () => {
@@ -572,6 +750,69 @@ test('an unread limit is not an empty one, and says why', async () => {
   assert.equal(state.provider.value, 'codex', 'no switch on a missing reading');
   assert.equal(state.limitLine('codex'), 'limits unavailable: codex app-server exited');
   assert.equal(state.limitLine('claude'), 'session 95% used');
+});
+
+test('usage counters show remaining allowance for every window and preserve reset information', async () => {
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: async () => [
+    { id: 'claude', windows: [{ label: 'session', usedPercent: 99.5, resetsAt: null, resetsText: 'Today at 3:50pm' }], unavailable: null },
+    { id: 'codex', windows: [
+      { label: '5-hour', usedPercent: 26, resetsAt: 1789304323, resetsText: null },
+      { label: 'week', usedPercent: 100, resetsAt: null, resetsText: null },
+      { label: 'other', usedPercent: NaN, resetsAt: NaN, resetsText: null },
+    ], unavailable: null },
+  ] });
+  await settle();
+  const [claude, codex] = state.usageCounters.value;
+  assert.equal(claude.windows[0].left, 0.5);
+  assert.equal(claude.windows[0].leftLabel, '<1%', 'a fraction left is not an exhausted plan');
+  assert.equal(claude.windows[0].resets, 'Today at 3:50pm');
+  assert.equal(codex.windows[0].leftLabel, '74%');
+  assert.equal(codex.windows[0].shortLabel, '5h');
+  assert.ok(codex.windows[0].resets);
+  assert.equal(codex.windows[1].left, 0, 'a reported zero is distinct from unknown');
+  assert.equal(codex.windows[2].left, null);
+  assert.equal(codex.windows[2].leftLabel, '—');
+  assert.equal(codex.windows[2].resets, null);
+  assert.equal(state.headroom('codex'), null, 'an invalid window cannot guide provider selection');
+});
+
+test('usage counters distinguish missing installation, sign-in, and unavailable readings', async () => {
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(95, null) });
+  await settle();
+  assert.equal(state.usageCounters.value[1].status, 'Unavailable');
+  assert.equal(state.usageCounters.value[1].reason, 'codex app-server exited');
+  assert.equal(state.usageCounters.value[1].windows.length, 0);
+  state.providers.value[0].auth = 'signedOut';
+  assert.equal(state.usageCounters.value[0].status, 'Sign in required');
+  assert.equal(state.usageCounters.value[0].windows.length, 0, 'old readings stay hidden after sign-out');
+  state.providers.value[1].path = null;
+  assert.equal(state.usageCounters.value[1].status, 'Not installed');
+});
+
+test('usage refresh keeps the latest response and exposes loading and failed checks', async () => {
+  const pending = [];
+  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) });
+  assert.equal(state.limitsLoading.value, true);
+  assert.equal(state.usageCounters.value[0].status, 'Checking usage…');
+  const latest = state.loadLimits();
+  pending[1].resolve(await reading(25, 50)());
+  await latest;
+  const checked = state.limitsCheckedAt.value;
+  assert.equal(state.limitsLoading.value, false);
+  assert.ok(checked);
+  pending[0].resolve(await reading(99, 100)());
+  await settle();
+  assert.equal(state.usageCounters.value[0].windows[0].left, 75, 'late initial response cannot overwrite the manual refresh');
+  assert.equal(state.limitsCheckedAt.value, checked);
+
+  const failed = state.loadLimits();
+  assert.equal(state.usageCounters.value[0].windows[0].left, 75, 'the previous reading remains visible while refreshing');
+  pending[2].reject(new Error('Could not reach the CLI'));
+  await failed;
+  assert.equal(state.limitsLoading.value, false);
+  assert.equal(state.usageCounters.value[0].status, 'Unavailable');
+  assert.equal(state.usageCounters.value[0].reason, 'Could not reach the CLI');
+  assert.equal(state.headroom('claude'), null, 'failed checks do not leave stale allowance available to routing');
 });
 
 test('a route that may not fit in the fullest window warns before it starts', async () => {

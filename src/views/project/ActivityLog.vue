@@ -24,13 +24,16 @@ const lines = computed(() => props.items ?? project.lines.value);
 <style scoped>
 .stream {
   margin: 0;
-  padding: 12px 18px;
+  padding: 12px 0;
   list-style: none;
   max-height: 360px;
   overflow-y: auto;
+  background: none;
+  border-width: 1px 0;
+  border-radius: 0;
 }
 .stream li {
-  padding: 3px 0;
+  padding: 4px 0;
   color: var(--text-dim);
   white-space: pre-wrap;
   overflow-wrap: anywhere;

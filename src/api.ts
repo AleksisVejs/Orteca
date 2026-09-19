@@ -4,11 +4,14 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
+  Commit,
   Detected,
+  DirEntry,
   GitAction,
   GitState,
   Limits,
   Mode,
+  ModelOverride,
   OpenedProject,
   Preflight,
   Project,
@@ -78,8 +81,8 @@ export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
 /** `headroom` is the room left in the provider's tightest plan window, or null
  *  when unread. The router may run a checked route a tier down when it is low. */
-export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode, headroom: number | null, isolation: Isolation) =>
-  invoke<Preflight>("preview_task", { path, prompt, provider, mode, headroom, isolation });
+export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode, headroom: number | null, isolation: Isolation, model: ModelOverride | null) =>
+  invoke<Preflight>("preview_task", { path, prompt, provider, mode, headroom, isolation, model });
 
 /** Deletes a finished run's copy folder. Git refuses while it holds uncommitted
  *  work; the branch always stays. */
@@ -101,6 +104,9 @@ export const removeWorktree =(path: string, taskId: number) =>
 export const gitAction = (path: string, action: GitAction, input = "") =>
   invoke<GitState>("git_action", { path, action, input });
 
+/** Refresh local Git state without fetching or planning an AI task. */
+export const gitStatus = (path: string) => invoke<GitState>("git_status", { path });
+
 /** Plan limits from each CLI's own answer. Costs no tokens; takes seconds. */
 export const providerLimits = () => invoke<Limits[]>("provider_limits");
 
@@ -119,6 +125,7 @@ export const startTask = (
   headroom: number | null,
   isolation: Isolation,
   attachments: string[],
+  model: ModelOverride | null,
   onEvent: (event: ProviderEvent) => void,
   onTask: (taskId: number) => void,
   // The change, once its focused tests pass and while the full suite runs.
@@ -135,7 +142,7 @@ export const startTask = (
   task.onmessage = onTask;
   const checking = new Channel<TaskResult>();
   checking.onmessage = onChecking;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, events, task, checking });
+  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, model, events, task, checking });
 };
 
 /**
@@ -173,3 +180,47 @@ export const signInProvider = (provider: ProviderId) =>
 
 export const onSignInEvent = (fn: (provider: ProviderId, line: string) => void) =>
   listen<[ProviderId, string]>("sign-in-event", (e) => fn(e.payload[0], e.payload[1]));
+
+/* --- The dock: terminals, the file tree and one file in the code tab. --- */
+
+/** Opens a shell in `sub` (relative to the project) and returns its id. */
+export const ptyOpen = (path: string, sub: string, shell: string, cols: number, rows: number) =>
+  invoke<number>("pty_open", { path, sub, shell, cols, rows });
+
+export const ptyWrite = (id: number, data: string) =>
+  invoke<void>("pty_write", { id, data });
+
+export const ptyResize = (id: number, cols: number, rows: number) =>
+  invoke<void>("pty_resize", { id, cols, rows });
+
+/** Closes a terminal and everything it started. Never throws for a dead one. */
+export const ptyClose = (id: number) => invoke<void>("pty_close", { id });
+
+/** Output from one terminal. The returned promise resolves to an unlisten fn. */
+export const onPtyData = (id: number, fn: (chunk: string) => void) =>
+  listen<string>(`pty:${id}`, (e) => fn(e.payload));
+
+/** The shell ended on its own — the tab stays, holding what it printed. */
+export const onPtyExit = (id: number, fn: () => void) =>
+  listen<null>(`pty-exit:${id}`, () => fn());
+
+export const listDir = (path: string, sub: string) =>
+  invoke<DirEntry[]>("list_dir", { path, sub });
+
+export const readText = (path: string, file: string) =>
+  invoke<string>("read_text", { path, file });
+
+export const writeText = (path: string, file: string, text: string) =>
+  invoke<void>("write_text", { path, file, text });
+
+/** The repository's own commits, newest first, from `skip` back. */
+export const gitLog = (path: string, skip: number, count: number) =>
+  invoke<Commit[]>("git_log", { path, skip, count });
+
+/** What one commit changed, as a patch. */
+export const commitPatch = (path: string, hash: string) =>
+  invoke<string>("commit_patch", { path, hash });
+
+/** What the working tree has that no commit holds yet, as a patch. */
+export const workingPatch = (path: string) =>
+  invoke<string>("working_patch", { path });

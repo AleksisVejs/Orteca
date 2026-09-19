@@ -4,7 +4,7 @@
 //! Provider-agnostic on purpose — `providers::claude` and `providers::codex`
 //! both emit newline-delimited JSON, they just disagree about the field names.
 
-mod job;
+pub mod job;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
-use job::Job;
+pub use job::Job;
 
 /// One line off a running CLI.
 #[derive(Debug, Clone)]

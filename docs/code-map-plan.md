@@ -124,10 +124,17 @@ and reverted the same way.
    Two things this run does not show. The live "Start here" recall was 4/10
    then 3/10 — too few files to read, and it counts files the agent created,
    which no list can hold; the 73% of step 5 is the number with meaning.
-   And every run ended `verifyFailed`: `tests/Feature/TrustedProxyTest.php`
-   already fails at the base commit on this machine, so no side ever bought
-   a Fix round. It hits both arms alike, but a bench that exercises Fix needs
-   that test looked at first.
+   And every run ended `verifyFailed`, so no side ever bought a Fix round.
+   It hits both arms alike, so it does not touch the comparison above.
+
+   **Cause found (2026-09-19).** Not `TrustedProxyTest.php`, which LiftMe
+   `4b64e71` fixed. `tests/Feature/ScratchDebugTest.php` was a tracked file
+   holding only `<?php`: PHPUnit cannot find the class it names, reports a
+   runner warning, and exits non-zero with all 363 tests passing. Anything
+   reading the exit code — Orteca's local suite included — read the whole
+   suite as failed, reran it at `base_commit`, found it failing there too,
+   and ended the run `verifyFailed` without buying the Fix. Removed in
+   LiftMe `5da76b9`; `composer test` exits 0 and the bench can exercise Fix.
 
 7. **Docs.** Update `architecture.md` §12 "As built" and the `CLAUDE.md`
    module list (`codemap.rs`).

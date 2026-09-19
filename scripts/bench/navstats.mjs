@@ -162,6 +162,7 @@ function recall() {
       },
     });
     const lists = out.split('\n').filter((l) => l.startsWith('NAV ')).map((l) => JSON.parse(l.slice(4)));
+    const notes = out.split('\n').filter((l) => l.startsWith('NOTES ')).map((l) => JSON.parse(l.slice(6)));
     const listOf = new Map(prompts.map((p, i) => [p, new Set(lists[i])]));
     let hit = 0;
     let total = 0;
@@ -180,7 +181,8 @@ function recall() {
       for (const [i, p] of prompts.entries()) {
         const edited = new Set(cases.filter((c) => c.task === p).flatMap((c) => c.edited).filter((f) => existed.has(f)));
         const miss = [...edited].filter((f) => !listOf.get(p).has(f));
-        console.log(`\n${p.slice(0, 100)}\n  ${lists[i].map((f) => (edited.has(f) ? '* ' : '  ') + f).join('\n  ')}\n  missed: ${miss.join(', ')}`);
+        const line = (f, j) => `${edited.has(f) ? '* ' : '  '}${f}${notes[i][j] ? `: ${notes[i][j]}` : ''}`;
+        console.log(`\n${p.slice(0, 100)}\n  ${lists[i].map(line).join('\n  ')}\n  missed: ${miss.join(', ')}`);
       }
     }
   } finally {

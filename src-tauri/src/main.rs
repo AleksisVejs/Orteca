@@ -1166,6 +1166,7 @@ mod tests {
         for prompt in prompts {
             let route = routing::route(&prompt, Mode::Balanced, &signals);
             println!("NAV {}", serde_json::to_string(&route.candidate_paths).unwrap());
+            println!("NOTES {}", serde_json::to_string(&route.candidate_notes).unwrap());
         }
     }
 

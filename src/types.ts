@@ -217,6 +217,8 @@ export interface Route {
   tierReason: string;
   /** Paths named in the brief. Names only — never file contents. */
   candidatePaths: string[];
+  /** What the first few of those define and use, same order. Absent on runs from before the code map. */
+  candidateNotes?: string[];
   /** What each stage would have preferred to run on. Recorded, not acted on. */
   preferredProviders: ProviderId[];
 }

@@ -359,6 +359,10 @@ pub struct Route {
     /// pastes the few small ones into a Codex brief, and never into Claude's,
     /// whose Edit tool makes it Read a file first anyway.
     pub candidate_paths: Vec<String>,
+    /// What the first few candidate paths define and use, from the code map,
+    /// in the same order; empty where the map has nothing.
+    #[serde(default)]
+    pub candidate_notes: Vec<String>,
     /// What each stage would have preferred to run on, recorded and not acted
     /// on. See `Capability::preferred_provider`.
     pub preferred_providers: Vec<ProviderId>,
@@ -1278,6 +1282,24 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         .map(|s| s.capability().preferred_provider())
         .collect();
 
+    // A brief names a handful of paths, not a directory listing. A question
+    // is about the code, so the tests paired beside it are only cost.
+    let candidate_paths: Vec<String> = candidate_paths
+        .into_iter()
+        .filter(|p| kind != RouteKind::Answer || !is_test(p))
+        .take(LISTED)
+        .collect();
+    let map: HashMap<&str, &FileFacts> = repo.code_map.iter().map(|(p, f)| (p.as_str(), f)).collect();
+    let ours: HashSet<&str> = repo
+        .code_map
+        .iter()
+        .flat_map(|(_, f)| f.defines.iter().filter(|s| s.kind != "method").map(|s| s.name.as_str()))
+        .collect();
+    let candidate_notes = candidate_paths
+        .iter()
+        .take(NOTED)
+        .map(|p| map.get(p.as_str()).map(|f| file_note(f, &ours)).unwrap_or_default())
+        .collect();
     Route {
         kind,
         mode,
@@ -1286,15 +1308,61 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         signals,
         reason,
         tier_reason,
-        // A brief names a handful of paths, not a directory listing. A question
-        // is about the code, so the tests paired beside it are only cost.
-        candidate_paths: candidate_paths
-            .into_iter()
-            .filter(|p| kind != RouteKind::Answer || !is_test(p))
-            .take(LISTED)
-            .collect(),
+        candidate_paths,
+        candidate_notes,
         preferred_providers,
     }
+}
+
+/// How many of the listed paths the brief describes.
+const NOTED: usize = 5;
+
+/// One line on what a file holds, from the code map:
+/// `class QuoteController (index, show, store); uses Quote, StoreQuoteRequest`.
+/// Only names the repository defines are listed as uses: `Model` or
+/// `JsonResponse` tell the agent nothing. Capped, so five lines stay far
+/// under the brief's budget.
+fn file_note(facts: &FileFacts, ours: &HashSet<&str>) -> String {
+    const MEMBERS: usize = 8;
+    const USES: usize = 8;
+    fn list(names: &[&str], cap: usize) -> String {
+        let mut out = names[..names.len().min(cap)].join(", ");
+        if names.len() > cap {
+            out.push_str(", ...");
+        }
+        out
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut functions: Vec<&str> = Vec::new();
+    // Methods follow their type in line order.
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for symbol in &facts.defines {
+        match (symbol.kind.as_str(), current.as_mut()) {
+            ("method", Some((_, members))) => members.push(&symbol.name),
+            ("method" | "function", _) => functions.push(&symbol.name),
+            (kind, _) => {
+                parts.extend(current.take().map(|(head, members)| typed(head, &members)));
+                current = Some((format!("{kind} {}", symbol.name), Vec::new()));
+            }
+        }
+    }
+    fn typed(head: String, members: &[&str]) -> String {
+        if members.is_empty() { head } else { format!("{head} ({})", list(members, MEMBERS)) }
+    }
+    parts.extend(current.map(|(head, members)| typed(head, &members)));
+    if !functions.is_empty() {
+        parts.push(format!("functions {}", list(&functions, MEMBERS)));
+    }
+    let uses: Vec<&str> = facts
+        .uses
+        .iter()
+        .map(String::as_str)
+        .filter(|u| ours.contains(u))
+        .collect();
+    if !uses.is_empty() {
+        parts.push(format!("uses {}", list(&uses, USES)));
+    }
+    parts.join("; ")
 }
 
 /// Tiers per route.
@@ -1433,9 +1501,13 @@ pub fn brief(
             "\nStart here. These tracked paths match the task, most likely first; open the \
              ones you need directly, with no search first, and ignore the rest:\n"
         });
-        for path in &route.candidate_paths {
+        for (i, path) in route.candidate_paths.iter().enumerate() {
             out.push_str("- ");
             out.push_str(path);
+            if let Some(note) = route.candidate_notes.get(i).filter(|n| !n.is_empty()) {
+                out.push_str(": ");
+                out.push_str(note);
+            }
             out.push('\n');
         }
     }
@@ -1655,6 +1727,45 @@ mod tests {
 
         let r = route("Add an archive action to resources/js/stores/chat.js for a quote", Mode::Balanced, &signals);
         assert_eq!(r.candidate_paths[0], "resources/js/stores/chat.js", "a named path goes first");
+        assert_eq!(r.candidate_notes[0], "", "an unmapped file has no note");
+    }
+
+    #[test]
+    fn the_brief_says_what_the_first_files_hold() {
+        let symbol = |name: &str, kind: &str| crate::codemap::Symbol { name: name.into(), kind: kind.into(), line: 1 };
+        let controller = FileFacts {
+            defines: vec![
+                symbol("QuoteController", "class"),
+                symbol("index", "method"),
+                symbol("show", "method"),
+                symbol("Status", "enum"),
+                symbol("helper", "function"),
+            ],
+            uses: ["Quote", "StoreQuoteRequest", "url:api/quotes", "lang/*/shop.php"].map(String::from).to_vec(),
+        };
+        let ours: HashSet<&str> = ["Quote", "StoreQuoteRequest"].into();
+        assert_eq!(
+            file_note(&controller, &ours),
+            "class QuoteController (index, show); enum Status; functions helper; uses Quote, StoreQuoteRequest"
+        );
+        let many = FileFacts { defines: vec![], uses: (0..10).map(|i| format!("U{i}")).collect() };
+        let names: Vec<String> = (0..10).map(|i| format!("U{i}")).collect();
+        let ours: HashSet<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(file_note(&many, &ours), "uses U0, U1, U2, U3, U4, U5, U6, U7, ...");
+        assert_eq!(file_note(&many, &HashSet::new()), "", "framework names are not listed");
+
+        let path = "app/Http/Controllers/QuoteController.php".to_string();
+        let signals = RepoSignals {
+            tracked_paths: vec![path.clone()],
+            code_map: vec![(path, controller)],
+            ..Default::default()
+        };
+        let r = route("fix the quote controller", Mode::Balanced, &signals);
+        let text = brief(&r, r.stages[0], "fix the quote controller", &[], &[]);
+        assert!(
+            text.contains("- app/Http/Controllers/QuoteController.php: class QuoteController (index, show); enum Status; functions helper\n"),
+            "{text}"
+        );
     }
 
     fn balanced(prompt: &str, paths: &[&str]) -> Route {

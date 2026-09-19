@@ -14,11 +14,15 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const LIFTME = process.env.BENCH === "liftme";
-const RIG = LIFTME ? "C:\\Users\\User\\Projects\\LiftMe" : "C:\\Users\\User\\Projects\\RigInspectBE";
-const ROOT = LIFTME ? "C:\\Users\\User\\Projects\\liftme-bench" : "C:\\Users\\User\\Projects\\riginspect-bench";
+const NAME = LIFTME ? "LiftMe" : "RigInspectBE";
+// RIG=<path> for a checkout somewhere else; the bench root sits beside it.
+const RIG = process.env.RIG ?? [`C:\\Users\\User\\Projects\\${NAME}`, `E:\\PROJECTS\\${NAME}`].find(existsSync);
+if (!RIG) throw Error(`no ${NAME} checkout found; set RIG=<path>`);
+const ROOT = join(dirname(RIG), LIFTME ? "liftme-bench" : "riginspect-bench");
 const TAURI = join(here, "..", "..", "src-tauri");
 const RESULTS = join(ROOT, process.env.RESULTS ?? "results.json");
-const ENV = { ...process.env, PATH: `C:\\Program Files\\MySQL\\MySQL Server 9.4\\bin;${process.env.PATH}` };
+const MYSQL = readdirSync("C:\\Program Files\\MySQL").filter((d) => d.startsWith("MySQL Server ")).sort().pop();
+const ENV = { ...process.env, PATH: `C:\\Program Files\\MySQL\\${MYSQL}\\bin;${process.env.PATH}` };
 const CAPS = { "claude week (all models)": 98, "codex week": 90 };
 const CAP_DEFAULT = 95;
 const ARM_TIMEOUT = 45 * 60_000;

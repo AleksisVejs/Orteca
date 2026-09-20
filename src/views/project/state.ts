@@ -968,6 +968,11 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         },
         opts.resume ?? null,
         opts.continueTask ?? null,
+        // A follow-up's prompt carries the whole exchange so the agent has the
+        // context, but the route must be chosen from what the user just said:
+        // read the blob, a classifier answers about the task at the top instead
+        // of the reply at the bottom.
+        opts.asked?.at(-1) ?? null,
       );
     } catch (e) {
       live.error = isAppError(e) ? e.message : String(e);

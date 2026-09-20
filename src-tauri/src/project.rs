@@ -52,6 +52,12 @@ pub struct TrustFinding {
     pub reason: &'static str,
 }
 
+/// Folders a build regenerates. No test suite is looked for in one, and the
+/// trust scan walks none of them: a single `target/` is tens of thousands of
+/// entries, enough to spend the scan's whole budget before it reaches the
+/// repository's own source. Their top level is still scanned.
+const GENERATED_DIRS: &[&str] = &["node_modules", "vendor", "target", "dist", "build"];
+
 const TRUST_TARGETS: &[(&str, &str)] = &[
     (
         ".claude",
@@ -126,7 +132,24 @@ pub fn trust_scan(root: &Path) -> Vec<TrustFinding> {
                     "linked path may load configuration outside the scanned tree",
                 ));
             } else if metadata.is_dir() {
-                pending.push(path);
+                if GENERATED_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d)) {
+                    scan_targets(root, &path, &mut findings);
+                    // Skipped, and said so. Walking one `target/` can spend the
+                    // whole budget before the scan reaches the repository's own
+                    // source, but a skip the user is not told about is worse
+                    // than the cost: the consent dialog would read as complete
+                    // while configuration nested inside went unlooked-at. The
+                    // budget used to announce itself when it ran out; this is
+                    // that announcement, made where the decision is taken.
+                    findings.push(finding(
+                        root,
+                        &path,
+                        "generated directory: only its top level was scanned, \
+                         and configuration nested deeper was not checked",
+                    ));
+                } else {
+                    pending.push(path);
+                }
             }
         }
     }
@@ -431,8 +454,18 @@ pub fn working_patch(dir: &Path) -> Result<String> {
 /// rendered as new-file hunks here. Large and binary untracked files remain in
 /// the file-stat list but are called out instead of loading unbounded data.
 pub fn patch_since(dir: &Path, base: Option<&str>) -> Result<String> {
+    patch_of(dir, base, None)
+}
+
+/// The same patch narrowed to `only`, for a caller that knows which paths it is
+/// asking about. `None` is every path; an empty slice is no path and yields an
+/// empty patch, which is the honest answer to "show me nothing".
+pub fn patch_of(dir: &Path, base: Option<&str>, only: Option<&[String]>) -> Result<String> {
     const MAX_PATCH_BYTES: usize = 512 * 1024;
     const MAX_UNTRACKED_BYTES: usize = 64 * 1024;
+    if only.is_some_and(<[String]>::is_empty) {
+        return Ok(String::new());
+    }
     let empty_tree;
     let base = match base {
         Some(base) => base,
@@ -441,20 +474,25 @@ pub fn patch_since(dir: &Path, base: Option<&str>) -> Result<String> {
             empty_tree.trim()
         }
     };
-    let mut patch = git_output(
-        dir,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--binary",
-            "--full-index",
-            base,
-            "--",
-        ],
-    )?;
+    let mut argv = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--binary",
+        "--full-index",
+        base,
+        // Everything after this is a pathspec, so a path that starts with a
+        // dash cannot be read as a flag.
+        "--",
+    ];
+    argv.extend(only.unwrap_or_default().iter().map(String::as_str));
+    let mut patch = git_output(dir, &argv)?;
     let untracked = git_output(dir, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+    for path in untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| only.map_or(true, |only| only.iter().any(|kept| kept == path)))
+    {
         if patch.len() >= MAX_PATCH_BYTES {
             break;
         }
@@ -546,7 +584,7 @@ pub fn check_commands(root: &Path) -> Vec<Check> {
         .filter(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             !name.starts_with('.')
-                && !["node_modules", "vendor", "target", "dist", "build"].contains(&name.as_str())
+                && !GENERATED_DIRS.contains(&name.as_str())
         })
         .map(|entry| entry.path())
         .collect();
@@ -1481,6 +1519,27 @@ mod tests {
         let mut unknown = diff_since(&dir, Some(&base)).unwrap();
         attribute(&dir, &mut unknown, None);
         assert!(unknown.iter().all(|f| f.origin.is_none()));
+
+        // What a Review is shown: the run's work, and not the user's own edits
+        // from before it. A reviewer handed both reports the user's as an
+        // unrequested change and holds up work that never touched it.
+        let ours: Vec<String> = diff
+            .iter()
+            .filter(|f| f.origin != Some(Origin::BeforeRun))
+            .map(|f| f.path.clone())
+            .collect();
+        let patch = patch_of(&dir, Some(&base), Some(&ours)).unwrap();
+        for ran in ["clean.txt", "edited.txt", "created.txt"] {
+            assert!(patch.contains(ran), "{ran} missing from\n{patch}");
+        }
+        for theirs in ["stray.txt", "gone.txt"] {
+            assert!(!patch.contains(theirs), "{theirs} shown in\n{patch}");
+        }
+        // Untracked included: a new file the run wrote is the run's work.
+        assert!(patch.contains("agent\n"), "{patch}");
+        // No path is no patch, and no filter is every path.
+        assert_eq!(patch_of(&dir, Some(&base), Some(&[])).unwrap(), "");
+        assert!(patch_since(&dir, Some(&base)).unwrap().contains("stray.txt"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1598,6 +1657,49 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    /// A build folder must not cost the scan the rest of the repository: its
+    /// own top level is still read, but nothing under it is walked, so the
+    /// source beside it is always reached.
+    #[test]
+    fn the_trust_scan_does_not_walk_generated_folders() {
+        let root = temp_dir("trust-generated");
+        for file in [
+            root.join("node_modules/CLAUDE.md"),
+            root.join("target/deep/CLAUDE.md"),
+            root.join("src/.claude/settings.json"),
+        ] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "instructions").unwrap();
+        }
+        let found = |rel: &str| {
+            trust_scan(&root)
+                .iter()
+                .any(|finding| finding.path.replace('\\', "/").starts_with(rel))
+        };
+        assert!(found("node_modules/CLAUDE.md"), "the folder's own top level is scanned");
+        assert!(found("src/.claude"), "source beside a build folder is scanned");
+        assert!(!found("target/deep"), "a build folder was walked");
+
+        // Not walking it is a saving; not saying so would be a silent gap, and
+        // consent given against a list that looks complete is not informed.
+        let skipped: Vec<String> = trust_scan(&root)
+            .iter()
+            .filter(|f| f.reason.starts_with("generated directory"))
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        for dir in ["node_modules", "target"] {
+            assert!(
+                skipped.iter().any(|s| s == dir),
+                "{dir} was skipped without saying so: {skipped:?}"
+            );
+        }
+        assert!(
+            !skipped.iter().any(|s| s == "src"),
+            "a walked folder claimed to be skipped"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

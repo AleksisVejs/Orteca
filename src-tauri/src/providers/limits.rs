@@ -7,7 +7,8 @@
 //!
 //! Neither answer is a credential read: Orteca asks the CLI, as it does for auth.
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -58,12 +59,56 @@ const CLAUDE_ARGS: &[&str] = &[
     "haiku",
 ];
 
+/// The last reading a Claude run's own stream carried, and when it arrived.
+///
+/// Every model call sends a `rate_limit_event` before its answer, so a run that
+/// has just finished has already been told what `/usage` would cost another
+/// haiku call and two seconds of CLI start-up to ask. The UI polls limits on a
+/// timer, so that call was being paid for over and over beside runs that
+/// answered it for free.
+static STREAMED: Mutex<Option<(Instant, Vec<Window>)>> = Mutex::new(None);
+
+/// How long a streamed reading stands in for a fresh one. The windows it
+/// describes roll over five hours and seven days; minutes do not move them.
+const STREAMED_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// Keep a reading a run's stream carried. Called with every raw
+/// `rate_limit_event`, whatever its status.
+pub fn remember(id: ProviderId, v: &Value) {
+    if id != ProviderId::Claude {
+        return;
+    }
+    if let Some(windows) = parse_claude_event(v) {
+        if let Ok(mut latest) = STREAMED.lock() {
+            *latest = Some((Instant::now(), windows));
+        }
+    }
+}
+
+/// A streamed reading still inside `STREAMED_FOR`, if there is one.
+fn streamed(id: ProviderId) -> Option<Vec<Window>> {
+    if id != ProviderId::Claude {
+        return None;
+    }
+    let latest = STREAMED.lock().ok()?;
+    let (at, windows) = latest.as_ref()?;
+    (at.elapsed() < STREAMED_FOR).then(|| windows.clone())
+}
+
 pub async fn read(id: ProviderId) -> Limits {
     let none = |why: String| Limits {
         id,
         windows: Vec::new(),
         unavailable: Some(why),
     };
+    // A run just told us. Asking again would start a process to be told the same.
+    if let Some(windows) = streamed(id) {
+        return Limits {
+            id,
+            windows,
+            unavailable: None,
+        };
+    }
     let Some(path) = which(id.program()) else {
         return none("not installed".into());
     };

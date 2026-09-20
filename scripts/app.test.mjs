@@ -334,10 +334,12 @@ test('a reply goes on in the same task, unless that task ran in a copy', async (
     return { ...finished, taskId: 7, status: 'done', failure: null, summary: 'did it', worktree: calls.length === 2 ? {} : null };
   } });
   await state.run();
-  assert.equal(calls[0].at(-1), null, 'a first run opens its own task');
+  assert.equal(calls[0].at(-2), null, 'a first run opens its own task');
+  assert.equal(calls[0].at(-1), null, 'a first ask is routed on the whole prompt');
   state.reply.value = 'also this';
   await state.sendReply();
-  assert.equal(calls[1].at(-1), 7);
+  assert.equal(calls[1].at(-2), 7);
+  assert.equal(calls[1].at(-1), 'also this', 'the route reads the reply, not the exchange above it');
   assert.equal(calls[1][1], [
     'test',
     'Your answer:\ndid it',
@@ -345,7 +347,7 @@ test('a reply goes on in the same task, unless that task ran in a copy', async (
   ].join('\n\n'), 'the follow-up keeps user and assistant text under the correct labels');
   state.reply.value = 'and that';
   await state.sendReply();
-  assert.equal(calls[2].at(-1), null, 'a copy folder is not where the task is');
+  assert.equal(calls[2].at(-2), null, 'a copy folder is not where the task is');
 });
 
 test('a reply carries on in the run on screen, with its own attachments', async () => {
@@ -412,14 +414,15 @@ test('an old task from the sidebar can be replied to, and goes on in that task',
   await state.replyToPast();
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].at(-1), 42, 'it goes on in the task it was replying to');
+  assert.equal(calls[0].at(-2), 42, 'it goes on in the task it was replying to');
+  assert.equal(calls[0].at(-1), 'now do the other half', 'the route reads the reply alone');
   assert.equal(calls[0][1], [
     'the original ask',
     'Your answer:' + String.fromCharCode(10) + 'what it did',
     'My reply:' + String.fromCharCode(10) + 'now do the other half',
     'Files changed so far: src/a.ts',
   ].join(String.fromCharCode(10, 10)), 'the recap carries the old exchange, since the session is cold');
-  assert.equal(calls[0].at(-2), null, 'a task this old has no session left to resume');
+  assert.equal(calls[0].at(-3), null, 'a task this old has no session left to resume');
 
   const row = state.runs.value[0];
   assert.equal(state.runs.value.length, 1, 'the reply opens one run for the task');
@@ -1077,7 +1080,7 @@ test('a reply that hands off to the other CLI stays in its task', async () => {
     detectProviders: bothInstalled,
     providerLimits: reading(100, 30),
     startTask: async (...args) => {
-      sent.push({ provider: args[2], task: args.at(-1) });
+      sent.push({ provider: args[2], task: args.at(-2) });
       return outcomes.shift();
     },
   });

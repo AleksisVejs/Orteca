@@ -182,6 +182,9 @@ async fn start_task(
     app: AppHandle,
     path: String,
     prompt: String,
+    // Only what the user just said, when `prompt` also carries the exchange
+    // before it. The route and the classifier read this; the agent reads `prompt`.
+    asked: Option<String>,
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
@@ -234,6 +237,7 @@ async fn start_task(
         recordings,
         path,
         prompt,
+        asked,
         provider,
         mode,
         headroom,
@@ -308,6 +312,9 @@ struct Scanned {
     program: std::path::PathBuf,
     git: GitState,
     prompt: String,
+    /// The words the route is chosen from. The same as `prompt` for a first
+    /// ask; on a follow-up it is only what the user just said.
+    routed: String,
     mode: Mode,
     signals: routing::RepoSignals,
 }
@@ -320,7 +327,7 @@ impl Scanned {
             job,
             ..self.signals
         };
-        let route = routing::route(&self.prompt, self.mode, &signals);
+        let route = routing::route(&self.routed, self.mode, &signals);
         PlannedRun {
             dir: self.dir,
             project: self.project,
@@ -332,10 +339,27 @@ impl Scanned {
     }
 }
 
+/// The words a route is chosen from.
+///
+/// A follow-up's prompt carries the whole exchange - the original order, the
+/// answer, then the reply - because the agent needs that context when its
+/// session has gone cold. The route must not read it: handed the blob, the
+/// classifier answers about the task at the top instead of the reply at the
+/// bottom. "ELI5" after a finished change was read as more of the change, ran
+/// an Implement stage that rightly edited nothing, and turned a done task into
+/// "Couldn't finish".
+fn routing_words(prompt: &str, asked: Option<&str>) -> Option<String> {
+    asked
+        .and_then(run::clean_prompt)
+        .or_else(|| run::clean_prompt(prompt))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_run(
     store: &Store,
     path: String,
     prompt: String,
+    asked: Option<String>,
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
@@ -347,6 +371,7 @@ fn scan_run(
             "Type what you want done first.",
         ));
     };
+    let routed = routing_words(&prompt, asked.as_deref()).unwrap_or_else(|| prompt.clone());
     let (dir, project) = trusted_dir(store, &path)?;
     let git = project::git_state(&dir);
 
@@ -378,6 +403,8 @@ fn scan_run(
             Ok(_) => Vec::new(),
             Err(_) => store.code_map(project.id).unwrap_or_default(),
         },
+        // The whole prompt, which is what the task row stores: this counts the
+        // same ask failing again, and `routed` is deliberately not the same ask.
         prior_failures: store.prior_failures(project.id, &prompt)?,
         stalled_tiers: store.stalled_tiers(project.id, provider.program(), mode.name())?,
         // The frontend's reading, not a fresh one: the preview and the run
@@ -391,6 +418,7 @@ fn scan_run(
         program,
         git,
         prompt,
+        routed,
         mode,
         signals,
     })
@@ -405,6 +433,7 @@ async fn begin(
     recordings: Option<std::path::PathBuf>,
     path: String,
     prompt: String,
+    asked: Option<String>,
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
@@ -417,7 +446,17 @@ async fn begin(
     // Read on the provider the run will spend. Unreadable means the keyword
     // router decides, never a failed run. The same call names the task, so a
     // title costs no extra call; a prompt keywords already read gets none.
-    let reading = match (run::clean_prompt(&prompt), providers::which(provider.program())) {
+    //
+    // A follow-up reads only what the user just said. The prompt it runs on
+    // carries the whole exchange so the agent has the context, and a classifier
+    // handed that reads the task at the top instead of the reply at the bottom:
+    // "ELI5" after a finished change was routed as more of the change, ran an
+    // Implement stage that rightly edited nothing, and the finished task turned
+    // into "Couldn't finish".
+    let reading = match (
+        routing_words(&prompt, asked.as_deref()),
+        providers::which(provider.program()),
+    ) {
         (Some(text), Some(program)) if !routing::keywords_suffice(&text) => {
             Some(tokio::spawn(async move {
                 let read = intent::read(provider, &program.to_string_lossy(), &text).await;
@@ -432,7 +471,7 @@ async fn begin(
         if let Ok((dir, record)) = trusted_dir(store, &path) {
             let _ = store.scan_map(record.id, &dir, &project::tracked_paths(&dir));
         }
-        scan_run(store, path, prompt, provider, mode, headroom, isolation)
+        scan_run(store, path, prompt, asked, provider, mode, headroom, isolation)
     });
     let scan_ms = ms(started);
     let scanned = match scanned {
@@ -473,6 +512,7 @@ async fn preview_task(
     app: AppHandle,
     path: String,
     prompt: String,
+    asked: Option<String>,
     provider: ProviderId,
     mode: Mode,
     headroom: Option<f64>,
@@ -484,7 +524,7 @@ async fn preview_task(
     // call per pause would cost more than the runs it routes. Off the main
     // thread: git, PATH and ACL probes froze the window on every pause.
     let planned = tauri::async_runtime::spawn_blocking(move || {
-        scan_run(&app.state::<Store>(), path, prompt, provider, mode, headroom, isolation)
+        scan_run(&app.state::<Store>(), path, prompt, asked, provider, mode, headroom, isolation)
             .map(|scanned| scanned.route(None, None))
     })
     .await
@@ -1169,6 +1209,25 @@ mod tests {
         assert!(operations.cancel(ProviderId::Codex).is_err());
     }
 
+    /// The bug this guards: a finished task, a one-word reply, and a run that
+    /// ended `failed` because the reply was routed as more of the task.
+    #[test]
+    fn a_follow_up_is_routed_on_the_reply_not_the_exchange_it_carries() {
+        let blob = "add a projects list to the sidebar
+
+Your answer:
+Done, 85 tests pass.
+
+My reply:
+ELI5";
+        assert_eq!(routing_words(blob, Some("ELI5")).unwrap(), "ELI5");
+        // A first ask has no reply of its own, so the whole prompt is the route's.
+        assert_eq!(routing_words(blob, None).unwrap(), blob);
+        // Blank is not words. The prompt still routes the run rather than nothing.
+        assert_eq!(routing_words(blob, Some("   ")).unwrap(), blob);
+        assert_eq!(routing_words("  ", Some("")), None);
+    }
+
     #[test]
     fn trust_is_bound_to_the_canonical_directory() {
         let root = std::env::temp_dir().join(format!("orteca-run-trust-{}", std::process::id()));
@@ -1251,6 +1310,7 @@ mod tests {
             None,
             key,
             var("BENCH_PROMPT"),
+            None,
             json(var("BENCH_PROVIDER")),
             json(var("BENCH_MODE")),
             None,

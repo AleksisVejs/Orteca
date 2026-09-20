@@ -80,9 +80,11 @@ export const recentTasks = (path: string) =>
 export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
 /** `headroom` is the room left in the provider's tightest plan window, or null
- *  when unread. The router may run a checked route a tier down when it is low. */
-export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode, headroom: number | null, isolation: Isolation, model: ModelOverride | null) =>
-  invoke<Preflight>("preview_task", { path, prompt, provider, mode, headroom, isolation, model });
+ *  when unread. The router may run a checked route a tier down when it is low.
+ *  `asked` is only what the user just said, when `prompt` also carries the
+ *  exchange before it; the route is chosen from it. */
+export const previewTask = (path: string, prompt: string, provider: ProviderId, mode: Mode, headroom: number | null, isolation: Isolation, model: ModelOverride | null, asked: string | null = null) =>
+  invoke<Preflight>("preview_task", { path, prompt, asked, provider, mode, headroom, isolation, model });
 
 /** Deletes a finished run's copy folder. Git refuses while it holds uncommitted
  *  work; the branch always stays. */
@@ -133,6 +135,10 @@ export const startTask = (
   resume: (Resume & { reply: string }) | null = null,
   // A reply that goes on in this task instead of opening a new one.
   continueTask: number | null = null,
+  // Only what the user just said, when `prompt` also carries the exchange
+  // before it. The route and the classifier read this, so a question asked
+  // after a finished change is routed as a question and not as more of it.
+  asked: string | null = null,
 ) => {
   const events = new Channel<ProviderEvent>();
   events.onmessage = onEvent;
@@ -142,7 +148,7 @@ export const startTask = (
   task.onmessage = onTask;
   const checking = new Channel<TaskResult>();
   checking.onmessage = onChecking;
-  return invoke<TaskResult>("start_task", { path, prompt, provider, mode, headroom, isolation, attachments, resume, continueTask, model, events, task, checking });
+  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, model, events, task, checking });
 };
 
 /**

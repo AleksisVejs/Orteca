@@ -1155,7 +1155,7 @@ pub async fn stream(
             let mut brief =
                 routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes);
             brief.push_str(&attached_note(&ctx.attachments));
-            brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
+            brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref()));
             let payload = stage_payload(Stage::Review, index + 1, stages.len(), &review_ctx.plan, id);
             if let Err(e) = note(store, &review_ctx, "stage", &payload) {
                 state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
@@ -1265,7 +1265,7 @@ pub async fn stream(
             }
             brief.push_str(&attached_note(&ctx.attachments));
             if stage == Stage::Review {
-                brief.push_str(&pasted_diff(&ctx.dir, base_commit.as_deref()));
+                brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref()));
             }
             if let Err(e) = note(
                 store,
@@ -1615,29 +1615,68 @@ fn runnable(check: &project::Check) -> bool {
         .all(|command| crate::providers::which(command[0]).is_some())
 }
 
-/// Small candidate files pasted into a Codex Implement brief, so Codex spends no
-/// shell call opening them. Claude gets none: its Edit tool refuses a file it has
-/// not Read in the same session, so pasting would pay for the bytes twice.
-/// Symlinks are skipped, because a tracked link can point outside the repository.
-// ponytail: first three candidates, 8 KB each, 16 KB in all; tune once runs show
-// how often a pasted file was the one edited.
-/// The change a Review reads, pasted so it does not spend turns finding it.
-/// A patch too large to paste is left for the reviewer to open.
-fn pasted_diff(dir: &Path, base: Option<&str>) -> String {
+/// Everything a Review reads about the change: the patch, and the files it
+/// touches pasted whole.
+///
+/// Only what this run wrote. A tree that was already dirty when the run started
+/// diffs against `base_commit` exactly like the run's own work, and a reviewer
+/// handed both cannot tell them apart: one reported a pre-existing edit to
+/// `trust_scan` as an unrequested change in the patch, which held up work that
+/// never touched it and bought the Fix three turns of `git status` to
+/// disentangle. `attribute` already labels every file; this uses the labels.
+///
+/// The whole files go with it because a patch is hunks and a reviewer needs what
+/// surrounds them: given only the diff it opened all four candidate files
+/// anyway, a round-trip of uncached context each. A Review never edits, so
+/// unlike a writing stage it owes Claude's Edit tool no prior Read and the
+/// bytes are paid for once.
+fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snapshot>) -> String {
     const MAX_BYTES: usize = 48 * 1024;
-    match project::patch_since(dir, base) {
+    // A diff that cannot be read narrows nothing: the whole patch is still the
+    // truth, and blanking the review over a failed `git diff` would not be.
+    // `attribute` only labels when there is a snapshot to label against, which
+    // there is exactly when the tree started dirty - the case that needs it.
+    let only = project::diff_since(dir, base).ok().map(|mut diff| {
+        project::attribute(dir, &mut diff, before);
+        diff.into_iter()
+            .filter(|f| f.origin != Some(project::Origin::BeforeRun))
+            .map(|f| f.path)
+            .collect::<Vec<_>>()
+    });
+    let patch = match project::patch_of(dir, base, only.as_deref()) {
         Ok(patch) if !patch.trim().is_empty() && patch.len() <= MAX_BYTES => format!(
-            "\nThe change under review, as a patch against where the run started. Open \
-             other files only where the patch is not enough:\n```diff\n{}\n```\n",
+            "\nThe change under review, as a patch: what this run wrote, and only that. \
+             The tree may hold other edits that were already there when the run started; \
+             they are not under review and are not shown:\n```diff\n{}\n```\n",
             patch.trim_end()
         ),
-        _ => String::new(),
-    }
+        // A patch too large to paste is left for the reviewer to open, and the
+        // files it touches are not pasted either - that is the same bytes twice.
+        _ => return String::new(),
+    };
+    let Some(changed) = only else {
+        return patch;
+    };
+    format!("{patch}{}", pasted_files(dir, &changed))
 }
 
+/// The candidate files, pasted whole so a stage does not spend a turn each
+/// opening them. Symlinks are skipped, because a tracked link can point outside
+/// the repository.
+///
+/// Codex Implement gets these so it spends no shell call opening them; a Claude
+/// writing stage gets none, because its Edit tool refuses a file it has not Read
+/// in the same session and pasting would pay for the bytes twice. A Review edits
+/// nothing, so it gets them on either provider.
+///
+/// The caps are the size of a file worth pasting, not of one that is cheap to
+/// paste: at the old 8 KB the 42 KB Vue component three stages in a row re-read
+/// was silently skipped, which is exactly the file the paste existed for.
+// ponytail: first three candidates, 48 KB each, 96 KB in all; tune once runs
+// show how often a pasted file was the one edited.
 fn pasted_files(dir: &Path, paths: &[String]) -> String {
-    const EACH: u64 = 8_000;
-    const TOTAL: usize = 16_000;
+    const EACH: u64 = 48 * 1024;
+    const TOTAL: usize = 96 * 1024;
     let mut out = String::new();
     for path in paths.iter().take(3) {
         let full = dir.join(path);
@@ -2996,14 +3035,28 @@ async fn attempt(
                 // Claude's running thinking-token count says nothing the usage
                 // event does not; logging it buried real unknowns 3 to 1.
                 let tick = value["type"] == "system" && value["subtype"] == "thinking_tokens";
-                if events.is_empty() && !tick {
+                // The reading `provider_limits` otherwise starts a whole call to
+                // ask for. It arrives before every answer, so a run keeps the
+                // limits panel current for free. Only `rejected` becomes an
+                // event; the rest are kept here and are no longer unknown.
+                let limits = value["type"] == "rate_limit_event";
+                if limits {
+                    crate::providers::limits::remember(ctx.id, &value);
+                }
+                if events.is_empty() && !tick && !limits {
                     state.unknown_events = state.unknown_events.saturating_add(1);
+                    // Enough to say what the line was, not enough to store a
+                    // file in it. An unrecognised line can carry a whole Read
+                    // result or a pasted image base64: unknown rows were half
+                    // the database, and none of that weight said anything the
+                    // first kilobyte does not. The recording above still has
+                    // every byte.
                     if let Err(e) = store.append_event(
                         ctx.task_id,
                         ctx.stage(),
                         "unknown",
                         ctx.id.program(),
-                        &value.to_string(),
+                        &routing::clip_event(&value.to_string()),
                     ) {
                         state.outcome.failure =
                             Some(format!("could not record run event: {}", e.message));
@@ -3293,7 +3346,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orteca-paste-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("slug.js"), "export const slug = s => s;").unwrap();
-        std::fs::write(dir.join("big.js"), "x".repeat(9_000)).unwrap();
+        std::fs::write(dir.join("big.js"), "x".repeat(49 * 1024)).unwrap();
         let paths = ["big.js", "missing.js", "slug.js"].map(String::from);
         let text = pasted_files(&dir, &paths);
         assert!(

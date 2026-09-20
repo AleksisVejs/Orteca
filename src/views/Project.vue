@@ -9,13 +9,47 @@ import TaskResult from "./project/TaskResult.vue";
 import TaskRun from "./project/TaskRun.vue";
 import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
-import type { GitAction, OpenedProject } from "../types";
+import { recentProjects } from "../api";
+import type { GitAction, OpenedProject, Project } from "../types";
 import { visiblePath } from "../path";
 
 // The shell: sidebar, top bar and whichever page the sidebar picked.
 // All state lives in `useProject`; the pages inject it.
-const props = defineProps<{ opened: OpenedProject; active: boolean }>();
-const emit = defineEmits<{ close: []; busy: [count: number] }>();
+
+/** Every project currently open, with how many runs each has going right now. */
+type OpenProject = { path: string; name: string; running: number };
+const props = defineProps<{ opened: OpenedProject; active: boolean; openProjects?: OpenProject[] }>();
+const emit = defineEmits<{ close: []; switch: [path: string]; open: [path: string]; busy: [count: number] }>();
+
+// Every project worked on before, not just the ones open this session, so the
+// sidebar can switch between them without dropping back to the launch screen.
+const recents = ref<Project[]>([]);
+async function loadRecents() {
+  try {
+    recents.value = await recentProjects();
+  } catch {
+    // The launch screen already surfaces this failure; the sidebar just omits the list.
+  }
+}
+onMounted(loadRecents);
+watch(() => props.opened.project.path, loadRecents);
+
+const otherProjects = computed(() => {
+  const running = new Map((props.openProjects ?? []).map((p) => [p.path, p.running]));
+  const seen = new Set([props.opened.project.path]);
+  const list: Array<{ path: string; name: string; running: number }> = [];
+  for (const p of props.openProjects ?? []) {
+    if (seen.has(p.path)) continue;
+    seen.add(p.path);
+    list.push(p);
+  }
+  for (const p of recents.value) {
+    if (seen.has(p.path)) continue;
+    seen.add(p.path);
+    list.push({ path: p.path, name: p.name, running: running.get(p.path) ?? 0 });
+  }
+  return list;
+});
 
 const state = useProject(props.opened, computed(() => props.active));
 provide(PROJECT, state);
@@ -224,6 +258,23 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       </ul>
       <p v-if="taskError" class="note side-note" role="alert">{{ taskError }}</p>
 
+      <template v-if="otherProjects.length">
+        <h2 class="label side-label">Projects</h2>
+        <ul class="switch-list">
+          <li v-for="p in otherProjects" :key="p.path">
+            <button
+              :title="visiblePath(p.path)"
+              @click="p.running || openProjects?.some((o) => o.path === p.path) ? $emit('switch', p.path) : $emit('open', p.path)"
+            >
+              <span v-if="p.running" class="dot live" aria-hidden="true"></span>
+              <svg v-else viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+              <span class="grow">{{ p.name }}</span>
+              <span v-if="p.running" class="note">{{ p.running === 1 ? "1 running" : `${p.running} running` }}</span>
+            </button>
+          </li>
+        </ul>
+      </template>
+
       <dialog ref="deleteDialog" class="confirm" aria-labelledby="delete-title" @close="deleteAsk = null">
         <h2 id="delete-title">Delete this task?</h2>
         <p>{{ deleteAsk && taskName(deleteAsk) }}</p>
@@ -235,9 +286,9 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       </dialog>
 
       <div class="side-project">
-        <button class="switch-project" @click="$emit('close')">
-          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M13 5H3m3-3L3 5l3 3M3 11h10m-3-3 3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
-          Switch project
+        <button class="switch-project" title="Back to the start screen" @click="$emit('close')">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 7.5 8 2l6 5.5M4 6.5V13a1 1 0 0 0 1 1h2.5v-3.5h1V14H10a1 1 0 0 0 1-1V6.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          Start screen
         </button>
       </div>
     </aside>
@@ -485,7 +536,8 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
   list-style: none;
 }
 .nav button,
-.recent button {
+.recent button,
+.switch-list button {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -500,6 +552,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 }
 .nav button:hover,
 .recent button:hover,
+.switch-list button:hover,
 .nav button.on,
 .recent button.on {
   background: var(--surface-2);
@@ -656,6 +709,24 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 .confirm .danger:hover {
   border-color: var(--err);
 }
+.switch-list {
+  display: grid;
+  gap: 2px;
+  flex-shrink: 0;
+  max-height: 30%;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.switch-list svg {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.switch-list .dot {
+  flex-shrink: 0;
+}
+
 .side-project {
   margin-top: auto;
   padding-top: 12px;

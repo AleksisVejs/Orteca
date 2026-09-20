@@ -105,7 +105,10 @@ function closeProject(path: string) {
     :key="p.project.path"
     :opened="p"
     :active="p.project.path === activePath"
+    :open-projects="openProjects"
     @close="close"
+    @switch="(path) => (activePath = path)"
+    @open="open"
     @busy="(count) => (busy[p.project.path] = count)"
   />
   <Launch

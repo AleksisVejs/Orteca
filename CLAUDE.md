@@ -120,6 +120,20 @@ never the store. Colors and spacing come from `src/styles/tokens.css`, and
   `--sandbox workspace-write`). Orteca configures them and adds a denylist on top; it
   does not reimplement sandboxing. Never `--sandbox danger-full-access`.
 
+## Orteca on Orteca
+
+This repo is a normal project for Orteca: open it, consent once, run in **Current tree**.
+Two things make it different from any other target:
+
+- **Run the built app, not `npm run tauri dev`.** The dev watcher rebuilds and restarts
+  the app the moment a run edits `src-tauri/`, and the run dies with it - its children
+  are in the app's Job Object. Vite's HMR does the same to a live run's UI on a `src/`
+  edit. `src-tauri/target/release/orteca.exe` (or the NSIS installer beside it) has
+  neither watcher; `npm run tauri dev -- --no-watch` covers only the Rust half.
+- Verify is this repo's own suites, no model: `npm test` (~4s) and `src-tauri`'s
+  `cargo test` (~19s warm). A worktree copy starts cold - `npm ci` plus a full build,
+  about two minutes - which fits the 10-minute per-command limit with room to spare.
+
 ## Gotchas already paid for
 
 - `tauri-build` needs `src-tauri/icons/icon.ico` even for `cargo test`. The whole icon

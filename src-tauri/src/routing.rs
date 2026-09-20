@@ -200,7 +200,13 @@ pub const PLAN_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"
 
 /// The Review artifact. `verdict: "pass"` is what lets the route end without a
 /// fix call - which is where "calls avoided" is actually earned.
-pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["findings","verdict"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","line","issue","fix"],"properties":{"severity":{"type":"string","enum":["low","medium","high"]},"file":{"type":"string"},"line":{"type":"integer"},"issue":{"type":"string"},"fix":{"type":"string"}}}},"verdict":{"type":"string","enum":["pass","changes_requested"]}}}"#;
+///
+/// `fix` is described as the requirement, not the edit. A reviewer that writes
+/// the patch spends the route's most expensive output tokens on code, and the
+/// Fix follows it literally: one review dictated "emit `switch` for an
+/// already-open path and a new `open` event for the rest" into a codebase whose
+/// `open()` already did both, and the redundant event shipped.
+pub const REVIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["findings","verdict"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","line","issue","fix"],"properties":{"severity":{"type":"string","enum":["low","medium","high"]},"file":{"type":"string"},"line":{"type":"integer"},"issue":{"type":"string","description":"The defect and the failure it causes, in one or two sentences."},"fix":{"type":"string","description":"What must become true for this finding to be resolved, in one or two sentences. State the requirement and any constraint it must keep, not the code: do not write the patch, name the functions to call, or dictate an implementation. The fixing agent reads the repository and chooses how."}}}},"verdict":{"type":"string","enum":["pass","changes_requested"]}}}"#;
 
 /// The Verify artifact: each check that ran and whether it passed.
 pub const VERIFY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["checks","verdict"],"properties":{"checks":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["command","passed","output"],"properties":{"command":{"type":"string"},"passed":{"type":"boolean"},"output":{"type":"string"}}}},"verdict":{"type":"string","enum":["pass","fail"]}}}"#;
@@ -418,16 +424,20 @@ impl Route {
     pub fn review_model(&self, id: ProviderId) -> Option<ModelChoice> {
         let review_tier = self.budget.review_tier?;
         let mut choice = review_tier.model(id);
-        if self.mode == Mode::Efficient {
-            match id {
-                ProviderId::Claude => choice.effort = "medium",
-                // Terra high found the same seeded containment defect as Sol
-                // low with fewer tokens and lower latency (§4.3.6).
-                ProviderId::Codex => {
-                    choice = Tier::Standard.model(id);
-                    choice.effort = "high";
-                }
+        match id {
+            // Medium in every mode: the seeded regression Sonnet missed was
+            // caught by Opus *medium* (§4.3.6), so high is effort the evidence
+            // never asked for. On one 60-line frontend diff high spent 13.9k
+            // output tokens and 173s - 60% of the run's cost, 54% of its wall
+            // time - to return findings medium reaches.
+            ProviderId::Claude => choice.effort = "medium",
+            // Terra high found the same seeded containment defect as Sol
+            // low with fewer tokens and lower latency (§4.3.6).
+            ProviderId::Codex if self.mode == Mode::Efficient => {
+                choice = Tier::Standard.model(id);
+                choice.effort = "high";
             }
+            ProviderId::Codex => {}
         }
         Some(choice)
     }
@@ -1457,6 +1467,14 @@ fn clip(text: &str, limit: usize) -> String {
 {}", &text[..head], tail - head, &text[tail..])
 }
 
+/// An unrecognised provider line, cut to what diagnosing it needs. The head
+/// names the type and the tail shows how it ended; a Read result or a pasted
+/// image's base64 in between says nothing either does not.
+pub fn clip_event(line: &str) -> String {
+    const UNKNOWN_EVENT: usize = 2048;
+    clip(line, UNKNOWN_EVENT)
+}
+
 /// One stage's artifact as the next one should see it.
 ///
 /// A Verify or Fix artifact carries every check's whole stdout, and a passing
@@ -1506,7 +1524,8 @@ pub fn brief(
                  Do not edit any file. Return only the structured review. Check it against \
                  every rule the task states: a rule that is missing or only partly met is a \
                  finding. Ask for changes only for a high or medium finding; report low ones, \
-                 which do not hold the work up.",
+                 which do not hold the work up. Say what each finding requires and what it \
+                 must not break; do not write the patch or dictate an implementation.",
             );
             // The latest check, not any: a pass before a later fix says nothing
             // about the tree as it is now.
@@ -1866,6 +1885,35 @@ mod tests {
     /// Short on allowance, a checked route runs one tier down. Never where
     /// evidence raised the tier, never on
     /// guarded work, never onto a tier that stalled, never without a check.
+    /// The bench that bought the deep Review tier caught its seeded regression
+    /// with Opus *medium*; shipping high was effort nothing measured asked for.
+    #[test]
+    fn a_claude_review_reasons_at_medium_in_every_mode() {
+        for mode in [Mode::Balanced, Mode::Efficient] {
+            let r = route("make the header bold", mode, &repo(REPO));
+            let Some(review) = r.review_model(ProviderId::Claude) else {
+                continue;
+            };
+            assert_eq!(review.model, "opus", "{mode:?}");
+            assert_eq!(review.effort, "medium", "{mode:?}");
+        }
+    }
+
+    /// A reviewer that writes the patch spends the route's dearest output
+    /// tokens on code the fixing agent then copies without reading the repo.
+    #[test]
+    fn a_review_is_asked_for_the_requirement_and_not_the_patch() {
+        assert!(REVIEW_SCHEMA.contains("do not write the patch"), "{REVIEW_SCHEMA}");
+        let brief = brief(
+            &balanced("make the header bold", REPO),
+            Stage::Review,
+            "make the header bold",
+            &[],
+            &[],
+        );
+        assert!(brief.contains("do not write the patch"), "{brief}");
+    }
+
     #[test]
     fn a_low_plan_limit_drops_a_checked_route_one_tier() {
         let low = |room: f64| RepoSignals {
@@ -2100,10 +2148,13 @@ mod tests {
             [Stage::Plan, Stage::Implement, Stage::Verify, Stage::Review]
         );
 
-        // Balanced reviews on deep. Efficient uses the provider-specific
-        // combination that passed its seeded review benchmark.
+        // Balanced reviews on deep too - the deep model, at the effort the
+        // seeded review benchmark actually passed on.
         let claude = ProviderId::Claude;
-        assert_eq!(r.review_model(claude), Some(Tier::Deep.model(claude)));
+        assert_eq!(
+            r.review_model(claude).map(|c| (c.model, c.effort)),
+            Some((Tier::Deep.model(claude).model, "medium"))
+        );
         let lean = route(
             "add an authorization check before the delete endpoint",
             Mode::Efficient,

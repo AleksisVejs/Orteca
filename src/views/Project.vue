@@ -63,6 +63,14 @@ const {
   commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
 } = state;
 
+const historySearch = ref("");
+const historyStatus = ref("all");
+const filteredHistory = computed(() => history.value.filter((task) => {
+  const query = historySearch.value.trim().toLocaleLowerCase();
+  return (!query || [task.title, task.prompt, task.summary, task.provider].some((text) => text?.toLocaleLowerCase().includes(query)))
+    && (historyStatus.value === "all" || (historyStatus.value === "attention" ? ["failed", "verifyFailed", "reviewRejected", "budgetReached"].includes(task.status) : task.status === historyStatus.value));
+}));
+
 // The launch screen lists every open project and says which are busy, so a run
 // left going in another one is never invisible.
 watch(runningCount, (count) => emit("busy", count), { immediate: true });
@@ -208,10 +216,18 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         <span v-if="!historyError && history.length" class="count" :title="`${history.length} recent tasks`">{{ history.length }}</span>
       </div>
       <h3 class="hidden-label">Recent tasks</h3>
+      <div v-if="history.length" class="history-filters">
+        <input v-model="historySearch" type="search" aria-label="Search recent tasks" placeholder="Search recent tasks…" />
+        <select v-model="historyStatus" aria-label="Filter recent tasks by status"><option value="all">All statuses</option><option value="done">Done</option><option value="attention">Needs attention</option><option value="cancelled">Stopped</option><option value="running">Running</option></select>
+        <span class="note">{{ filteredHistory.length }} of {{ history.length }} recent tasks</span>
+      </div>
       <p v-if="historyError" class="note side-note">History unavailable.</p>
       <p v-else-if="!history.length" class="note side-note">Finished tasks show up here.</p>
+      <p v-else-if="!filteredHistory.length" class="note side-note">No matching tasks.</p>
       <ul v-else class="recent">
-        <li v-for="t in history" :key="t.id">
+        <template v-for="(t, i) in filteredHistory" :key="t.id">
+        <li v-if="i === 0 || filteredHistory[i - 1]?.startedAt.slice(0, 10) !== t.startedAt.slice(0, 10)" class="history-date">{{ t.startedAt.slice(0, 10) }} · UTC</li>
+        <li>
           <input
             v-if="renameId === t.id"
             v-model="renaming"
@@ -255,6 +271,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <button role="menuitem" class="danger" @click="askDelete(t)">Delete</button>
           </div>
         </li>
+        </template>
       </ul>
       <p v-if="taskError" class="note side-note" role="alert">{{ taskError }}</p>
 
@@ -285,12 +302,6 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </footer>
       </dialog>
 
-      <div class="side-project">
-        <button class="switch-project" title="Back to the start screen" @click="$emit('close')">
-          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 7.5 8 2l6 5.5M4 6.5V13a1 1 0 0 0 1 1h2.5v-3.5h1V14H10a1 1 0 0 0 1-1V6.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
-          Start screen
-        </button>
-      </div>
     </aside>
 
     <div class="main">
@@ -432,6 +443,10 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
     </div>
 
     <footer class="statusbar" aria-label="Workspace status">
+      <button class="switch-project" title="Back to the start screen" @click="$emit('close')">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 7.2 8 2l6 5.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /><path d="M3.6 6.4v6.1c0 .5.4.9.9.9h7c.5 0 .9-.4.9-.9V6.4M6.6 13.4V9.6h2.8v3.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        Start screen
+      </button>
       <span class="mono grow" :title="visiblePath(opened.project.path)">{{ visiblePath(opened.project.path) }}</span>
       <span v-if="anyRunning" class="status-item"><span class="dot live" aria-hidden="true"></span>{{ runningCount === 1 ? "Task running" : `${runningCount} tasks running` }}</span>
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
@@ -497,6 +512,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
   flex-direction: column;
   gap: 2px;
   min-height: 0;
+  overflow-y: auto;
   padding: 0 8px 8px;
   background: var(--surface);
   border-right: 1px solid var(--border);
@@ -607,7 +623,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
   grid-template-columns: minmax(0, 1fr);
   overflow-x: hidden;
   align-content: start;
-  min-height: 0;
+  min-height: 140px;
   overflow-y: auto;
 }
 .recent li {
@@ -727,30 +743,24 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
   flex-shrink: 0;
 }
 
-.side-project {
-  margin-top: auto;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
 .switch-project {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  width: 100%;
-  min-height: 32px;
-  padding: 6px 10px;
-  border-radius: var(--r-sm);
-  color: var(--text-faint);
-  font-size: 12px;
-  text-align: left;
-  transition: background 120ms ease, color 120ms ease;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: 22px;
+  padding: 2px 10px 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim, var(--text-faint));
+  font-size: 11px;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
 .switch-project:hover {
   color: var(--text);
   background: var(--surface-2);
-}
-.recent + .side-project {
-  margin-top: 8px;
+  border-color: var(--text-faint);
 }
 
 .main {
@@ -1218,4 +1228,8 @@ h1 {
     padding: 24px 20px 48px;
   }
 }
+.history-filters { display: flex; flex-direction: column; gap: 8px; margin: 8px 12px; }
+.history-filters input, .history-filters select { width: 100%; min-width: 0; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 8px; font: inherit; font-size: 12px; }
+.history-filters input::placeholder { color: var(--text-faint); }
+.recent .history-date { padding: 12px 10px 4px 20px; font-size: 11px; color: var(--text-faint); }
 </style>

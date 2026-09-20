@@ -1124,3 +1124,38 @@ test('a run in a separate copy asks for one, and removing the copy takes a secon
   assert.deepEqual([...state.removedCopies.value], [1]);
   assert.equal(state.confirmRemove.value, null);
 });
+
+
+test('live stage progress stays with its run and accepts inserted and concurrent steps', async () => {
+  const pending = [];
+  const { state } = await projectView({ startTask: (...args) => new Promise(resolve => {
+    pending.push({ emit: args[8], resolve }); args[9](pending.length);
+  }) });
+  const first = state.run();
+  const firstRun = state.activeRun.value;
+  state.newTask(); state.task.value = 'second';
+  const second = state.run();
+  pending[0].emit({ kind: 'stageProgress', data: { stages: ['implement', 'verify', 'review'], current: [1, 2] } });
+  assert.equal(state.activeRun.value.progress, undefined);
+  assert.deepEqual([...firstRun.progress.current], [1, 2]);
+  pending[0].emit({ kind: 'stageProgress', data: { stages: ['implement', 'verify', 'fix', 'verify'], current: [2] } });
+  assert.equal(firstRun.progress.stages[2], 'fix');
+  assert.equal(firstRun.stream.length, 0, 'stage metadata must not become an AI message');
+  for (const run of pending) run.resolve({ ...finished, status: 'done' });
+  await Promise.all([first, second]);
+});
+
+for (const [disposition, expected] of [['held', 'Queued for next step'], ['resumed', 'Applied · step restarted'], ['live', 'Delivered to the running agent']]) {
+  test('steering displays the backend receipt: ' + disposition, async () => {
+    let release;
+    const { state } = await projectView({
+      sendInstruction: async () => ({ disposition }),
+      startTask: (...args) => { args[9](1); return new Promise(resolve => { release = resolve; }); },
+    });
+    const run = state.run();
+    state.instruction.value = 'keep the public API';
+    await state.instruct(disposition === 'resumed');
+    assert.equal(state.lines.value.at(-1).delivery, expected);
+    release(finished); await run;
+  });
+}

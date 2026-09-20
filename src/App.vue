@@ -46,12 +46,14 @@ async function open(path: string) {
     activePath.value = already.project.path;
     return;
   }
-  activePath.value = null;
+  // Stay on the current screen while it loads; going home first made a flash.
   let result: OpenedProject;
   try {
     result = await openProject(path);
   } catch (e) {
     if (request !== openRequest) return;
+    // The error shows on the launch screen, so go there only when it fails.
+    activePath.value = null;
     openError.value = isAppError(e) ? e.message : String(e);
     return;
   }
@@ -59,6 +61,7 @@ async function open(path: string) {
 
   // Custom instruction filenames and future config formats cannot bypass consent.
   if (!result.project.trusted) {
+    activePath.value = null;
     pendingTrust.value = result;
     return;
   }

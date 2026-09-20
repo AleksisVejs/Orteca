@@ -8,7 +8,7 @@ const {
   schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
   installed, provider, providerPicked, pickedFor, previewing, preview, previewError,
   limitWarning, alternative, switchTo, runError, providerError, helpersPending, view,
-  MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount,
+  MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git,
 } = inject(PROJECT)!;
 </script>
 
@@ -16,6 +16,12 @@ const {
   <section class="composer" aria-labelledby="composer-title">
     <h2 id="composer-title" class="hero">Start a new task</h2>
     <p class="lede">Ask a question, fix a bug, or build something new.</p>
+
+    <dl class="task-context" aria-label="Task destination">
+      <div><dt>Project</dt><dd :title="opened.project.path">{{ opened.project.name }}</dd></div>
+      <div><dt>Working location</dt><dd>{{ isolation === 'worktree' ? 'Separate copy · new branch' : 'Current folder' }}<span class="mono">{{ isolation === 'worktree' ? 'from ' : '' }}{{ git.branch ?? 'Branch unavailable' }}</span></dd></div>
+      <div><dt>AI helper</dt><dd>{{ providerPicked ? (provider === 'codex' ? 'Codex' : 'Claude') : 'Auto · ' + (provider === 'codex' ? 'Codex' : 'Claude') }}<span>{{ providerPicked ? modelChoices[provider].model ?? 'Automatic model' : 'Chosen from available allowance' }}</span></dd></div>
+    </dl>
 
     <section class="ask card" :class="{ dragging }">
       <label class="hidden-label" :for="domId('task')">Describe your task</label>
@@ -474,4 +480,9 @@ textarea:focus {
     margin-left: auto;
   }
 }
+.task-context { display: flex; flex-wrap: wrap; gap: 16px 24px; margin: 0 0 24px; padding: 16px 0; border-block: 1px solid var(--border); }
+.task-context > div { flex: 1 1 140px; min-width: 0; }
+.task-context dt { color: var(--text-faint); font-size: 12px; margin-bottom: 6px; }
+.task-context dd { margin: 0; overflow-wrap: anywhere; }
+.task-context dd span { display: block; margin-top: 4px; color: var(--text-dim); font-size: 12px; }
 </style>

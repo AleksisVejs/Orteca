@@ -274,6 +274,7 @@ export interface FileEdit {
 
 /** Adjacently tagged in Rust, so every variant carries its payload in `data`. */
 export type ProviderEvent =
+  | { kind: "stageProgress"; data: { stages: string[]; current: number[] } }
   | { kind: "started"; data: { sessionId: string } }
   | { kind: "text"; data: string }
   | { kind: "toolUse"; data: { name: string; summary: string; id?: string; changes?: FileEdit[] } }

@@ -113,10 +113,12 @@ is the only place colour, radius and spacing are defined.
 - The composer separates writing and attachments from task settings. The AI,
   approach and working location stay visible while the settings are collapsed.
   “Run task” is the primary action, with a Ctrl+Enter hint on wider windows.
-- Launch uses a centered wordmark, one project action, an open-project list and
-  a simple recent project list. Projects stay open while another is on screen,
-  so the open list says how many tasks each one has running and refuses to close
-  one that is busy. Switching project closes nothing. The workspace has a 240px sidebar (208px in smaller desktop
+- Launch uses a centered wordmark, a one-click "Continue" for the newest recent
+  project (with its branch and age), a smaller "Open another project" (Ctrl+O,
+  or drop a folder on the window), one merged project list (open ones marked with
+  a dot, arrow keys walk it) and a line of CLI status. Projects stay open while
+  another is on screen, so an open row says how many tasks it has running and
+  refuses to close while busy. Switching project closes nothing. The workspace has a 240px sidebar (208px in smaller desktop
   windows), a 44px pane header and a compact status bar. Task history nests
   under the current project and shows each task’s status and provider.
 - The pane header identifies the current screen with a tab-like treatment.
@@ -190,8 +192,9 @@ draggable divider, and `Ctrl+\`` shows and hides it.
 
 - Transitions are 120ms ease, on colour and background only. Nothing moves,
   slides or bounces on mount.
-- The only looping animation in the app is the run progress bar, and it is
-  disabled under `prefers-reduced-motion`.
+- The only looping animations in the app are the run progress bar and the
+  `Orb` (the dotted sphere in a live run's status pill). Both stop under
+  `prefers-reduced-motion`; the orb then shows one still frame.
 - Every interactive element is a real `<button>` / `<a>` / `<input>`. Focus
   uses the global `:focus-visible` ring; never remove an outline without
   replacing it.
@@ -205,3 +208,28 @@ draggable divider, and `Ctrl+\`` shows and hides it.
 The mocks show a future app (task history, routing insights, agent picker).
 Build the screen that exists today in the mock's visual language — do not build
 the mock's chrome for features that are not wired up yet.
+
+## Task running and results
+
+- Running tasks lead with status and the request, then the orb, current activity
+  and Stop. The progress bar is indeterminate; it never claims a percentage.
+- The latest AI response has its own readable panel; earlier updates remain
+  available in a disclosure. Tool activity and steering follow below.
+- Completed and saved tasks share a header with rerun and new-task actions,
+  followed by Summary, Files, Details and Activity. Details show recorded
+  execution steps, labelled usage, and direct links to changes and activity.
+- Live execution comes from runner-owned stage events, including parallel stages
+  and added Fix steps. A stage that ran is labelled Ran, not Passed.
+- Completion shows changed-file count, the latest structured verification result,
+  and remaining-work status. Missing evidence never becomes a pass.
+- Activity supports message, edit and check filters. It follows new events only
+  at the bottom; readers who scroll up get a New activity action instead. Steering
+  reports the backend delivery receipt: queued, delivered, or restarted.
+- File review keeps file selection next to its recorded patch on wide panes and
+  stacks it on narrow panes. Added/deleted/renamed labels come from the Git patch;
+  unknown and pre-existing changes stay explicit.
+- Recent-task search and status filters apply to loaded recent history, grouped
+  by UTC date. The search never claims to cover older, unloaded tasks.
+- The composer displays project, working branch/copy and helper before submission.
+  AI helper rows keep sign-in state, remaining allowance, reset times and their
+  next action together; unknown auth never earns a green ready indicator.

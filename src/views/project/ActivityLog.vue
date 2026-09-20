@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject } from "vue";
+import { computed, inject, ref, watch, nextTick } from "vue";
 import FileLink from "./FileLink.vue";
 import { PROJECT } from "./state";
 import type { ActivityLine } from "./state";
@@ -13,19 +13,49 @@ const project = inject(PROJECT)!;
 const finished = computed(() => props.finished ?? !!project.result.value);
 const dirtyAtStart = computed(() => props.dirtyAtStart ?? project.result.value?.dirtyAtStart);
 const taskPatch = computed(() => parseHistoryPatch(props.items ? props.patchText ?? "" : project.result.value?.patchText ?? ""));
-const lines = computed(() => (props.items ?? project.lines.value).map((line) => ({
+const allLines = computed(() => (props.items ?? project.lines.value).map((line) => ({
   ...line,
   edits: (line.failed ? [] : line.changes ?? (line.text === "Editing" && line.file ? [{ path: line.file, patch: null }] : []))
     .map((edit) => ({ path: edit.path, ...activityPatch(visiblePath(edit.path), edit.patch, taskPatch.value.files,
       visiblePath(props.root ?? (props.items ? null : project.result.value?.worktree?.path) ?? project.opened.project.path)) })),
 })));
+const filter = ref("all");
+const filters = [{ id: "all", label: "All" }, { id: "messages", label: "Messages" }, { id: "edits", label: "Edits" }, { id: "checks", label: "Checks" }];
+const lines = computed(() => allLines.value.filter((line) => filter.value === "all"
+  || (filter.value === "messages" && ["text", "instruction", "failed"].includes(line.kind))
+  || (filter.value === "edits" && (line.edits.length > 0 || line.failed))
+  || (filter.value === "checks" && /test|check|lint|build|compil|verif|passed|failed/i.test(line.text))));
+const log = ref<HTMLOListElement | null>(null);
+const following = ref(true);
+const unread = ref(false);
+function onScroll() {
+  if (!log.value) return;
+  following.value = log.value.scrollHeight - log.value.scrollTop - log.value.clientHeight < 32;
+  if (following.value) unread.value = false;
+}
+async function follow() {
+  following.value = true;
+  unread.value = false;
+  await nextTick();
+  if (log.value) log.value.scrollTop = log.value.scrollHeight;
+}
+watch(() => (props.items ?? project.lines.value).at(-1), (next, previous) => {
+  if (finished.value || !next || next === previous) return;
+  if (following.value && log.value) log.value.scrollTop = log.value.scrollHeight;
+  else unread.value = true;
+}, { flush: "post" });
+watch(() => props.items ?? project.activeRun.value?.key ?? project.historyDetail.value?.id, () => { following.value = true; unread.value = false; filter.value = "all"; });
 </script>
 
 <template>
-  <p v-if="!lines.length" class="note">Nothing to show yet.</p>
-  <ol v-else class="card stream" role="log" aria-live="polite" aria-relevant="additions">
-    <li v-for="(line, i) in lines" :key="i" :class="line.kind">
-      <span v-if="line.kind === 'instruction'" class="said">you</span>
+  <div class="activity-controls" role="group" aria-label="Filter activity">
+    <button v-for="option in filters" :key="option.id" class="btn" :aria-pressed="filter === option.id" @click="filter = option.id">{{ option.label }}</button>
+    <button v-if="unread && !finished" class="btn new-activity" @click="follow">New activity ↓</button>
+  </div>
+  <p v-if="!lines.length" class="note">{{ allLines.length ? 'No activity matches this filter.' : 'Nothing to show yet.' }}</p>
+  <ol v-else ref="log" class="card stream" @scroll="onScroll" role="log" aria-live="polite" aria-relevant="additions">
+    <li v-for="(line, i) in lines" :key="i" :class="[line.kind, { failed: line.failed }]">
+      <span v-if="line.kind === 'instruction'" class="said">you</span><span v-if="line.delivery" class="delivery">{{ line.delivery }}</span>
       <template v-if="line.edits.length">
         <details v-for="edit in line.edits" :key="edit.path" class="edit">
           <summary :title="`Show changes in ${edit.path}`">
@@ -74,7 +104,8 @@ const lines = computed(() => (props.items ?? project.lines.value).map((line) => 
   border-radius: 0;
 }
 .stream li {
-  padding: 4px 0;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
   color: var(--text-dim);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -193,4 +224,9 @@ const lines = computed(() => (props.items ?? project.lines.value).map((line) => 
   font-size: 11px;
   color: var(--text-faint);
 }
+.activity-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.activity-controls .btn { padding: 4px 10px; font-size: 12px; }
+.activity-controls [aria-pressed="true"] { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
+.new-activity { margin-left: auto; }
+.delivery { display: block; color: var(--text-faint); font-size: 11px; }
 </style>

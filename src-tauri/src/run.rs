@@ -1133,6 +1133,18 @@ pub async fn stream(
         }
         ctx.plan = stage_plan(&route, model.as_ref(), id, task_id, &stages, index);
         ctx.final_stage = index + 1 == stages.len();
+        let completed = state.notes.len();
+        let current = if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
+            vec![completed, completed + 1]
+        } else {
+            vec![completed]
+        };
+        let _ = emit(&ProviderEvent::StageProgress {
+            stages: state.notes.iter().map(|note| note.stage)
+                .chain(stages[index..].iter().copied())
+                .map(|stage| stage.name().to_owned()).collect(),
+            current,
+        });
         state.outcome.begin_stage();
         let stage_started = now_ms();
         state.structured = None;
@@ -5199,7 +5211,19 @@ ping -n 60 127.0.0.1 >nul
             }),
         );
 
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        let progress = std::cell::RefCell::new(Vec::new());
+        let result = stream(&store, &Live::default(), request, |event| {
+            if let ProviderEvent::StageProgress { stages, current } = event {
+                progress.borrow_mut().push((stages.clone(), current.clone()));
+            }
+            Ok(())
+        }).await;
+        let progress = progress.into_inner();
+        assert_eq!(progress.len(), 4);
+        for (index, (stages, current)) in progress.iter().enumerate() {
+            assert_eq!(stages, &["plan", "implement", "review", "verify"]);
+            assert_eq!(current, &[index]);
+        }
 
         assert_eq!(result.status, "done");
         assert_eq!(
@@ -5361,7 +5385,14 @@ ping -n 60 127.0.0.1 >nul
         let dir = request.dir.clone();
         std::fs::write(dir.join("package.json"), script(0)).unwrap();
         claude_shim(&mut request, &review);
-        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+        let progress = std::cell::RefCell::new(Vec::new());
+        let result = stream(&store, &Live::default(), request, |event| {
+            if let ProviderEvent::StageProgress { current, .. } = event {
+                progress.borrow_mut().push(current.clone());
+            }
+            Ok(())
+        }).await;
+        assert!(progress.borrow().contains(&vec![1, 2]), "parallel checks and review must both be visible");
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(
             stages(&result),

@@ -53,7 +53,7 @@ export type Turn = { said: string; summary: string; failure: string | null };
 
 /** A live update; `file` is the full path it is about, shown by name and openable. */
 export type Activity = { text: string; file: string | null; id?: string; changes?: FileEdit[]; failed?: boolean };
-export type ActivityLine = Omit<Activity, "file"> & { kind: string; file?: string | null };
+export type ActivityLine = Omit<Activity, "file"> & { kind: string; file?: string | null; delivery?: string };
 
 const EDIT_RE = /edit|write|patch|create|delete|move|rename|file_change|set-content|out-file|new-item|remove-item/;
 const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect/;
@@ -451,6 +451,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     turns: Turn[];
     active: boolean;
     stream: ActivityLine[];
+    progress?: { stages: string[]; current: number[] };
     result: TaskResult | null;
     checking: TaskResult | null;
     error: string | null;
@@ -541,7 +542,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       }
       // Shown as the user's own words. Never pushed through `describe`, which
       // would file them among the things the agent said.
-      live.stream.push({ kind: "instruction", text, file: null });
+      const delivery = receipt.disposition === "held" ? "Queued for next step"
+        : receipt.disposition === "resumed" ? "Applied · step restarted" : "Delivered to the running agent";
+      live.stream.push({ kind: "instruction", text, file: null, delivery });
       live.instruction = "";
     } catch (e) {
       live.instructionError = isAppError(e) ? e.message : String(e);
@@ -924,6 +927,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         asked: opts.asked ?? [],
         active: true,
         stream: [],
+        progress: undefined,
         result: null,
         checking: null,
         error: null,
@@ -951,6 +955,11 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         attached,
         modelOverride.value,
         (event) => {
+          if (event.kind === "stageProgress") {
+            live.progress = event.data;
+            live.activity = { text: event.data.current.map((i) => stageLabel(event.data.stages[i] ?? "Working")).join(" + "), file: null };
+            return;
+          }
           const activity = activityFor(event);
           if (activity !== null) live.activity = activity;
           appendActivity(live.stream, event);

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from "vue";
+import { parseHistoryPatch } from "./historyPatch";
+import { verificationSummary, unfinishedSummary, savedArtifacts } from "./taskPresentation";
 import Markdown from "../../components/Markdown.vue";
 import ActivityLog from "./ActivityLog.vue";
 import { PROJECT } from "./state";
@@ -60,6 +62,12 @@ function editAgain() {
   selectRun(null);
   focusTask();
 }
+const selectedFile = ref<string | null>(null);
+const parsedPatch = computed(() => parseHistoryPatch(d.value?.patchText ?? ""));
+const selectedPath = computed(() => changed.value.byRun.some((f) => f.path === selectedFile.value) ? selectedFile.value : changed.value.byRun[0]?.path);
+const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path === selectedPath.value));
+const verification = computed(() => verificationSummary(savedArtifacts(d.value?.events ?? [])));
+watch(() => d.value?.id, () => { selectedFile.value = null; });
 </script>
 
 <template>
@@ -67,6 +75,8 @@ function editAgain() {
   <p v-else-if="historyDetailError" class="missing" role="alert">Task details unavailable.</p>
   <p v-else-if="!d" class="note">Pick a task on the left.</p>
   <section v-else class="card outcome">
+    <header class="result-header">
+    <div class="result-heading">
     <div class="head">
       <span class="dot" :class="TONE[d.status]" aria-hidden="true"></span>
       <h2 class="status">
@@ -75,7 +85,15 @@ function editAgain() {
       <span class="note">{{ formatDuration(d.durationMs) }} · {{ d.startedAt.slice(0, 16) }} UTC</span>
     </div>
     <div v-if="historyRow?.title" class="name" :title="historyRow.title">{{ historyRow.title }}</div>
-    <p class="prompt">{{ d.prompt }}</p>
+    <h1 class="prompt">{{ d.prompt }}</h1>
+    <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(d.status) }}</span></div>
+
+    </div>
+    <div class="actions">
+      <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
+      <button class="btn primary" @click="newTask">New task</button>
+    </div>
+    </header>
 
     <div class="tabs" role="tablist" aria-label="Past task">
       <button
@@ -168,35 +186,44 @@ function editAgain() {
       </template>
 
       <template v-else-if="tab === 'files'">
-        <ul class="diff">
-          <li v-for="f in changed.byRun" :key="f.path">
-            <span class="mono grow">{{ f.path }}</span>
-            <span v-if="f.origin === 'both'" class="note">also changed before this run; counts include both</span>
-            <span v-if="f.added !== null" class="note">+{{ f.added }} &minus;{{ f.deleted }}</span>
-            <span v-else class="note">new or binary</span>
-          </li>
-          <li v-if="!changed.byRun.length" class="note">No files changed.</li>
-        </ul>
-        <p class="note caveat">Only files Git can see are listed.</p>
-        <p v-if="changed.unknown" class="note caveat">
-          This repository already had uncommitted changes, so some of the above may not have been made by this run.
-        </p>
-        <p v-if="changed.beforeRun.length" class="note caveat">
-          Already changed before this run, and left as they were:
-          <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(", ") }}</span>
-        </p>
-        <details v-if="d.patchText" class="code-view">
-          <summary>View patch</summary>
-          <pre>{{ d.patchText }}</pre>
-        </details>
+        <div v-if="changed.byRun.length" class="file-review">
+          <ul class="review-files" aria-label="Changed files">
+            <li v-for="f in changed.byRun" :key="f.path">
+              <button :aria-pressed="selectedPath === f.path" @click="selectedFile = f.path">
+                <span class="mono file-path">{{ f.path }}</span>
+                <span class="note">{{ parsedPatch.files.find((p) => p.path === f.path)?.status ?? 'Status unavailable' }} · <template v-if="f.added !== null && f.deleted !== null">+{{ f.added }} −{{ f.deleted }}</template><template v-else>Counts unavailable</template></span>
+                <span v-if="f.origin === 'both'" class="note">Includes pre-existing changes</span>
+                <span v-else-if="f.origin === null" class="note">Change origin unknown</span>
+              </button>
+            </li>
+          </ul>
+          <section class="review-patch" aria-label="Selected file changes" tabindex="0">
+            <h2 class="label mono">{{ selectedPath }}</h2>
+            <p v-if="changed.byRun.find((f) => f.path === selectedPath)?.origin === 'both'" class="note">This patch includes changes already present before the task.</p>
+            <template v-if="selectedPatch">
+              <p v-for="note in selectedPatch.notes" :key="note" class="note">{{ note }}</p>
+              <div v-for="(line, i) in selectedPatch.lines" :key="i" class="patch-line" :class="line.kind"><span class="line-number">{{ line.before ?? '' }}</span><span class="line-number">{{ line.after ?? '' }}</span><code>{{ line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : line.kind === 'hunk' ? '@@ ' : ' ' }}{{ line.text }}</code></div>
+              <p v-if="!selectedPatch.lines.length && !selectedPatch.notes.length" class="note">No text changes recorded.</p>
+            </template>
+            <p v-else class="note">This file’s patch is unavailable or was truncated.</p>
+          </section>
+        </div>
+        <p v-else class="note">No files changed.</p>
+        <p class="note caveat">Only files Git can see are listed. Line counts may include pre-existing changes.</p>
+        <p v-if="changed.unknown" class="note caveat">Some changes could not be attributed to this task.</p>
+        <p v-if="changed.beforeRun.length" class="note caveat">Already changed before this task and left untouched: <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(', ') }}</span></p>
+        <p v-for="notice in parsedPatch.notices" :key="notice" class="note">{{ notice }}</p>
+        <details v-if="d.patchText" class="code-view"><summary>View full patch</summary><pre>{{ d.patchText }}</pre></details>
       </template>
 
       <template v-else-if="tab === 'details'">
+        <section class="execution" aria-label="Execution">
+          <div class="section-heading"><h2 class="label">Execution</h2><span class="note">Steps taken for this task</span></div>
         <ol v-if="routeSteps.length" class="route">
           <template v-for="(step, i) in routeSteps" :key="i">
             <li v-if="i" class="arrow" aria-hidden="true">→</li>
-            <li :class="{ ran: step.ran }">
-              {{ stageLabel(step.stage) }}<span class="hidden-label"> — {{ step.ran ? "ran" : "not started" }}</span>
+            <li :class="{ ran: step.ran }"><span class="step-number" aria-hidden="true">{{ i + 1 }}</span><div>
+              {{ stageLabel(step.stage) }}<small>{{ step.ran ? "Ran" : "Not started" }}</small></div>
             </li>
           </template>
         </ol>
@@ -206,6 +233,8 @@ function editAgain() {
             · brief named <span class="mono">{{ route.candidatePaths.join(", ") }}</span>
           </template>
         </p>
+
+        </section>
 
         <dl class="tiles">
           <div>
@@ -232,11 +261,13 @@ function editAgain() {
             <dt class="note">model reported by provider</dt>
             <dd class="model">{{ d.model ?? "—" }}</dd>
           </div>
-          <div>
-            <dt class="note">Git-visible files changed</dt>
-            <dd>{{ changed.byRun.length }}</dd>
-          </div>
+
         </dl>
+        <div class="detail-links">
+          <section class="detail-section"><h2 class="label">Changes</h2><p><strong>{{ changed.byRun.length }}</strong> Git-visible files changed</p><p class="note">Review recorded changes and their patches.</p><button class="btn" @click="tab = 'files'">View changed files</button></section>
+          <section class="detail-section"><h2 class="label">Execution activity</h2><p>Follow the work step by step.</p><p class="note">Agent messages, tool activity and recorded edits.</p><button class="btn" @click="tab = 'activity'">View activity</button></section>
+        </div>
+
       </template>
 
       <template v-else>
@@ -253,10 +284,7 @@ function editAgain() {
       </template>
     </div>
 
-    <div class="actions">
-      <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
-      <button class="btn primary" @click="newTask">New task</button>
-    </div>
+
   </section>
 </template>
 

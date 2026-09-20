@@ -159,6 +159,11 @@ pub const CODEX_ISOLATION: &[&str] = &[
     rename_all_fields = "camelCase"
 )]
 pub enum ProviderEvent {
+    /// Runner-owned progress; never inferred from provider prose.
+    StageProgress {
+        stages: Vec<String>,
+        current: Vec<usize>,
+    },
     Started {
         session_id: String,
     },
@@ -226,6 +231,7 @@ impl ProviderEvent {
     /// The `task_events.kind` column. Same spelling as the serialised tag.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::StageProgress { .. } => "stageProgress",
             Self::Started { .. } => "started",
             Self::Text(_) => "text",
             Self::ToolUse { .. } => "toolUse",
@@ -563,6 +569,15 @@ fn version_of(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stage_progress_preserves_repeated_and_concurrent_stages() {
+        let event = ProviderEvent::StageProgress { stages: vec!["verify".into(), "review".into(), "fix".into(), "verify".into()], current: vec![0, 1] };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["kind"], "stageProgress");
+        assert_eq!(value["data"]["current"], serde_json::json!([0, 1]));
+        let decoded: ProviderEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, event);
+    }
 
     /// The numbers a steered run reports. Claude sends usage per turn and cost
     /// as a session running total, so one of them adds and the other replaces.

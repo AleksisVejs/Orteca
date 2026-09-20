@@ -1,21 +1,48 @@
 <script setup lang="ts">
-import { inject } from "vue";
+import { computed, inject, ref } from "vue";
 import Markdown from "../../components/Markdown.vue";
 import ActivityLog from "./ActivityLog.vue";
 import { PROJECT } from "./state";
+import { visiblePath } from "../../path";
 
 // The page after a run: what happened first, the rest one tab away.
 const {
-  task, result, running, provider, switchedFrom, describeVerdict, stageLabel,
+  activeRun, said, result, running, ranOn, domId, switchedFrom, describeVerdict, stageLabel,
+  attachments, attachError, addAttachments, pasteImages, fileName,
   removedCopies, confirmRemove, removeCopy, removeError, routeSteps, calls, tokens,
   comparison, changed, OUTCOME, TONE, TABS, resultTab, formatTokens, formatCost,
   formatDuration, newTask, editAgain, reply, sendReply, warmLeft,
   git, openGit,
 } = inject(PROJECT)!;
+
+const selectedFile = ref<string | null>(null);
+
+const selectedPatch = computed(() => {
+  if (!selectedFile.value || !result.value?.patchText) return null;
+  const patch = result.value.patchText;
+  const escaped = selectedFile.value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const start = new RegExp(`(?:^|\\n)(diff --git a/${escaped} b/${escaped}\\n[\\s\\S]*?)(?=\\ndiff --git |$)`);
+  return patch.match(start)?.[1] ?? null;
+});
+
+function showFilePatch(path: string) {
+  selectedFile.value = path;
+}
+
+function closeFilePatch() {
+  selectedFile.value = null;
+}
 </script>
 
 <template>
   <section v-if="result" class="card outcome">
+    <!-- Everything already said in this task, so a follow-up reads as one thread. -->
+    <article v-for="(t, i) in activeRun?.turns ?? []" :key="i" class="turn">
+      <p class="said">{{ t.said }}</p>
+      <Markdown v-if="t.summary" class="summary" :text="describeVerdict(t.summary) ?? t.summary" />
+      <p v-else class="note">{{ t.failure ?? "No summary was reported." }}</p>
+    </article>
+
     <div class="head">
       <span class="dot" :class="TONE[result.status]" aria-hidden="true"></span>
       <h2 class="status">
@@ -23,7 +50,7 @@ const {
       </h2>
       <span class="note">{{ formatDuration(result.durationMs) }}</span>
     </div>
-    <p class="prompt">{{ task }}</p>
+    <p class="prompt">{{ said }}</p>
 
     <div class="tabs" role="tablist" aria-label="Result">
       <button
@@ -44,22 +71,48 @@ const {
       <template v-if="resultTab === 'summary'">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
         <p v-if="switchedFrom" class="note switched" role="status">
-          {{ switchedFrom }} ran out of plan usage, so {{ provider }} carried on with the same request.
+          {{ switchedFrom }} ran out of plan usage, so {{ ranOn }} carried on with the same request.
         </p>
         <Markdown v-if="result.summary" class="summary" :text="describeVerdict(result.summary) ?? result.summary" />
         <p v-else-if="!result.failure" class="note">No summary was reported.</p>
         <!-- A copy's committed work is on its branch; a fresh run would start without it. -->
         <div v-if="result.summary && !result.worktree?.commit" class="reply">
-          <input
+          <label class="hidden-label" :for="domId('reply')">Reply</label>
+          <textarea
+            :id="domId('reply')"
             v-model="reply"
-            type="text"
+            rows="2"
             spellcheck="false"
-            aria-label="Reply"
             placeholder="Reply, or ask for something more…"
             :disabled="running"
-            @keyup.enter="sendReply"
-          />
-          <button class="btn" :disabled="running || !reply.trim()" @click="sendReply">Reply</button>
+            @paste="pasteImages"
+            @keydown.ctrl.enter.prevent="sendReply"
+          ></textarea>
+          <ul v-if="attachments.length" class="attachments" aria-label="Attached">
+            <li v-for="path in attachments" :key="path" class="chip">
+              <span class="mono" :title="path">{{ fileName(path) }}</span>
+              <button
+                class="unattach"
+                :title="`Remove ${fileName(path)}`"
+                :aria-label="`Remove ${fileName(path)}`"
+                @click="attachments = attachments.filter((p) => p !== path)"
+              >
+                ×
+              </button>
+            </li>
+          </ul>
+          <p v-if="attachError" class="attach-error">{{ attachError }}</p>
+          <div class="reply-controls">
+            <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
+              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+              Attach
+            </button>
+            <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
+              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+            </button>
+            <span class="shortcut note">Ctrl + Enter</span>
+            <button class="btn" :disabled="running || !reply.trim()" @click="sendReply">Reply</button>
+          </div>
         </div>
         <p v-if="result.summary && !result.worktree?.commit" class="note reply-cost">
           <template v-if="warmLeft > 0">
@@ -92,9 +145,9 @@ const {
             </template>
             <template v-else>Nothing changed, so there is nothing to merge.</template>
           </p>
-          <button v-if="result.worktree.commit" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('merge', result.worktree.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
+          <button v-if="result.worktree.commit" class="btn" :popovertarget="domId('project-git')" popovertargetaction="show" @click="openGit('merge', result.worktree.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
           <template v-if="!removedCopies.includes(result.taskId)">
-            <p class="note mono">{{ result.worktree.path }}</p>
+            <p class="note mono">{{ visiblePath(result.worktree.path) }}</p>
             <button
               class="btn"
               :class="{ confirming: confirmRemove === result.taskId }"
@@ -114,10 +167,10 @@ const {
       </template>
 
       <template v-else-if="resultTab === 'files'">
-        <button v-if="!result.worktree && git.dirty" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('commit')">Commit changes…</button>
+        <button v-if="!result.worktree && git.dirty" class="btn" :popovertarget="domId('project-git')" popovertargetaction="show" @click="openGit('commit')">Commit changes…</button>
         <ul class="diff">
           <li v-for="f in changed.byRun" :key="f.path">
-            <span class="mono grow">{{ f.path }}</span>
+            <button class="file-diff-link mono grow" @click="showFilePatch(f.path)">{{ f.path }}</button>
             <span v-if="f.origin === 'both'" class="note">also changed before this run; counts include both</span>
             <span v-if="f.added !== null" class="note">+{{ f.added }} &minus;{{ f.deleted }}</span>
             <span v-else class="note">new or binary</span>
@@ -137,6 +190,15 @@ const {
           <summary>View patch</summary>
           <pre>{{ result.patchText }}</pre>
         </details>
+
+        <div v-if="selectedFile" class="file-diff" role="dialog" aria-modal="true" aria-labelledby="file-diff-title">
+          <div class="file-diff-head">
+            <h3 id="file-diff-title">{{ selectedFile }}</h3>
+            <button class="link" @click="closeFilePatch">Close</button>
+          </div>
+          <pre v-if="selectedPatch" class="code-view">{{ selectedPatch }}</pre>
+          <p v-else class="note">This file’s patch is unavailable or was truncated.</p>
+        </div>
       </template>
 
       <template v-else-if="resultTab === 'details'">

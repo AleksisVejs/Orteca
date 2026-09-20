@@ -173,6 +173,25 @@ button {
   max-width: 75ch;
 }
 
+/* One finished exchange above the current one. A thread, not nested cards:
+   the divider is the only chrome, per the rule against boxes inside boxes. */
+.turn {
+  padding-bottom: 24px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+.turn .said {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.turn .summary {
+  margin: 0;
+  color: var(--text-dim);
+}
+
 /* Quiet inline action. Not green: green is for outcomes. */
 .link {
   padding: 0;

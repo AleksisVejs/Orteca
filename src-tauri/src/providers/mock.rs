@@ -107,11 +107,15 @@ mod tests {
         assert!(events.contains(&ProviderEvent::ToolUse {
             name: "Read".into(),
             summary: "src-tauri/migrations/0001_init.sql".into(),
+            id: None,
+            changes: Vec::new(),
         }));
         // Keys are ordered, so the command wins over its description.
         assert!(events.contains(&ProviderEvent::ToolUse {
             name: "Bash".into(),
             summary: "git diff --stat".into(),
+            id: None,
+            changes: Vec::new(),
         }));
         assert_eq!(
             events.last(),
@@ -146,10 +150,17 @@ mod tests {
         assert!(events.contains(&ProviderEvent::ToolUse {
             name: "Shell".into(),
             summary: "git status --porcelain".into(),
+            id: None,
+            changes: Vec::new(),
         }));
         assert!(events.contains(&ProviderEvent::ToolUse {
             name: "Edit".into(),
             summary: "src-tauri/src/store.rs".into(),
+            id: Some("item_2".into()),
+            changes: vec![crate::providers::FileEdit {
+                path: "src-tauri/src/store.rs".into(),
+                patch: None
+            }],
         }));
         assert!(events.contains(&ProviderEvent::Text(
             "Added the opened_seq bump to touch_project.".into()
@@ -174,7 +185,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                ProviderEvent::ToolUse { name, summary } if name == "Edit" && summary.ends_with("slug.js")
+                ProviderEvent::ToolUse { name, summary, .. } if name == "Edit" && summary.ends_with("slug.js")
             )),
             "the file change is missing"
         );

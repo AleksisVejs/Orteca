@@ -11,6 +11,30 @@ const parseHistoryPatch = vm.runInNewContext(`(() => {
   ${ts.transpile(parser, { target: ts.ScriptTarget.ES2022 })}; return parseHistoryPatch;
 })()`, { TextEncoder, TextDecoder });
 
+const activityPatch = vm.runInNewContext(`(() => {
+  ${ts.transpile(parser, { target: ts.ScriptTarget.ES2022 })}; return activityPatch;
+})()`, { TextEncoder, TextDecoder });
+
+test('activity diffs prefer exact edits and match task files within the correct worktree', () => {
+  const { files } = parseHistoryPatch('diff --git a/src/state.ts b/src/state.ts\n@@ -1 +1 @@\n-before task\n+after task\n');
+  const edit = activityPatch('E:/copy/src/state.ts', '@@ -20,1 +20,2 @@\n-before edit\n+after edit\n+extra\n', files, 'E:/copy');
+  assert.equal(edit.exact, true);
+  assert.equal(edit.file.added, 2);
+  assert.equal(edit.file.removed, 1);
+  assert.equal(edit.file.lines[1].text, 'before edit');
+  assert.equal(edit.file.lines[1].before, 20);
+  const full = activityPatch('src/state.ts', 'diff --git a/src/state.ts b/src/state.ts\n@@ -1 +1 @@\n-before\n+after\n', [], 'E:/copy');
+  assert.equal(full.file.added, 1, 'a provider-supplied complete diff has no synthetic empty file');
+  assert.equal(full.file.removed, 1);
+  const task = activityPatch('E:\\copy\\src\\state.ts', null, files, 'E:/copy');
+  assert.equal(task.exact, false);
+  assert.equal(task.file, files[0]);
+  assert.equal(activityPatch('src/state.ts', null, files, 'E:/copy').file, files[0]);
+  assert.equal(activityPatch('E:/different/src/state.ts', null, files, 'E:/copy').file, undefined);
+  assert.equal(activityPatch('E:/copycat/src/state.ts', null, files, 'E:/copy').file, undefined);
+  assert.equal(activityPatch('src/state.ts', null, [], 'E:/copy').file, undefined, 'unknown is not zero changes');
+});
+
 test('file comparisons keep exact code, counts, and old/new line numbers across hunks', () => {
   const { files } = parseHistoryPatch(`diff --git a/src/main.ts b/src/main.ts
 index abc..def 100644

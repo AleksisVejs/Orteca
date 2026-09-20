@@ -3,15 +3,16 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
-import { ref, computed } from 'vue';
+import { ref, computed, reactive } from 'vue';
 
 function app(api = {}) {
   const source = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
     .match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
     .replace(/^import .*;$/gm, '');
   const js = ts.transpile(source, { target: ts.ScriptTarget.ES2022 });
-  return vm.runInNewContext(`(async () => { ${js}; return { open, confirmTrust, close, opened, pendingTrust, openError }; })()`, {
+  return vm.runInNewContext(`(async () => { ${js}; return { open, confirmTrust, close, closeProject, projects, activePath, busy, openProjects, pendingTrust, openError }; })()`, {
     ref,
+    computed,
     isAppError: e => !!e?.message,
     ...api,
   });
@@ -74,7 +75,7 @@ async function projectView(api = {}) {
   let mounted;
   const listeners = {};
   const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return useProject(opened); })()`, {
-    ref, computed, nextTick: async () => {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
+    ref, computed, reactive, nextTick: async () => {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
     opened: project,
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
     detectProviders: async () => [{ id: 'codex', path: 'fake.exe' }],
@@ -151,11 +152,12 @@ test('Fetch runs immediately without tracking and keeps an open commit draft', a
 
 test('Git submissions cannot overlap each other or an AI task', async () => {
   let finish;
+  let endTask;
   let calls = 0;
   let tasks = 0;
   const { state } = await projectView({
     gitAction: () => { calls++; return new Promise(resolve => { finish = resolve; }); },
-    startTask: async () => { tasks++; return finished; },
+    startTask: () => { tasks++; return new Promise(resolve => { endTask = resolve; }); },
   });
   state.git.value = { ...gitState, dirty: true, dirtyCount: 1 };
   state.openGit('commit');
@@ -172,9 +174,12 @@ test('Git submissions cannot overlap each other or an AI task', async () => {
   await pending;
   assert.equal(state.gitBusy.value, null);
   assert.equal(state.git.value.ahead, 1);
-  state.running.value = true;
+  const running = state.run();
+  assert.equal(tasks, 1);
   await state.runGit('fetch');
-  assert.equal(calls, 1);
+  assert.equal(calls, 1, 'Git waits on the AI tasks, not the other way round');
+  endTask(finished);
+  await running;
 });
 
 test('a failed Git command refreshes status, keeps its error and draft, and can be retried', async () => {
@@ -279,6 +284,49 @@ test('a change still being checked is shown while running and never becomes the 
   assert.equal(state.result.value.status, 'verifyFailed', 'the suite decides, not the early result');
 });
 
+test('two runs go at once in one project, each with its own stream and result', async () => {
+  const ends = [];
+  const events = [];
+  const { state } = await projectView({
+    startTask: (...args) => {
+      const fns = args.filter(arg => typeof arg === 'function');
+      events.push(fns[0]);
+      return new Promise(resolve => { ends.push(resolve); });
+    },
+  });
+  state.task.value = 'first thing';
+  const first = state.run();
+  state.task.value = 'second thing';
+  const second = state.run();
+
+  assert.equal(state.runs.value.length, 2, 'a second run never replaces the first');
+  assert.equal(state.runningCount.value, 2);
+  assert.equal(state.anyRunning.value, true);
+  assert.deepEqual(Array.from(state.runs.value, r => state.runLabel(r)), ['second thing', 'first thing'],
+    'newest first, each labelled by what it asked');
+
+  events[0]({ kind: 'text', data: 'from the first' });
+  events[1]({ kind: 'text', data: 'from the second' });
+  assert.deepEqual(Array.from(state.stream.value, l => l.text), ['from the second'],
+    'the screen shows only the run it is on');
+
+  const firstKey = state.runs.value[1].key;
+  state.selectRun(firstKey);
+  assert.deepEqual(Array.from(state.stream.value, l => l.text), ['from the first']);
+  assert.equal(state.running.value, true);
+
+  ends[0]({ ...finished, taskId: 11, status: 'done', failure: null });
+  await first;
+  assert.equal(state.result.value.taskId, 11, 'the finished run is the one on screen');
+  assert.equal(state.runningCount.value, 1, 'the other one is still going');
+  assert.equal(state.anyRunning.value, true);
+
+  ends[1]({ ...finished, taskId: 12, status: 'done', failure: null });
+  await second;
+  assert.equal(state.result.value.taskId, 11, 'a run finishing elsewhere never takes over the screen');
+  assert.equal(state.anyRunning.value, false);
+});
+
 test('a reply goes on in the same task, unless that task ran in a copy', async () => {
   const calls = [];
   const { state } = await projectView({ startTask: async (...args) => {
@@ -290,9 +338,96 @@ test('a reply goes on in the same task, unless that task ran in a copy', async (
   state.reply.value = 'also this';
   await state.sendReply();
   assert.equal(calls[1].at(-1), 7);
+  assert.equal(calls[1][1], [
+    'test',
+    'Your answer:\ndid it',
+    'My reply:\nalso this',
+  ].join('\n\n'), 'the follow-up keeps user and assistant text under the correct labels');
   state.reply.value = 'and that';
   await state.sendReply();
   assert.equal(calls[2].at(-1), null, 'a copy folder is not where the task is');
+});
+
+test('a reply carries on in the run on screen, with its own attachments', async () => {
+  const calls = [];
+  const { state } = await projectView({
+    pickAttachments: async () => ['C:/repo/notes.md'],
+    startTask: async (...args) => {
+      calls.push(args);
+      return { ...finished, taskId: 7, status: 'done', failure: null, summary: `answer ${calls.length}`, worktree: null };
+    },
+  });
+  await state.run();
+  const row = state.runs.value[0];
+  assert.equal(state.runLabel(row), 'test');
+
+  await state.addAttachments(false);
+  state.reply.value = 'also this';
+  await state.sendReply();
+  assert.equal(state.runs.value.length, 1, 'a follow-up stays in the run it answers');
+  assert.equal(state.activeRun.value, row, 'and on the same page');
+  assert.equal(state.runLabel(row), 'test', 'the row keeps the name of what was first asked');
+  assert.equal(row.turns.length, 1);
+  assert.equal(row.turns[0].said, 'test');
+  assert.equal(row.turns[0].summary, 'answer 1');
+  assert.equal(state.said.value, 'also this', 'the page shows what was typed, not the recap sent to the CLI');
+  assert.equal(calls[1][6].join(), 'C:/repo/notes.md', 'the reply sends what was attached to it');
+  assert.equal(state.attachments.value.length, 0, 'and the box empties, so the next reply does not resend them');
+
+  state.reply.value = 'and that';
+  await state.sendReply();
+  assert.equal(state.runs.value.length, 1);
+  assert.equal(row.turns.length, 2, 'every exchange stays on the page');
+  assert.equal(calls[2][6].length, 0, 'a reply with nothing attached sends nothing');
+});
+
+test('a reply that had to open its own task gets its own run row', async () => {
+  const { state } = await projectView({ startTask: async () => ({
+    ...finished, taskId: 7, status: 'done', failure: null, summary: 'did it', worktree: {},
+  }) });
+  await state.run();
+  state.reply.value = 'also this';
+  await state.sendReply();
+  assert.equal(state.runs.value.length, 2, 'a copy is a different task, and the sidebar says so');
+});
+
+test('an old task from the sidebar can be replied to, and goes on in that task', async () => {
+  const past = {
+    id: 42, prompt: 'the original ask', status: 'done', summary: 'what it did',
+    diff: [{ path: 'src/a.ts', origin: null, added: 1, deleted: 0 }], events: [], worktreePath: null,
+  };
+  const calls = [];
+  const { state } = await projectView({
+    recentTasks: async () => [past],
+    getTaskDetail: async () => past,
+    startTask: async (...args) => {
+      calls.push(args);
+      return { ...finished, taskId: 42, status: 'done', failure: null, summary: 'and again', worktree: null };
+    },
+  });
+  await state.openHistory(past);
+  assert.equal(state.runs.value.length, 0, 'nothing is running yet');
+
+  state.reply.value = 'now do the other half';
+  await state.replyToPast();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].at(-1), 42, 'it goes on in the task it was replying to');
+  assert.equal(calls[0][1], [
+    'the original ask',
+    'Your answer:' + String.fromCharCode(10) + 'what it did',
+    'My reply:' + String.fromCharCode(10) + 'now do the other half',
+    'Files changed so far: src/a.ts',
+  ].join(String.fromCharCode(10, 10)), 'the recap carries the old exchange, since the session is cold');
+  assert.equal(calls[0].at(-2), null, 'a task this old has no session left to resume');
+
+  const row = state.runs.value[0];
+  assert.equal(state.runs.value.length, 1, 'the reply opens one run for the task');
+  assert.equal(state.runLabel(row), 'the original ask', 'named after what was first asked');
+  assert.equal(row.turns.length, 1, 'the exchange it answers opens the page');
+  assert.equal(row.turns[0].said, 'the original ask');
+  assert.equal(row.turns[0].summary, 'what it did');
+  assert.equal(state.view.value, 'task', 'and the page moves from history to the run');
 });
 
 test('activity is bounded even when a provider emits long messages', async () => {
@@ -324,6 +459,45 @@ test('provider actions become plain-English live updates', async () => {
   assert.deepEqual({ ...state.toolActivity('Shell', 'Get-Content -Raw "app/User.php"') }, { text: 'Reading', file: 'app/User.php' });
   assert.deepEqual({ ...state.toolActivity('Shell', ps) }, { text: 'Reading rg -n Write-Output app', file: null });
   assert.deepEqual({ ...state.toolActivity('Shell', 'npm test') }, { text: 'Testing: npm test', file: null });
+});
+
+test('edit results update their own activity entry and replay without replacing another edit', async () => {
+  const { state } = await projectView();
+  const lines = [];
+  const first = { kind: 'toolUse', data: { name: 'Edit', summary: 'state.ts', id: 'first', changes: [{ path: 'C:/repo/src/state.ts', patch: null }] } };
+  const second = { kind: 'toolUse', data: { ...first.data, id: 'second' } };
+  const patch = '@@ -8,1 +8,2 @@\n-old\n+new\n+extra\n';
+  const applied = { kind: 'toolResult', data: { id: 'first', failed: false, changes: [{ path: first.data.changes[0].path, patch }] } };
+  for (const event of [first, second, applied]) state.appendActivity(lines, event);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].changes[0].patch, patch);
+  assert.equal(lines[1].changes[0].patch, null);
+  assert.equal(lines[0].file, 'C:/repo/src/state.ts', 'the full path survives a shortened summary');
+  state.appendActivity(lines, { kind: 'toolResult', data: { id: 'missing', failed: false, changes: applied.data.changes } });
+  assert.equal(lines.length, 2, 'an unmatched result cannot attach to a different call');
+  state.appendActivity(lines, { kind: 'toolResult', data: { id: 'second', failed: true, changes: [] } });
+  assert.equal(lines[1].text, 'Edit failed');
+  assert.equal(lines[1].changes.length, 0, 'failed tools cannot claim a successful diff');
+  assert.equal(lines[0].changes[0].patch, patch);
+});
+
+test('live edit completion retains its diff when subsequent activity arrives', async () => {
+  const patch = '@@ -1 +1 @@\n-before\n+after\n';
+  const { state } = await projectView({ startTask: async (...args) => {
+    const emit = args[8];
+    emit({ kind: 'toolUse', data: { id: 'edit-1', name: 'Edit', summary: 'state.ts', changes: [{ path: 'state.ts', patch: null }] } });
+    assert.equal(state.currentActivity.value.changes[0].patch, null, 'render the pending edit before it completes');
+    const rendered = computed(() => state.lines.value[0].changes[0].patch);
+    assert.equal(rendered.value, null);
+    emit({ kind: 'toolResult', data: { id: 'edit-1', failed: false, changes: [{ path: 'state.ts', patch }] } });
+    assert.equal(state.currentActivity.value.changes[0].patch, patch);
+    assert.equal(rendered.value, patch, 'an already-rendered log updates when its result arrives');
+    emit({ kind: 'toolUse', data: { name: 'Read', summary: 'other.ts' } });
+    return finished;
+  } });
+  await state.run();
+  assert.equal(state.lines.value[0].changes[0].patch, patch);
+  assert.equal(state.lines.value[1].file, 'other.ts');
 });
 
 test('detection errors and invoke failures are exposed', async () => {
@@ -358,9 +532,10 @@ test('double clicks cannot enter two install loops and failures stay visible', a
 test('untrusted findings require successful consent', async () => {
   const state = await app({ openProject: async () => structuredClone(project), trustProject: async () => {} });
   await state.open('C:/repo');
-  assert.equal(state.opened.value, null);
+  assert.equal(state.activePath.value, null);
   await state.confirmTrust();
-  assert.equal(state.opened.value.project.trusted, true);
+  assert.equal(state.projects.value[0].project.trusted, true);
+  assert.equal(state.activePath.value, 'C:/repo');
 });
 
 test('a new repository requires consent even without recognized configuration', async () => {
@@ -368,7 +543,7 @@ test('a new repository requires consent even without recognized configuration', 
   result.trustFindings = [];
   const state = await app({ openProject: async () => result });
   await state.open('C:/repo');
-  assert.equal(state.opened.value, null);
+  assert.equal(state.activePath.value, null);
   assert.deepEqual(state.pendingTrust.value, result);
 });
 
@@ -378,7 +553,7 @@ test('remembered consent opens the project', async () => {
   const state = await app({ openProject: async () => result });
   await state.open('C:/repo');
   assert.equal(state.pendingTrust.value, null);
-  assert.equal(state.opened.value.project.path, 'C:/repo');
+  assert.equal(state.activePath.value, 'C:/repo');
 });
 
 test('a late open cannot replace a newer pending trust decision', async () => {
@@ -390,7 +565,7 @@ test('a late open cannot replace a newer pending trust decision', async () => {
   await state.open('new');
   finish({ project: { path: 'old', trusted: true }, trustFindings: [] });
   await old;
-  assert.equal(state.opened.value, null);
+  assert.equal(state.activePath.value, null);
   assert.equal(state.pendingTrust.value.project.path, 'C:/repo');
 });
 
@@ -398,7 +573,7 @@ test('failed consent stays closed and exposes the error', async () => {
   const state = await app({ openProject: async () => structuredClone(project), trustProject: async () => { throw new Error('database unavailable'); } });
   await state.open('C:/repo');
   await state.confirmTrust();
-  assert.equal(state.opened.value, null);
+  assert.equal(state.activePath.value, null);
   assert.equal(state.openError.value, 'database unavailable');
 });
 
@@ -410,7 +585,33 @@ test('cancelling pending consent does not reopen on late completion', async () =
   state.pendingTrust.value = null;
   finish();
   await confirmation;
-  assert.equal(state.opened.value, null);
+  assert.equal(state.activePath.value, null);
+});
+
+test('projects stay open while another is on screen, and a busy one cannot be closed', async () => {
+  const opened = path => ({ project: { path, name: path, trusted: true }, git: gitState, trustFindings: [] });
+  const state = await app({ openProject: async path => opened(path) });
+  await state.open('C:/one');
+  await state.open('C:/two');
+  assert.deepEqual(Array.from(state.projects.value, p => p.project.path), ['C:/one', 'C:/two'],
+    'the first project is still open behind the second');
+  assert.equal(state.activePath.value, 'C:/two');
+
+  await state.open('C:/one');
+  assert.equal(state.projects.value.length, 2, 'reopening one already open only shows it again');
+  assert.equal(state.activePath.value, 'C:/one');
+
+  state.close();
+  assert.equal(state.activePath.value, null, 'switching away closes nothing');
+  assert.equal(state.projects.value.length, 2);
+
+  state.busy.value['C:/one'] = 1;
+  assert.deepEqual(Array.from(state.openProjects.value, p => p.running), [1, 0]);
+  state.closeProject('C:/one');
+  assert.equal(state.projects.value.length, 2, 'a project with a task running is not closed');
+  state.busy.value['C:/one'] = 0;
+  state.closeProject('C:/one');
+  assert.deepEqual(Array.from(state.projects.value, p => p.project.path), ['C:/two']);
 });
 
 
@@ -703,7 +904,11 @@ const reading = (claude, codex) => async () => [
 const settle = () => new Promise(r => setTimeout(r));
 
 test('the provider with the most limit left is picked, until the user picks one', async () => {
-  const { state } = await projectView({ detectProviders: bothInstalled, providerLimits: reading(35, 90) });
+  const { state } = await projectView({
+    detectProviders: bothInstalled,
+    providerLimits: reading(35, 90),
+    startTask: () => new Promise(() => {}),
+  });
   await settle();
   assert.equal(state.provider.value, 'claude', 'codex has 10% left, claude 65%');
   assert.match(state.pickedFor.value, /claude 65%, codex 10%/);
@@ -715,7 +920,7 @@ test('the provider with the most limit left is picked, until the user picks one'
   assert.equal(state.provider.value, 'codex', 'a choice the user made is never overridden');
 
   state.providerPicked.value = false;
-  state.running.value = true;
+  void state.run();
   await state.loadLimits();
   assert.equal(state.provider.value, 'codex', 'refreshing usage cannot change the provider during a run');
 });
@@ -861,6 +1066,31 @@ test('a run that ran out of plan usage carries on with the other CLI by itself, 
 
   state.result.value = { ...finished, status: 'failed', failureKind: 'crashed' };
   assert.equal(state.fallback.value, null, 'a crash is not a reason to switch');
+});
+
+test('a reply that hands off to the other CLI stays in its task', async () => {
+  const sent = [];
+  const done = { ...finished, taskId: 7, status: 'done', failure: null, failureKind: null, summary: 'did it', worktree: null };
+  const spent = { ...done, status: 'failed', failure: 'usage limit is used up.', failureKind: 'usageLimit' };
+  const outcomes = [done, spent, done];
+  const { state } = await projectView({
+    detectProviders: bothInstalled,
+    providerLimits: reading(100, 30),
+    startTask: async (...args) => {
+      sent.push({ provider: args[2], task: args.at(-1) });
+      return outcomes.shift();
+    },
+  });
+  await settle();
+  state.providerPicked.value = true;
+  state.provider.value = 'claude';
+  await state.run();
+  state.reply.value = 'also this';
+  await state.sendReply();
+  assert.deepEqual(sent.slice(1), [
+    { provider: 'claude', task: 7 },
+    { provider: 'codex', task: 7 },
+  ], 'the handoff continues the reply’s task rather than opening another');
 });
 
 test('a run in a separate copy asks for one, and removing the copy takes a second click', async () => {

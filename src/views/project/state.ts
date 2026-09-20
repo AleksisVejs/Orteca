@@ -1,7 +1,7 @@
 // Everything the Project screen knows and does. The pages in this folder only
 // render it, and share one instance through provide/inject.
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import type { InjectionKey } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
+import type { InjectionKey, Ref } from "vue";
 import {
   pickAttachments,
   savePastedImage,
@@ -30,6 +30,7 @@ import {
 import type {
   Auth,
   Detected,
+  FileEdit,
   GitAction,
   GitState,
   Isolation,
@@ -47,13 +48,27 @@ import type {
   TaskSummary,
 } from "../../types";
 
+/** One finished exchange: what the user said, and what came back. */
+export type Turn = { said: string; summary: string; failure: string | null };
+
 /** A live update; `file` is the full path it is about, shown by name and openable. */
-export type Activity = { text: string; file: string | null };
+export type Activity = { text: string; file: string | null; id?: string; changes?: FileEdit[]; failed?: boolean };
+export type ActivityLine = Omit<Activity, "file"> & { kind: string; file?: string | null };
 
 const EDIT_RE = /edit|write|patch|create|delete|move|rename|file_change|set-content|out-file|new-item|remove-item/;
 const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect/;
 
-export function useProject(opened: OpenedProject) {
+// Several projects are open at once, each with its own copy of the workspace in
+// the document. Element ids have to be unique per project: a popover is targeted
+// by id, and two panels called "project-git" would mean every button opened the
+// first one.
+let instances = 0;
+
+/** `active` is whether this project is the one on screen. A hidden project keeps
+ *  its runs, its terminals and its state; it just stops answering the window. */
+export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(true)) {
+  const uid = `p${++instances}`;
+  const domId = (name: string) => `${name}-${uid}`;
   const task = ref("");
 
   // Absolute paths the run is told about. Kept after a run, like the prompt.
@@ -164,7 +179,7 @@ export function useProject(opened: OpenedProject) {
   const installError = ref<string | null>(null);
 
   async function install(ids: ProviderId[]) {
-    if (installing.value !== null || running.value) return;
+    if (installing.value !== null || anyRunning.value) return;
     installError.value = null;
     for (const id of ids) {
       installing.value = id;
@@ -198,7 +213,7 @@ export function useProject(opened: OpenedProject) {
   const signInError = ref<string | null>(null);
 
   async function signIn(id: ProviderId) {
-    if (signingIn.value !== null || installing.value !== null || running.value) return;
+    if (signingIn.value !== null || installing.value !== null || anyRunning.value) return;
     signInError.value = null;
     signingIn.value = id;
     signInLine.value = "starting sign-in…";
@@ -262,7 +277,7 @@ export function useProject(opened: OpenedProject) {
   /** Move to the runnable provider with the most room left. Only when every
    *  runnable one has a reading: an unread limit is not an empty one. */
   function pickByHeadroom() {
-    if (providerPicked.value || running.value) return;
+    if (providerPicked.value || anyRunning.value) return;
     const runnable = installed.value
       .filter((p) => p.auth !== "signedOut")
       .map((p) => ({ id: p.id, room: headroom(p.id) }));
@@ -357,14 +372,22 @@ export function useProject(opened: OpenedProject) {
   });
 
   /** After a run that stopped because its plan ran out: the CLI that takes over.
-   *  `run` continues there on its own, once. */
-  const fallback = computed(() => {
-    const r = result.value;
+   *  `run` continues there on its own, once. Asked of the run itself, because
+   *  the composer may already be pointed at a different CLI by then. */
+  function fallbackFor(r: {
+    result: TaskResult | null;
+    provider: ProviderId;
+  }): { id: ProviderId; room: number | null } | null {
+    const done = r.result;
     // A copy's work is on its branch; a fresh run would start from the commit without it.
-    if (r?.status !== "failed" || r.failureKind !== "usageLimit" || r.worktree) return null;
-    const other = otherThan(provider.value);
+    if (done?.status !== "failed" || done.failureKind !== "usageLimit" || done.worktree) return null;
+    const other = otherThan(r.provider);
     return other && (other.room === null || other.room > 0) ? other : null;
-  });
+  }
+
+  const fallback = computed(() =>
+    activeRun.value ? fallbackFor(activeRun.value) : null,
+  );
 
   function switchTo(id: ProviderId) {
     provider.value = id;
@@ -393,20 +416,11 @@ export function useProject(opened: OpenedProject) {
     providerPicked.value ? { ...modelChoices.value[provider.value] } : null,
   );
 
-  /** The same request on the other CLI. What the stopped run changed is still on disk. */
-  async function continueWith(id: ProviderId) {
-    provider.value = id;
-    providerPicked.value = true;
-    pickedFor.value = null;
-    await run();
-  }
-
   /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
   /// and refusing to run on a guess would be the same mistake in the other
   /// direction. The run itself reports an auth failure honestly either way.
   const canRun = computed(
     () =>
-      !running.value &&
       !gitBusy.value &&
       installing.value === null &&
       signingIn.value === null &&
@@ -415,16 +429,78 @@ export function useProject(opened: OpenedProject) {
       selected.value.auth !== "signedOut",
   );
 
-  // One run at a time. The stream and the result are the whole screen while it
-  // is going, and Stop is the only other thing worth doing.
-  const running = ref(false);
-  const stream = ref<Array<{ kind: string; text: string; file?: string | null }>>([]);
-  const result = ref<TaskResult | null>(null);
+  // Runs are independent, so each owns the whole of its screen - its stream,
+  // its result, its steering box - instead of sharing one set of refs. The
+  // backend already keys everything by task id; nothing here serialises them.
+  type LiveRun = {
+    key: symbol;
+    /** The task id, from the moment the row exists until the run ends. */
+    id: number | null;
+    prompt: string;
+    /** How many paths the run was handed, for the line its page shows. */
+    attachmentCount: number;
+    provider: ProviderId;
+    /** The CLI whose spent plan this run took over from, if it did. */
+    switchedFrom: ProviderId | null;
+    /** The user's own words across a chain of follow-ups, oldest first. */
+    asked: string[];
+    /** The exchanges already finished in this task, oldest first. A follow-up
+     *  pushes the one it answers here rather than opening a run of its own.
+     *  Only what an exchange said, so one read back from the database seeds it
+     *  as easily as one that just finished on screen. */
+    turns: Turn[];
+    active: boolean;
+    stream: ActivityLine[];
+    result: TaskResult | null;
+    checking: TaskResult | null;
+    error: string | null;
+    activity: Activity;
+    stopping: boolean;
+    instruction: string;
+    sending: boolean;
+    instructionError: string | null;
+  };
+  // Newest first. Every run still going is kept; finished ones are capped,
+  // since the database holds them and the sidebar lists them from there.
+  const runs = ref<LiveRun[]>([]);
+  const KEPT_FINISHED = 20;
+  const selectedRun = ref<symbol | null>(null);
+  const activeRun = computed(() => runs.value.find((r) => r.key === selectedRun.value) ?? null);
+  /** Anything going in this project. Git and installs wait on this, not on the run on screen. */
+  const anyRunning = computed(() => runs.value.some((r) => r.active));
+  const runningCount = computed(() => runs.value.filter((r) => r.active).length);
+  const running = computed(() => !!activeRun.value?.active);
+  const stream = computed(() => activeRun.value?.stream ?? []);
+  const result = computed<TaskResult | null>({ get: () => activeRun.value?.result ?? null, set: (value) => { if (activeRun.value) activeRun.value.result = value; } });
   /** The change while its full suite still runs. Never a finished result. */
-  const checking = ref<TaskResult | null>(null);
-  const runError = ref<string | null>(null);
-  const currentActivity = ref<Activity>({ text: "Getting ready", file: null });
+  const checking = computed<TaskResult | null>(() => activeRun.value?.checking ?? null);
+  const runError = computed<string | null>(() => activeRun.value?.error ?? null);
+  const currentActivity = computed<Activity>(() => activeRun.value?.activity ?? { text: "Getting ready", file: null });
+  /** The CLI whose spent plan the run on screen took over from, if it did. */
+  const switchedFrom = computed(() => activeRun.value?.switchedFrom ?? null);
   const fileError = ref<string | null>(null);
+
+  /** A run's sidebar label: the first line of what was asked. A follow-up keeps
+   *  the name of the request it continues, not the recap sent to the CLI. */
+  function runLabel(r: LiveRun): string {
+    const source = r.asked[0] ?? r.prompt;
+    const first = source.split("\n").find((line) => line.trim())?.trim() ?? "Task";
+    return first.length > 40 ? `${first.slice(0, 39).trimEnd()}…` : first;
+  }
+
+  /** What the user typed for one exchange. `prompt` is what the CLI gets, and
+   *  for a follow-up that is the whole chain recapped. */
+  const saidIn = (r: LiveRun) => r.asked.at(-1) ?? r.prompt;
+  const said = computed(() => (activeRun.value ? saidIn(activeRun.value) : ""));
+
+  /** Put a run on screen, or null for the composer. The warm-session clock
+   *  follows the selection, since it is about the run being looked at. */
+  function selectRun(key: symbol | null) {
+    selectedRun.value = key;
+    view.value = "task";
+    if (tick !== null) clearTimeout(tick);
+    tickWhileWarm();
+  }
 
   async function openActivityFile(file: string, reveal: boolean) {
     fileError.value = null;
@@ -438,41 +514,45 @@ export function useProject(opened: OpenedProject) {
   // The backend sends this the moment the task row exists, which is what Stop
   // names. Until it arrives there is a run on screen that cannot yet be stopped,
   // so the button is disabled rather than lying about what it would do.
-  const taskId = ref<number | null>(null);
-  const stopping = ref(false);
+  const taskId = computed(() => activeRun.value?.id ?? null);
+  const stopping = computed(() => !!activeRun.value?.stopping);
 
   // A mid-task instruction. Where it lands is the provider's business, and the
   // card says which before the user types rather than after they have sent it.
-  const instruction = ref("");
-  const sending = ref(false);
-  const instructionError = ref<string | null>(null);
-  const steering = computed(() => selected.value?.steering ?? "checkpoint");
+  // The run on screen decides that, not the composer's current pick.
+  const instruction = computed<string>({ get: () => activeRun.value?.instruction ?? "", set: (value) => { if (activeRun.value) activeRun.value.instruction = value; } });
+  const sending = computed(() => !!activeRun.value?.sending);
+  const instructionError = computed(() => activeRun.value?.instructionError ?? null);
+  const steering = computed(
+    () => providers.value.find((p) => p.id === (activeRun.value?.provider ?? provider.value))?.steering ?? "checkpoint",
+  );
 
   async function instruct(applyNow: boolean) {
     const text = instruction.value.trim();
     if (!running.value || taskId.value === null || sending.value || !text) return;
-    sending.value = true;
-    instructionError.value = null;
+    const live = activeRun.value!;
+    live.sending = true;
+    live.instructionError = null;
     try {
       const receipt = await sendInstruction(taskId.value, text, applyNow);
       if (receipt.disposition === "tooLate") {
-        instructionError.value = "The run finished before it could take that instruction.";
+        live.instructionError = "The run finished before it could take that instruction.";
         return;
       }
       // Shown as the user's own words. Never pushed through `describe`, which
       // would file them among the things the agent said.
-      stream.value.push({ kind: "instruction", text });
-      instruction.value = "";
+      live.stream.push({ kind: "instruction", text, file: null });
+      live.instruction = "";
     } catch (e) {
-      instructionError.value = isAppError(e) ? e.message : String(e);
+      live.instructionError = isAppError(e) ? e.message : String(e);
     } finally {
-      sending.value = false;
+      live.sending = false;
     }
   }
 
   async function stopRun() {
     if (!running.value || taskId.value === null || stopping.value) return;
-    stopping.value = true;
+    activeRun.value!.stopping = true;
     try {
       await cancelTask(taskId.value);
     } catch {
@@ -606,7 +686,7 @@ export function useProject(opened: OpenedProject) {
   let gitRequest = 0;
 
   async function refreshGit() {
-    if (running.value || gitBusy.value) return;
+    if (anyRunning.value || gitBusy.value) return;
     const request = ++gitRequest;
     gitLoading.value = true;
     gitRefreshError.value = null;
@@ -625,7 +705,7 @@ export function useProject(opened: OpenedProject) {
 
   function gitDisabledReason(action: GitAction): string {
     const g = git.value;
-    if (running.value) return "Available when the task finishes.";
+    if (anyRunning.value) return runningCount.value > 1 ? "Available when the tasks finish." : "Available when the task finishes.";
     if (gitBusy.value) return "Wait for the current Git action to finish.";
     if (gitLoading.value) return "Refreshing Git status…";
     if (!g.isRepo) return "This folder is no longer a Git repository.";
@@ -641,7 +721,7 @@ export function useProject(opened: OpenedProject) {
 
   function openGit(action: GitAction | null = null, branch = "") {
     gitOpen.value = true;
-    if (gitBusy.value || running.value) return;
+    if (gitBusy.value || anyRunning.value) return;
     gitAsk.value = action;
     gitError.value = null;
     gitNotice.value = null;
@@ -707,7 +787,7 @@ export function useProject(opened: OpenedProject) {
   function schedulePreview() {
     previewRequest += 1;
     if (previewTimer !== null) clearTimeout(previewTimer);
-    if (!task.value.trim() || !selected.value?.path || running.value) {
+    if (!task.value.trim() || !selected.value?.path) {
       preview.value = null;
       previewError.value = null;
       return;
@@ -726,7 +806,7 @@ export function useProject(opened: OpenedProject) {
       const planned = await previewTask(opened.project.path, task.value, chosen.id, mode.value, headroom(chosen.id), isolation.value, modelOverride.value);
       if (request === previewRequest) {
         preview.value = planned;
-        if (gitVersion === gitRequest && !gitBusy.value && !gitLoading.value && !running.value) git.value = planned.git;
+        if (gitVersion === gitRequest && !gitBusy.value && !gitLoading.value && !anyRunning.value) git.value = planned.git;
       }
     } catch (e) {
       if (request === previewRequest) previewError.value = isAppError(e) ? e.message : String(e);
@@ -739,7 +819,8 @@ export function useProject(opened: OpenedProject) {
     void loadHistory();
     void loadLimits();
     limitsTimer = setInterval(() => {
-      if (!limitsLoading.value) void loadLimits();
+      // A reading costs a CLI start each. Only the project on screen asks.
+      if (!limitsLoading.value && active.value) void loadLimits();
     }, 60_000);
     try {
       providers.value = await detectProviders((one) => {
@@ -758,8 +839,10 @@ export function useProject(opened: OpenedProject) {
 
     stop = await Promise.all([
       onFileDrop((over, paths) => {
+        // One window, one drop target: whichever project is on screen takes it.
+        if (!active.value) return;
         dragging.value = over;
-        if (!running.value) attach(paths);
+        attach(paths);
       }),
       onInstallEvent((id, line) => {
         if (installing.value === id) installLine.value = line;
@@ -778,87 +861,139 @@ export function useProject(opened: OpenedProject) {
     stop.forEach((off) => off());
   });
 
-  async function run() {
-    const resume = resumeWith;
-    const chained = following;
-    const continueTask = continuing;
-    resumeWith = null;
-    continuing = null;
-    following = false;
-    const auto = switching;
-    switching = false;
+  /** Everything one `run` carries over from the call that asked for it.
+   *  Passed rather than stashed, so two runs started at once cannot mix. */
+  type RunOpts = {
+    resume?: (Resume & { reply: string }) | null;
+    /** The task a follow-up goes on in, when it goes on in one at all. */
+    continueTask?: number | null;
+    /** The words already asked in this chain; empty for a fresh request. */
+    asked?: string[];
+    /** The spent plan this run is taking over from, if it is. */
+    switchedFrom?: ProviderId | null;
+    /** The run this one carries on in, keeping its row and its exchanges. */
+    continueRun?: LiveRun | null;
+    /** The paths already taken off the composer, for a handoff that re-sends them. */
+    attachments?: string[];
+    /** Exchanges to open the new run with, when it carries on a task whose own
+     *  run is no longer on screen. */
+    turns?: Turn[];
+  };
+
+  async function run(opts: RunOpts = {}) {
     if (!canRun.value) return;
+    // The composer empties on send, the way the chain of replies below it does.
+    // A handoff re-sends what the first attempt was given rather than nothing.
+    const attached = opts.attachments ?? attachments.value;
+    if (!opts.attachments) attachments.value = [];
+    const carry = opts.continueRun ?? null;
+    // Reactive up front: the callbacks below write through this object for as
+    // long as the run lasts, and a plain one would leave the screen frozen on
+    // whatever it happened to show first.
+    const live: LiveRun = carry ?? reactive({
+      key: Symbol("run"),
+      id: null,
+      prompt: task.value,
+      attachmentCount: attached.length,
+      provider: provider.value,
+      switchedFrom: opts.switchedFrom ?? null,
+      asked: opts.asked ?? [],
+      turns: opts.turns ?? [],
+      active: true,
+      stream: [],
+      result: null,
+      checking: null,
+      error: null,
+      activity: { text: "Getting ready", file: null },
+      stopping: false,
+      instruction: "",
+      sending: false,
+      instructionError: null,
+    });
+    if (carry) {
+      // The exchange it answers stays on the page, above the new one.
+      if (carry.result) {
+        carry.turns.push({ said: saidIn(carry), summary: carry.result.summary, failure: carry.result.failure });
+      }
+      Object.assign(carry, {
+        id: null,
+        prompt: task.value,
+        attachmentCount: attached.length,
+        provider: provider.value,
+        switchedFrom: opts.switchedFrom ?? null,
+        asked: opts.asked ?? [],
+        active: true,
+        stream: [],
+        result: null,
+        checking: null,
+        error: null,
+        activity: { text: "Getting ready", file: null },
+        stopping: false,
+      });
+    } else {
+      runs.value = [live, ...runs.value].filter((r, i) => r.active || i < KEPT_FINISHED);
+    }
+    selectedRun.value = live.key;
     ++gitRequest;
     gitLoading.value = false;
     gitAsk.value = null;
-    if (!chained) asked = [];
-    switchedFrom.value = auto ? ranOn.value : null;
-    ranOn.value = provider.value;
-    stream.value = [];
-    result.value = null;
-    checking.value = null;
-    runError.value = null;
-    taskId.value = null;
-    stopping.value = false;
-    instruction.value = "";
-    instructionError.value = null;
-    currentActivity.value = { text: "Getting ready", file: null };
     view.value = "task";
     resultTab.value = "summary";
-    running.value = true;
     try {
-      result.value = await startTask(
+      live.result = await startTask(
         opened.project.path,
-        task.value,
-        provider.value,
+        live.prompt,
+        live.provider,
         mode.value,
         // The same reading the preview was routed on, so the run matches it.
-        headroom(provider.value),
+        headroom(live.provider),
         isolation.value,
-        attachments.value,
+        attached,
         modelOverride.value,
         (event) => {
           const activity = activityFor(event);
-          if (activity !== null) currentActivity.value = activity;
-          const text = describe(event);
-          if (text === null) return;
-          const file = event.kind === "toolUse" ? toolActivity(event.data.name, event.data.summary) : null;
-          stream.value.push(
-            file?.file
-              ? { kind: event.kind, ...file }
-              : { kind: event.kind, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text },
-          );
-          if (stream.value.length > 500) stream.value.shift();
+          if (activity !== null) live.activity = activity;
+          appendActivity(live.stream, event);
+          if (event.kind === "toolResult" && live.activity.id === event.data.id) {
+            const updated = [...live.stream].reverse().find((line) => line.id === event.data.id);
+            if (updated) live.activity = { ...updated, file: updated.file ?? null };
+          }
+          if (live.stream.length > 500) live.stream.shift();
         },
         (id) => {
-          taskId.value = id;
+          live.id = id;
         },
         (early) => {
-          checking.value = early;
+          live.checking = early;
         },
-        resume,
-        continueTask,
+        opts.resume ?? null,
+        opts.continueTask ?? null,
       );
     } catch (e) {
-      running.value = false;
-      runError.value = isAppError(e) ? e.message : String(e);
+      live.error = isAppError(e) ? e.message : String(e);
     } finally {
-      running.value = false;
-      stopping.value = false;
-      checking.value = null;
-      taskId.value = null;
-      if (tick !== null) clearTimeout(tick);
-      tickWhileWarm();
+      live.active = false;
+      live.stopping = false;
+      live.checking = null;
+      live.id = null;
+      if (selectedRun.value === live.key) {
+        if (tick !== null) clearTimeout(tick);
+        tickWhileWarm();
+      }
       await loadHistory();
       void refreshGit();
       // The run just spent some of a limit; the next pick should know.
       void loadLimits();
     }
     // Out of plan usage: the other CLI carries on, once, so two spent plans cannot bounce.
-    const next = auto ? null : fallback.value;
+    const next = opts.switchedFrom ? null : fallbackFor(live);
     if (next) {
-      switching = true;
-      await continueWith(next.id);
+      // The same request on the other CLI. What the stopped run changed is still on disk.
+      provider.value = next.id;
+      providerPicked.value = true;
+      pickedFor.value = null;
+      // The handoff is the same request carrying on: it keeps the reply's task.
+      await run({ ...opts, attachments: attached, switchedFrom: live.provider });
     }
   }
 
@@ -924,7 +1059,12 @@ export function useProject(opened: OpenedProject) {
       case "text":
         return say("Thinking through the request");
       case "toolUse":
-        return toolActivity(event.data.name, event.data.summary);
+        return {
+          ...toolActivity(event.data.name, event.data.summary),
+          ...(event.data.changes?.length ? { text: "Editing", file: event.data.changes[0]!.path } : {}),
+          ...(event.data.name === "Edit failed" ? { text: "Edit failed", failed: true } : {}),
+          id: event.data.id, changes: event.data.changes,
+        };
       case "done":
         return say("Putting on the finishing touches");
       case "failed":
@@ -932,6 +1072,27 @@ export function useProject(opened: OpenedProject) {
       default:
         return null;
     }
+  }
+
+  /** Replay and live delivery match a result to its own tool call. */
+  function appendActivity(items: ActivityLine[], event: ProviderEvent) {
+    if (event.kind === "toolResult") {
+      const line = [...items].reverse().find((item) => item.id === event.data.id);
+      if (line) {
+        line.failed = event.data.failed;
+        if (event.data.failed) {
+          line.text = "Edit failed";
+          line.changes = [];
+        } else if (event.data.changes.length) {
+          line.changes = event.data.changes;
+        }
+      }
+      return;
+    }
+    const text = describe(event);
+    if (text === null) return;
+    const activity = event.kind === "toolUse" ? activityFor(event)! : { text, file: null };
+    items.push({ kind: event.kind, ...activity, text: activity.text.slice(0, 4000) + (activity.text.length > 4000 ? "…" : "") });
   }
 
   /** A checker's JSON verdict, in words. Null for anything that isn't one. */
@@ -1149,15 +1310,13 @@ export function useProject(opened: OpenedProject) {
   const helpersReady = computed(() => installed.value.filter((p) => p.auth !== "signedOut").length);
 
   function focusTask() {
-    void nextTick(() => document.getElementById("task")?.focus());
+    void nextTick(() => document.getElementById(domId("task"))?.focus());
   }
 
+  // An empty composer. Whatever is running keeps running; it is still in the
+  // sidebar, one click away.
   function newTask() {
-    view.value = "task";
-    if (running.value) return;
-    result.value = null;
-    stream.value = [];
-    runError.value = null;
+    selectRun(null);
     task.value = "";
     attachments.value = [];
     focusTask();
@@ -1165,7 +1324,7 @@ export function useProject(opened: OpenedProject) {
 
   /** Back to the prompt with the same words, to tweak and run again. */
   function editAgain() {
-    result.value = null;
+    selectRun(null);
     focusTask();
   }
 
@@ -1186,15 +1345,8 @@ export function useProject(opened: OpenedProject) {
   });
 
   const reply = ref("");
-  const ranOn = ref<ProviderId | null>(null);
-  /** The CLI whose spent plan this run took over from, if it did. */
-  const switchedFrom = ref<ProviderId | null>(null);
-  let switching = false;
-  // The user's own words across a chain of follow-ups, oldest first.
-  let asked: string[] = [];
-  let following = false;
-  let resumeWith: (Resume & { reply: string }) | null = null;
-  let continuing: number | null = null;
+  /** The CLI the run on screen actually ran on. */
+  const ranOn = computed(() => activeRun.value?.provider ?? null);
 
   /** Milliseconds a reply can still resume the session; 0 means it starts over. */
   const warmLeft = computed(() => {
@@ -1203,26 +1355,82 @@ export function useProject(opened: OpenedProject) {
     return Math.max(0, r.endedAt + WARM_MS - now.value);
   });
 
-  async function sendReply() {
-    const r = result.value;
+  /** One exchange a reply can go on from, whether it is still on screen or was
+   *  read back out of the database. */
+  type Answered = {
+    taskId: number;
+    /** It worked in a separate copy, so this folder is not where its work is. */
+    inCopy: boolean;
+    summary: string;
+    files: string[];
+    /** The session to pick back up, when one is still warm. */
+    resume: Resume | null;
+    /** The user's own words so far, oldest first. */
+    asked: string[];
+    /** The run to carry on in, or null to open one. */
+    carry: LiveRun | null;
+    /** What to open that new run with, when there is no run to carry on in. */
+    turns: Turn[];
+  };
+
+  async function followUp(from: Answered) {
     const answer = reply.value.trim();
-    if (!answer || !r?.summary || running.value) return;
-    asked = [...(asked.length ? asked : [task.value]), answer];
+    if (!answer) return;
+    const asked = [...from.asked, answer];
     // What a fresh run needs, and no more: the requests, the last reply, and where the work is.
-    const files = r.diff.map((f) => f.path);
     task.value = [
       asked.slice(0, -1).join("\n\n"),
-      `You replied:\n${r.summary}`,
-      `My answer:\n${answer}`,
-      ...(files.length ? [`Files changed so far: ${files.join(", ")}`] : []),
+      `Your answer:\n${from.summary}`,
+      `My reply:\n${answer}`,
+      ...(from.files.length ? [`Files changed so far: ${from.files.join(", ")}`] : []),
     ].join("\n\n");
-    // The resumed session already holds everything but the answer.
-    resumeWith = r.resume && warmLeft.value > 0 ? { ...r.resume, reply: answer } : null;
-    following = true;
-    // A copy folder is not where the task's work is; a reply there starts its own.
-    continuing = isolation.value === "currentTree" && !r.worktree ? r.taskId : null;
     reply.value = "";
-    await run();
+    // A copy folder is not where the task's work is; a reply there starts its own.
+    const continueTask = isolation.value === "currentTree" && !from.inCopy ? from.taskId : null;
+    await run({
+      asked,
+      // The resumed session already holds everything but the answer.
+      resume: from.resume && warmLeft.value > 0 ? { ...from.resume, reply: answer } : null,
+      continueTask,
+      // The page stays on the conversation exactly when the task does. A reply
+      // that had to open its own task gets its own row, because that is true.
+      continueRun: continueTask === null ? null : from.carry,
+      turns: from.turns,
+    });
+  }
+
+  async function sendReply() {
+    const live = activeRun.value;
+    const r = live?.result;
+    if (!live || live.active || !r?.summary) return;
+    await followUp({
+      taskId: r.taskId,
+      inCopy: !!r.worktree,
+      summary: r.summary,
+      files: r.diff.map((f) => f.path),
+      resume: r.resume,
+      asked: live.asked.length ? live.asked : [live.prompt],
+      carry: live,
+      turns: [],
+    });
+  }
+
+  /** A reply to a task from the sidebar. Its run is long over and its provider
+   *  session long cold, so this always reads the files again - but it goes on in
+   *  the same task row, and opens with the exchange it is answering. */
+  async function replyToPast() {
+    const d = historyDetail.value;
+    if (!d?.summary) return;
+    await followUp({
+      taskId: d.id,
+      inCopy: !!d.worktreePath,
+      summary: d.summary,
+      files: d.diff.map((f) => f.path),
+      resume: null,
+      asked: [d.prompt],
+      carry: null,
+      turns: [{ said: d.prompt, summary: d.summary, failure: null }],
+    });
   }
 
   function showHistory(t: TaskSummary) {
@@ -1232,6 +1440,7 @@ export function useProject(opened: OpenedProject) {
 
   return {
     opened,
+    domId,
     task,
     attachments,
     attachError,
@@ -1283,8 +1492,15 @@ export function useProject(opened: OpenedProject) {
     fallback,
     switchedFrom,
     switchTo,
-    continueWith,
     canRun,
+    runs,
+    runLabel,
+    said,
+    selectRun,
+    selectedRun,
+    activeRun,
+    anyRunning,
+    runningCount,
     running,
     stream,
     result,
@@ -1349,6 +1565,7 @@ export function useProject(opened: OpenedProject) {
     friendlyToolUse,
     toolActivity,
     activityFor,
+    appendActivity,
     describeVerdict,
     describe,
     lines,
@@ -1377,7 +1594,9 @@ export function useProject(opened: OpenedProject) {
     newTask,
     editAgain,
     reply,
+    ranOn,
     sendReply,
+    replyToPast,
     warmLeft,
     showHistory,
   };

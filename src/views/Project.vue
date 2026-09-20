@@ -10,22 +10,28 @@ import TaskRun from "./project/TaskRun.vue";
 import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
 import type { GitAction, OpenedProject } from "../types";
+import { visiblePath } from "../path";
 
 // The shell: sidebar, top bar and whichever page the sidebar picked.
 // All state lives in `useProject`; the pages inject it.
-const props = defineProps<{ opened: OpenedProject }>();
-defineEmits<{ close: [] }>();
+const props = defineProps<{ opened: OpenedProject; active: boolean }>();
+const emit = defineEmits<{ close: []; busy: [count: number] }>();
 
-const state = useProject(props.opened);
+const state = useProject(props.opened, computed(() => props.active));
 provide(PROJECT, state);
 const {
-  view, running, result, history, historyError, historyDetail, historyLine, showHistory, newTask, taskName,
+  view, running, result, runs, runLabel, selectRun, selectedRun, activeRun, anyRunning, runningCount,
+  history, historyError, historyDetail, historyLine, showHistory, newTask, taskName,
   taskMenu, renameId, renaming, deleteAsk, askDelete, startRename, saveRename, removeTask, taskError,
-  rows, helpersPending, helpersReady, TONE, HISTORY_STATUS,
+  rows, helpersPending, helpersReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
   git, gitOpen, gitAsk, gitBusy, gitLoading, gitRefreshError, gitError, gitNotice,
-  commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit,
+  commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
 } = state;
+
+// The launch screen lists every open project and says which are busy, so a run
+// left going in another one is never invisible.
+watch(runningCount, (count) => emit("busy", count), { immediate: true });
 
 const gitTrigger = ref<HTMLButtonElement | null>(null);
 const gitPanel = ref<HTMLElement | null>(null);
@@ -100,7 +106,8 @@ function nudge(by: number) {
 // Ctrl+` shows and hides the dock; with Shift it opens another terminal. The
 // physical key is what matters - Ctrl+Shift+` is a tilde on some layouts.
 function shortcut(e: KeyboardEvent) {
-  if (!e.ctrlKey || e.altKey || e.code !== "Backquote") return;
+  // One window: the project on screen owns the keyboard.
+  if (!props.active || !e.ctrlKey || e.altKey || e.code !== "Backquote") return;
   e.preventDefault();
   if (e.shiftKey) dock.openTerminal();
   else if (dockPrefs.open) dockPrefs.open = false;
@@ -127,20 +134,25 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
     <aside class="sidebar" aria-label="Workspace">
       <div class="brand"><VeloMark :size="26" /> Orteca</div>
 
-      <button class="btn new-task" :class="{ on: view === 'task' && !running && !result }" :aria-current="view === 'task' && !running && !result ? 'page' : undefined" @click="newTask">
+      <button class="btn new-task" :class="{ on: view === 'task' && !activeRun }" :aria-current="view === 'task' && !activeRun ? 'page' : undefined" @click="newTask">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
         New task
       </button>
 
       <nav class="nav" aria-label="Project">
         <button
-          v-if="running || result"
-          :class="{ on: view === 'task' }"
-          :aria-current="view === 'task' ? 'page' : undefined"
-          @click="view = 'task'"
+          v-for="r in runs"
+          :key="r.key"
+          :class="{ on: view === 'task' && selectedRun === r.key }"
+          :aria-current="view === 'task' && selectedRun === r.key ? 'page' : undefined"
+          :title="r.prompt"
+          @click="selectRun(r.key)"
         >
-          <span class="dot" :class="running ? 'live' : result && TONE[result.status]" aria-hidden="true"></span>
-          <span class="grow">{{ running ? "Running now" : "Latest result" }}</span>
+          <span class="dot" :class="r.active ? 'live' : r.result ? TONE[r.result.status] : r.error ? 'bad' : ''" aria-hidden="true"></span>
+          <span class="task-copy">
+            <span class="task-title">{{ runLabel(r) }}</span>
+            <span class="task-caption">{{ r.active ? "Running now" : r.result ? OUTCOME[r.result.status] : "Couldn’t start" }} · {{ r.provider }}</span>
+          </span>
         </button>
         <button
           :class="{ on: view === 'helpers' }"
@@ -158,7 +170,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       <h2 class="label side-label">Project</h2>
       <div class="project-root">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-        <span class="grow" :title="opened.project.path">{{ opened.project.name }}</span>
+        <span class="grow" :title="visiblePath(opened.project.path)">{{ opened.project.name }}</span>
         <span v-if="!historyError && history.length" class="count" :title="`${history.length} recent tasks`">{{ history.length }}</span>
       </div>
       <h3 class="hidden-label">Recent tasks</h3>
@@ -242,7 +254,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           ref="gitTrigger"
           class="git-trigger"
           :class="{ on: gitOpen }"
-          popovertarget="project-git"
+          :popovertarget="domId('project-git')"
           :title="`Git · ${git.branch ?? 'detached HEAD'} · ${git.dirtyCount} uncommitted changes`"
           :aria-label="`Git status and actions: ${git.branch ?? 'detached HEAD'}, ${git.dirtyCount} changed files`"
           aria-haspopup="dialog"
@@ -271,10 +283,10 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </button>
       </header>
 
-      <section id="project-git" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" aria-labelledby="git-title" @toggle="toggleGit">
+      <section :id="domId('project-git')" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" aria-labelledby="git-title" @toggle="toggleGit">
         <div class="git-heading">
           <h2 id="git-title">Git</h2>
-          <button class="git-close" popovertarget="project-git" popovertargetaction="hide" aria-label="Close Git actions" title="Close Git actions">
+          <button class="git-close" :popovertarget="domId('project-git')" popovertargetaction="hide" aria-label="Close Git actions" title="Close Git actions">
             <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
           </button>
         </div>
@@ -331,7 +343,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         <p v-if="gitBusy || gitNotice" class="note git-notice" role="status">{{ gitProgress || gitNotice }}</p>
         <footer class="git-footer">
           <span class="note">{{ gitLoading ? 'Refreshing status…' : 'Local repository status' }}</span>
-          <button class="link" :disabled="running || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
+          <button class="link" :disabled="anyRunning || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
         </footer>
       </section>
 
@@ -369,11 +381,11 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
     </div>
 
     <footer class="statusbar" aria-label="Workspace status">
-      <span class="mono grow" :title="opened.project.path">{{ opened.project.path }}</span>
-      <span v-if="running" class="status-item"><span class="dot live" aria-hidden="true"></span>Task running</span>
+      <span class="mono grow" :title="visiblePath(opened.project.path)">{{ visiblePath(opened.project.path) }}</span>
+      <span v-if="anyRunning" class="status-item"><span class="dot live" aria-hidden="true"></span>{{ runningCount === 1 ? "Task running" : `${runningCount} tasks running` }}</span>
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
         <template v-for="usage in usageCounters" :key="usage.id">
-          <button class="usage-counter" :popovertarget="`usage-${usage.id}`" :title="`${usage.name} usage details and reset times`">
+          <button class="usage-counter" :popovertarget="domId(`usage-${usage.id}`)" :title="`${usage.name} usage details and reset times`">
             <span class="usage-name">{{ usage.name }}</span>
             <span v-if="usage.status" class="usage-unavailable">— {{ usage.status }}</span>
             <template v-else>
@@ -388,10 +400,10 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             </template>
           </button>
 
-          <section :id="`usage-${usage.id}`" class="usage-popover" popover role="dialog" :aria-labelledby="`usage-title-${usage.id}`">
+          <section :id="domId(`usage-${usage.id}`)" class="usage-popover" popover role="dialog" :aria-labelledby="`usage-title-${usage.id}`">
             <header class="usage-heading">
               <h2 :id="`usage-title-${usage.id}`">{{ usage.name }} usage</h2>
-              <button class="usage-close" :popovertarget="`usage-${usage.id}`" popovertargetaction="hide" :title="`Close ${usage.name} usage`" :aria-label="`Close ${usage.name} usage`">
+              <button class="usage-close" :popovertarget="domId(`usage-${usage.id}`)" popovertargetaction="hide" :title="`Close ${usage.name} usage`" :aria-label="`Close ${usage.name} usage`">
                 <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
               </button>
             </header>
@@ -399,7 +411,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <template v-if="usage.status">
               <p class="usage-empty" role="status">{{ usage.status }}</p>
               <p v-if="usage.status === 'Unavailable'" class="note usage-reason">{{ usage.reason }}</p>
-              <button v-if="usage.status === 'Not installed' || usage.status === 'Sign in required'" class="btn" :popovertarget="`usage-${usage.id}`" popovertargetaction="hide" @click="view = 'helpers'">Open AI helpers</button>
+              <button v-if="usage.status === 'Not installed' || usage.status === 'Sign in required'" class="btn" :popovertarget="domId(`usage-${usage.id}`)" popovertargetaction="hide" @click="view = 'helpers'">Open AI helpers</button>
             </template>
             <div v-for="(w, i) in usage.windows" :key="i" class="usage-detail" :class="{ low: w.left !== null && w.left <= 20 }">
               <div class="usage-detail-label"><span>{{ w.label }}</span><strong>{{ w.leftLabel }} {{ w.left === null ? 'unavailable' : 'left' }}</strong></div>

@@ -266,11 +266,18 @@ export interface Usage {
   costQuality: CostQuality;
 }
 
+export interface FileEdit {
+  path: string;
+  /** Unified hunks recorded for this edit; null when the CLI only reports a path. */
+  patch: string | null;
+}
+
 /** Adjacently tagged in Rust, so every variant carries its payload in `data`. */
 export type ProviderEvent =
   | { kind: "started"; data: { sessionId: string } }
   | { kind: "text"; data: string }
-  | { kind: "toolUse"; data: { name: string; summary: string } }
+  | { kind: "toolUse"; data: { name: string; summary: string; id?: string; changes?: FileEdit[] } }
+  | { kind: "toolResult"; data: { id: string; changes: FileEdit[]; failed: boolean } }
   | { kind: "usage"; data: Usage }
   | { kind: "done"; data: { result: string; structured: unknown } }
   | { kind: "failed"; data: { kind: FailureKind; message: string } };

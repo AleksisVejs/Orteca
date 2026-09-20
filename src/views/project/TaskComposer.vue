@@ -8,7 +8,7 @@ const {
   schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
   installed, provider, providerPicked, pickedFor, previewing, preview, previewError,
   limitWarning, alternative, switchTo, runError, providerError, helpersPending, view,
-  MODELS, modelChoices, chooseProvider, chooseModel,
+  MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount,
 } = inject(PROJECT)!;
 </script>
 
@@ -18,16 +18,16 @@ const {
     <p class="lede">Ask a question, fix a bug, or build something new.</p>
 
     <section class="ask card" :class="{ dragging }">
-      <label class="hidden-label" for="task">Describe your task</label>
+      <label class="hidden-label" :for="domId('task')">Describe your task</label>
       <textarea
-        id="task"
+        :id="domId('task')"
         v-model="task"
         rows="4"
         spellcheck="false"
         placeholder="Describe the task and what a good result looks like…"
         @input="schedulePreview"
         @paste="pasteImages"
-        @keydown.ctrl.enter.prevent="run"
+        @keydown.ctrl.enter.prevent="run()"
       ></textarea>
 
       <ul v-if="attachments.length" class="attachments" aria-label="Attached">
@@ -54,7 +54,7 @@ const {
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
         </button>
         <span class="shortcut note">Ctrl + Enter</span>
-        <button class="btn primary run" :disabled="!canRun" title="Run task (Ctrl+Enter)" @click="run">
+        <button class="btn primary run" :disabled="!canRun" title="Run task (Ctrl+Enter)" @click="run()">
           Run task
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3 8h10M8 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
@@ -174,6 +174,12 @@ const {
           <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
         </span>
         <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
+        <!-- Two agents editing one folder is allowed, but what each one changed
+             stops being separable, so the composer says so before the click. -->
+        <span v-if="anyRunning && isolation === 'currentTree'" class="missing" role="status">
+          {{ runningCount === 1 ? "Another task is" : `${runningCount} other tasks are` }} already changing this folder.
+          Their changes and this one will be mixed together in every diff.
+        </span>
       </div>
       <p v-else-if="previewError" class="preview missing" role="status">Preview unavailable: {{ previewError }}</p>
     </section>

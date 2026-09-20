@@ -2,10 +2,15 @@
 import { computed, onMounted, ref } from "vue";
 import VeloMark from "../components/VeloMark.vue";
 import { forgetProject, isAppError, pickFolder, recentProjects } from "../api";
+import { visiblePath } from "../path";
 import type { Project } from "../types";
 
-const props = defineProps<{ openError?: string | null }>();
-const emit = defineEmits<{ open: [path: string] }>();
+/** Projects already open, with how many runs each has going right now. */
+type OpenProject = { path: string; name: string; running: number };
+const props = defineProps<{ openError?: string | null; openProjects?: OpenProject[] }>();
+const emit = defineEmits<{ open: [path: string]; closeProject: [path: string] }>();
+
+const open = computed(() => props.openProjects ?? []);
 
 const recents = ref<Project[]>([]);
 const loadError = ref<string | null>(null);
@@ -48,13 +53,38 @@ async function forget(path: string) {
       <p v-if="error" class="error" role="alert">{{ error }}</p>
     </div>
 
+    <section v-if="open.length" class="recents">
+      <h2 class="label">Open projects</h2>
+      <ul>
+        <li v-for="p in open" :key="p.path">
+          <button class="entry" @click="emit('open', p.path)">
+            <span class="name">{{ p.name }}</span>
+            <span class="mono path" :title="visiblePath(p.path)">{{ visiblePath(p.path) }}</span>
+          </button>
+          <span v-if="p.running" class="running" role="status">
+            <span class="dot live" aria-hidden="true"></span>
+            {{ p.running === 1 ? "1 task running" : `${p.running} tasks running` }}
+          </span>
+          <button
+            class="forget"
+            :disabled="p.running > 0"
+            :title="p.running ? 'Stop its tasks before closing it' : 'Close this project'"
+            :aria-label="`Close ${p.name}`"
+            @click="emit('closeProject', p.path)"
+          >
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+          </button>
+        </li>
+      </ul>
+    </section>
+
     <section v-if="recents.length" class="recents">
       <h2 class="label">Recent projects</h2>
       <ul>
         <li v-for="p in recents" :key="p.path">
           <button class="entry" @click="emit('open', p.path)">
             <span class="name">{{ p.name }}</span>
-            <span class="mono path" :title="p.path">{{ p.path }}</span>
+            <span class="mono path" :title="visiblePath(p.path)">{{ visiblePath(p.path) }}</span>
           </button>
           <button class="forget" title="Remove from list" :aria-label="`Remove ${p.name} from recent projects`" @click="forget(p.path)">
             <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
@@ -169,9 +199,22 @@ h1 {
   color: var(--text-faint);
   transition: background 120ms ease, color 120ms ease;
 }
-.forget:hover {
+.forget:hover:not(:disabled) {
   background: var(--surface-2);
   color: var(--text);
+}
+.forget:disabled {
+  opacity: 0.4;
+}
+
+.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding-right: 4px;
+  font-size: 12px;
+  color: var(--text-faint);
 }
 
 .foot {

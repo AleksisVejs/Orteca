@@ -2,20 +2,28 @@
 import { inject } from "vue";
 import ActivityLog from "./ActivityLog.vue";
 import FileLink from "./FileLink.vue";
+import Markdown from "../../components/Markdown.vue";
 import { PROJECT } from "./state";
 
 // The page while a run is going. Stop and steering are the only other things worth doing.
 const {
-  task, attachments, currentActivity, fileError, taskId, stopping, stopRun,
+  activeRun, said, describeVerdict, currentActivity, fileError, taskId, stopping, stopRun,
   instruction, sending, instructionError, steering, instruct, checking,
 } = inject(PROJECT)!;
 </script>
 
 <template>
+  <!-- Everything already said in this task, so a follow-up reads as one thread. -->
+  <article v-for="(t, i) in activeRun?.turns ?? []" :key="i" class="turn">
+    <p class="said">{{ t.said }}</p>
+    <Markdown v-if="t.summary" class="summary" :text="describeVerdict(t.summary) ?? t.summary" />
+    <p v-else class="note">{{ t.failure ?? "No summary was reported." }}</p>
+  </article>
+
   <section class="card head">
-    <p class="prompt">{{ task }}</p>
-    <p v-if="attachments.length" class="note">
-      {{ attachments.length }} attached {{ attachments.length === 1 ? "item" : "items" }}
+    <p class="prompt">{{ said }}</p>
+    <p v-if="activeRun?.attachmentCount" class="note">
+      {{ activeRun.attachmentCount }} attached {{ activeRun.attachmentCount === 1 ? "item" : "items" }}
     </p>
     <div class="now" role="status" aria-live="polite">
       <span class="dot live" aria-hidden="true"></span>

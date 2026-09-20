@@ -38,6 +38,12 @@ Toolchain: Node 22, Rust 1.98 MSVC, VS 2022 Build Tools (`VC.Tools.x86.x64`).
 
 Rust (`src-tauri/src/`) owns processes, git and storage; Vue owns two screens and a modal.
 The Project screen is a shell plus pages in `src/views/project/`, sharing `state.ts`.
+Runs are concurrent in both directions: `state.ts` keeps a `runs` list, one reactive
+`LiveRun` per task with its own stream, result and steering box, and `App.vue` keeps
+every opened project mounted (hidden, never torn down) so a run keeps streaming while
+another project is on screen. That is why each project namespaces its element ids
+through `domId` - popovers are targeted by id - and why window-wide listeners (file
+drop, Ctrl+`) check the `active` flag before answering.
 
 - `main.rs` — Tauri commands (projects: `open_project`, `recent_projects`,
   `trust_project`, `forget_project`; providers: `detect_providers`,

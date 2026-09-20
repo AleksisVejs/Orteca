@@ -6,11 +6,13 @@ import DockHistory from "./DockHistory.vue";
 import DockPreview from "./DockPreview.vue";
 import DockTerminal from "./DockTerminal.vue";
 import { DOCK, FONTS, SHELLS } from "./dock";
+import { PROJECT } from "./state";
 
 // The dock's own chrome: the tab strip, the settings and whichever tab is on
 // top. Every tab stays mounted underneath, so a build keeps running while you
 // read a file.
 const dock = inject(DOCK)!;
+const { domId } = inject(PROJECT)!;
 const { prefs, tabs, active } = dock;
 
 const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", preview: "Preview", history: "Commit history" } as const;
@@ -54,7 +56,7 @@ const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", pre
       <button class="strip-button" title="Dev server preview" aria-label="Dev server preview" @click="dock.openPreview()">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M2 6h12" stroke="currentColor" stroke-width="1.3" /></svg>
       </button>
-      <button class="strip-button" popovertarget="dock-settings" title="Dock settings" aria-label="Dock settings">
+      <button class="strip-button" :popovertarget="domId('dock-settings')" title="Dock settings" aria-label="Dock settings">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 1.6v1.6M8 12.8v1.6M14.4 8h-1.6M3.2 8H1.6m10.9-4.5-1.1 1.1M4.6 11.4l-1.1 1.1m9 0-1.1-1.1M4.6 4.6 3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
       </button>
       <button
@@ -69,7 +71,7 @@ const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", pre
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
       </button>
 
-      <section id="dock-settings" class="settings" popover role="dialog" aria-labelledby="dock-settings-title">
+      <section :id="domId('dock-settings')" class="settings" popover role="dialog" aria-labelledby="dock-settings-title">
         <header class="settings-head">
           <h2 id="dock-settings-title">Dock settings</h2>
           <button class="link" @click="dock.resetPrefs()">Reset</button>

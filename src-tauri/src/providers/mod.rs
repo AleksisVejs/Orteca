@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codex_edits;
 pub mod limits;
 #[cfg(test)]
 pub mod mock;
@@ -165,6 +166,15 @@ pub enum ProviderEvent {
     ToolUse {
         name: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<FileEdit>,
+    },
+    ToolResult {
+        id: String,
+        changes: Vec<FileEdit>,
+        failed: bool,
     },
     Usage(Usage),
     Done {
@@ -180,6 +190,14 @@ pub enum ProviderEvent {
         kind: FailureKind,
         message: String,
     },
+}
+
+/// A provider-recorded edit. Missing patch means the CLI only named the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEdit {
+    pub path: String,
+    pub patch: Option<String>,
 }
 
 /// Only the kinds a parser actually produces. `CliMissing`, `Cancelled` and
@@ -211,6 +229,7 @@ impl ProviderEvent {
             Self::Started { .. } => "started",
             Self::Text(_) => "text",
             Self::ToolUse { .. } => "toolUse",
+            Self::ToolResult { .. } => "toolResult",
             Self::Usage(_) => "usage",
             Self::Done { .. } => "done",
             Self::Failed { .. } => "failed",

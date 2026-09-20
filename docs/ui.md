@@ -83,9 +83,11 @@ is the only place colour, radius and spacing are defined.
   one page at a time from `views/project/`: composer, live run, result, past
   task, AI helpers. All state lives in `views/project/state.ts` and the pages
   `inject` it. A page renders; it does not own logic.
-- The sidebar holds only destinations that exist: New task, the current run,
-  AI helpers, recent tasks, switch project. No entry for a feature that is not
-  wired up.
+- The sidebar holds only destinations that exist: New task, one row per live or
+  just-finished run, AI helpers, recent tasks, switch project. No entry for a
+  feature that is not wired up. Runs are concurrent, so a row per run is the
+  only honest listing; each carries its own dot, its own label taken from what
+  was asked, and opens its own stream or result.
 - A status dot is green for done, `--err` for failed, `--warn` for checks that
   did not pass, blue while running, and neutral otherwise.
 - A result shows what happened first; route, metrics, files and activity sit
@@ -97,11 +99,24 @@ is the only place colour, radius and spacing are defined.
   Results link directly to Commit or Merge with the task's branch selected.
   Git status refreshes when the popover opens, after tasks and on demand;
   incoming and outgoing counts explicitly reflect the last fetch.
+- A reply continues the run it answers: same sidebar row, same page, the
+  finished exchanges stacked above the current one with a hairline between them
+  and no nested cards. The row keeps the name of what was first asked, and the
+  heading shows what the user typed, never the recap sent to the CLI. A reply
+  that had to open its own task — one whose run worked in a separate copy —
+  gets its own row, because that is what happened. The reply box carries the
+  composer's affordances: attach, add folder, paste, drop, Ctrl+Enter.
+- A finished task in the sidebar takes a reply too, on the same terms. It opens
+  a run showing the exchange it answers, and goes on in that same task. Its
+  provider session is long cold, so the box says the reply reads the files again
+  rather than picking up where it left off — it never implies a warm one.
 - The composer separates writing and attachments from task settings. The AI,
   approach and working location stay visible while the settings are collapsed.
   “Run task” is the primary action, with a Ctrl+Enter hint on wider windows.
-- Launch uses a centered wordmark, one project action, and a simple recent
-  project list. The workspace has a 240px sidebar (208px in smaller desktop
+- Launch uses a centered wordmark, one project action, an open-project list and
+  a simple recent project list. Projects stay open while another is on screen,
+  so the open list says how many tasks each one has running and refuses to close
+  one that is busy. Switching project closes nothing. The workspace has a 240px sidebar (208px in smaller desktop
   windows), a 44px pane header and a compact status bar. Task history nests
   under the current project and shows each task’s status and provider.
 - The pane header identifies the current screen with a tab-like treatment.

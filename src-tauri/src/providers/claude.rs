@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use super::{classify_failure, CostQuality, FailureKind, ProviderEvent, Usage};
+use super::{classify_failure, CostQuality, FailureKind, FileEdit, ProviderEvent, Usage};
 
 /// One user message in the shape `--input-format stream-json` accepts.
 ///
@@ -38,6 +38,7 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             .map(|blocks| blocks.iter().filter_map(block).collect())
             .unwrap_or_default(),
         "result" => result(v),
+        "user" => edit_result(v).into_iter().collect(),
         // Sent before the answer on every call; `allowed` and `allowed_warning`
         // are recorded. `rejected` is the plan's limit being used up. The result
         // that follows may word it in a way `classify_failure` does not know,
@@ -70,12 +71,76 @@ pub fn structured_output(v: &Value) -> Option<Value> {
 fn block(b: &Value) -> Option<ProviderEvent> {
     match b["type"].as_str()? {
         "text" => Some(ProviderEvent::Text(b["text"].as_str()?.to_string())),
-        "tool_use" => Some(ProviderEvent::ToolUse {
-            name: b["name"].as_str()?.to_string(),
-            summary: summarize(&b["input"]),
-        }),
+        "tool_use" => {
+            let name = b["name"].as_str()?;
+            let editing = matches!(name, "Edit" | "Write" | "MultiEdit");
+            Some(ProviderEvent::ToolUse {
+                name: name.to_string(),
+                summary: summarize(&b["input"]),
+                id: if editing {
+                    b["id"].as_str().map(str::to_string)
+                } else {
+                    None
+                },
+                changes: if editing {
+                    b["input"]["file_path"]
+                        .as_str()
+                        .map(|path| FileEdit {
+                            path: path.to_string(),
+                            patch: None,
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            })
+        }
         _ => None,
     }
+}
+
+fn edit_result(v: &Value) -> Option<ProviderEvent> {
+    let result = v["message"]["content"]
+        .as_array()?
+        .iter()
+        .find(|block| block["type"] == "tool_result")?;
+    let data = &v["tool_use_result"];
+    let failed = result["is_error"] == true;
+    if !failed && data["filePath"].as_str().is_none() {
+        return None;
+    }
+    let changes = data["filePath"]
+        .as_str()
+        .map(|path| FileEdit {
+            path: path.to_string(),
+            patch: if failed { None } else { edit_patch(data) },
+        })
+        .into_iter()
+        .collect();
+    Some(ProviderEvent::ToolResult {
+        id: result["tool_use_id"].as_str()?.to_string(),
+        changes,
+        failed,
+    })
+}
+
+fn edit_patch(data: &Value) -> Option<String> {
+    let mut patch = String::new();
+    for hunk in data["structuredPatch"].as_array()? {
+        patch.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            hunk["oldStart"].as_u64()?,
+            hunk["oldLines"].as_u64()?,
+            hunk["newStart"].as_u64()?,
+            hunk["newLines"].as_u64()?
+        ));
+        for line in hunk["lines"].as_array()? {
+            patch.push_str(line.as_str()?);
+            patch.push('\n');
+        }
+    }
+    Some(patch)
 }
 
 /// The input fields that say what a tool call is about, best first.
@@ -180,6 +245,66 @@ fn n(v: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_edits_keep_the_completed_patch_and_call_id() {
+        let events: Vec<_> = include_str!("../../fixtures/claude-isolated-run.jsonl")
+            .lines()
+            .flat_map(|line| parse_line(&serde_json::from_str(line).unwrap()))
+            .collect();
+        let (id, changes) = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolUse {
+                    name, id, changes, ..
+                } if name == "Edit" => Some((id, changes)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(changes[0].path.ends_with("notes.txt"));
+        assert_eq!(changes[0].patch, None, "a request is not a completed edit");
+        let completed = events.iter().find(|event| matches!(event,
+            ProviderEvent::ToolResult { id: result_id, .. } if Some(result_id) == id.as_ref()
+        )).unwrap();
+        let ProviderEvent::ToolResult {
+            changes, failed, ..
+        } = completed
+        else {
+            unreachable!()
+        };
+        assert!(!failed);
+        assert_eq!(
+            changes[0].patch.as_deref(),
+            Some("@@ -1,1 +1,1 @@\n-helo world\n+hello world\n")
+        );
+        // This is the exact shape both SQLite and the live stream receive.
+        let saved = serde_json::to_string(completed).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProviderEvent>(&saved).unwrap(),
+            *completed
+        );
+        assert!(saved.contains("toolResult"));
+    }
+
+    #[test]
+    fn failed_edits_and_old_events_never_invent_a_patch() {
+        let events = parse_line(&serde_json::json!({"type":"user", "message":{"content":[{
+            "type":"tool_result", "tool_use_id":"bad-edit", "is_error":true, "content":"not found"
+        }]}}));
+        assert!(
+            matches!(&events[0], ProviderEvent::ToolResult { failed: true, changes, .. } if changes.is_empty())
+        );
+        let old: ProviderEvent =
+            serde_json::from_str(r#"{"kind":"toolUse","data":{"name":"Edit","summary":"a.ts"}}"#)
+                .unwrap();
+        assert!(
+            matches!(old, ProviderEvent::ToolUse { id: None, changes, .. } if changes.is_empty())
+        );
+        assert_eq!(
+            edit_patch(&serde_json::json!({"structuredPatch":[{"oldStart":1}]})),
+            None
+        );
+    }
 
     fn summary(input: Value) -> String {
         let block = serde_json::json!({"type": "tool_use", "name": "T", "input": input});

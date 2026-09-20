@@ -2,12 +2,23 @@
 import { computed, inject } from "vue";
 import FileLink from "./FileLink.vue";
 import { PROJECT } from "./state";
+import type { ActivityLine } from "./state";
+import { activityPatch, parseHistoryPatch } from "./historyPatch";
+import { visiblePath } from "../../path";
 
 // The live, plain-English view of a run. The full technical log is saved with the task.
 // A past task passes its own lines, rebuilt from the saved log.
-const props = defineProps<{ items?: Array<{ kind: string; text: string; file?: string | null }> }>();
+const props = defineProps<{ items?: ActivityLine[]; patchText?: string | null; root?: string; finished?: boolean; dirtyAtStart?: boolean }>();
 const project = inject(PROJECT)!;
-const lines = computed(() => props.items ?? project.lines.value);
+const finished = computed(() => props.finished ?? !!project.result.value);
+const dirtyAtStart = computed(() => props.dirtyAtStart ?? project.result.value?.dirtyAtStart);
+const taskPatch = computed(() => parseHistoryPatch(props.items ? props.patchText ?? "" : project.result.value?.patchText ?? ""));
+const lines = computed(() => (props.items ?? project.lines.value).map((line) => ({
+  ...line,
+  edits: (line.failed ? [] : line.changes ?? (line.text === "Editing" && line.file ? [{ path: line.file, patch: null }] : []))
+    .map((edit) => ({ path: edit.path, ...activityPatch(visiblePath(edit.path), edit.patch, taskPatch.value.files,
+      visiblePath(props.root ?? (props.items ? null : project.result.value?.worktree?.path) ?? project.opened.project.path)) })),
+})));
 </script>
 
 <template>
@@ -15,8 +26,38 @@ const lines = computed(() => props.items ?? project.lines.value);
   <ol v-else class="card stream" role="log" aria-live="polite" aria-relevant="additions">
     <li v-for="(line, i) in lines" :key="i" :class="line.kind">
       <span v-if="line.kind === 'instruction'" class="said">you</span>
-      {{ line.text }}
-      <FileLink v-if="line.file" :file="line.file" />
+      <template v-if="line.edits.length">
+        <details v-for="edit in line.edits" :key="edit.path" class="edit">
+          <summary :title="`Show changes in ${edit.path}`">
+            <span class="edit-label">{{ line.text }} <span class="edit-name">{{ edit.path.split(/[\\/]/).pop() }}</span></span>
+            <span class="edit-counts" :aria-label="edit.file && !edit.file.binary ? `${edit.file.added} lines added, ${edit.file.removed} lines removed` : 'Show diff'">
+              <template v-if="edit.file && !edit.file.binary"><span class="added">+{{ edit.file.added }}</span> <span class="removed">−{{ edit.file.removed }}</span></template>
+              <template v-else>+ / −</template>
+            </span>
+            <span v-if="edit.file && !edit.exact" class="scope">task</span>
+          </summary>
+          <div class="edit-body">
+            <div class="edit-heading"><FileLink :file="edit.path" /></div>
+            <p v-if="edit.file" class="note">{{ edit.exact ? 'This edit' : 'All changes to this file in the task' }}<template v-if="!edit.exact && dirtyAtStart"> · Includes changes already present when the task started.</template></p>
+            <template v-if="edit.file">
+              <p v-for="note in edit.file.notes" :key="note" class="note">{{ note }}</p>
+              <template v-if="!edit.exact"><p v-for="notice in taskPatch.notices" :key="notice" class="note">{{ notice }}</p></template>
+              <div v-if="edit.file.lines.length" class="edit-code" tabindex="0" :aria-label="`Changes in ${edit.path}. Minus means removed; plus means added.`">
+                <div v-for="(row, rowIndex) in edit.file.lines" :key="rowIndex" class="edit-row" :class="row.kind">
+                  <template v-if="row.kind === 'hunk'"><span class="hunk-label">@@ −{{ row.before }} +{{ row.after }} @@ {{ row.text }}</span></template>
+                  <template v-else>
+                    <span class="line-number" aria-hidden="true">{{ row.before }}</span><span class="line-number" aria-hidden="true">{{ row.after }}</span>
+                    <span class="line-sign">{{ row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' ' }}</span><code>{{ row.text }}</code>
+                  </template>
+                </div>
+              </div>
+              <p v-else-if="!edit.file.notes.length" class="note">No text lines changed.</p>
+            </template>
+            <p v-else class="note">{{ finished ? 'No recorded diff is available for this edit.' : 'Waiting for edit details. If the provider only reports file names, the task diff appears when the run finishes.' }}</p>
+          </div>
+        </details>
+      </template>
+      <template v-else>{{ line.text }} <FileLink v-if="line.file" :file="line.file" /></template>
     </li>
   </ol>
 </template>
@@ -53,6 +94,94 @@ const lines = computed(() => props.items ?? project.lines.value);
 }
 .stream li.failed {
   color: var(--err);
+}
+.edit summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+  list-style: none;
+}
+.edit summary::-webkit-details-marker {
+  display: none;
+}
+.edit summary:hover, .edit[open] summary {
+  color: var(--text);
+}
+.edit-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.edit-name {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.edit-counts {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.scope {
+  color: var(--text-faint);
+  font-family: var(--font);
+  font-size: 11px;
+}
+.edit-body {
+  margin: 8px 0 12px;
+  white-space: normal;
+}
+.edit-heading {
+  overflow-wrap: anywhere;
+  color: var(--text-dim);
+}
+.edit-body .note {
+  margin: 8px 0;
+  font-family: var(--font);
+}
+.edit-code {
+  max-height: 320px;
+  overflow: auto;
+  color: var(--text-dim);
+  border-block: 1px solid var(--border);
+  line-height: 1.65;
+  tab-size: 4;
+}
+.edit-row {
+  display: grid;
+  grid-template-columns: 5ch 5ch 2ch minmax(0, 1fr);
+  min-width: 100%;
+  width: max-content;
+}
+.edit-row code {
+  padding-right: 12px;
+  font: inherit;
+  white-space: pre;
+}
+.line-number {
+  text-align: right;
+  padding-right: 1ch;
+  color: var(--text-faint);
+  user-select: none;
+}
+.added {
+  color: var(--syntax-string);
+}
+.removed {
+  color: var(--syntax-number);
+}
+.edit-row.added {
+  background: color-mix(in srgb, var(--syntax-string) 9%, var(--bg));
+}
+.edit-row.removed {
+  background: color-mix(in srgb, var(--syntax-number) 9%, var(--bg));
+}
+.hunk-label {
+  grid-column: 1 / -1;
+  padding: 4px 12px;
+  color: var(--text-faint);
+  background: var(--surface);
+  white-space: pre;
 }
 /* The user's own words, marked as theirs rather than as something said back. */
 .stream li.instruction {

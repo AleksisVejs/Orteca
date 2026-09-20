@@ -2205,6 +2205,8 @@ async fn run_all(
     say(ProviderEvent::ToolUse {
         name: "orteca".into(),
         summary: shown.to_string(),
+        id: None,
+        changes: Vec::new(),
     });
     let started = now_ms();
 
@@ -2920,6 +2922,11 @@ async fn attempt(
     // call it spent, and hiding the failures would flatter the metric.
     state.calls_used = state.calls_used.saturating_add(1);
     state.outcome.begin_process();
+    // ponytail: bounded file snapshots and Git run on this worker like the
+    // task's other Git checks; move to spawn_blocking if large repos need it.
+    let mut edit_snapshots = if ctx.id == ProviderId::Codex && ctx.plan.stage.writes() {
+        crate::providers::codex_edits::EditSnapshots::capture(&ctx.dir)
+    } else { None };
     let mut run = match proc::spawn(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir) {
         Ok(run) => run,
         Err(e) => {
@@ -2972,6 +2979,9 @@ async fn attempt(
                     }
                 }
                 let mut events = ctx.id.parse_line(&value);
+                if let Some(snapshots) = &mut edit_snapshots {
+                    snapshots.complete(&value, &mut events);
+                }
                 if ctx.id == ProviderId::Codex {
                     added_since(&mut state.thread_totals, state.session.as_deref(), &mut events);
                     price_codex(store, &ctx.plan.model(ctx.id).model, &mut state.outcome, &mut events);
@@ -3416,6 +3426,50 @@ mod tests {
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("code 1"));
         assert!(!events.borrow().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_edit_diff_is_emitted_before_the_task_finishes() {
+        let store = Store::in_memory().unwrap();
+        let request = task_request(&store, "live-edit-diff");
+        let dir = request.dir.clone();
+        std::fs::write(dir.join("state.ts"), "already dirty\n").unwrap();
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        std::fs::write(dir.join("fake.js"), r#"
+const fs = require('fs');
+const emit = value => console.log(JSON.stringify(value));
+process.stdin.resume();
+process.stdin.on('end', () => {
+  emit({ type: 'thread.started', thread_id: 'live-edit' });
+  fs.writeFileSync('state.ts', 'first edit\n');
+  emit({ type: 'item.completed', item: { type: 'file_change', id: 'item_1', status: 'completed', changes: [{ path: 'state.ts', kind: 'update' }] } });
+  const timeout = setTimeout(() => process.exit(1), 5000);
+  const wait = setInterval(() => {
+    if (!fs.existsSync('seen-edit')) return;
+    clearInterval(wait);
+    clearTimeout(timeout);
+    fs.writeFileSync('state.ts', 'second edit\n');
+    emit({ type: 'item.completed', item: { type: 'file_change', id: 'item_2', status: 'completed', changes: [{ path: 'state.ts', kind: 'update' }] } });
+    emit({ type: 'turn.completed', usage: {} });
+  }, 20);
+});
+"#).unwrap();
+        let patches = std::cell::RefCell::new(Vec::new());
+        let _ = stream(&store, &Live::default(), request, |event| {
+            if let ProviderEvent::ToolUse { changes, .. } = event {
+                if let Some(edit) = changes.iter().find(|edit| edit.path == "state.ts") {
+                    patches.borrow_mut().push(edit.patch.clone().expect("diff exists while still running"));
+                    std::fs::write(dir.join("seen-edit"), "yes").unwrap();
+                }
+            }
+            Ok(())
+        }).await;
+        let patches = patches.into_inner();
+        assert_eq!(patches.len(), 2);
+        assert!(patches[0].contains("-already dirty\n+first edit"));
+        assert!(patches[1].contains("-first edit\n+second edit"));
+        assert!(!patches[1].contains("already dirty"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

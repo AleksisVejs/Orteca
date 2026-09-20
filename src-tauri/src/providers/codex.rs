@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use super::{classify_failure, CostQuality, ProviderEvent, Usage};
+use super::{classify_failure, CostQuality, FileEdit, ProviderEvent, Usage};
 use crate::store::Price;
 
 /// Community-kept, no key, and its OpenAI rates matched LiteLLM's on 2026-09-14
@@ -41,7 +41,11 @@ pub fn parse_prices(v: &Value) -> Vec<(String, Price)> {
     models
         .iter()
         .filter_map(|(slug, m)| {
-            let rate = |key: &str| m["cost"][key].as_f64().filter(|r| r.is_finite() && *r >= 0.0);
+            let rate = |key: &str| {
+                m["cost"][key]
+                    .as_f64()
+                    .filter(|r| r.is_finite() && *r >= 0.0)
+            };
             Some((
                 slug.clone(),
                 Price {
@@ -140,10 +144,33 @@ fn item(i: &Value) -> Option<ProviderEvent> {
         "command_execution" => Some(ProviderEvent::ToolUse {
             name: "Shell".into(),
             summary: i["command"].as_str().unwrap_or_default().to_string(),
+            id: None,
+            changes: Vec::new(),
         }),
         "file_change" => Some(ProviderEvent::ToolUse {
-            name: "Edit".into(),
+            name: if i["status"] == "failed" {
+                "Edit failed"
+            } else {
+                "Edit"
+            }
+            .into(),
             summary: changed_paths(&i["changes"]),
+            id: i["id"].as_str().map(str::to_string),
+            changes: if i["status"] == "failed" {
+                Vec::new()
+            } else {
+                i["changes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|change| {
+                        Some(FileEdit {
+                            path: change["path"].as_str()?.to_string(),
+                            patch: change["diff"].as_str().map(str::to_string),
+                        })
+                    })
+                    .collect()
+            },
         }),
         "error" => Some(failed(message_of(i))),
         _ => None,
@@ -186,6 +213,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_changes_keep_all_paths_without_inventing_per_edit_diffs() {
+        let mut value = serde_json::json!({"type":"item.completed", "item":{
+            "type":"file_change", "id":"edit-2", "status":"completed", "changes":[
+                {"path":"src/first file.ts", "kind":"update"}, {"path":"src/other.ts", "kind":"add"}
+            ]
+        }});
+        let events = parse_line(&value);
+        let ProviderEvent::ToolUse { id, changes, .. } = &events[0] else {
+            panic!("expected edit")
+        };
+        assert_eq!(id.as_deref(), Some("edit-2"));
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/first file.ts", "src/other.ts"]
+        );
+        assert!(changes.iter().all(|change| change.patch.is_none()));
+        value["item"]["status"] = "failed".into();
+        assert!(
+            matches!(&parse_line(&value)[0], ProviderEvent::ToolUse { name, changes, .. }
+            if name == "Edit failed" && changes.is_empty())
+        );
+    }
+
+    #[test]
     fn cached_reads_are_not_counted_twice() {
         let events = parse_line(&serde_json::json!({"type":"turn.completed", "usage": {
             "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20, "reasoning_output_tokens": 5
@@ -213,7 +267,9 @@ mod tests {
         let store = crate::store::Store::in_memory().unwrap();
         store.save_prices(&prices).unwrap();
         store.save_prices(&[]).unwrap();
-        let luna = store.price("gpt-5.6-luna").expect("an empty fetch kept the list");
+        let luna = store
+            .price("gpt-5.6-luna")
+            .expect("an empty fetch kept the list");
         assert_eq!(store.price("negative"), None);
 
         let usage = Usage {

@@ -16,6 +16,16 @@ export type PatchFile = {
   notes: string[];
 };
 
+/** Exact recorded hunks take priority over the file's aggregate task patch. */
+export function activityPatch(path: string, patch: string | null, files: PatchFile[], root: string) {
+  if (patch !== null) return { file: parseHistoryPatch(patch.startsWith("diff --git ") ? patch : `diff --git a/edit b/edit\n${patch}`).files[0], exact: true };
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
+  let relative = normalize(path);
+  const prefix = normalize(root) + "/";
+  if (relative.startsWith(prefix)) relative = relative.slice(prefix.length);
+  return { file: files.find((file) => normalize(file.path) === relative || normalize(file.previousPath ?? "") === relative), exact: false };
+}
+
 // Git quotes unusual paths and writes non-ASCII bytes as octal escapes.
 function gitPath(value: string): string {
   if (!value.startsWith('"')) return value;

@@ -5,7 +5,7 @@ import { PROJECT } from "./state";
 // The coding CLIs Orteca drives: installed, signed in, and how much plan is left.
 const {
   rows, missing, providerError, signingIn, signInLine, signInError, signIn, installing,
-  installLine, installError, install, cancelProvider, limitLine, running, AUTH,
+  installLine, installError, install, cancelProvider, limitLine, anyRunning, AUTH,
 } = inject(PROJECT)!;
 </script>
 
@@ -35,7 +35,7 @@ const {
         <button
           v-if="p.auth === 'signedOut'"
           class="btn"
-          :disabled="signingIn !== null || installing !== null || running"
+          :disabled="signingIn !== null || installing !== null || anyRunning"
           @click="signIn(p.id)"
         >
           Sign in
@@ -47,13 +47,13 @@ const {
       </template>
       <template v-else>
         <span class="note grow">not set up</span>
-        <button class="btn" :disabled="installing !== null || running" @click="install([p.id])">Set up</button>
+        <button class="btn" :disabled="installing !== null || anyRunning" @click="install([p.id])">Set up</button>
       </template>
     </li>
   </ul>
 
   <p v-if="missing.length > 1 && !providerError" class="both">
-    <button class="btn" :disabled="installing !== null || running" @click="install(missing.map((p) => p.id))">
+    <button class="btn" :disabled="installing !== null || anyRunning" @click="install(missing.map((p) => p.id))">
       {{ installing ? "Setting up…" : "Set up both" }}
     </button>
     <span class="note">

@@ -3,14 +3,17 @@ import { computed, inject, ref, watch } from "vue";
 import Markdown from "../../components/Markdown.vue";
 import ActivityLog from "./ActivityLog.vue";
 import { PROJECT } from "./state";
+import type { ActivityLine } from "./state";
 import type { ProviderEvent, Route } from "../../types";
+import { visiblePath } from "../../path";
 
 // One finished task from the sidebar, laid out like the page after a run.
 const {
   historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE, TABS,
   formatTokens, formatCost, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
-  removeError, running, historyRow, describeVerdict, describe, toolActivity, stageLabel,
-  task, result, view, focusTask, newTask,
+  removeError, historyRow, describeVerdict, appendActivity, stageLabel,
+  task, selectRun, anyRunning, focusTask, newTask, domId,
+  reply, replyToPast, running, attachments, attachError, addAttachments, pasteImages, fileName,
   git, openGit,
 } = inject(PROJECT)!;
 
@@ -42,22 +45,19 @@ const routeSteps = computed(() => {
 });
 
 // The same plain-English lines the live log showed, rebuilt from the saved events.
-const lines = computed(() =>
-  (d.value?.events ?? []).flatMap((e) => {
+const lines = computed(() => {
+  const items: ActivityLine[] = [];
+  for (const e of d.value?.events ?? []) {
     const ev = e.payload as ProviderEvent;
-    if (typeof ev !== "object" || ev === null || !("kind" in ev)) return [];
-    const text = describe(ev);
-    if (text === null) return [];
-    const act = ev.kind === "toolUse" ? toolActivity(ev.data.name, ev.data.summary) : null;
-    return [act?.file ? { kind: ev.kind, ...act } : { kind: ev.kind, text, file: null }];
-  }),
-);
+    if (typeof ev === "object" && ev !== null && "kind" in ev) appendActivity(items, ev);
+  }
+  return items;
+});
 
 function editAgain() {
   if (!d.value) return;
   task.value = d.value.prompt;
-  result.value = null;
-  view.value = "task";
+  selectRun(null);
   focusTask();
 }
 </script>
@@ -96,18 +96,63 @@ function editAgain() {
       <template v-if="tab === 'summary'">
         <Markdown v-if="d.summary" class="summary" :text="describeVerdict(d.summary) ?? d.summary" />
         <p v-else class="note">No summary was reported.</p>
+        <!-- A copy's work is on its branch; a follow-up would start without it. -->
+        <template v-if="d.summary && !d.worktreePath">
+          <div class="reply">
+            <label class="hidden-label" :for="domId('past-reply')">Reply</label>
+            <textarea
+              :id="domId('past-reply')"
+              v-model="reply"
+              rows="2"
+              spellcheck="false"
+              placeholder="Reply, or ask for something more…"
+              :disabled="running"
+              @paste="pasteImages"
+              @keydown.ctrl.enter.prevent="replyToPast"
+            ></textarea>
+            <ul v-if="attachments.length" class="attachments" aria-label="Attached">
+              <li v-for="path in attachments" :key="path" class="chip">
+                <span class="mono" :title="path">{{ fileName(path) }}</span>
+                <button
+                  class="unattach"
+                  :title="`Remove ${fileName(path)}`"
+                  :aria-label="`Remove ${fileName(path)}`"
+                  @click="attachments = attachments.filter((p) => p !== path)"
+                >
+                  ×
+                </button>
+              </li>
+            </ul>
+            <p v-if="attachError" class="attach-error">{{ attachError }}</p>
+            <div class="reply-controls">
+              <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+                Attach
+              </button>
+              <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+              </button>
+              <span class="shortcut note">Ctrl + Enter</span>
+              <button class="btn" :disabled="running || !reply.trim()" @click="replyToPast">Reply</button>
+            </div>
+          </div>
+          <p class="note reply-cost">
+            This task is over, so a reply reads the files again rather than picking up
+            where it left off. It goes on in this same task.
+          </p>
+        </template>
         <p v-if="d.status === 'cancelled'" class="note caveat">
           Stopped part-way. Anything the agent had already written is still on disk — Orteca reverts nothing.
         </p>
         <div v-if="d.worktreePath" class="copy" role="status">
           <p class="note">Worked in a separate copy on branch <span class="mono">{{ d.branch }}</span>.</p>
-          <button v-if="d.branch && git.branches.includes(d.branch)" class="btn" popovertarget="project-git" popovertargetaction="show" @click="openGit('merge', d.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
+          <button v-if="d.branch && git.branches.includes(d.branch)" class="btn" :popovertarget="domId('project-git')" popovertargetaction="show" @click="openGit('merge', d.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
           <template v-if="!removedCopies.includes(d.id)">
-            <p class="note mono">{{ d.worktreePath }}</p>
+            <p class="note mono">{{ visiblePath(d.worktreePath) }}</p>
             <button
               class="btn"
               :class="{ confirming: confirmRemove === d.id }"
-              :disabled="running"
+              :disabled="anyRunning"
               @click="removeCopy(d.id)"
             >
               {{ confirmRemove === d.id ? "Yes, delete the copy folder" : "Remove copy" }}
@@ -195,7 +240,7 @@ function editAgain() {
       </template>
 
       <template v-else>
-        <ActivityLog :items="lines" />
+        <ActivityLog :items="lines" :patch-text="d.patchText" :root="d.worktreePath ?? undefined" :finished="true" :dirty-at-start="d.dirtyAtStart" />
         <details class="code-view log">
           <summary>View full task log · {{ d.events.length }} events</summary>
           <ol>
@@ -209,7 +254,7 @@ function editAgain() {
     </div>
 
     <div class="actions">
-      <button class="btn" :disabled="running" @click="editAgain">Edit and run again</button>
+      <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
       <button class="btn primary" @click="newTask">New task</button>
     </div>
   </section>

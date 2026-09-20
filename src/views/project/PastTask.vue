@@ -6,6 +6,7 @@ import Markdown from "../../components/Markdown.vue";
 import ActivityLog from "./ActivityLog.vue";
 import { PROJECT } from "./state";
 import type { ActivityLine } from "./state";
+import { split, tidy } from "./picks";
 import type { ProviderEvent, Route } from "../../types";
 import { visiblePath } from "../../path";
 
@@ -14,7 +15,7 @@ const {
   historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE, TABS,
   formatTokens, formatCost, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
   removeError, historyRow, describeVerdict, appendActivity, stageLabel,
-  task, selectRun, anyRunning, focusTask, newTask, domId,
+  task, picks, selectRun, anyRunning, focusTask, newTask, domId,
   reply, replyToPast, running, attachments, attachError, addAttachments, pasteImages, fileName,
   git, openGit,
 } = inject(PROJECT)!;
@@ -58,7 +59,9 @@ const lines = computed(() => {
 
 function editAgain() {
   if (!d.value) return;
-  task.value = d.value.prompt;
+  const { picks: again, rest } = split(d.value.prompt);
+  task.value = rest;
+  picks.value = again;
   selectRun(null);
   focusTask();
 }
@@ -85,7 +88,7 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
       <span class="note">{{ formatDuration(d.durationMs) }} · {{ d.startedAt.slice(0, 16) }} UTC</span>
     </div>
     <div v-if="historyRow?.title" class="name" :title="historyRow.title">{{ historyRow.title }}</div>
-    <h1 class="prompt">{{ d.prompt }}</h1>
+    <h1 class="prompt" :class="{ long: tidy(d.prompt).length > 140 }">{{ tidy(d.prompt) }}</h1>
     <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(d.status) }}</span></div>
 
     </div>

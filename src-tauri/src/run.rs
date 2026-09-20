@@ -3679,7 +3679,10 @@ process.stdin.on('end', () => {
 
         let live = std::cell::RefCell::new(Vec::new());
         let result = stream(&store, &Live::default(), request, |e| {
-            live.borrow_mut().push(serde_json::to_string(e).unwrap());
+            // Stage progress is Orteca's own marker, not something the CLI said.
+            if !matches!(e, ProviderEvent::StageProgress { .. }) {
+                live.borrow_mut().push(serde_json::to_string(e).unwrap());
+            }
             Ok(())
         })
         .await;
@@ -3742,7 +3745,11 @@ ping -n 60 127.0.0.1 >nul
             async {
                 // Stop only once the CLI has actually started talking, so this
                 // tests a running agent and not a race with its start-up.
-                assert_eq!(hearing.recv().await, Some("text"));
+                let mut kind = hearing.recv().await;
+                while kind == Some("stageProgress") {
+                    kind = hearing.recv().await;
+                }
+                assert_eq!(kind, Some("text"));
                 live.send(task, Control::Cancel).unwrap();
             }
         );

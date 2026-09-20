@@ -29,6 +29,9 @@ portable-pty = "0.9.0"
 shell-words = "1"
 
 [target.'cfg(windows)'.dependencies]
+# Same versions tauri's own WebView2 layer uses, so the types line up.
+webview2-com = "0.38"
+windows-core = "0.61"
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   # CreateJobObjectW takes SECURITY_ATTRIBUTES, so it is gated behind this.

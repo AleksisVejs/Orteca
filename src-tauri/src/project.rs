@@ -1058,6 +1058,45 @@ pub fn git_installed() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// The lines of the repo that mention what a picked element shows: its text,
+/// its class list, its id. Best match first, at most five, as `file:line: text`.
+pub fn find_lines(dir: &Path, needles: &[String]) -> Vec<String> {
+    let needles: Vec<&str> = needles.iter().map(|n| n.trim()).filter(|n| n.len() >= 3).take(4).collect();
+    if needles.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["grep", "-n", "-I", "-F", "--untracked", "--exclude-standard"];
+    for n in &needles {
+        args.extend(["-e", n]);
+    }
+    rank_hits(&git(dir, &args).unwrap_or_default(), &needles)
+}
+
+/// `git grep -n` output ranked by how many distinct needles a line holds.
+/// A minified line is skipped: it matches everything and helps nobody.
+fn rank_hits(output: &str, needles: &[&str]) -> Vec<String> {
+    let mut hits: Vec<(usize, &str)> = output
+        .lines()
+        .filter(|l| l.len() < 400)
+        .map(|l| (needles.iter().filter(|n| l.contains(**n)).count(), l))
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0)); // stable: ties keep git's file order
+    hits.into_iter()
+        .take(5)
+        .map(|(_, l)| clip(l))
+        .collect()
+}
+
+/// A long line keeps both ends: a tag opens with its classes, but the handler
+/// and the text that tell one twin from another come last.
+fn clip(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= 170 {
+        return line.to_string();
+    }
+    format!("{} … {}", chars[..70].iter().collect::<String>(), chars[chars.len() - 90..].iter().collect::<String>())
+}
+
 /// Run git and return trimmed stdout, or `None` if git failed or isn't there.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let text = git_output(dir, args).ok()?.trim().to_string();
@@ -1090,6 +1129,23 @@ fn git_run(dir: &Path, args: &[&str], failure: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bench helper (scripts/bench/pick.mjs): the real search, on a bench worktree.
+    #[test]
+    #[ignore = "BENCH_DIR + BENCH_NEEDLES (JSON array); prints FOUND <json>"]
+    fn bench_find() {
+        let dir = std::env::var("BENCH_DIR").unwrap();
+        let needles: Vec<String> = serde_json::from_str(&std::env::var("BENCH_NEEDLES").unwrap()).unwrap();
+        println!("FOUND {}", serde_json::to_string(&find_lines(Path::new(&dir), &needles)).unwrap());
+    }
+
+    #[test]
+    fn hits_rank_by_how_many_needles_a_line_holds() {
+        let out = "a.vue:3:<p>Buy now</p>\nb.vue:9:<button class=\"btn\">Buy now</button>";
+        let ranked = rank_hits(out, &["Buy now", "class=\"btn\""]);
+        assert!(ranked[0].starts_with("b.vue:9:"));
+        assert_eq!(ranked.len(), 2);
+    }
 
     #[test]
     fn a_commit_subject_carrying_a_tab_or_a_newline_still_parses() {

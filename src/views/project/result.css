@@ -21,6 +21,15 @@
   white-space: pre-line;
   overflow-wrap: anywhere;
 }
+.prompt.long {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0;
+  color: var(--text-dim);
+  max-height: 7.5em;
+  overflow-y: auto;
+}
 
 .tabs {
   display: flex;

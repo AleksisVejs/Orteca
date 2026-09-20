@@ -85,6 +85,7 @@ async function projectView(api = {}) {
     onSignInEvent: async () => () => {},
     onFileDrop: async () => () => {},
     cancelTask: async () => {},
+    tidy: s => s,
     recentTasks: async () => [],
     gitStatus: async () => ({ ...gitState }),
     sendInstruction: async () => ({ disposition: 'live' }),

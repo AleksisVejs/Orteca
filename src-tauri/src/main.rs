@@ -1083,6 +1083,32 @@ fn cancel_provider_operation(
     operations.cancel(provider)
 }
 
+/// The preview tab is an iframe, and dev servers (Laravel's
+/// `X-Frame-Options`, CSP `frame-ancestors`) often refuse to be framed.
+/// WebView2 can name extra trusted ancestors for that check; Orteca's own
+/// origins are the only ones, so no other page gains anything.
+#[cfg(windows)]
+fn allow_preview_frames(window: &tauri::WebviewWindow) {
+    use webview2_com::{Microsoft::Web::WebView2::Win32::ICoreWebView2NavigationStartingEventArgs2, NavigationStartingEventHandler};
+    use windows_core::{w, Interface};
+
+    let _ = window.with_webview(|wv| unsafe {
+        let Ok(core) = wv.controller().CoreWebView2() else { return };
+        let handler = NavigationStartingEventHandler::create(Box::new(|_, args| {
+            if let Some(args) = args.and_then(|a| a.cast::<ICoreWebView2NavigationStartingEventArgs2>().ok()) {
+                // The built app's origin, then the dev server's.
+                let _ = args.SetAdditionalAllowedFrameAncestors(w!("http://tauri.localhost http://localhost:1420"));
+            }
+            Ok(())
+        }));
+        let mut token = 0;
+        let _ = core.add_FrameNavigationStarting(&handler, &mut token);
+    });
+}
+
+#[cfg(not(windows))]
+fn allow_preview_frames(_: &tauri::WebviewWindow) {}
+
 fn main() {
     tauri::Builder::default()
         // First, so a second launch exits before setup tries the database the
@@ -1110,6 +1136,13 @@ fn main() {
             app.manage(run::Live::default());
             app.manage(ProviderOperations::default());
             app.manage(dock::Terminals::default());
+            // Built here, not from tauri.conf.json alone, because only the builder
+            // can put the element picker into the preview tab's iframe.
+            let window = app.config().app.windows[0].clone();
+            let main = tauri::WebviewWindowBuilder::from_config(app.handle(), &window)?
+                .initialization_script_for_all_frames(include_str!("picker.js"))
+                .build()?;
+            allow_preview_frames(&main);
             // Codex runs are priced from this list. Offline keeps the last one.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -1150,6 +1183,7 @@ fn main() {
             dock::read_text,
             dock::write_text,
             dock::git_log,
+            dock::find_lines,
             dock::commit_patch,
             dock::working_patch
         ])

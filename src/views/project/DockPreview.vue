@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { inject, ref } from "vue";
+import { inject, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { DOCK } from "./dock";
 import type { Tab } from "./dock";
+import { PROJECT } from "./state";
+import { CLOSING } from "./picks";
+import { findLines } from "../../api";
 
 // The dev server's own page, inside the workspace. Orteca does not start it —
 // a terminal tab does, and the address it prints lands here.
@@ -26,6 +29,54 @@ function use(url: string) {
   typed.value = url;
   go();
 }
+
+// Point at one element in the page. picker.js (injected into every frame by
+// main.rs) reports the click; it lands in the composer as a chip and travels
+// with the task.
+const { picks, domId, opened } = inject(PROJECT)!;
+interface Picked { url: string; selector: string; file: string; id: string; cls: string; tag: string; text: string; html: string }
+const frame = ref<HTMLIFrameElement | null>(null);
+const picking = ref(false);
+const picked = ref<Picked | null>(null);
+const change = ref("");
+
+function pick(on = !picking.value) {
+  picking.value = on;
+  if (on) picked.value = null;
+  frame.value?.contentWindow?.postMessage({ orteca: "pick", on }, "*");
+}
+
+function heard(e: MessageEvent) {
+  if (e.source !== frame.value?.contentWindow) return;
+  if (e.data?.orteca === "picked") {
+    picking.value = false;
+    picked.value = e.data;
+    change.value = "";
+  } else if (e.data?.orteca === "cancelled") {
+    picking.value = false;
+  }
+}
+onMounted(() => window.addEventListener("message", heard));
+onBeforeUnmount(() => window.removeEventListener("message", heard));
+
+async function reference() {
+  const p = picked.value;
+  if (!p || !change.value.trim()) return;
+  // Language-agnostic: the repo lines that hold this element's text, classes or id.
+  const found = await findLines(opened.project.path, [p.text.replace(/…$/, ""), p.cls, p.id && `id="${p.id}"`]).catch(() => []);
+  const lines = [
+    `On ${p.url}, this element: <${p.tag}> ${p.text ? `"${p.text}"` : ""}`.trimEnd(),
+    ...(p.file ? [`Source file: ${p.file}`] : []),
+    `Selector: ${p.selector}`,
+    `HTML: ${p.html}`,
+    ...(found.length ? ["Likely in the code (best first):", ...found.map((l) => `  ${l}`)] : []),
+    `Change: ${change.value.trim()}`,
+    CLOSING,
+  ];
+  picks.value.push({ label: (lines[0] ?? "").replace(/^On \S+, this element: /, ""), block: lines.join("\n") });
+  picked.value = null;
+  nextTick(() => document.getElementById(domId("task"))?.focus());
+}
 </script>
 
 <template>
@@ -35,6 +86,9 @@ function use(url: string) {
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13 6a5 5 0 0 0-8.5-2L2 6m0-4v4h4M3 10a5 5 0 0 0 8.5 2L14 10m0 4v-4h-4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
       <input v-model="typed" class="address mono" aria-label="Address" placeholder="http://localhost:5173" @keydown.enter="go" />
+      <button class="head-button" :class="{ on: picking }" title="Point at an element to change" aria-label="Point at an element to change" :aria-pressed="picking" @click="pick()">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 2l4 11 1.5-4.5L13 7z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+      </button>
       <select v-model="width" class="address size" aria-label="Frame width">
         <option value="0">Full width</option>
         <option value="1280">1280</option>
@@ -46,9 +100,16 @@ function use(url: string) {
       <span class="note">Seen in a terminal:</span>
       <button v-for="url in devUrls" :key="url" class="link mono" @click="use(url)">{{ url }}</button>
     </p>
+    <form v-if="picked" class="found picked" @submit.prevent="reference">
+      <code class="mono chosen">{{ picked.selector }}</code>
+      <input v-model="change" class="address" aria-label="What to change" placeholder="What should change here?" autofocus />
+      <button class="link" type="submit">Add to task</button>
+      <button class="link" type="button" @click="picked = null">Cancel</button>
+    </form>
     <div class="frame-well">
       <iframe
         v-if="tab.url"
+        ref="frame"
         :key="`${tab.url}#${reloads}`"
         :src="tab.url"
         :style="width === '0' ? undefined : { width: `${width}px` }"
@@ -88,6 +149,20 @@ function use(url: string) {
 .head-button:hover {
   background: var(--surface-2);
   color: var(--text);
+}
+.head-button.on {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.picked {
+  flex-shrink: 0;
+}
+.chosen {
+  flex: 1 0 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
 }
 .address {
   flex: 1;

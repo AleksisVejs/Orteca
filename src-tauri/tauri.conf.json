@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Orteca",
         "width": 1040,
         "height": 720,

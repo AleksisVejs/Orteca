@@ -220,7 +220,9 @@ export const writeText = (path: string, file: string, text: string) =>
   invoke<void>("write_text", { path, file, text });
 
 /** The repository's own commits, newest first, from `skip` back. */
-export const gitLog = (path: string, skip: number, count: number) =>
+export const findLines = (path: string, needles: string[]) =>
+  invoke<string[]>("find_lines", { path, needles });
+export const gitLog =(path: string, skip: number, count: number) =>
   invoke<Commit[]>("git_log", { path, skip, count });
 
 /** What one commit changed, as a patch. */

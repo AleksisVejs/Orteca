@@ -4,7 +4,7 @@ import { PROJECT } from "./state";
 
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
-  task, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
+  task, picks, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
   schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
   installed, provider, providerPicked, pickedFor, previewing, preview, previewError,
   limitWarning, alternative, switchTo, runError, providerError, helpersPending, view,
@@ -36,6 +36,12 @@ const {
         @keydown.ctrl.enter.prevent="run()"
       ></textarea>
 
+      <ul v-if="picks.length" class="attachments" aria-label="Elements pointed at">
+        <li v-for="(pick, i) in picks" :key="pick.block" class="chip">
+          <span class="mono" :title="pick.block">⌖ {{ pick.label }}</span>
+          <button class="unattach" title="Remove this element" aria-label="Remove this element" @click="picks.splice(i, 1)">×</button>
+        </li>
+      </ul>
       <ul v-if="attachments.length" class="attachments" aria-label="Attached">
         <li v-for="path in attachments" :key="path" class="chip">
           <span class="mono" :title="path">{{ fileName(path) }}</span>

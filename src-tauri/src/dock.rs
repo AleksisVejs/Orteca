@@ -259,6 +259,13 @@ pub fn git_log(path: String, skip: u32, count: u32, store: State<Store>) -> Resu
     crate::project::git_log(&root, skip, count.clamp(1, 200))
 }
 
+/// Where the repo mentions what a picked preview element shows.
+#[tauri::command(async)]
+pub fn find_lines(path: String, needles: Vec<String>, store: State<Store>) -> Result<Vec<String>> {
+    let (root, _) = crate::trusted_dir(&store, &path)?;
+    Ok(crate::project::find_lines(&root, &needles))
+}
+
 /// What one commit changed, as a patch.
 #[tauri::command(async)]
 pub fn commit_patch(path: String, hash: String, store: State<Store>) -> Result<String> {

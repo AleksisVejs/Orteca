@@ -27,7 +27,7 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
 
   <section class="card head">
     <div class="run-meta"><span class="dot live" aria-hidden="true"></span><strong>{{ stopping ? "Stopping" : "Running" }}</strong><span class="note">{{ ranOn === "codex" ? "Codex" : "Claude" }}</span></div>
-    <h1 class="prompt">{{ said }}</h1>
+    <h1 class="prompt" :class="{ long: said.length > 140 }">{{ said }}</h1>
     <p v-if="activeRun?.attachmentCount" class="note">
       {{ activeRun.attachmentCount }} attached {{ activeRun.attachmentCount === 1 ? "item" : "items" }}
     </p>
@@ -138,6 +138,14 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
   letter-spacing: -0.02em;
   white-space: pre-line;
   overflow-wrap: anywhere;
+}
+.prompt.long {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0;
+  max-height: 7.5em;
+  overflow-y: auto;
 }
 .head .note {
   margin: 0;

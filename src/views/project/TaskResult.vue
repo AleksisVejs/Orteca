@@ -43,7 +43,7 @@ watch(() => result.value?.taskId, () => { selectedFile.value = null; });
       </h2>
       <span class="note">{{ ranOn === "codex" ? "Codex" : "Claude" }} · {{ formatDuration(result.durationMs) }}</span>
     </div>
-    <h1 class="prompt">{{ said }}</h1>
+    <h1 class="prompt" :class="{ long: said.length > 140 }">{{ said }}</h1>
     <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(result.status) }}</span></div>
 
     </div>

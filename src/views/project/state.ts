@@ -2,6 +2,8 @@
 // render it, and share one instance through provide/inject.
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import type { InjectionKey, Ref } from "vue";
+import { tidy } from "./picks";
+import type { Pick } from "./picks";
 import {
   pickAttachments,
   savePastedImage,
@@ -75,6 +77,10 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const attachments = ref<string[]>([]);
   const attachError = ref<string | null>(null);
   const dragging = ref(false);
+  // Elements pointed at in the preview tab. They ride in front of `task` when a
+  // run starts, and show as chips instead of the block of text they are.
+  const picks = ref<Pick[]>([]);
+  const promptText = () => [...picks.value.map((p) => p.block), task.value.trim()].filter(Boolean).join("\n\n");
 
   function attach(paths: string[]) {
     attachments.value = [...new Set([...attachments.value, ...paths])];
@@ -424,7 +430,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       !gitBusy.value &&
       installing.value === null &&
       signingIn.value === null &&
-      task.value.trim().length > 0 &&
+      (task.value.trim().length > 0 || picks.value.length > 0) &&
       !!selected.value?.path &&
       selected.value.auth !== "signedOut",
   );
@@ -491,7 +497,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   /** What the user typed for one exchange. `prompt` is what the CLI gets, and
    *  for a follow-up that is the whole chain recapped. */
-  const saidIn = (r: LiveRun) => r.asked.at(-1) ?? r.prompt;
+  const saidIn = (r: LiveRun) => tidy(r.asked.at(-1) ?? r.prompt);
   const said = computed(() => (activeRun.value ? saidIn(activeRun.value) : ""));
 
   /** Put a run on screen, or null for the composer. The warm-session clock
@@ -889,6 +895,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     // A handoff re-sends what the first attempt was given rather than nothing.
     const attached = opts.attachments ?? attachments.value;
     if (!opts.attachments) attachments.value = [];
+    const sent = promptText();
+    picks.value = [];
     const carry = opts.continueRun ?? null;
     // Reactive up front: the callbacks below write through this object for as
     // long as the run lasts, and a plain one would leave the screen frozen on
@@ -896,7 +904,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     const live: LiveRun = carry ?? reactive({
       key: Symbol("run"),
       id: null,
-      prompt: task.value,
+      prompt: sent,
       attachmentCount: attached.length,
       provider: provider.value,
       switchedFrom: opts.switchedFrom ?? null,
@@ -920,7 +928,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       }
       Object.assign(carry, {
         id: null,
-        prompt: task.value,
+        prompt: sent,
         attachmentCount: attached.length,
         provider: provider.value,
         switchedFrom: opts.switchedFrom ?? null,
@@ -1333,6 +1341,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     selectRun(null);
     task.value = "";
     attachments.value = [];
+    picks.value = [];
     focusTask();
   }
 
@@ -1457,6 +1466,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     domId,
     task,
     attachments,
+    picks,
     attachError,
     dragging,
     attach,

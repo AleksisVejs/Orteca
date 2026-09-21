@@ -115,7 +115,8 @@ async function loadPrice() {
 function ortecaRow(x) {
   const u = x.usage ?? {};
   return {
-    status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed,
+    status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed, turns: x.turnsUsed,
+    notes: x.route?.priorNotesWhy ?? [], noteChars: (x.route?.priorNotes ?? []).join("").length,
     budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
     cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
     stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
@@ -124,12 +125,12 @@ function ortecaRow(x) {
   };
 }
 
-function runArm(arm, dir, prompt) {
+function runArm(arm, dir, prompt, extraEnv = {}) {
   const t0 = Date.now();
   if (arm.startsWith("orteca-")) {
     const out = join(ROOT, "out", `${arm}-${Date.now()}.json`);
     mkdirSync(dirname(out), { recursive: true });
-    const env = { ...ENV, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out,
+    const env = { ...ENV, ...extraEnv, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out,
       ...(process.env.NOEDITLOCK ? { NAV_NOEDITLOCK: "1" } : {}) };
     const r = spawnSync("cargo", ["test", "bench_run", "--", "--ignored"], { cwd: TAURI, env, encoding: "utf8", shell: true, timeout: ARM_TIMEOUT });
     if (!existsSync(out)) return { status: "noResult", error: (r.stdout + r.stderr).slice(-400), ms: Date.now() - t0 };
@@ -298,6 +299,69 @@ if (process.env.DRY) {
     }
     dropWorktree(dir);
   }
+  process.exit(0);
+}
+
+if (process.env.NOTES) {
+  // Spends real usage, one provider: does earlier finished work in the brief help?
+  // A seed run (easy) fills a history file; each case then runs twice against its own
+  // copy of it, notes on and NOTES_OFF. Every run uses the same folder, because the
+  // project is keyed by its path. Rows go to results-notes.json; finished ones are skipped.
+  // NOTES=1 ARMS=orteca-claude node scripts/bench/riginspect.mjs
+  if (LIFTME) throw Error("NOTES runs on RigInspectBE only");
+  const arm = ARMS[0];
+  const dir = join(ROOT, "wt", `notes-${arm}`);
+  const db = join(ROOT, "notes", `${arm}-seed.db`);
+  const file = join(ROOT, "results-notes.json");
+  mkdirSync(dirname(db), { recursive: true });
+  const rows = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : [];
+  const save = (row) => { rows.push(row); writeFileSync(file, JSON.stringify(rows, null, 2)); console.log(JSON.stringify(row, null, 1)); };
+  const cases = [
+    // Both run on a tree that already has the seed's change, as after a merge. The
+    // follow-up touches the seed's file, so it should get the note (on and off);
+    // the other shares its generic words but no file, so it should get none (on only).
+    { name: "followup", modes: ["on", "off"], prompt: "GET /api/equipment (EquipmentController@show) now pages at 50 by default. Raise the per_page cap from 100 to 200 and update any test that assumes the old cap.", task: { hidden: [], also: TASKS.easy.also } },
+    { name: "unrelated", modes: ["on"], prompt: "Add a short doc comment above the main search method in GlobalSearchService saying what it returns when nothing matches and what it returns otherwise. Change no behaviour and update no test.", task: { hidden: [], also: ["tests/Feature/GlobalSearchTest.php"] } },
+  ];
+  // The seed's saved patch goes in as a commit, so the case's diff is only its own work.
+  const seedPatch = join(ROOT, "patches", `notes-seed-${arm}.patch`);
+  const withSeed = () => {
+    makeWorktree(dir);
+    execFileSync("git", ["-C", dir, "apply", "--whitespace=nowarn", seedPatch]);
+    git("-C", dir, "add", "-A");
+    git("-C", dir, "-c", "user.name=bench", "-c", "user.email=bench@example.com", "commit", "-m", "seed");
+  };
+  const capped = () => {
+    const now = limits();
+    const used = new Set(ARMS.map((a) => a.replace("orteca-", "")));
+    const over = Object.entries(now).find(([k, v]) => used.has(k.split(" ")[0]) && v >= (CAPS[k] ?? CAP_DEFAULT));
+    if (over) { console.log(`STOP: ${over[0]} at ${over[1]}%`); process.exit(2); }
+  };
+  if (!rows.some((r) => r.case === "seed")) {
+    makeWorktree(dir);
+    console.log("running seed");
+    const m = runArm(arm, dir, TASKS.easy.prompt, { BENCH_DB: db });
+    save({ case: "seed", ...grade(dir, TASKS.easy, "notes-seed", arm), ...m });
+    dropWorktree(dir);
+    if (rows.at(-1).status !== "done") { console.log("seed did not finish done; no history to test"); process.exit(1); }
+    capped();
+  }
+  for (const c of cases) {
+    if (process.env.ONLY && !process.env.ONLY.split(",").includes(c.name)) continue;
+    for (const mode of c.modes) {
+      if (rows.some((r) => r.case === c.name && r.notes_mode === mode)) continue;
+      const copy = join(ROOT, "notes", `${arm}-${c.name}-${mode}.db`);
+      for (const ext of ["", "-wal", "-shm"]) if (existsSync(db + ext)) copyFileSync(db + ext, copy + ext);
+      withSeed();
+      console.log(`running ${c.name} / notes ${mode}`);
+      const m = runArm(arm, dir, c.prompt, { BENCH_DB: copy, ...(mode === "off" ? { NOTES_OFF: "1" } : {}) });
+      save({ case: c.name, notes_mode: mode, ...grade(dir, c.task, `notes-${c.name}-${mode}`, arm), ...m });
+      dropWorktree(dir);
+      capped();
+    }
+  }
+  console.log("\ncase        notes  status  turns  uncached  cached   noteChars  grade  why");
+  for (const r of rows) console.log([r.case.padEnd(11), (r.notes_mode ?? "seed").padEnd(6), String(r.status).padEnd(7), String(r.turns).padEnd(6), String(r.input).padEnd(9), String(r.cached).padEnd(8), String(r.noteChars).padEnd(10), String(r.grade).padEnd(6), (r.notes ?? []).join(" | ")].join(" "));
   process.exit(0);
 }
 

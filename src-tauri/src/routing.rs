@@ -369,6 +369,14 @@ pub struct Route {
     /// in the same order; empty where the map has nothing.
     #[serde(default)]
     pub candidate_notes: Vec<String>,
+    /// Earlier work in this project that bears on the prompt, for the
+    /// Implement brief. Empty when nothing does.
+    #[serde(default)]
+    pub prior_notes: Vec<String>,
+    /// Why each was chosen, saved with the route so a strange run can be
+    /// traced. Never in a brief.
+    #[serde(default)]
+    pub prior_notes_why: Vec<String>,
     /// What each stage would have preferred to run on, recorded and not acted
     /// on. See `Capability::preferred_provider`.
     pub preferred_providers: Vec<ProviderId>,
@@ -631,6 +639,15 @@ const STOPWORDS: &[&str] = &[
     "which",
 ];
 
+/// One finished task, as a note for a later brief.
+#[derive(Debug, Clone)]
+pub struct PastNote {
+    pub id: i64,
+    pub note: String,
+    /// Every file the task changed.
+    pub files: Vec<String>,
+}
+
 /// The repository side of the decision. Collected once, cheaply, before the
 /// classifier runs - so the classifier itself stays a pure function of its
 /// inputs and is testable without a repository at all.
@@ -644,6 +661,9 @@ pub struct RepoSignals {
     /// What each mapped source file defines and uses. Ranking only, never
     /// the blast radius.
     pub code_map: Vec<(String, FileFacts)>,
+    /// Notes on this project's earlier finished tasks, newest first. `route`
+    /// keeps the few that changed a file this prompt is about.
+    pub past: Vec<PastNote>,
     pub prior_failures: u32,
     /// Route kinds and tiers that stalled in this project's recent runs on the
     /// selected provider. See `Store::stalled_tiers`.
@@ -696,6 +716,14 @@ fn nouns(prompt: &str) -> Vec<String> {
     let all = words.clone();
     words.retain(|w| !all.iter().any(|base| base != w && names_word(w, base)));
     words
+}
+
+/// A built bundle a tracked `public/` folder or a `dist/` holds. Its symbols are
+/// minified and its names hashed, so it matches many ordinary words at once and
+/// outranks the one source file the prompt names.
+fn generated(path: &str) -> bool {
+    let built = path.ends_with(".js") || path.ends_with(".css") || path.ends_with(".map");
+    (path.starts_with("public/") && built) || path.starts_with("dist/") || path.contains("/dist/")
 }
 
 const TEST_WORDS: &[&str] = &["test", "tests", "spec"];
@@ -916,9 +944,10 @@ fn candidates(prompt: &str, repo: &RepoSignals) -> (usize, Vec<String>) {
         .map(|(path, facts)| (path.as_str(), defined_words(facts)))
         .collect();
     // Per matched file, per noun: (by path or symbols, by path alone).
-    let matched: Vec<(&String, Vec<(u32, u32)>)> = repo
-        .tracked_paths
+    let source: Vec<&String> = repo.tracked_paths.iter().filter(|p| !generated(p)).collect();
+    let matched: Vec<(&String, Vec<(u32, u32)>)> = source
         .iter()
+        .copied()
         .filter_map(|path| {
             let lower = path.to_ascii_lowercase();
             let name = lower.rsplit('/').next();
@@ -967,7 +996,7 @@ fn candidates(prompt: &str, repo: &RepoSignals) -> (usize, Vec<String>) {
         .filter(|(path, m)| m.iter().any(|(_, p)| *p > 0) && !paired_to(&path_stems, path))
         .count();
 
-    let total = repo.tracked_paths.len() as f64;
+    let total = source.len() as f64;
     let weights: Vec<f64> = (0..nouns.len())
         .map(|i| {
             let df = matched.iter().filter(|(_, m)| m[i].0 > 0).count().max(1) as f64;
@@ -1332,6 +1361,27 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         .take(NOTED)
         .map(|p| map.get(p.as_str()).map(|f| file_note(f, &ours)).unwrap_or_default())
         .collect();
+    // Earlier work counts only where it touched a file this prompt is about.
+    // Words do not decide it: the first benchmark matched on them, and ordinary
+    // ones (list, keep, return) pulled a pagination note into unrelated tasks.
+    let mut chosen: Vec<(usize, String, String)> = Vec::new();
+    for past in &repo.past {
+        let shared: Vec<&str> = candidate_paths
+            .iter()
+            .take(NOTED)
+            .filter(|p| past.files.contains(p))
+            .map(String::as_str)
+            .collect();
+        if !shared.is_empty() {
+            let why = format!("task #{}, shared files: {}", past.id, shared.join(", "));
+            chosen.push((shared.len(), past.note.clone(), why));
+        }
+    }
+    // Stable, so the newest of equal matches comes first.
+    chosen.sort_by_key(|(n, ..)| std::cmp::Reverse(*n));
+    chosen.truncate(3);
+    let (prior_notes, prior_notes_why): (Vec<String>, Vec<String>) =
+        chosen.into_iter().map(|(_, note, why)| (note, why)).unzip();
     Route {
         kind,
         mode,
@@ -1342,6 +1392,8 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         tier_reason,
         candidate_paths,
         candidate_notes,
+        prior_notes,
+        prior_notes_why,
         preferred_providers,
     }
 }
@@ -1601,6 +1653,20 @@ pub fn brief(
                 out.push_str(": ");
                 out.push_str(note);
             }
+            out.push('\n');
+        }
+    }
+
+    // Implement only: later stages read the tree and the task, and a note on
+    // old work would be paid for again in each of them.
+    if stage == Stage::Implement && !route.prior_notes.is_empty() {
+        out.push_str(
+            "\nEarlier finished work in this project that may bear on the task, from \
+             Orteca's records. The working tree is the truth if it disagrees:\n",
+        );
+        for note in &route.prior_notes {
+            out.push_str("- ");
+            out.push_str(note);
             out.push('\n');
         }
     }
@@ -2465,6 +2531,50 @@ mod tests {
         assert!(cut.len() < text.len() && cut.contains("bytes cut"));
         assert!(cut.starts_with('é') && cut.ends_with('é'));
         assert_eq!(clip("short", 64), "short");
+    }
+
+    #[test]
+    fn built_bundles_are_never_listed_as_the_files_a_prompt_is_about() {
+        let signals = RepoSignals {
+            tracked_paths: vec![
+                "public/build/assets/QuoteView-Crz1qG.js".into(),
+                "public/workbox-a9a38afb.js".into(),
+                "app/Http/Controllers/QuoteController.php".into(),
+            ],
+            ..Default::default()
+        };
+        let r = route("fix the quote controller", Mode::Balanced, &signals);
+        assert_eq!(r.candidate_paths, ["app/Http/Controllers/QuoteController.php"]);
+        assert!(generated("public/build/assets/x.js") && !generated("public/index.php"));
+    }
+
+    #[test]
+    fn earlier_work_is_carried_only_where_it_touched_the_files_the_prompt_is_about() {
+        let past = |id, files: &[&str]| PastNote {
+            id,
+            note: format!("Task: earlier {id}"),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        };
+        let signals = RepoSignals {
+            tracked_paths: vec![
+                "app/Http/Controllers/QuoteController.php".into(),
+                "app/Models/Invoice.php".into(),
+            ],
+            past: vec![
+                past(2, &["app/Models/Invoice.php"]),
+                past(1, &["app/Http/Controllers/QuoteController.php"]),
+            ],
+            ..Default::default()
+        };
+        let r = route("fix the quote controller", Mode::Balanced, &signals);
+        assert_eq!(r.prior_notes, ["Task: earlier 1"]);
+        assert!(r.prior_notes_why[0].contains("task #1") && r.prior_notes_why[0].contains("QuoteController"));
+        let text = brief(&r, Stage::Implement, "fix the quote controller", &[], &[]);
+        assert!(text.contains("Task: earlier 1") && !text.contains("earlier 2"));
+        assert!(!brief(&r, Stage::Verify, "fix the quote controller", &[], &[]).contains("earlier 1"));
+
+        let r = route("rename the login page label", Mode::Balanced, &signals);
+        assert!(r.prior_notes.is_empty(), "no shared file, no history");
     }
 
     /// The brief names paths so the agent stops hunting. It must never carry

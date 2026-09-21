@@ -13,7 +13,15 @@ use crate::codemap;
 use crate::error::{AppError, ErrorKind, Result};
 use crate::project::FileStat;
 use crate::providers::{CostQuality, Usage};
-use crate::routing::{RouteKind, Tier};
+use crate::routing::{PastNote, RouteKind, Tier};
+
+/// `text` cut to at most `max` characters, with an ellipsis when it was cut.
+fn cut(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
+}
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -675,6 +683,47 @@ impl Store {
         Ok(files.into_iter().map(|(_, path, facts)| (path, facts)).collect())
     }
 
+    /// This project's last 200 finished tasks as short factual notes: what was
+    /// asked, what came back, which files changed. Choosing among them is
+    /// `routing`'s job, on the files the new prompt is about.
+    // ponytail: the last 200 done tasks; an index when a project outgrows that.
+    pub fn past_notes(&self, project_id: i64) -> Result<Vec<PastNote>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, prompt, summary, diff_stat_json FROM tasks
+              WHERE project_id = ?1 AND status = 'done' ORDER BY id DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map([project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut notes = Vec::new();
+        for row in rows {
+            let (id, asked, summary, diff) = row?;
+            let summary = summary.unwrap_or_default();
+            let files: Vec<String> = diff
+                .and_then(|d| serde_json::from_str::<Vec<FileStat>>(&d).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            let mut note = format!("Task: {}", cut(asked.trim(), 160));
+            if !summary.trim().is_empty() {
+                note.push_str(&format!("\n  Result: {}", cut(summary.trim(), 300)));
+            }
+            if !files.is_empty() {
+                let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
+                note.push_str(&format!("\n  Files: {}", shown.join(", ")));
+            }
+            notes.push(PastNote { id, note, files });
+        }
+        Ok(notes)
+    }
+
     /// A project's runs, newest first. Token counts stay NULL where the
     /// provider reported none, as they are in `usage`.
     pub fn recent_tasks(&self, project_id: i64, limit: u32) -> Result<Vec<TaskSummary>> {
@@ -1113,6 +1162,30 @@ mod tests {
                 Some("diff --git"),
                 1,
                 Some(1250),
+    #[test]
+    fn past_notes_are_this_projects_finished_work_with_its_files() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let other = store.touch_project("b", "b").unwrap();
+        let mine = store.create_task(new_task(project.id, "Fix duplicate sync", "balanced")).unwrap();
+        store
+            .finish_task_details(
+                mine, "done", "Stopped a retry queueing the same UUID twice.",
+                r#"[{"path":"src/offlineSync.ts","added":4,"deleted":1,"origin":null}]"#,
+                None, 0, None, 1,
+            )
+            .unwrap();
+        let running = store.create_task(new_task(project.id, "still going", "balanced")).unwrap();
+        let theirs = store.create_task(new_task(other.id, "Other project", "balanced")).unwrap();
+        store.finish_task_details(theirs, "done", "x", "[]", None, 0, None, 1).unwrap();
+        let _ = running;
+
+        let got = store.past_notes(project.id).unwrap();
+        assert_eq!(got.len(), 1, "only this project's finished tasks");
+        assert_eq!(got[0].files, ["src/offlineSync.ts"]);
+        assert!(got[0].note.contains("same UUID") && got[0].note.contains("Files: src/offlineSync.ts"));
+    }
+
                 1,
             )
             .unwrap();

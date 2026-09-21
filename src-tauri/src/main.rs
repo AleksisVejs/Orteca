@@ -395,6 +395,12 @@ fn scan_run(
             format!("{} is not installed or not on PATH.", provider.program()),
         )
     })?;
+    // NOTES_OFF withholds earlier work from the brief, for the benchmark's
+    // before arm.
+    let past = match std::env::var("NOTES_OFF") {
+        Ok(_) => Vec::new(),
+        Err(_) => store.past_notes(project.id).unwrap_or_default(),
+    };
     let signals = routing::RepoSignals {
         tracked_paths: project::tracked_paths(&dir),
         recent_paths: project::recent_paths(&dir),
@@ -403,6 +409,7 @@ fn scan_run(
             Ok(_) => Vec::new(),
             Err(_) => store.code_map(project.id).unwrap_or_default(),
         },
+        past,
         // The whole prompt, which is what the task row stores: this counts the
         // same ask failing again, and `routed` is deliberately not the same ask.
         prior_failures: store.prior_failures(project.id, &prompt)?,
@@ -1319,7 +1326,8 @@ ELI5";
 
     /// Spends real usage. One Orteca run for a benchmark driver:
     /// BENCH_DIR, BENCH_PROMPT, BENCH_PROVIDER (claude|codex), BENCH_MODE
-    /// (efficient|balanced), BENCH_OUT (TaskResult JSON).
+    /// (efficient|balanced), BENCH_OUT (TaskResult JSON). BENCH_DB keeps the
+    /// history in that file between runs, for the notes benchmark.
     /// `cargo test bench_run -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -1327,7 +1335,10 @@ ELI5";
         let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
         let dir = std::path::PathBuf::from(var("BENCH_DIR")).canonicalize().unwrap();
         let key = dir.to_str().unwrap().to_string();
-        let store = Store::in_memory().unwrap();
+        let store = match std::env::var("BENCH_DB") {
+            Ok(db) => Store::open(std::path::Path::new(&db)).unwrap(),
+            Err(_) => Store::in_memory().unwrap(),
+        };
         store.touch_project(&key, "bench").unwrap();
         store.set_trusted(&key, true).unwrap();
         // The app loads this at startup; without it every Codex run is unpriced.

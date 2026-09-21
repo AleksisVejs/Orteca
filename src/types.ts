@@ -24,6 +24,12 @@ export interface TaskSummary {
   patchAvailable: boolean;
 }
 
+/** A task in the shared sidebar, including the project that owns it. */
+export interface GlobalTaskSummary extends TaskSummary {
+  projectPath: string;
+  projectName: string;
+}
+
 export type ErrorKind =
   | "notFound"
   | "notAGitRepo"
@@ -53,6 +59,7 @@ export interface GitState {
   head: string | null;
   dirty: boolean;
   dirtyCount: number;
+  changes: GitChange[];
   /** The tracked remote branch and the distance at the last fetch; null when none. */
   upstream: string | null;
   ahead: number | null;
@@ -61,7 +68,13 @@ export interface GitState {
   branches: string[];
 }
 
-export type GitAction = "fetch" | "pull" | "commit" | "push" | "merge";
+export interface GitChange {
+  path: string;
+  /** Two-character Git porcelain status, for example ` M` or `??`. */
+  status: string;
+}
+
+export type GitAction = "fetch" | "pull" | "commit" | "push" | "merge" | "discard";
 
 export interface TrustFinding {
   path: string;

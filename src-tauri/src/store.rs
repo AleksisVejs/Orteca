@@ -753,6 +753,37 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Recent tasks across remembered projects, with their owners for the
+    /// shared sidebar. Details remain project-scoped.
+    pub fn global_tasks(&self, limit: u32) -> Result<Vec<GlobalTaskSummary>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.prompt, t.title, t.status, t.started_at, t.summary,
+                    json_extract(t.route_json, '$.kind'), t.calls_used, u.provider, u.model,
+                    u.input_tokens + u.cached_input_tokens + u.output_tokens,
+                    u.input_tokens + u.output_tokens, u.cached_input_tokens, u.cost_usd,
+                    u.cost_quality, t.unknown_events, t.duration_ms,
+                    (t.patch_text IS NOT NULL AND length(t.patch_text) > 0), p.path, p.name
+               FROM tasks t JOIN projects p ON p.id = t.project_id
+               LEFT JOIN usage u ON u.task_id = t.id
+              ORDER BY t.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(GlobalTaskSummary {
+                task: TaskSummary {
+                    id: r.get(0)?, prompt: r.get(1)?, title: r.get(2)?, status: r.get(3)?,
+                    started_at: r.get(4)?, summary: r.get(5)?, route_kind: r.get(6)?,
+                    calls_used: r.get(7)?, provider: r.get(8)?, model: r.get(9)?,
+                    tokens: r.get(10)?, uncached_tokens: r.get(11)?, cached_tokens: r.get(12)?,
+                    cost_usd: r.get(13)?, cost_quality: r.get(14)?, unknown_events: r.get(15)?,
+                    duration_ms: r.get(16)?, patch_available: r.get(17)?,
+                },
+                project_path: r.get(18)?, project_name: r.get(19)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn rename_task(&self, project_id: i64, task_id: i64, title: &str) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
         let changed = conn.execute(
@@ -881,6 +912,16 @@ pub struct TaskSummary {
     pub unknown_events: u32,
     pub duration_ms: Option<u64>,
     pub patch_available: bool,
+}
+
+/// A task for the global sidebar, carrying its project's display identity.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalTaskSummary {
+    #[serde(flatten)]
+    pub task: TaskSummary,
+    pub project_path: String,
+    pub project_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1020,6 +1061,24 @@ mod tests {
     }
 
     #[test]
+    fn global_tasks_include_the_project_that_owns_each_task() {
+        let store = Store::in_memory().unwrap();
+        let first = store.touch_project("C:/first", "First").unwrap();
+        let second = store.touch_project("C:/second", "Second").unwrap();
+        let first_task = store.create_task(new_task(first.id, "first task", "balanced")).unwrap();
+        let second_task = store.create_task(new_task(second.id, "second task", "balanced")).unwrap();
+        store.finish_task(first_task, "done", "", "[]", 0).unwrap();
+        store.finish_task(second_task, "done", "", "[]", 0).unwrap();
+
+        let rows = store.global_tasks(20).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].task.id, second_task);
+        assert_eq!((&rows[0].project_path, &rows[0].project_name), (&"C:/second".to_string(), &"Second".to_string()));
+        assert_eq!(rows[1].task.id, first_task);
+        assert_eq!((&rows[1].project_path, &rows[1].project_name), (&"C:/first".to_string(), &"First".to_string()));
+    }
+
+    #[test]
     fn history_is_newest_first_and_never_a_zero_for_unknown_usage() {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("a", "a").unwrap();
@@ -1104,6 +1163,30 @@ mod tests {
     }
 
     #[test]
+    fn past_notes_are_this_projects_finished_work_with_its_files() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        let other = store.touch_project("b", "b").unwrap();
+        let mine = store.create_task(new_task(project.id, "Fix duplicate sync", "balanced")).unwrap();
+        store
+            .finish_task_details(
+                mine, "done", "Stopped a retry queueing the same UUID twice.",
+                r#"[{"path":"src/offlineSync.ts","added":4,"deleted":1,"origin":null}]"#,
+                None, 0, None, 1,
+            )
+            .unwrap();
+        let running = store.create_task(new_task(project.id, "still going", "balanced")).unwrap();
+        let theirs = store.create_task(new_task(other.id, "Other project", "balanced")).unwrap();
+        store.finish_task_details(theirs, "done", "x", "[]", None, 0, None, 1).unwrap();
+        let _ = running;
+
+        let got = store.past_notes(project.id).unwrap();
+        assert_eq!(got.len(), 1, "only this project's finished tasks");
+        assert_eq!(got[0].files, ["src/offlineSync.ts"]);
+        assert!(got[0].note.contains("same UUID") && got[0].note.contains("Files: src/offlineSync.ts"));
+    }
+
+    #[test]
     fn tasks_rename_and_delete_only_in_their_project_and_once_settled() {
         let store = Store::in_memory().unwrap();
         let project = store.touch_project("a", "a").unwrap();
@@ -1162,30 +1245,6 @@ mod tests {
                 Some("diff --git"),
                 1,
                 Some(1250),
-    #[test]
-    fn past_notes_are_this_projects_finished_work_with_its_files() {
-        let store = Store::in_memory().unwrap();
-        let project = store.touch_project("a", "a").unwrap();
-        let other = store.touch_project("b", "b").unwrap();
-        let mine = store.create_task(new_task(project.id, "Fix duplicate sync", "balanced")).unwrap();
-        store
-            .finish_task_details(
-                mine, "done", "Stopped a retry queueing the same UUID twice.",
-                r#"[{"path":"src/offlineSync.ts","added":4,"deleted":1,"origin":null}]"#,
-                None, 0, None, 1,
-            )
-            .unwrap();
-        let running = store.create_task(new_task(project.id, "still going", "balanced")).unwrap();
-        let theirs = store.create_task(new_task(other.id, "Other project", "balanced")).unwrap();
-        store.finish_task_details(theirs, "done", "x", "[]", None, 0, None, 1).unwrap();
-        let _ = running;
-
-        let got = store.past_notes(project.id).unwrap();
-        assert_eq!(got.len(), 1, "only this project's finished tasks");
-        assert_eq!(got[0].files, ["src/offlineSync.ts"]);
-        assert!(got[0].note.contains("same UUID") && got[0].note.contains("Files: src/offlineSync.ts"));
-    }
-
                 1,
             )
             .unwrap();

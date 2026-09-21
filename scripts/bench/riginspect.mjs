@@ -321,6 +321,7 @@ if (process.env.NOTES) {
     // follow-up touches the seed's file, so it should get the note (on and off);
     // the other shares its generic words but no file, so it should get none (on only).
     { name: "followup", modes: ["on", "off"], prompt: "GET /api/equipment (EquipmentController@show) now pages at 50 by default. Raise the per_page cap from 100 to 200 and update any test that assumes the old cap.", task: { hidden: [], also: TASKS.easy.also } },
+    { name: "followup2", modes: ["on", "off"], prompt: "GET /api/equipment (EquipmentController@show) should reject a negative per_page with a 422 instead of clamping it. Add a test for it and keep the existing tests passing.", task: { hidden: [], also: TASKS.easy.also } },
     { name: "unrelated", modes: ["on"], prompt: "Add a short doc comment above the main search method in GlobalSearchService saying what it returns when nothing matches and what it returns otherwise. Change no behaviour and update no test.", task: { hidden: [], also: ["tests/Feature/GlobalSearchTest.php"] } },
   ];
   // The seed's saved patch goes in as a commit, so the case's diff is only its own work.

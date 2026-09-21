@@ -1059,6 +1059,12 @@ fn recent_tasks(path: String, store: State<Store>) -> Result<Vec<store::TaskSumm
     store.recent_tasks(store.project(&dir.to_string_lossy())?.id, 20)
 }
 
+/// Past runs across every remembered project, newest first.
+#[tauri::command]
+fn global_tasks(store: State<Store>) -> Result<Vec<store::GlobalTaskSummary>> {
+    store.global_tasks(80)
+}
+
 #[tauri::command]
 fn rename_task(path: String, task_id: i64, title: String, store: State<Store>) -> Result<()> {
     let title = title.trim();
@@ -1172,6 +1178,7 @@ fn main() {
             trust_project,
             forget_project,
             recent_tasks,
+            global_tasks,
             rename_task,
             delete_task,
             task_detail,

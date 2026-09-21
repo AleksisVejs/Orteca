@@ -16,6 +16,41 @@ const projects = ref<OpenedProject[]>([]);
 const activePath = ref<string | null>(null);
 const pendingTrust = ref<OpenedProject | null>(null);
 const openError = ref<string | null>(null);
+const taskFocus = ref<{ path: string; id: number } | null>(null);
+const newTaskPath = ref<string | null>(null);
+const SIDEBAR_STATE_KEY = "orteca.sidebar.task-groups.v1";
+function loadSidebarState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SIDEBAR_STATE_KEY) ?? "{}");
+    return {
+      closed: new Set<string>(Array.isArray(saved.closed) ? saved.closed : []),
+      expanded: new Set<string>(Array.isArray(saved.expanded) ? saved.expanded : []),
+      search: typeof saved.search === "string" ? saved.search : "",
+      status: typeof saved.status === "string" ? saved.status : "all",
+    };
+  } catch {
+    return { closed: new Set<string>(), expanded: new Set<string>(), search: "", status: "all" };
+  }
+}
+const savedSidebarState = loadSidebarState();
+// Sidebar state lives above individual project screens, so switching never
+// swaps in a separate set of open groups, filters, or expanded task lists.
+const closedTaskProjects = ref(savedSidebarState.closed);
+const expandedTaskProjects = ref(savedSidebarState.expanded);
+const sidebarSearch = ref(savedSidebarState.search);
+const sidebarStatus = ref(savedSidebarState.status);
+function saveSidebarState() {
+  try {
+    localStorage.setItem(SIDEBAR_STATE_KEY, JSON.stringify({
+      closed: [...closedTaskProjects.value],
+      expanded: [...expandedTaskProjects.value],
+      search: sidebarSearch.value,
+      status: sidebarStatus.value,
+    }));
+  } catch {
+    // Storage can be disabled; the current app session still keeps its state.
+  }
+}
 // Runs per project, reported by each screen. Closing a busy project is refused.
 const busy = ref<Record<string, number>>({});
 let openRequest = 0;
@@ -68,6 +103,40 @@ async function open(path: string) {
   show(result);
 }
 
+async function openTask(path: string, id: number) {
+  taskFocus.value = { path, id };
+  await open(path);
+}
+
+async function newTaskForProject(path: string) {
+  newTaskPath.value = path;
+  await open(path);
+}
+
+function toggleTaskProject(path: string) {
+  const next = new Set(closedTaskProjects.value);
+  next.has(path) ? next.delete(path) : next.add(path);
+  closedTaskProjects.value = next;
+  saveSidebarState();
+}
+
+function toggleExpandedTaskProject(path: string) {
+  const next = new Set(expandedTaskProjects.value);
+  next.has(path) ? next.delete(path) : next.add(path);
+  expandedTaskProjects.value = next;
+  saveSidebarState();
+}
+
+function setSidebarSearch(value: string) {
+  sidebarSearch.value = value;
+  saveSidebarState();
+}
+
+function setSidebarStatus(value: string) {
+  sidebarStatus.value = value;
+  saveSidebarState();
+}
+
 async function confirmTrust() {
   const result = pendingTrust.value;
   if (!result) return;
@@ -109,9 +178,23 @@ function closeProject(path: string) {
     :opened="p"
     :active="p.project.path === activePath"
     :open-projects="openProjects"
+    :task-focus="taskFocus?.path === p.project.path ? taskFocus.id : null"
+    :new-task-focus="newTaskPath === p.project.path"
+    :closed-task-projects="closedTaskProjects"
+    :expanded-task-projects="expandedTaskProjects"
+    :sidebar-search="sidebarSearch"
+    :sidebar-status="sidebarStatus"
     @close="close"
     @switch="(path) => (activePath = path)"
     @open="open"
+    @task="openTask"
+    @new-task="newTaskForProject"
+    @toggle-project="toggleTaskProject"
+    @toggle-expanded-project="toggleExpandedTaskProject"
+    @update-search="setSidebarSearch"
+    @update-status="setSidebarStatus"
+    @focused="taskFocus = null"
+    @new-task-focused="newTaskPath = null"
     @busy="(count) => (busy[p.project.path] = count)"
   />
   <Launch

@@ -22,6 +22,8 @@ pub struct GitState {
     pub head: Option<String>,
     pub dirty: bool,
     pub dirty_count: usize,
+    /// Every file Git reports as changed, with its porcelain status code.
+    pub changes: Vec<GitChange>,
     /// The remote branch this one tracks, and how far apart they were at the
     /// last fetch. All `None` when the branch tracks nothing.
     pub upstream: Option<String>,
@@ -31,8 +33,15 @@ pub struct GitState {
     pub branches: Vec<String>,
 }
 
-/// A git command the user picked by name and confirmed. None of them can
-/// throw work away: pull only fast-forwards and push is never forced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChange {
+    pub path: String,
+    /// The two-character `git status --porcelain` code, e.g. ` M` or `??`.
+    pub status: String,
+}
+
+/// A git command the user picked by name and confirmed.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GitAction {
@@ -41,6 +50,7 @@ pub enum GitAction {
     Commit,
     Push,
     Merge,
+    Discard,
 }
 
 /// A potential agent configuration source, or a path the scan could not inspect.
@@ -190,8 +200,8 @@ pub fn git_state(dir: &Path) -> GitState {
 
     let branch = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
 
-    let status = git(dir, &["status", "--porcelain"]).unwrap_or_default();
-    let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
+    let changes = git_changes(dir);
+    let dirty_count = changes.len();
 
     let upstream = git(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
     let counts = upstream
@@ -218,7 +228,25 @@ pub fn git_state(dir: &Path) -> GitState {
         head: git(dir, &["rev-parse", "HEAD"]),
         dirty: dirty_count > 0,
         dirty_count,
+        changes,
     }
+}
+
+fn git_changes(dir: &Path) -> Vec<GitChange> {
+    let Ok(status) = git_output(dir, &["status", "--porcelain=v1", "-z"]) else {
+        return Vec::new();
+    };
+    let mut records = status.split('\0');
+    let mut changes = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 { continue; }
+        let status = &record[..2];
+        let path = &record[3..];
+        changes.push(GitChange { path: path.replace('\\', "/"), status: status.to_string() });
+        // Rename and copy records include a second, old path after the new one.
+        if matches!(status.as_bytes().first(), Some(b'R' | b'C')) { records.next(); }
+    }
+    changes
 }
 
 /// One changed file. Line counts are `None` for a binary file or an untracked
@@ -1023,8 +1051,37 @@ pub fn git_action(dir: &Path, action: GitAction, input: &str) -> Result<()> {
             git_run(dir, &["push", "-u", remote, "HEAD"], "Git could not push")
         }
         GitAction::Merge => merge(dir, input),
+        GitAction::Discard => discard(dir, input),
     }
     .map(drop)
+}
+
+/// Revert one selected path, or every Git-visible path when `path` is empty.
+/// The UI confirms this destructive action and the backend re-checks that the
+/// requested path is currently changed, so arbitrary paths never reach Git.
+fn discard(dir: &Path, path: &str) -> Result<String> {
+    let changes = git_changes(dir);
+    let selected: Vec<&GitChange> = if path.is_empty() {
+        changes.iter().collect()
+    } else {
+        changes.iter().filter(|change| change.path == path).collect()
+    };
+    if selected.is_empty() {
+        return Err(AppError::new(ErrorKind::Invalid, "That changed file is no longer available to revert."));
+    }
+    for change in selected {
+        if change.status == "??" {
+            git_run(dir, &["clean", "-f", "--", &change.path], "Git could not remove the untracked file")?;
+        } else if git(dir, &["rev-parse", "HEAD"]).is_none() {
+            // An unborn branch has no HEAD to restore from. Unstage first so
+            // the file becomes untracked, then remove it with Git as usual.
+            git_run(dir, &["rm", "--cached", "--", &change.path], "Git could not unstage the file")?;
+            git_run(dir, &["clean", "-f", "--", &change.path], "Git could not remove the untracked file")?;
+        } else {
+            git_run(dir, &["restore", "--source=HEAD", "--staged", "--worktree", "--", &change.path], "Git could not revert the file")?;
+        }
+    }
+    Ok(String::new())
 }
 
 /// Only a clean tree, so a clash can be undone with nothing of the user's
@@ -1855,11 +1912,37 @@ mod tests {
         let dirty = git_state(&dir);
         assert!(dirty.dirty);
         assert_eq!(dirty.dirty_count, 1);
+        assert_eq!(dirty.changes, [GitChange { path: "a.txt".into(), status: " M".into() }]);
 
         run(&["checkout", "--detach", "-q"]);
         assert!(git_state(&dir).branch.is_none());
         assert!(git_state(&dir).head.is_some());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn discard_reverts_one_file_or_every_changed_file() {
+        let dir = temp_dir("git-discard");
+        let run = |args: &[&str]| {
+            assert!(Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("tracked.txt"), "base").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "base"]);
+        std::fs::write(dir.join("tracked.txt"), "changed").unwrap();
+        std::fs::write(dir.join("new.txt"), "new").unwrap();
+
+        git_action(&dir, GitAction::Discard, "tracked.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "base");
+        assert!(dir.join("new.txt").exists());
+
+        git_action(&dir, GitAction::Discard, "").unwrap();
+        assert!(!dir.join("new.txt").exists());
+        assert!(!git_state(&dir).dirty);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -151,6 +151,20 @@ test('Fetch runs immediately without tracking and keeps an open commit draft', a
   assert.match(state.gitNotice.value, /Fetched/);
 });
 
+test('Git revert requires confirmation and scopes to one selected file or all files', async () => {
+  const sent = [];
+  const { state } = await projectView({ gitAction: async (...args) => { sent.push(args); return { ...gitState, dirty: true, dirtyCount: 2 }; } });
+  state.git.value = { ...gitState, dirty: true, dirtyCount: 2 };
+  await state.runGit('discard');
+  assert.equal(sent.length, 0, 'revert cannot run without the confirmation form');
+  state.openGit('discard', 'src/App.vue');
+  assert.match(state.gitQuestion('discard'), /src\/App\.vue/);
+  await state.runGit('discard');
+  state.openGit('discard');
+  await state.runGit('discard');
+  assert.deepEqual(sent, [['C:/repo', 'discard', 'src/App.vue'], ['C:/repo', 'discard', '']]);
+});
+
 test('Git submissions cannot overlap each other or an AI task', async () => {
   let finish;
   let endTask;

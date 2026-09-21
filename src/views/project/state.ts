@@ -692,6 +692,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const gitNotice = ref<string | null>(null);
   const commitMessage = ref("");
   const mergeBranch = ref("");
+  const discardPath = ref("");
   let gitRequest = 0;
 
   async function refreshGit() {
@@ -719,6 +720,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     if (gitLoading.value) return "Refreshing Git status…";
     if (!g.isRepo) return "This folder is no longer a Git repository.";
     if (action === "commit" && !g.dirty) return "No changes to commit.";
+    if (action === "discard" && !g.dirty) return "No changes to revert.";
     if (action === "pull" && !g.upstream) return "Publish this branch before pulling.";
     if (action === "pull" && g.behind === 0) return "No incoming commits at the last fetch.";
     if (action === "push" && !g.branch) return "Check out a branch before pushing.";
@@ -735,6 +737,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitError.value = null;
     gitNotice.value = null;
     if (action === "merge") mergeBranch.value = branch || git.value.branches[0] || "";
+    if (action === "discard") discardPath.value = branch;
   }
 
   function gitQuestion(action: GitAction): string {
@@ -754,12 +757,14 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
           : `Publish ${g.branch ?? "this branch"} to the remote for the first time? Others will see it.`;
       case "merge":
         return `Bring ${mergeBranch.value || "a branch"} into ${g.branch ?? "this detached HEAD"}? If they change the same lines, Orteca stops and changes nothing.`;
+      case "discard":
+        return discardPath.value === "" ? `Revert all ${n(g.dirtyCount, "changed file")}? This permanently removes uncommitted changes.` : `Revert ${discardPath.value}? This permanently removes its uncommitted changes.`;
     }
   }
 
   async function runGit(action: GitAction) {
     if (gitDisabledReason(action) || (action !== "fetch" && gitAsk.value !== action)) return;
-    const input = action === "merge" ? mergeBranch.value : action === "commit" ? commitMessage.value.trim() : "";
+    const input = action === "merge" ? mergeBranch.value : action === "commit" ? commitMessage.value.trim() : action === "discard" ? discardPath.value : "";
     if (action === "commit" && !input) return;
     if (action === "merge" && !git.value.branches.includes(input)) return;
     ++gitRequest;
@@ -776,6 +781,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         commit: "Changes committed.",
         push: "Pushed to the remote.",
         merge: `Merged ${input}.`,
+        discard: input ? `Reverted ${input}.` : "Reverted all uncommitted changes.",
       }[action];
     } catch (e) {
       gitError.value = isAppError(e) ? e.message : String(e);
@@ -1573,6 +1579,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitNotice,
     commitMessage,
     mergeBranch,
+    discardPath,
     gitQuestion,
     gitDisabledReason,
     openGit,

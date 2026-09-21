@@ -9,53 +9,37 @@ import TaskResult from "./project/TaskResult.vue";
 import TaskRun from "./project/TaskRun.vue";
 import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
-import { recentProjects } from "../api";
-import type { GitAction, OpenedProject, Project } from "../types";
+import { globalTasks, workingPatch } from "../api";
+import type { GitAction, GlobalTaskSummary, OpenedProject } from "../types";
 import { visiblePath } from "../path";
+import { parseHistoryPatch } from "./project/historyPatch";
 
 // The shell: sidebar, top bar and whichever page the sidebar picked.
 // All state lives in `useProject`; the pages inject it.
 
 /** Every project currently open, with how many runs each has going right now. */
 type OpenProject = { path: string; name: string; running: number };
-const props = defineProps<{ opened: OpenedProject; active: boolean; openProjects?: OpenProject[] }>();
-const emit = defineEmits<{ close: []; switch: [path: string]; open: [path: string]; busy: [count: number] }>();
+const props = defineProps<{ opened: OpenedProject; active: boolean; openProjects?: OpenProject[]; taskFocus?: number | null; newTaskFocus?: boolean; closedTaskProjects?: Set<string>; expandedTaskProjects?: Set<string>; sidebarSearch?: string; sidebarStatus?: string }>();
+const emit = defineEmits<{ close: []; switch: [path: string]; open: [path: string]; task: [path: string, id: number]; newTask: [path: string]; focused: []; newTaskFocused: []; toggleProject: [path: string]; toggleExpandedProject: [path: string]; updateSearch: [value: string]; updateStatus: [value: string]; busy: [count: number] }>();
 
-// Every project worked on before, not just the ones open this session, so the
-// sidebar can switch between them without dropping back to the launch screen.
-const recents = ref<Project[]>([]);
-async function loadRecents() {
+// The sidebar is a task inbox. Its contents do not change when the active
+// workspace changes, so work from another project remains immediately visible.
+const allTasks = ref<GlobalTaskSummary[]>([]);
+const globalHistoryError = ref(false);
+async function loadGlobalTasks() {
   try {
-    recents.value = await recentProjects();
+    allTasks.value = await globalTasks();
+    globalHistoryError.value = false;
   } catch {
-    // The launch screen already surfaces this failure; the sidebar just omits the list.
+    globalHistoryError.value = true;
   }
 }
-onMounted(loadRecents);
-watch(() => props.opened.project.path, loadRecents);
-
-const otherProjects = computed(() => {
-  const running = new Map((props.openProjects ?? []).map((p) => [p.path, p.running]));
-  const seen = new Set([props.opened.project.path]);
-  const list: Array<{ path: string; name: string; running: number }> = [];
-  for (const p of props.openProjects ?? []) {
-    if (seen.has(p.path)) continue;
-    seen.add(p.path);
-    list.push(p);
-  }
-  for (const p of recents.value) {
-    if (seen.has(p.path)) continue;
-    seen.add(p.path);
-    list.push({ path: p.path, name: p.name, running: running.get(p.path) ?? 0 });
-  }
-  return list;
-});
 
 const state = useProject(props.opened, computed(() => props.active));
 provide(PROJECT, state);
 const {
   view, running, result, runs, runLabel, selectRun, selectedRun, activeRun, anyRunning, runningCount,
-  history, historyError, historyDetail, historyLine, showHistory, newTask, taskName,
+  history, historyDetail, historyLine, showHistory, newTask, taskName,
   taskMenu, renameId, renaming, deleteAsk, askDelete, startRename, saveRename, removeTask, taskError,
   rows, helpersPending, helpersReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
@@ -63,13 +47,56 @@ const {
   commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
 } = state;
 
-const historySearch = ref("");
-const historyStatus = ref("all");
-const filteredHistory = computed(() => history.value.filter((task) => {
+onMounted(loadGlobalTasks);
+watch(history, () => void loadGlobalTasks());
+watch([() => props.active, () => props.taskFocus, history], () => {
+  if (!props.active || props.taskFocus === null || props.taskFocus === undefined) return;
+  const task = history.value.find((row) => row.id === props.taskFocus);
+  if (task) {
+    void showHistory(task);
+    emit("focused");
+  }
+}, { immediate: true });
+watch([() => props.active, () => props.newTaskFocus], () => {
+  if (!props.active || !props.newTaskFocus) return;
+  newTask();
+  emit("newTaskFocused");
+}, { immediate: true });
+
+const historySearch = computed({ get: () => props.sidebarSearch ?? "", set: (value: string) => emit("updateSearch", value) });
+const historyStatus = computed({ get: () => props.sidebarStatus ?? "all", set: (value: string) => emit("updateStatus", value) });
+const filteredHistory = computed(() => allTasks.value.filter((task) => {
   const query = historySearch.value.trim().toLocaleLowerCase();
-  return (!query || [task.title, task.prompt, task.summary, task.provider].some((text) => text?.toLocaleLowerCase().includes(query)))
+  return (!query || [task.title, task.prompt, task.summary, task.provider, task.projectName].some((text) => text?.toLocaleLowerCase().includes(query)))
     && (historyStatus.value === "all" || (historyStatus.value === "attention" ? ["failed", "verifyFailed", "reviewRejected", "budgetReached"].includes(task.status) : task.status === historyStatus.value));
 }));
+const expandedProjects = computed(() => props.expandedTaskProjects ?? new Set<string>());
+const closedProjects = computed(() => props.closedTaskProjects ?? new Set<string>());
+const taskGroups = computed(() => {
+  const groups = new Map<string, { path: string; name: string; tasks: GlobalTaskSummary[] }>();
+  for (const task of filteredHistory.value) {
+    const group = groups.get(task.projectPath) ?? { path: task.projectPath, name: task.projectName, tasks: [] };
+    group.tasks.push(task);
+    groups.set(task.projectPath, group);
+  }
+  return [...groups.values()].sort((a, b) => Number(b.path === props.opened.project.path) - Number(a.path === props.opened.project.path));
+});
+const visibleTasks = (group: { path: string; tasks: GlobalTaskSummary[] }) =>
+  expandedProjects.value.has(group.path) ? group.tasks : group.tasks.slice(0, 5);
+function toggleExpandedProject(path: string) {
+  emit("toggleExpandedProject", path);
+}
+function toggleProjectSection(path: string) {
+  emit("toggleProject", path);
+}
+
+function openTask(task: GlobalTaskSummary) {
+  if (task.projectPath === props.opened.project.path) {
+    void showHistory(task);
+  } else {
+    emit("task", task.projectPath, task.id);
+  }
+}
 
 // The launch screen lists every open project and says which are busy, so a run
 // left going in another one is never invisible.
@@ -78,12 +105,27 @@ watch(runningCount, (count) => emit("busy", count), { immediate: true });
 const gitTrigger = ref<HTMLButtonElement | null>(null);
 const gitPanel = ref<HTMLElement | null>(null);
 const gitPosition = ref({ top: "56px" });
+const selectedGitPath = ref<string | null>(null);
+const gitPatch = ref("");
+const gitPatchError = ref<string | null>(null);
+const selectedGitPatch = computed(() => parseHistoryPatch(gitPatch.value).files.find((file) => file.path === selectedGitPath.value));
+watch(() => git.value.changes, (changes) => {
+  if (!changes.some((change) => change.path === selectedGitPath.value)) selectedGitPath.value = changes[0]?.path ?? null;
+}, { immediate: true });
 const gitActions: Array<{ id: GitAction; label: string; busy: string }> = [
   { id: "commit", label: "Commit", busy: "Committing…" },
   { id: "pull", label: "Pull", busy: "Pulling…" },
   { id: "push", label: "Push", busy: "Pushing…" },
   { id: "merge", label: "Merge", busy: "Merging…" },
 ];
+const gitStatusLabel = (status: string) => {
+  if (status === "??") return "Untracked";
+  if (status.includes("A")) return "Added";
+  if (status.includes("D")) return "Deleted";
+  if (status.includes("R")) return "Renamed";
+  if (status.includes("C")) return "Copied";
+  return status[0] !== " " ? "Staged" : "Modified";
+};
 const gitActionLabel = (action: GitAction) => action === "push" && !git.value.upstream
   ? "Publish branch" : gitActions.find((a) => a.id === action)?.label ?? "Fetch";
 const gitProgress = computed(() => gitBusy.value === "fetch" ? "Fetching…"
@@ -97,7 +139,20 @@ function toggleGit(event: Event) {
   if (gitOpen.value) {
     positionGit();
     void refreshGit();
+    void loadGitPatch();
   } else if (!gitBusy.value) gitAsk.value = null;
+}
+function closeGit() {
+  gitPanel.value?.hidePopover();
+  gitOpen.value = false;
+}
+async function loadGitPatch() {
+  try {
+    gitPatch.value = await workingPatch(props.opened.project.path);
+    gitPatchError.value = null;
+  } catch (error) {
+    gitPatchError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 watch(gitOpen, (open) => open ? gitPanel.value?.showPopover() : gitPanel.value?.hidePopover());
 watch(gitAsk, async (action, previous) => {
@@ -209,25 +264,27 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </button>
       </nav>
 
-      <h2 class="label side-label">Project</h2>
-      <div class="project-root">
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-        <span class="grow" :title="visiblePath(opened.project.path)">{{ opened.project.name }}</span>
-        <span v-if="!historyError && history.length" class="count" :title="`${history.length} recent tasks`">{{ history.length }}</span>
+      <div class="task-inbox">
+        <input v-model="historySearch" type="search" aria-label="Search tasks across projects" placeholder="Search all tasks…" />
+        <select v-model="historyStatus" aria-label="Filter tasks by status"><option value="all">All</option><option value="done">Done</option><option value="attention">Needs attention</option><option value="cancelled">Stopped</option><option value="running">Running</option></select>
       </div>
-      <h3 class="hidden-label">Recent tasks</h3>
-      <div v-if="history.length" class="history-filters">
-        <input v-model="historySearch" type="search" aria-label="Search recent tasks" placeholder="Search recent tasks…" />
-        <select v-model="historyStatus" aria-label="Filter recent tasks by status"><option value="all">All statuses</option><option value="done">Done</option><option value="attention">Needs attention</option><option value="cancelled">Stopped</option><option value="running">Running</option></select>
-        <span class="note">{{ filteredHistory.length }} of {{ history.length }} recent tasks</span>
-      </div>
-      <p v-if="historyError" class="note side-note">History unavailable.</p>
-      <p v-else-if="!history.length" class="note side-note">Finished tasks show up here.</p>
+      <p v-if="globalHistoryError" class="note side-note">Tasks are unavailable.</p>
+      <p v-else-if="!allTasks.length" class="note side-note">Tasks from every project appear here.</p>
       <p v-else-if="!filteredHistory.length" class="note side-note">No matching tasks.</p>
-      <ul v-else class="recent">
-        <template v-for="(t, i) in filteredHistory" :key="t.id">
-        <li v-if="i === 0 || filteredHistory[i - 1]?.startedAt.slice(0, 10) !== t.startedAt.slice(0, 10)" class="history-date">{{ t.startedAt.slice(0, 10) }} · UTC</li>
-        <li>
+      <div v-else class="project-groups">
+        <section v-for="group in taskGroups" :key="group.path" class="project-group">
+          <h2 class="project-heading">
+            <button class="project-toggle" :aria-expanded="!closedProjects.has(group.path)" :aria-label="`${closedProjects.has(group.path) ? 'Open' : 'Close'} ${group.name} tasks`" @click="toggleProjectSection(group.path)">
+              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+              <span>{{ group.name }}</span>
+              <svg class="project-chevron" :class="{ closed: closedProjects.has(group.path) }" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="m3 4.5 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <button class="project-new" :title="`New task in ${group.name}`" :aria-label="`New task in ${group.name}`" @click="emit('newTask', group.path)">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+            </button>
+          </h2>
+          <ul v-if="!closedProjects.has(group.path)" class="recent">
+            <li v-for="t in visibleTasks(group)" :key="t.id">
           <input
             v-if="renameId === t.id"
             v-model="renaming"
@@ -241,19 +298,19 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           />
           <button
             v-else
-            :class="{ on: view === 'history' && historyDetail?.id === t.id }"
-            :aria-current="view === 'history' && historyDetail?.id === t.id ? 'page' : undefined"
-            :title="`${t.title || t.prompt}\n${historyLine(t)}`"
-            @click="showHistory(t)"
+            :class="{ on: t.projectPath === opened.project.path && view === 'history' && historyDetail?.id === t.id }"
+            :aria-current="t.projectPath === opened.project.path && view === 'history' && historyDetail?.id === t.id ? 'page' : undefined"
+            :title="`${t.projectName}\n${t.title || t.prompt}\n${historyLine(t)}`"
+            @click="openTask(t)"
           >
             <span class="dot" :class="TONE[t.status]" aria-hidden="true"></span>
             <span class="task-copy">
               <span class="task-title">{{ taskName(t) }}</span>
-              <span class="task-caption">{{ HISTORY_STATUS[t.status] ?? t.status }} · {{ t.provider }}</span>
+              <span class="task-caption">{{ t.projectName }} · {{ HISTORY_STATUS[t.status] ?? t.status }}</span>
             </span>
           </button>
           <button
-            v-if="renameId !== t.id && t.status !== 'running'"
+            v-if="t.projectPath === opened.project.path && renameId !== t.id && t.status !== 'running'"
             class="row-menu"
             :class="{ open: taskMenu === t.id }"
             title="Task options"
@@ -271,26 +328,13 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <button role="menuitem" class="danger" @click="askDelete(t)">Delete</button>
           </div>
         </li>
-        </template>
-      </ul>
+          </ul>
+          <button v-if="!closedProjects.has(group.path) && group.tasks.length > 5" class="show-more" @click="toggleExpandedProject(group.path)">
+            {{ expandedProjects.has(group.path) ? "Show less" : "Show more" }}
+          </button>
+        </section>
+      </div>
       <p v-if="taskError" class="note side-note" role="alert">{{ taskError }}</p>
-
-      <template v-if="otherProjects.length">
-        <h2 class="label side-label">Projects</h2>
-        <ul class="switch-list">
-          <li v-for="p in otherProjects" :key="p.path">
-            <button
-              :title="visiblePath(p.path)"
-              @click="p.running || openProjects?.some((o) => o.path === p.path) ? $emit('switch', p.path) : $emit('open', p.path)"
-            >
-              <span v-if="p.running" class="dot live" aria-hidden="true"></span>
-              <svg v-else viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-              <span class="grow">{{ p.name }}</span>
-              <span v-if="p.running" class="note">{{ p.running === 1 ? "1 running" : `${p.running} running` }}</span>
-            </button>
-          </li>
-        </ul>
-      </template>
 
       <dialog ref="deleteDialog" class="confirm" aria-labelledby="delete-title" @close="deleteAsk = null">
         <h2 id="delete-title">Delete this task?</h2>
@@ -345,30 +389,55 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </button>
       </header>
 
-      <section :id="domId('project-git')" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" aria-labelledby="git-title" @toggle="toggleGit">
+      <section :id="domId('project-git')" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" aria-labelledby="git-title" @toggle="toggleGit" @keydown.esc.stop="closeGit">
         <div class="git-heading">
           <h2 id="git-title">Git</h2>
-          <button class="git-close" :popovertarget="domId('project-git')" popovertargetaction="hide" aria-label="Close Git actions" title="Close Git actions">
+          <button type="button" class="git-close" aria-label="Close Git actions" title="Close Git actions" @click="closeGit">
             <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
           </button>
         </div>
         <p class="git-current mono">{{ git.branch ?? "detached HEAD" }}</p>
         <p class="note" :class="{ 'git-dirty': git.dirty }">{{ git.dirty ? `${git.dirtyCount} changed file${git.dirtyCount === 1 ? '' : 's'}` : 'Working tree clean' }}</p>
-        <div class="git-remote">
-          <div>
-            <span v-if="git.upstream" class="mono">{{ git.upstream }}</span>
-            <span v-else class="note">No tracking branch</span>
-            <p v-if="git.upstream" class="note">{{ git.behind ?? '—' }} incoming · {{ git.ahead ?? '—' }} outgoing · at last fetch</p>
-          </div>
-          <button class="btn" :disabled="!!gitDisabledReason('fetch')" :title="gitDisabledReason('fetch') || 'Check the remote for new commits; your files stay as they are'" @click="runGit('fetch')">{{ gitBusy === 'fetch' ? 'Fetching…' : 'Fetch' }}</button>
-        </div>
-        <div v-if="!gitAsk" class="git-actions" role="group" aria-label="Git actions">
-          <div v-for="action in gitActions" :key="action.id" :title="gitDisabledReason(action.id)">
-            <button class="btn" :disabled="!!gitDisabledReason(action.id)" @click="openGit(action.id)">{{ gitActionLabel(action.id) }}</button>
-            <span v-if="gitDisabledReason(action.id) && !running && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason(action.id) }}</span>
-          </div>
-        </div>
-        <form v-else class="git-confirm" @submit.prevent="runGit(gitAsk!)">
+        <div class="git-workspace">
+          <section class="git-diff" aria-label="Selected file changes">
+            <template v-if="selectedGitPath">
+              <h3 class="mono">{{ selectedGitPath }}</h3>
+              <template v-if="selectedGitPatch">
+                <p v-for="note in selectedGitPatch.notes" :key="note" class="note">{{ note }}</p>
+                <div v-for="(line, index) in selectedGitPatch.lines" :key="index" class="patch-line" :class="line.kind"><span class="line-number">{{ line.before ?? '' }}</span><span class="line-number">{{ line.after ?? '' }}</span><code>{{ line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : line.kind === 'hunk' ? '@@ ' : ' ' }}{{ line.text }}</code></div>
+              </template>
+              <p v-else class="note">No text comparison is available for this file.</p>
+            </template>
+            <p v-else-if="gitPatchError" class="git-error" role="alert">Could not load changes: {{ gitPatchError }}</p>
+            <p v-else class="note git-diff-empty">Select a changed file to review its diff.</p>
+          </section>
+          <aside class="git-sidebar">
+            <ul v-if="git.changes.length" class="git-changes" aria-label="Changed files">
+              <li v-for="change in git.changes" :key="change.path" :class="{ selected: selectedGitPath === change.path }">
+                <button class="mono git-change-path" :title="`Show changes in ${change.path}`" :aria-pressed="selectedGitPath === change.path" @click="selectedGitPath = change.path">{{ change.path }}</button>
+                <span class="note">{{ gitStatusLabel(change.status) }}</span>
+                <button class="link danger-link" :disabled="!!gitDisabledReason('discard')" @click="openGit('discard', change.path)">Revert</button>
+              </li>
+            </ul>
+            <div class="git-remote">
+              <div>
+                <span v-if="git.upstream" class="mono">{{ git.upstream }}</span>
+                <span v-else class="note">No tracking branch</span>
+                <p v-if="git.upstream" class="note">{{ git.behind ?? '—' }} incoming · {{ git.ahead ?? '—' }} outgoing · at last fetch</p>
+              </div>
+              <button class="btn" :disabled="!!gitDisabledReason('fetch')" :title="gitDisabledReason('fetch') || 'Check the remote for new commits; your files stay as they are'" @click="runGit('fetch')">{{ gitBusy === 'fetch' ? 'Fetching…' : 'Fetch' }}</button>
+            </div>
+            <div v-if="!gitAsk" class="git-actions" role="group" aria-label="Git actions">
+              <div v-for="action in gitActions" :key="action.id" :title="gitDisabledReason(action.id)">
+                <button class="btn" :disabled="!!gitDisabledReason(action.id)" @click="openGit(action.id)">{{ gitActionLabel(action.id) }}</button>
+                <span v-if="gitDisabledReason(action.id) && !running && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason(action.id) }}</span>
+              </div>
+              <div :title="gitDisabledReason('discard')">
+                <button class="btn danger" :disabled="!!gitDisabledReason('discard')" @click="openGit('discard')">Revert all</button>
+                <span v-if="gitDisabledReason('discard') && !running && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason('discard') }}</span>
+              </div>
+            </div>
+            <form v-else class="git-confirm" @submit.prevent="runGit(gitAsk!)">
           <h3>{{ gitActionLabel(gitAsk) }}</h3>
           <p id="git-scope" class="note">{{ gitQuestion(gitAsk) }}</p>
           <label v-if="gitAsk === 'commit'" for="commit-message" class="label">Commit message</label>
@@ -394,19 +463,21 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
               class="btn git-yes"
               :disabled="!!gitDisabledReason(gitAsk) || (gitAsk === 'commit' && !commitMessage.trim()) || (gitAsk === 'merge' && !git.branches.includes(mergeBranch))"
             >
-              {{ gitBusy ? gitProgress : gitAsk === 'commit' ? 'Commit all changes' : gitActionLabel(gitAsk) }}
+              {{ gitBusy ? gitProgress : gitAsk === 'commit' ? 'Commit all changes' : gitAsk === 'discard' ? 'Revert changes' : gitActionLabel(gitAsk) }}
             </button>
             <button type="button" class="btn" :disabled="!!gitBusy" @click="openGit()">Back</button>
           </div>
-        </form>
-        <p v-if="running" class="note" role="status">Git actions are available when the task finishes.</p>
-        <p v-if="gitError" class="git-error" role="alert">{{ gitError }}</p>
-        <p v-if="gitRefreshError" class="git-error" role="alert">Could not refresh Git status: {{ gitRefreshError }}</p>
-        <p v-if="gitBusy || gitNotice" class="note git-notice" role="status">{{ gitProgress || gitNotice }}</p>
-        <footer class="git-footer">
-          <span class="note">{{ gitLoading ? 'Refreshing status…' : 'Local repository status' }}</span>
-          <button class="link" :disabled="anyRunning || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
-        </footer>
+            </form>
+            <p v-if="running" class="note" role="status">Git actions are available when the task finishes.</p>
+            <p v-if="gitError" class="git-error" role="alert">{{ gitError }}</p>
+            <p v-if="gitRefreshError" class="git-error" role="alert">Could not refresh Git status: {{ gitRefreshError }}</p>
+            <p v-if="gitBusy || gitNotice" class="note git-notice" role="status">{{ gitProgress || gitNotice }}</p>
+            <footer class="git-footer">
+              <span class="note">{{ gitLoading ? 'Refreshing status…' : 'Local repository status' }}</span>
+              <button class="link" :disabled="anyRunning || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
+            </footer>
+          </aside>
+        </div>
       </section>
 
       <div ref="split" class="split" :class="[dockPrefs.side, { dragging }]">
@@ -618,13 +689,59 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 .side-note {
   margin: 6px 10px 6px 32px;
 }
-.recent {
+.project-groups {
+  display: grid;
+  align-content: start;
+  gap: 16px;
   flex: 1;
+  min-height: 0;
+  padding: 6px 0 12px;
+  overflow-y: auto;
+}
+.project-group {
+  min-width: 0;
+}
+.project-heading {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 10px 5px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.project-heading .project-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 0;
+  color: var(--text-dim);
+  text-align: left;
+}
+.project-heading .project-toggle:hover { color: var(--text); }
+.project-heading span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-heading svg {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.project-heading .project-chevron { margin-left: auto; transition: transform 120ms ease; }
+.project-heading .project-chevron.closed { transform: rotate(-90deg); }
+.project-heading .project-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 26px;
+  min-height: 26px;
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+}
+.project-heading .project-new:hover { color: var(--text); background: var(--surface-2); }
+.recent {
   grid-template-columns: minmax(0, 1fr);
   overflow-x: hidden;
   align-content: start;
-  min-height: 140px;
-  overflow-y: auto;
 }
 .recent li {
   position: relative;
@@ -683,6 +800,16 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 .recent .menu .danger,
 .recent .menu .danger:hover {
   color: var(--err);
+}
+.show-more {
+  margin: 4px 10px 0 20px;
+  padding: 4px 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  text-align: left;
+}
+.show-more:hover {
+  color: var(--text);
 }
 .rename-input {
   width: 100%;
@@ -830,17 +957,20 @@ h1 {
 }
 .git-panel {
   inset: 56px 12px auto auto;
-  width: min(380px, calc(100vw - 24px));
-  max-height: calc(100dvh - 72px);
+  width: min(860px, calc(100vw - 24px));
   max-height: calc(100dvh - v-bind('gitPosition.top') - 16px);
   margin: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 16px;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border-strong);
   border-radius: var(--r);
   font-size: 12px;
+}
+.git-panel:popover-open {
+  display: flex;
+  flex-direction: column;
 }
 .git-heading,
 .git-remote,
@@ -875,8 +1005,8 @@ h1 {
   color: var(--warn);
 }
 .git-remote {
-  margin: 16px 0;
-  padding-bottom: 16px;
+  margin: 12px 0;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
 .git-remote > div {
@@ -885,6 +1015,107 @@ h1 {
 }
 .git-remote .btn {
   flex-shrink: 0;
+}
+.git-changes {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.git-changes li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+.git-change-path {
+  min-width: 0;
+  padding: 3px 4px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  text-align: left;
+}
+.git-change-path:hover,
+.git-changes .selected .git-change-path {
+  background: var(--surface-2);
+}
+.git-change-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-diff {
+  min-height: 300px;
+  margin: 0;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.git-diff h3 {
+  position: sticky;
+  top: 0;
+  margin: 0;
+  padding: 8px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.git-diff .note { padding: 0 8px; }
+.git-diff .patch-line {
+  display: grid;
+  grid-template-columns: 6ch 6ch minmax(max-content, 1fr);
+  width: max-content;
+  min-width: 100%;
+  font: 12px/1.7 var(--mono);
+  white-space: pre;
+}
+.git-diff .line-number {
+  min-width: 0;
+  padding-right: 1ch;
+  color: var(--text-faint);
+  text-align: right;
+  user-select: none;
+}
+.git-diff .patch-line code { padding-right: 12px; font: inherit; }
+.git-diff .patch-line.added {
+  color: var(--syntax-string);
+  background: color-mix(in srgb, var(--syntax-string) 16%, var(--bg));
+}
+.git-diff .patch-line.removed {
+  color: var(--syntax-number);
+  background: color-mix(in srgb, var(--syntax-number) 16%, var(--bg));
+}
+.git-diff .patch-line.hunk {
+  margin: 8px 0 2px;
+  color: var(--text-faint);
+  background: var(--surface-2);
+}
+.git-diff-empty {
+  display: grid;
+  min-height: 280px;
+  place-items: center;
+  margin: 0 !important;
+  color: var(--text-faint);
+}
+.git-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 270px;
+  flex: 1;
+  min-height: 0;
+  gap: 16px;
+  margin-top: 14px;
+}
+.git-sidebar {
+  min-width: 0;
+  overflow-y: auto;
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+}
+.danger-link {
+  color: var(--err);
 }
 .git-actions {
   display: grid;
@@ -940,6 +1171,13 @@ h1 {
   margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--border);
+}
+@media (max-width: 720px) {
+  .git-panel { overflow-y: auto; }
+  .git-workspace { grid-template-columns: 1fr; }
+  .git-diff { min-height: 220px; max-height: 320px; }
+  .git-sidebar { padding-left: 0; border-left: 0; }
+  .git-changes { max-height: 180px; }
 }
 
 .split {
@@ -1198,10 +1436,7 @@ h1 {
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
-  .recent {
-    flex: 0 0 auto;
-    max-height: 120px;
-  }
+  .project-groups { max-height: 240px; }
   .brand {
     margin-bottom: 8px;
   }
@@ -1228,8 +1463,9 @@ h1 {
     padding: 24px 20px 48px;
   }
 }
-.history-filters { display: flex; flex-direction: column; gap: 8px; margin: 8px 12px; }
-.history-filters input, .history-filters select { width: 100%; min-width: 0; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 8px; font: inherit; font-size: 12px; }
-.history-filters input::placeholder { color: var(--text-faint); }
-.recent .history-date { padding: 12px 10px 4px 20px; font-size: 11px; color: var(--text-faint); }
+.task-inbox { display: flex; gap: 6px; margin: 8px 12px 6px; }
+.task-inbox input, .task-inbox select { min-width: 0; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 7px 8px; font: inherit; font-size: 12px; }
+.task-inbox input { flex: 1; }
+.task-inbox select { flex: 0 0 58px; padding-right: 2px; }
+.task-inbox input::placeholder { color: var(--text-faint); }
 </style>

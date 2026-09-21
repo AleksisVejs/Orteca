@@ -22,6 +22,7 @@ import type {
   Resume,
   TaskResult,
   TaskSummary,
+  GlobalTaskSummary,
   TaskDetail,
 } from "./types";
 
@@ -77,6 +78,8 @@ export const forgetProject = (path: string) =>
 /** This project's past runs, newest first. */
 export const recentTasks = (path: string) =>
   invoke<TaskSummary[]>("recent_tasks", { path });
+/** Recent tasks across every remembered project, newest first. */
+export const globalTasks = () => invoke<GlobalTaskSummary[]>("global_tasks");
 export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
 /** `headroom` is the room left in the provider's tightest plan window, or null

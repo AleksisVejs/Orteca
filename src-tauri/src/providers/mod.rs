@@ -146,6 +146,10 @@ pub const CODEX_ISOLATION: &[&str] = &[
     // 0. Both values write; `elevated` is the stronger fence.
     "-c",
     "windows.sandbox=\"elevated\"",
+    // The repo's `AGENTS.md` reaches a run only through Orteca's memory, once
+    // the user has imported it. Global `AGENTS.md` still loads (no switch).
+    "-c",
+    "project_doc_max_bytes=0",
 ];
 
 /// Adjacently tagged so every variant survives, including the newtype ones:
@@ -302,7 +306,10 @@ impl ProviderId {
     /// `schema` is the stage's artifact contract. A resumed stage keeps it, or
     /// the resume would quietly drop the shape the route asked for and the
     /// stage would come back as prose nobody may parse.
-    pub fn resume_args(self, session: &str, schema: Option<&Path>) -> Vec<String> {
+    ///
+    /// `writes` is the stage's own fence: a Plan or Review resumed to take an
+    /// instruction stays read-only, exactly as its first launch was.
+    pub fn resume_args(self, session: &str, schema: Option<&Path>, writes: bool) -> Vec<String> {
         let arg = str::to_string;
         match self {
             Self::Codex => [
@@ -313,7 +320,11 @@ impl ProviderId {
                     arg("-"),
                     arg("--json"),
                     arg("-c"),
-                    arg("sandbox_mode=\"workspace-write\""),
+                    arg(if writes {
+                        "sandbox_mode=\"workspace-write\""
+                    } else {
+                        "sandbox_mode=\"read-only\""
+                    }),
                 ],
                 CODEX_ISOLATION.iter().map(|a| arg(a)).collect(),
                 schema.map_or_else(Vec::new, |path| {
@@ -640,7 +651,7 @@ then stop"
     /// Losing it would leave a resumed agent read-only while still exiting 0.
     #[test]
     fn a_resumed_codex_session_keeps_its_write_sandbox() {
-        let argv = ProviderId::Codex.resume_args("abc-123", None).join(" ");
+        let argv = ProviderId::Codex.resume_args("abc-123", None, true).join(" ");
         assert!(argv.contains("exec resume abc-123"));
         assert!(argv.contains("sandbox_mode=\"workspace-write\""));
         assert!(!argv.contains("danger"));
@@ -649,13 +660,17 @@ then stop"
         assert!(argv.contains(&CODEX_ISOLATION.join(" ")));
         // The prompt arrives on stdin, never as an argument.
         assert!(ProviderId::Codex
-            .resume_args("abc-123", None)
+            .resume_args("abc-123", None, true)
             .contains(&"-".to_string()));
         // A resumed stage keeps the artifact contract its route asked for.
         let schema = PathBuf::from("C:/tmp/plan.json");
-        let with_schema = ProviderId::Codex.resume_args("abc-123", Some(&schema));
+        let with_schema = ProviderId::Codex.resume_args("abc-123", Some(&schema), true);
         assert!(with_schema.contains(&"--output-schema".to_string()));
         assert!(with_schema.contains(&schema.display().to_string()));
+        // A stage that may not write is resumed as one that may not write.
+        let review = ProviderId::Codex.resume_args("abc-123", None, false).join(" ");
+        assert!(review.contains("sandbox_mode=\"read-only\""));
+        assert!(!review.contains("workspace-write"));
     }
 
     fn temp_dir(label: &str) -> PathBuf {

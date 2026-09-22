@@ -1,5 +1,5 @@
 // Navigation stats from the Claude session logs the LiftMe bench left behind
-// (~/.claude/projects/*liftme-bench-wt-*). Free: reads logs, runs nothing.
+// (~/.claude/projects/*<bench>-bench-wt-*). Free: reads logs, runs nothing.
 //
 //   node scripts/bench/navstats.mjs
 //   node scripts/bench/navstats.mjs --recall   (NOMAP=1 for the old ranking, VERBOSE=1 for lists)
@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const ROOT = path.join(os.homedir(), '.claude', 'projects');
+const BENCH = process.env.BENCH ?? 'liftme';
 const EDIT = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const SEARCH_CMD = /^(grep|rg|find|ls|tree|dirname|git (grep|ls-files))\b/;
 const READ_CMD = /^(cat|sed -n|head|tail|wc)\b/;
@@ -90,9 +91,9 @@ export function startHere(prompt) {
   return out;
 }
 
-export function sessions(root = ROOT) {
+export function sessions(root = ROOT, bench = BENCH) {
   const out = [];
-  for (const d of fs.readdirSync(root).filter((d) => d.includes('liftme-bench-wt-'))) {
+  for (const d of fs.readdirSync(root).filter((d) => d.includes(`${bench}-bench-wt-`))) {
     const arm = d.endsWith('-orteca-claude') ? 'orteca' : 'plain';
     for (const f of fs.readdirSync(path.join(root, d)).filter((f) => f.endsWith('.jsonl'))) {
       out.push({ arm, dir: d, ...readSession(fs.readFileSync(path.join(root, d, f), 'utf8')) });
@@ -135,10 +136,12 @@ export function taskOf(prompt) {
 }
 
 // Offline recall: rank each recorded prompt again on a throwaway worktree of
-// LiftMe at HEAD (every bench run's base), and count the edited files that
+// the selected benchmark repository at HEAD, and count the edited files that
 // existed there which the new list holds. NOMAP=1 ranks without the map.
 function recall() {
-  const repo = process.env.LIFTME ?? 'C:/Users/User/Projects/LiftMe';
+  const repo = process.env.NAV_REPO ?? (BENCH === 'riginspect'
+    ? 'C:/Users/User/Projects/RigInspectBE'
+    : 'C:/Users/User/Projects/LiftMe');
   const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
   const cases = sessions()
     .filter((s) => s.arm === 'orteca' && taskOf(s.prompt))

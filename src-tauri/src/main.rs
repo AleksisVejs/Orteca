@@ -104,7 +104,7 @@ impl ProviderOperations {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_project(app: AppHandle, path: String, store: State<Store>) -> Result<OpenedProject> {
     let dir = project::validate_dir(&path)?;
     let git = project::git_state(&dir);
@@ -364,6 +364,7 @@ fn scan_run(
     mode: Mode,
     headroom: Option<f64>,
     isolation: Isolation,
+    refresh_map: bool,
 ) -> Result<Scanned> {
     let Some(prompt) = run::clean_prompt(&prompt) else {
         return Err(AppError::new(
@@ -401,8 +402,14 @@ fn scan_run(
         Ok(_) => Vec::new(),
         Err(_) => store.past_notes(project.id).unwrap_or_default(),
     };
+    let tracked_paths = project::tracked_paths(&dir);
+    // A run rescans before it ranks; a map that fails to refresh only weakens
+    // the file list, never the run. The preview reads what is already there.
+    if refresh_map {
+        let _ = store.scan_map(project.id, &dir, &tracked_paths);
+    }
     let signals = routing::RepoSignals {
-        tracked_paths: project::tracked_paths(&dir),
+        tracked_paths,
         recent_paths: project::recent_paths(&dir),
         // NAV_NOMAP ranks as before the map, for the benchmark's before arm.
         code_map: match std::env::var("NAV_NOMAP") {
@@ -473,12 +480,8 @@ async fn begin(
         _ => None,
     };
     // Git, PATH and ACL probes, on this thread while the call runs elsewhere.
-    // A map that fails to refresh only weakens the file list, never the run.
     let scanned = tokio::task::block_in_place(|| {
-        if let Ok((dir, record)) = trusted_dir(store, &path) {
-            let _ = store.scan_map(record.id, &dir, &project::tracked_paths(&dir));
-        }
-        scan_run(store, path, prompt, asked, provider, mode, headroom, isolation)
+        scan_run(store, path, prompt, asked, provider, mode, headroom, isolation, true)
     });
     let scan_ms = ms(started);
     let scanned = match scanned {
@@ -531,7 +534,7 @@ async fn preview_task(
     // call per pause would cost more than the runs it routes. Off the main
     // thread: git, PATH and ACL probes froze the window on every pause.
     let planned = tauri::async_runtime::spawn_blocking(move || {
-        scan_run(&app.state::<Store>(), path, prompt, asked, provider, mode, headroom, isolation)
+        scan_run(&app.state::<Store>(), path, prompt, asked, provider, mode, headroom, isolation, false)
             .map(|scanned| scanned.route(None, None))
     })
     .await
@@ -565,8 +568,9 @@ async fn preview_task(
 /// Costs no tokens and never runs inside a project. Never an error: a provider
 /// that cannot be read comes back with the reason.
 #[tauri::command]
-async fn provider_limits() -> Vec<providers::limits::Limits> {
-    let probes = ProviderId::ALL.map(|id| tauri::async_runtime::spawn(providers::limits::read(id)));
+async fn provider_limits(fresh: Option<bool>) -> Vec<providers::limits::Limits> {
+    let fresh = fresh.unwrap_or(false);
+    let probes = ProviderId::ALL.map(|id| tauri::async_runtime::spawn(providers::limits::read(id, fresh)));
     let mut limits = Vec::with_capacity(probes.len());
     for probe in probes {
         if let Ok(one) = probe.await {
@@ -727,7 +731,7 @@ fn make_worktree(
 
 /// Delete a finished run's copy. Git refuses while it holds uncommitted work,
 /// and the branch stays either way.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_worktree(path: String, task_id: i64, store: State<Store>) -> Result<()> {
     let (dir, record) = trusted_dir(&store, &path)?;
     let Some(copy) = store.worktree_path(record.id, task_id)? else {
@@ -1052,6 +1056,98 @@ fn forget_project(path: String, store: State<Store>) -> Result<()> {
     store.forget_project(&path)
 }
 
+/// An instructions file beside the rules a small model proposes from it:
+/// `user` is `~/.claude/CLAUDE.md`, `CLAUDE.md` and `AGENTS.md` are the
+/// project root's. Saves nothing: the panel asks first.
+#[tauri::command]
+async fn propose_memory_import(path: Option<String>, file: String) -> Result<MemoryProposal> {
+    let (file_path, shown) = match (file.as_str(), path) {
+        ("user", _) => {
+            let home = std::env::var("USERPROFILE").map_err(|_| AppError::new(ErrorKind::NotFound, "no home folder"))?;
+            (std::path::Path::new(&home).join(".claude").join("CLAUDE.md"), "~/.claude/CLAUDE.md")
+        }
+        ("CLAUDE.md", Some(path)) => (project::validate_dir(&path)?.join("CLAUDE.md"), "CLAUDE.md"),
+        ("AGENTS.md", Some(path)) => (project::validate_dir(&path)?.join("AGENTS.md"), "AGENTS.md"),
+        _ => return Err(AppError::new(ErrorKind::Invalid, "that file cannot be imported")),
+    };
+    let original = std::fs::read_to_string(&file_path)
+        .map_err(|_| AppError::new(ErrorKind::NotFound, format!("There is no {shown} to import.")))?;
+    if original.chars().count() > 20_000 {
+        return Err(AppError::new(ErrorKind::Invalid, "That file is too long to import. Add rules by hand."));
+    }
+    let (id, program) = any_cli()?;
+    let bullets = intent::memory_rules(id, &program, &original).await;
+    Ok(MemoryProposal { original, bullets })
+}
+
+/// Rules a small model proposes from this project's recent runs: corrections
+/// the user kept making, checks that kept failing. `original` is the digest it
+/// read. Saves nothing: the panel asks first.
+#[tauri::command]
+async fn propose_memory_from_runs(path: String, store: State<'_, Store>) -> Result<MemoryProposal> {
+    let project_id = memory_project(Some(path), store.inner())?.expect("a path gives a project");
+    let original = store.run_digest(project_id)?;
+    if original.is_empty() {
+        return Err(AppError::new(ErrorKind::NotFound, "No finished runs here yet."));
+    }
+    let saved: Vec<String> = store.memory(Some(project_id))?.items.into_iter().map(|i| i.text).collect();
+    let (id, program) = any_cli()?;
+    let bullets = intent::run_rules(id, &program, &original, &saved).await;
+    Ok(MemoryProposal { original, bullets })
+}
+
+/// The first installed CLI, for a small one-off model call.
+fn any_cli() -> Result<(ProviderId, String)> {
+    ProviderId::ALL
+        .into_iter()
+        .find_map(|id| providers::which(id.program()).map(|p| (id, p.to_string_lossy().into_owned())))
+        .ok_or_else(|| AppError::new(ErrorKind::CliMissing, "Neither Claude nor Codex is installed."))
+}
+
+#[derive(serde::Serialize)]
+struct MemoryProposal {
+    original: String,
+    bullets: Vec<String>,
+}
+
+/// The memory items, the limit and the estimated size. No path lists the
+/// global items alone, which is all the Launch screen has.
+#[tauri::command]
+fn memory(path: Option<String>, store: State<Store>) -> Result<store::MemoryState> {
+    store.memory(memory_project(path, store.inner())?)
+}
+
+#[tauri::command]
+fn add_memory(path: Option<String>, global: bool, text: String, store: State<Store>) -> Result<()> {
+    let project_id = if global { None } else { memory_project(path, store.inner())? };
+    if !global && project_id.is_none() {
+        return Err(AppError::new(ErrorKind::Invalid, "a project item needs a project"));
+    }
+    store.add_memory(project_id, &text)
+}
+
+fn memory_project(path: Option<String>, store: &Store) -> Result<Option<i64>> {
+    let Some(path) = path else { return Ok(None) };
+    let dir = project::validate_dir(&path)?;
+    Ok(Some(store.project(&dir.to_string_lossy())?.id))
+}
+
+#[tauri::command]
+fn edit_memory(id: i64, text: String, store: State<Store>) -> Result<()> {
+    store.edit_memory(id, &text)
+}
+
+#[tauri::command]
+fn delete_memory(id: i64, store: State<Store>) -> Result<()> {
+    store.delete_memory(id)
+}
+
+/// 0 means no limit.
+#[tauri::command]
+fn set_memory_limit(limit: u32, store: State<Store>) -> Result<()> {
+    store.set_memory_limit(limit)
+}
+
 /// Past runs in this project, newest first.
 #[tauri::command]
 fn recent_tasks(path: String, store: State<Store>) -> Result<Vec<store::TaskSummary>> {
@@ -1177,6 +1273,13 @@ fn main() {
             send_instruction,
             trust_project,
             forget_project,
+            memory,
+            add_memory,
+            edit_memory,
+            delete_memory,
+            set_memory_limit,
+            propose_memory_import,
+            propose_memory_from_runs,
             recent_tasks,
             global_tasks,
             rename_task,
@@ -1334,7 +1437,8 @@ ELI5";
     /// Spends real usage. One Orteca run for a benchmark driver:
     /// BENCH_DIR, BENCH_PROMPT, BENCH_PROVIDER (claude|codex), BENCH_MODE
     /// (efficient|balanced), BENCH_OUT (TaskResult JSON). BENCH_DB keeps the
-    /// history in that file between runs, for the notes benchmark.
+    /// history in that file between runs, for the notes benchmark. BENCH_MEMORY
+    /// saves one global memory item first.
     /// `cargo test bench_run -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -1348,6 +1452,9 @@ ELI5";
         };
         store.touch_project(&key, "bench").unwrap();
         store.set_trusted(&key, true).unwrap();
+        if let Ok(item) = std::env::var("BENCH_MEMORY") {
+            store.add_memory(None, &item).unwrap();
+        }
         // The app loads this at startup; without it every Codex run is unpriced.
         if let Some(prices) = providers::codex::fetch_prices() {
             store.save_prices(&prices).unwrap();
@@ -1387,7 +1494,7 @@ ELI5";
     #[ignore]
     async fn bench_limits() {
         for id in ProviderId::ALL {
-            println!("LIMITS {}", serde_json::to_string(&providers::limits::read(id).await).unwrap());
+            println!("LIMITS {}", serde_json::to_string(&providers::limits::read(id, true).await).unwrap());
         }
     }
 }

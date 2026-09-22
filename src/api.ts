@@ -10,6 +10,9 @@ import type {
   GitAction,
   GitState,
   Limits,
+  ImportFile,
+  MemoryProposal,
+  MemoryState,
   Mode,
   ModelOverride,
   OpenedProject,
@@ -75,6 +78,21 @@ export const trustProject = (path: string, trusted: boolean) =>
 export const forgetProject = (path: string) =>
   invoke<void>("forget_project", { path });
 
+/** Memory items, the limit and the estimated size. No path: global only. */
+export const memory = (path?: string) => invoke<MemoryState>("memory", { path });
+export const addMemory = (path: string | undefined, global: boolean, text: string) =>
+  invoke<void>("add_memory", { path, global, text });
+export const editMemory = (id: number, text: string) => invoke<void>("edit_memory", { id, text });
+export const deleteMemory = (id: number) => invoke<void>("delete_memory", { id });
+/** Rules a small model proposes from an instructions file. Saves nothing. */
+export const proposeMemoryImport = (path: string | undefined, file: ImportFile) =>
+  invoke<MemoryProposal>("propose_memory_import", { path, file });
+/** 0 means no limit. */
+/** Rules proposed from this project's recent runs; `original` is what the model read. */
+export const proposeMemoryFromRuns = (path: string) =>
+  invoke<MemoryProposal>("propose_memory_from_runs", { path });
+export const setMemoryLimit = (limit: number) => invoke<void>("set_memory_limit", { limit });
+
 /** This project's past runs, newest first. */
 export const recentTasks = (path: string) =>
   invoke<TaskSummary[]>("recent_tasks", { path });
@@ -113,7 +131,8 @@ export const gitAction = (path: string, action: GitAction, input = "") =>
 export const gitStatus = (path: string) => invoke<GitState>("git_status", { path });
 
 /** Plan limits from each CLI's own answer. Costs no tokens; takes seconds. */
-export const providerLimits = () => invoke<Limits[]>("provider_limits");
+/** `fresh` pays for a new Claude reading instead of the one kept for 15 minutes. */
+export const providerLimits = (fresh = false) => invoke<Limits[]>("provider_limits", { fresh });
 
 /**
  * The channel exists before invocation; completion uses the invoke response.

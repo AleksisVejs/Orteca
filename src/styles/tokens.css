@@ -26,6 +26,8 @@
   --warn: #d4a24c;
   --err: #e0715f;
   --overlay: rgb(0 0 0 / 0.66);
+  --dots: rgb(255 255 255 / 0.07); /* launch backdrop grid */
+  --dots-lit: rgb(255 255 255 / 0.3); /* the same grid under the cursor */
   --mark-shadow: rgb(0 0 0 / 0.5);
   --mark-rim: rgb(255 255 255 / 0.04);
 
@@ -180,6 +182,12 @@ button {
   padding-bottom: 24px;
   margin-bottom: 24px;
   border-bottom: 1px solid var(--border);
+}
+/* Marks who is speaking in the thread; only the user is named, the answer is set off by its colour. */
+.who {
+  margin: 0 0 4px;
+  font-size: 11px;
+  color: var(--text-faint);
 }
 .turn .said {
   margin: 0 0 12px;

@@ -5,6 +5,7 @@ import type { InjectionKey, Ref } from "vue";
 import { tidy } from "./picks";
 import type { Pick } from "./picks";
 import {
+  addMemory,
   pickAttachments,
   savePastedImage,
   cancelProviderOperation,
@@ -123,6 +124,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     ],
     codex: [
       { id: "gpt-6-astra", label: "GPT-6 Astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -131,7 +134,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   };
   const modelChoices = ref<Record<ProviderId, ModelOverride>>({
     claude: { model: "sonnet", effort: "high" },
-    codex: { model: "gpt-5.6-terra", effort: "medium" },
+    codex: { model: "gpt-6-sol", effort: "medium" },
   });
 
   // How readily the classifier takes the shorter route. Two modes, not three.
@@ -194,7 +197,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         const fresh = await installProvider(id);
         providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
         provider.value = id;
-        void loadLimits();
+        void loadLimits(true);
       } catch (e) {
         installError.value = isAppError(e) ? e.message : String(e);
         break;
@@ -228,7 +231,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
       // A signed-out CLI reports no limits, so the reading taken at open is stale
       // the moment a sign-in succeeds. Not awaited: it takes seconds.
-      void loadLimits();
+      void loadLimits(true);
     } catch (e) {
       signInError.value = isAppError(e) ? e.message : String(e);
     } finally {
@@ -251,13 +254,13 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const providerPicked = ref(false);
   const pickedFor = ref<string | null>(null);
 
-  async function loadLimits() {
+  async function loadLimits(fresh = false) {
     const request = ++limitsRequest;
     limitsLoading.value = true;
     try {
-      const fresh = await providerLimits();
+      const reading = await providerLimits(fresh);
       if (request !== limitsRequest) return;
-      limits.value = fresh;
+      limits.value = reading;
       limitsError.value = null;
     } catch (e) {
       if (request !== limitsRequest) return;
@@ -301,13 +304,16 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     }
   }
 
-  function resetWhen(w: LimitWindow): string | null {
-    if (w.resetsText) return w.resetsText;
-    if (w.resetsAt === null) return null;
-    const date = new Date(w.resetsAt * 1000);
+  function formatWhen(ms: number): string | null {
+    const date = new Date(ms);
     return Number.isFinite(date.getTime())
       ? date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
       : null;
+  }
+
+  function resetWhen(w: LimitWindow): string | null {
+    if (w.resetsText) return w.resetsText;
+    return w.resetsAt === null ? null : formatWhen(w.resetsAt * 1000);
   }
 
   const usageCounters = computed(() => rows.value.map((p) => {
@@ -355,11 +361,76 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     const p = preview.value;
     if (!p) return null;
     const calls = p.route.stages.length;
-    const windows = limits.value.find((l) => l.id === p.provider)?.windows ?? [];
-    const tight = windows
-      .filter((w) => 100 - w.usedPercent < calls * PERCENT_PER_CALL)
-      .sort((a, b) => b.usedPercent - a.usedPercent)[0];
-    return tight ? { window: tight, calls, resets: resetWhen(tight) } : null;
+    const all = tightWindows(p.provider, calls);
+    const tight = [...all].sort((a, b) => b.usedPercent - a.usedPercent)[0];
+    return tight ? { window: tight, calls, resets: resetWhen(tight), startsAt: resetsAfter(all) } : null;
+  });
+
+  function tightWindows(id: ProviderId, calls: number): LimitWindow[] {
+    return (limits.value.find((l) => l.id === id)?.windows ?? [])
+      .filter((w) => 100 - w.usedPercent < calls * PERCENT_PER_CALL);
+  }
+
+  /** When every one of these windows has reset, in Unix ms. Null when one
+   *  gives no time: Claude's older text reading is words, not a clock. */
+  function resetsAfter(windows: LimitWindow[]): number | null {
+    return windows.length && windows.every((w) => w.resetsAt !== null)
+      ? Math.max(...windows.map((w) => w.resetsAt!)) * 1000
+      : null;
+  }
+
+  // One task waiting for a plan to reset. It starts on its own, with the
+  // composer's mode, isolation and model at that moment.
+  // ponytail: one slot, in memory only; closing the app drops it. Persist it
+  // in the store if people start queueing overnight work.
+  type Waiting = { prompt: string; attachments: string[]; asked: string[]; provider: ProviderId; at: number };
+  const waiting = ref<Waiting | null>(null);
+  let waitTimer: ReturnType<typeof setTimeout> | null = null;
+  // The minute after a reset can still read as spent.
+  const RESET_SLACK_MS = 60_000;
+
+  /** Queue the composer's request, or a run the plan stopped, for `at`. */
+  function waitForReset(at: number, from: LiveRun | null = null) {
+    cancelWait();
+    waiting.value = from
+      ? { prompt: from.prompt, attachments: from.attachments, asked: from.asked, provider: from.provider, at }
+      : { prompt: promptText(), attachments: attachments.value, asked: [], provider: provider.value, at };
+    if (!from) {
+      task.value = "";
+      picks.value = [];
+      attachments.value = [];
+    }
+    waitTimer = setTimeout(startWaiting, Math.max(0, at - Date.now()) + RESET_SLACK_MS);
+  }
+
+  function startWaiting() {
+    const w = waiting.value;
+    if (!w) return;
+    // Git or an install busy: try again in a minute rather than drop it.
+    if (!ready.value) {
+      waitTimer = setTimeout(startWaiting, RESET_SLACK_MS);
+      return;
+    }
+    waiting.value = null;
+    waitTimer = null;
+    provider.value = w.provider;
+    providerPicked.value = true;
+    pickedFor.value = null;
+    void run({ prompt: w.prompt, attachments: w.attachments, asked: w.asked });
+  }
+
+  function cancelWait() {
+    if (waitTimer !== null) clearTimeout(waitTimer);
+    waitTimer = null;
+    waiting.value = null;
+  }
+
+  /** A run its plan stopped: when it could go again on the same CLI. */
+  const retryAt = computed(() => {
+    const r = activeRun.value;
+    // A copy's work is on its branch; a fresh run would start without it.
+    if (!r || r.active || r.result?.failureKind !== "usageLimit" || r.result.worktree) return null;
+    return resetsAfter(tightWindows(r.provider, r.result.route.stages.length));
   });
 
   /** The other runnable CLI, and its room left (null when unread). */
@@ -425,15 +496,32 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
   /// and refusing to run on a guess would be the same mistake in the other
   /// direction. The run itself reports an auth failure honestly either way.
-  const canRun = computed(
+  // "Remember: ..." saves a memory item instead of running a task. The text is
+  // held here until the user says which list it goes to.
+  const rememberText = ref<string | null>(null);
+  const rememberError = ref<string | null>(null);
+  const remembering = computed(() => /^remember:\s*\S/i.test(task.value.trim()));
+  async function remember(global: boolean) {
+    rememberError.value = null;
+    try {
+      await addMemory(opened.project.path, global, rememberText.value ?? "");
+      rememberText.value = null;
+      task.value = "";
+    } catch (err) {
+      rememberError.value = isAppError(err) ? err.message : String(err);
+    }
+  }
+
+  /** Nothing in the way of starting a run, whatever the composer holds. */
+  const ready = computed(
     () =>
       !gitBusy.value &&
       installing.value === null &&
       signingIn.value === null &&
-      (task.value.trim().length > 0 || picks.value.length > 0) &&
       !!selected.value?.path &&
       selected.value.auth !== "signedOut",
   );
+  const canRun = computed(() => ready.value && (task.value.trim().length > 0 || picks.value.length > 0));
 
   // Runs are independent, so each owns the whole of its screen - its stream,
   // its result, its steering box - instead of sharing one set of refs. The
@@ -443,8 +531,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     /** The task id, from the moment the row exists until the run ends. */
     id: number | null;
     prompt: string;
-    /** How many paths the run was handed, for the line its page shows. */
-    attachmentCount: number;
+    /** The paths the run was handed. */
+    attachments: string[];
     provider: ProviderId;
     /** The CLI whose spent plan this run took over from, if it did. */
     switchedFrom: ProviderId | null;
@@ -872,6 +960,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     ++gitRequest;
     ++limitsRequest;
     if (limitsTimer !== null) clearInterval(limitsTimer);
+    if (waitTimer !== null) clearTimeout(waitTimer);
     if (previewTimer !== null) clearTimeout(previewTimer);
     stop.forEach((off) => off());
   });
@@ -893,16 +982,23 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     /** Exchanges to open the new run with, when it carries on a task whose own
      *  run is no longer on screen. */
     turns?: Turn[];
+    /** The request itself, when it is not the composer's: a handoff or a run
+     *  that waited for a reset. The composer is left as the user has it. */
+    prompt?: string;
   };
 
   async function run(opts: RunOpts = {}) {
-    if (!canRun.value) return;
+    if (!(opts.prompt === undefined ? canRun.value : ready.value)) return;
+    if (!opts.continueRun && opts.prompt === undefined && remembering.value) {
+      rememberText.value = task.value.trim().replace(/^remember:\s*/i, "");
+      return;
+    }
     // The composer empties on send, the way the chain of replies below it does.
     // A handoff re-sends what the first attempt was given rather than nothing.
     const attached = opts.attachments ?? attachments.value;
     if (!opts.attachments) attachments.value = [];
-    const sent = promptText();
-    picks.value = [];
+    const sent = opts.prompt ?? promptText();
+    if (opts.prompt === undefined) picks.value = [];
     const carry = opts.continueRun ?? null;
     // Reactive up front: the callbacks below write through this object for as
     // long as the run lasts, and a plain one would leave the screen frozen on
@@ -911,7 +1007,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       key: Symbol("run"),
       id: null,
       prompt: sent,
-      attachmentCount: attached.length,
+      attachments: attached,
       provider: provider.value,
       switchedFrom: opts.switchedFrom ?? null,
       asked: opts.asked ?? [],
@@ -935,7 +1031,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       Object.assign(carry, {
         id: null,
         prompt: sent,
-        attachmentCount: attached.length,
+        attachments: attached,
         provider: provider.value,
         switchedFrom: opts.switchedFrom ?? null,
         asked: opts.asked ?? [],
@@ -1021,7 +1117,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       providerPicked.value = true;
       pickedFor.value = null;
       // The handoff is the same request carrying on: it keeps the reply's task.
-      await run({ ...opts, attachments: attached, switchedFrom: live.provider });
+      await run({ ...opts, prompt: live.prompt, attachments: attached, switchedFrom: live.provider });
     }
   }
 
@@ -1123,15 +1219,26 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     items.push({ kind: event.kind, ...activity, text: activity.text.slice(0, 4000) + (activity.text.length > 4000 ? "…" : "") });
   }
 
-  /** A checker's JSON verdict, in words. Null for anything that isn't one. */
+  /** A stage's JSON (a checker's verdict or a plan), in words. Null for anything that isn't one. */
   function describeVerdict(text: string): string | null {
-    let v: { verdict?: string; checks?: Array<{ command: string; passed: boolean }>; findings?: Array<{ issue: string }> };
+    let v: {
+      verdict?: string;
+      checks?: Array<{ command: string; passed: boolean }>;
+      findings?: Array<{ issue: string }>;
+      objective?: string;
+      implementation_steps?: unknown[];
+    };
     try {
       v = JSON.parse(text);
     } catch {
       return null;
     }
-    if (typeof v !== "object" || v === null || typeof v.verdict !== "string") return null;
+    if (typeof v !== "object" || v === null) return null;
+    if (typeof v.objective === "string") {
+      const steps = (v.implementation_steps ?? []).filter((s): s is string => typeof s === "string");
+      return [`Plan: ${v.objective}`, ...steps.map((s, i) => `${i + 1}. ${s}`)].join("\n");
+    }
+    if (typeof v.verdict !== "string") return null;
     const ok = v.verdict === "pass";
     if (v.findings) {
       return ok
@@ -1172,6 +1279,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
       uncached: usage.inputTokens + usage.outputTokens,
       cached: usage.cachedInputTokens,
+      cacheHit: cacheHit(usage.inputTokens, usage.cachedInputTokens),
       output: usage.outputTokens,
       cost: usage.costUsd,
       quality: usage.costQuality,
@@ -1180,6 +1288,14 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       effort: [...(result.value?.stages ?? [])].reverse().find((s) => s.effort)?.effort ?? null,
     };
   });
+
+  /** Share of input read from the provider's cache, as a whole percent. A low
+   *  figure on a resumed or long run means the context is being billed again.
+   *  null when there was no input to share out. */
+  function cacheHit(uncachedInput: number, cachedInput: number): number | null {
+    const input = uncachedInput + cachedInput;
+    return input > 0 ? Math.round((cachedInput / input) * 100) : null;
+  }
 
   function formatCost(cost: number): string {
     return cost > 0 && cost < 0.0001 ? "<$0.0001" : "$" + cost.toFixed(4);
@@ -1312,7 +1428,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   };
 
   // The main pane shows one thing at a time; the sidebar picks which.
-  const view = ref<"task" | "history" | "helpers">("task");
+  const view = ref<"task" | "history" | "agents">("task");
   const optionsOpen = ref(false);
 
   type ResultTab = "summary" | "files" | "details" | "activity";
@@ -1334,8 +1450,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     checking: "live",
   };
 
-  const helpersPending = computed(() => rows.value.some((r) => r.pending));
-  const helpersReady = computed(() => installed.value.filter((p) => p.auth !== "signedOut").length);
+  const agentsPending = computed(() => rows.value.some((r) => r.pending));
+  const agentsReady = computed(() => installed.value.filter((p) => p.auth !== "signedOut").length);
 
   function focusTask() {
     void nextTick(() => document.getElementById(domId("task"))?.focus());
@@ -1515,14 +1631,23 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     headroom,
     pickByHeadroom,
     resetWhen,
+    formatWhen,
     limitLine,
     limitWarning,
+    waiting,
+    waitForReset,
+    cancelWait,
+    retryAt,
     otherThan,
     alternative,
     fallback,
     switchedFrom,
     switchTo,
     canRun,
+    remembering,
+    rememberText,
+    rememberError,
+    remember,
     runs,
     runLabel,
     said,
@@ -1602,6 +1727,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     lines,
     tokens,
     formatCost,
+    cacheHit,
     formatTokens,
     formatDuration,
     formatPayload,
@@ -1619,8 +1745,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     resultTab,
     TABS,
     TONE,
-    helpersPending,
-    helpersReady,
+    agentsPending,
+    agentsReady,
     focusTask,
     newTask,
     editAgain,

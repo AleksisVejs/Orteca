@@ -76,11 +76,18 @@ fn env(id: ProviderId) -> Vec<(&'static str, std::path::PathBuf)> {
 pub fn model(id: ProviderId) -> &'static str {
     match id {
         ProviderId::Claude => "haiku",
-        ProviderId::Codex => "gpt-5.6-luna",
+        ProviderId::Codex => "gpt-6-luna",
     }
 }
 
+/// The normal classifier argv is only asserted by unit tests. Runtime calls
+/// supply their instruction explicitly through `args_with`.
+#[cfg(test)]
 fn args(id: ProviderId) -> Vec<String> {
+    args_with(id, INSTRUCTION)
+}
+
+fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
     let model = model(id);
     let fixed: Vec<&str> = match id {
         // No tools and a replaced system prompt: the whole call is the
@@ -98,7 +105,7 @@ fn args(id: ProviderId) -> Vec<String> {
             "--tools",
             "",
             "--system-prompt",
-            INSTRUCTION,
+            instruction,
             "--model",
             model,
         ],
@@ -187,6 +194,44 @@ pub fn parse_job(reply: &str) -> Option<Job> {
     })
 }
 
+const MEMORY_INSTRUCTION: &str = "You turn a personal instructions file for a coding agent into short standing rules. Reply with only a list, one rule per line, each line starting with `- `. Each rule is one plain sentence of at most 20 words that keeps the file's meaning. Keep only lasting rules about how the agent should behave or write code. Skip headings, examples, explanations, and anything that is not an instruction. Do not add rules the file does not state. At most 25 rules.";
+
+/// The rules a small model proposes from an instructions file. Nothing is
+/// saved here; the user approves each one first.
+pub async fn memory_rules(id: ProviderId, program: &str, file: &str) -> Vec<String> {
+    propose_rules(id, program, MEMORY_INSTRUCTION, &format!("Instructions file:\n{file}")).await
+}
+
+const RUNS_INSTRUCTION: &str = "You read a coding agent's recent runs in one project and propose short standing rules that would have saved the user effort. Reply with only a list, one rule per line, each line starting with `- `. Each rule is one plain sentence of at most 20 words. Propose a rule only for what the runs show more than once: a correction the user repeated, a convention they asked for, a check that kept failing. Never restate one task, and never repeat a rule already saved. At most 8 rules; an empty reply is fine.";
+
+/// Rules a small model proposes from a digest of this project's runs, minus
+/// the ones already saved. Nothing is saved here either.
+pub async fn run_rules(id: ProviderId, program: &str, digest: &str, saved: &[String]) -> Vec<String> {
+    let saved = if saved.is_empty() { "none".to_string() } else { saved.join("\n") };
+    let request = format!("Rules already saved:\n{saved}\n\nRecent runs, newest first:\n{digest}");
+    propose_rules(id, program, RUNS_INSTRUCTION, &request).await
+}
+
+async fn propose_rules(id: ProviderId, program: &str, instruction: &str, request: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, instruction, request, &mut events))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    parse_rules(&reply)
+}
+
+fn parse_rules(reply: &str) -> Vec<String> {
+    reply
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- ").or_else(|| l.trim().strip_prefix("* ")))
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .take(25)
+        .collect()
+}
+
 /// Ask the provider what `prompt` wants and what to call it, in one call.
 /// `None` means "could not tell" and the keyword router decides; the events
 /// come back either way, so what the call cost is still counted.
@@ -217,13 +262,23 @@ async fn ask(
     prompt: &str,
     events: &mut Vec<ProviderEvent>,
 ) -> Option<String> {
-    let argv = args(id);
+    ask_with(id, program, INSTRUCTION, &format!("Request:\n{prompt}"), events).await
+}
+
+async fn ask_with(
+    id: ProviderId,
+    program: &str,
+    instruction: &str,
+    request: &str,
+    events: &mut Vec<ProviderEvent>,
+) -> Option<String> {
+    let argv = args_with(id, instruction);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Never in the user's project: nobody has consented to its settings for this.
     let mut run = proc::spawn_env(program, &borrowed, &std::env::temp_dir(), &env(id)).ok()?;
     let request = match id {
-        ProviderId::Claude => format!("Request:\n{prompt}"),
-        ProviderId::Codex => format!("{INSTRUCTION}\n\nRequest:\n{prompt}"),
+        ProviderId::Claude => request.to_string(),
+        ProviderId::Codex => format!("{instruction}\n\n{request}"),
     };
     run.send_line(&request).await.ok()?;
     run.close_stdin();
@@ -252,6 +307,28 @@ async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_rules_only_from_list_lines() {
+        assert_eq!(parse_rules("Here:
+- Use tabs.
+* Be brief
+-
+not a rule"), ["Use tabs.", "Be brief"]);
+        assert!(args_with(ProviderId::Claude, MEMORY_INSTRUCTION).join(" ").contains("--tools  --system-prompt"));
+    }
+
+    /// Spends a few cents: proposes rules from the real ~/.claude/CLAUDE.md.
+    /// `cargo test live_memory_rules -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_memory_rules() {
+        let file = std::fs::read_to_string(std::path::Path::new(&std::env::var("USERPROFILE").unwrap()).join(".claude/CLAUDE.md")).unwrap();
+        let program = crate::providers::which("claude").unwrap();
+        let rules = memory_rules(ProviderId::Claude, &program.to_string_lossy(), &file).await;
+        println!("{rules:#?}");
+        assert!(!rules.is_empty());
+    }
 
     #[test]
     fn reads_the_first_label_in_the_reply() {

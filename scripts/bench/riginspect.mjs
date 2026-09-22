@@ -12,6 +12,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { weeklyHeadroomStop } from "./weekly-limit.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const LIFTME = process.env.BENCH === "liftme";
@@ -26,6 +27,10 @@ const MYSQL = readdirSync("C:\\Program Files\\MySQL").filter((d) => d.startsWith
 const ENV = { ...process.env, PATH: `C:\\Program Files\\MySQL\\${MYSQL}\\bin;${process.env.PATH}` };
 const CAPS = { "claude week (all models)": 98, "codex week": 90 };
 const CAP_DEFAULT = 95;
+// A post-arm limit check cannot protect a floor: reserve a conservative arm
+// before starting it. Set both to 0 only for an explicitly uncapped experiment.
+const WEEKLY_FLOOR = Number(process.env.WEEKLY_FLOOR ?? 15);
+const WEEKLY_ARM_RESERVE = Number(process.env.WEEKLY_ARM_RESERVE ?? 5);
 const ARM_TIMEOUT = 45 * 60_000;
 // Mid tier, not the top one: Sonnet for Claude, Terra medium for Codex.
 const CLAUDE_ARGS = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "sonnet"];
@@ -52,6 +57,12 @@ const TASKS = LIFTME ? (await import("./liftme.tasks.mjs")).TASKS : {
   },
 };
 const ARMS = (process.env.ARMS ?? "orteca-claude,claude,orteca-codex,codex").split(",");
+const usedProviders = () => new Set(ARMS.map((arm) => arm.replace("orteca-", "")));
+const limitStop = (now) => {
+  const used = usedProviders();
+  const over = Object.entries(now).find(([key, value]) => used.has(key.split(" ")[0]) && value >= (CAPS[key] ?? CAP_DEFAULT));
+  return over ? `STOP: ${over[0]} at ${over[1]}%` : weeklyHeadroomStop(now, used, WEEKLY_FLOOR, WEEKLY_ARM_RESERVE);
+};
 
 // A run that rebuilds public/build makes a patch far past Node's 1 MB default.
 const git = (...a) => execFileSync("git", a, { cwd: RIG, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256e6 });
@@ -334,9 +345,8 @@ if (process.env.NOTES) {
   };
   const capped = () => {
     const now = limits();
-    const used = new Set(ARMS.map((a) => a.replace("orteca-", "")));
-    const over = Object.entries(now).find(([k, v]) => used.has(k.split(" ")[0]) && v >= (CAPS[k] ?? CAP_DEFAULT));
-    if (over) { console.log(`STOP: ${over[0]} at ${over[1]}%`); process.exit(2); }
+    const stop = limitStop(now);
+    if (stop) { console.log(stop); process.exit(2); }
   };
   if (!rows.some((r) => r.case === "seed")) {
     makeWorktree(dir);
@@ -370,6 +380,8 @@ await loadPrice();
 const results = existsSync(RESULTS) ? JSON.parse(readFileSync(RESULTS, "utf8")) : [];
 const start = limits();
 console.log("limits at start", start);
+const initialStop = limitStop(start);
+if (initialStop) { console.log(initialStop); process.exit(2); }
 for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS).filter((n) => !TASKS[n].trap)) {
   for (const arm of ARMS) {
     if (results.some((r) => r.task === name && r.arm === arm)) continue;
@@ -385,9 +397,8 @@ for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object
     const now = limits();
     console.log("limits", now);
     // Only the providers this run uses can stop it.
-    const used = new Set(ARMS.map((a) => a.replace("orteca-", "")));
-    const over = Object.entries(now).find(([k, v]) => used.has(k.split(" ")[0]) && v >= (CAPS[k] ?? CAP_DEFAULT));
-    if (over) { console.log(`STOP: ${over[0]} at ${over[1]}% (started ${start[over[0]]}%)`); process.exit(2); }
+    const stop = limitStop(now);
+    if (stop) { console.log(`${stop} (started at ${JSON.stringify(start)})`); process.exit(2); }
   }
 }
 console.log("done");

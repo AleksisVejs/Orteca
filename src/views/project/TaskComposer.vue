@@ -1,15 +1,62 @@
 <script setup lang="ts">
-import { inject } from "vue";
+import { computed, inject, onMounted, ref } from "vue";
+import Memory from "./Memory.vue";
 import { PROJECT } from "./state";
+import { isAppError, memory } from "../../api";
+import type { MemoryState } from "../../types";
 
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
   task, picks, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
   schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
   installed, provider, providerPicked, pickedFor, previewing, preview, previewError,
-  limitWarning, alternative, switchTo, runError, providerError, helpersPending, view,
-  MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git,
+  limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
+  remembering, rememberText, rememberError, remember,
+  MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git, history,
 } = inject(PROJECT)!;
+
+// A run inherits only these explicit rules: global first, then this project.
+// Keep the receipt beside Run so the user can check the actual payload before
+// spending an agent call.
+const memories = ref<MemoryState>({ items: [], limit: 1000, tokens: 0 });
+const memoryError = ref("");
+async function loadMemory() {
+  try {
+    memories.value = await memory(opened.project.path);
+    memoryError.value = "";
+  } catch (err) {
+    memoryError.value = isAppError(err) ? err.message : String(err);
+  }
+}
+onMounted(loadMemory);
+
+// A compact local receipt, not a benchmark claim: it groups only by route and
+// provider, while task difficulty and mode can still vary within a row.
+const routeHistory = computed(() => {
+  const rows = history.value.filter((run) => run.status === "done" && run.routeKind && run.provider && run.uncachedTokens !== null);
+  const groups = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const key = `${row.routeKind}:${row.provider}`;
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  return [...groups.entries()].map(([key, runs]) => {
+    const median = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? 0;
+    const [route, provider] = key.split(":");
+    return {
+      key,
+      route,
+      provider,
+      runs: runs.length,
+      tokens: median(runs.map((run) => run.uncachedTokens!)),
+      duration: median(runs.map((run) => run.durationMs ?? 0).filter(Boolean)),
+    };
+  }).sort((a, b) => b.runs - a.runs || a.key.localeCompare(b.key));
+});
+
+function formatDuration(milliseconds: number) {
+  const seconds = Math.round(milliseconds / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
 </script>
 
 <template>
@@ -56,6 +103,14 @@ const {
         </li>
       </ul>
       <p v-if="attachError" class="attach-error">{{ attachError }}</p>
+      <p v-if="memoryError" class="attach-error" role="status">Memory could not be read: {{ memoryError }}</p>
+      <div v-if="rememberText !== null" class="remember" role="group" aria-label="Save to memory">
+        <span>Save “{{ rememberText }}” to memory for:</span>
+        <button class="btn" @click="remember(false)">This project</button>
+        <button class="btn" @click="remember(true)">All projects</button>
+        <button class="link" @click="rememberText = null">Cancel</button>
+        <p v-if="rememberError" class="attach-error" role="alert">{{ rememberError }}</p>
+      </div>
 
       <div class="controls">
         <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
@@ -65,9 +120,14 @@ const {
         <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
         </button>
+        <Memory :path="opened.project.path" :pop-id="domId('memory')" button-class="icon" @changed="loadMemory">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 2.5h8v11L8 10.8 4 13.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+          Memory
+          <span v-if="memories.items.length" class="count" :title="`${memories.items.length} rule${memories.items.length === 1 ? '' : 's'} · ~${memories.tokens.toLocaleString()} tokens, sent with every stage`">{{ memories.items.length }}</span>
+        </Memory>
         <span class="shortcut note">Ctrl + Enter</span>
         <button class="btn primary run" :disabled="!canRun" title="Run task (Ctrl+Enter)" @click="run()">
-          Run task
+          {{ remembering ? "Remember" : "Run task" }}
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3 8h10M8 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
       </div>
@@ -184,6 +244,7 @@ const {
           {{ preview.provider }}’s {{ limitWarning.window.label }} limit is {{ Math.round(limitWarning.window.usedPercent) }}% used<template v-if="limitWarning.resets">, resets {{ limitWarning.resets }}</template>.
           This takes at least {{ limitWarning.calls }} AI {{ limitWarning.calls === 1 ? "call" : "calls" }}, so it might not finish.
           <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
+          <button v-if="limitWarning.startsAt && canRun" class="link" @click="waitForReset(limitWarning.startsAt)">start it after the reset</button>
         </span>
         <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
         <!-- Two agents editing one folder is allowed, but what each one changed
@@ -196,21 +257,79 @@ const {
       <p v-else-if="previewError" class="preview missing" role="status">Preview unavailable: {{ previewError }}</p>
     </section>
 
+    <details v-if="routeHistory.length" class="route-history">
+      <summary>
+        Past runs in this project
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </summary>
+      <table>
+        <thead><tr><th>Route</th><th>AI</th><th class="num">Runs</th><th class="num">Median tokens</th><th class="num">Median time</th></tr></thead>
+        <tbody>
+          <tr v-for="row in routeHistory" :key="row.key">
+            <td class="cap">{{ row.route }}</td>
+            <td class="cap">{{ row.provider }}</td>
+            <td class="num">{{ row.runs }}</td>
+            <td class="num">{{ row.tokens.toLocaleString() }}</td>
+            <td class="num">{{ row.duration ? formatDuration(row.duration) : "— not recorded" }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">Finished runs only. Tokens leave out cached ones. A description of what happened, not a benchmark.</p>
+    </details>
+
+    <p v-if="waiting" class="note" role="status">
+      Waiting for {{ waiting.provider }}’s limit to reset: “{{ waiting.prompt.slice(0, 80) }}” starts {{ formatWhen(waiting.at) }}.
+      Keep Orteca open.
+      <button class="link" @click="cancelWait">Cancel</button>
+    </p>
     <p v-if="runError" class="missing">{{ runError }}</p>
-    <p v-else-if="!installed.length && !providerError && !helpersPending" class="missing">
+    <p v-else-if="!installed.length && !providerError && !agentsPending" class="missing">
       No AI helper is set up yet, so there is nothing to run.
-      <button class="link" @click="view = 'helpers'">Set one up</button>
+      <button class="link" @click="view = 'agents'">Set one up</button>
     </p>
   </section>
 </template>
 
 <style scoped>
+.remember {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  font-size: 12px;
+}
 .composer {
   container-type: inline-size;
   width: 100%;
   max-width: 680px;
   margin: auto;
 }
+/* Secondary, outside the card: it describes past runs, not this one. */
+.route-history { margin-top: 32px; font-size: 12px; }
+.route-history summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  padding: 4px 0;
+  color: var(--text-dim);
+  font-weight: 500;
+  list-style: none;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.route-history summary::-webkit-details-marker { display: none; }
+.route-history summary:hover { color: var(--text); }
+.route-history[open] summary svg { transform: rotate(180deg); }
+.route-history table { width: 100%; margin-top: 8px; border-collapse: collapse; text-align: left; font-variant-numeric: tabular-nums; }
+.route-history th, .route-history td { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.route-history th + th, .route-history td + td { padding-left: 12px; }
+.route-history th { color: var(--text-faint); font-weight: 400; }
+.route-history td { color: var(--text-dim); }
+.route-history .cap { text-transform: capitalize; }
+.route-history .num { text-align: right; }
+.route-history > .note { margin: 10px 0 0; }
 .hero {
   margin: 0;
   font-size: 20px;
@@ -290,7 +409,7 @@ textarea:focus {
   gap: 8px;
   padding: 8px 12px 12px;
 }
-.icon,
+.controls :deep(.icon),
 .options {
   display: inline-flex;
   align-items: center;
@@ -301,7 +420,7 @@ textarea:focus {
   font-size: 12px;
   transition: background 120ms ease, color 120ms ease;
 }
-.icon {
+.controls :deep(.icon) {
   border-radius: var(--r-sm);
 }
 .options {
@@ -326,7 +445,18 @@ textarea:focus {
 .shortcut {
   margin-left: auto;
 }
-.icon:hover,
+.count {
+  min-width: 18px;
+  padding: 0 5px;
+  background: var(--surface-2);
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.controls :deep(.icon:hover),
 .options:hover,
 .options[aria-expanded="true"] {
   background: var(--surface-2);

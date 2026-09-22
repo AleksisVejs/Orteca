@@ -23,7 +23,7 @@ function activity() {
   const project = { result: ref(null), lines: ref([]), activeRun: ref({ key: Symbol() }), historyDetail: ref(null), opened: { project: { path: 'C:/repo' } } };
   const scope = effectScope();
   const state = scope.run(() => vm.runInNewContext('(() => {' + ts.transpile(source, { target: ts.ScriptTarget.ES2022 }) + '; return { filter, lines, log, following, unread, onScroll, follow }; })()', {
-    computed, ref, watch, nextTick, defineProps: () => ({}), inject: () => project, PROJECT: Symbol(),
+    computed, ref, watch, nextTick, onMounted: () => {}, defineProps: () => ({}), inject: () => project, PROJECT: Symbol(),
     parseHistoryPatch: () => ({ files: [] }), visiblePath: value => value, activityPatch: () => ({}),
   }));
   return { state, project, stop: () => scope.stop() };

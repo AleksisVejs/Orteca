@@ -470,6 +470,7 @@ test('provider actions become plain-English live updates', async () => {
   assert.equal(state.describeVerdict('{"checks":[],"verdict":"fail"}'), 'Checks didn’t pass: nothing was run');
   assert.equal(state.describeVerdict('{"checks":[{"command":"npm test","passed":true,"output":"ok"}],"verdict":"pass"}'), 'npm test passed');
   assert.equal(state.describeVerdict('plain words'), null);
+  assert.equal(state.describeVerdict('{"objective":"Add a queue","constraints":[],"implementation_steps":["Read state.ts","Add the timer"],"risks":[]}'), 'Plan: Add a queue\n1. Read state.ts\n2. Add the timer');
   assert.equal(state.activityFor({ kind: 'text', data: 'I found the issue.' }).text, 'Thinking through the request');
   const file = 'C:\\Users\\me\\My App\\app\\Models\\User.php';
   assert.deepEqual({ ...state.toolActivity('Read', file) }, { text: 'Reading', file });
@@ -1084,6 +1085,40 @@ test('a run that ran out of plan usage carries on with the other CLI by itself, 
 
   state.result.value = { ...finished, status: 'failed', failureKind: 'crashed' };
   assert.equal(state.fallback.value, null, 'a crash is not a reason to switch');
+});
+
+test('a request can wait for its plan to reset, and a spent run can carry on then', async () => {
+  const timers = [];
+  const sent = [];
+  const resets = 2000000000;
+  const spent = { ...finished, status: 'failed', failure: 'usage limit is used up.', failureKind: 'usageLimit', worktree: null };
+  const { state } = await projectView({
+    providerLimits: async () => [{ id: 'codex', windows: [{ label: '5-hour', usedPercent: 100, resetsAt: resets, resetsText: null }], unavailable: null }],
+    startTask: async (path, prompt) => { sent.push(prompt); return spent; },
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout: () => {},
+  });
+  await settle();
+  state.preview.value = { provider: 'codex', route: oneCall };
+  assert.equal(state.limitWarning.value.startsAt, resets * 1000);
+  state.task.value = 'rename it';
+  state.waitForReset(state.limitWarning.value.startsAt);
+  const first = timers.at(-1);
+  assert.ok(first.ms > resets * 1000 - Date.now(), 'not before the reset');
+  assert.equal(state.task.value, '', 'the composer is free for the next thing');
+  assert.equal(state.waiting.value.prompt, 'rename it');
+  first.fn();
+  await settle();
+  assert.deepEqual(sent, ['rename it']);
+  assert.equal(state.waiting.value, null);
+
+  assert.equal(state.retryAt.value, resets * 1000, 'the spent run can wait for the same reset');
+  state.task.value = 'a draft';
+  state.waitForReset(state.retryAt.value, state.activeRun.value);
+  timers.at(-1).fn();
+  await settle();
+  assert.deepEqual(sent, ['rename it', 'rename it']);
+  assert.equal(state.task.value, 'a draft', 'carrying on leaves the composer alone');
 });
 
 test('a reply that hands off to the other CLI stays in its task', async () => {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref, watch, nextTick } from "vue";
+import { computed, inject, onMounted, ref, watch, nextTick } from "vue";
 import FileLink from "./FileLink.vue";
 import { PROJECT } from "./state";
 import type { ActivityLine } from "./state";
@@ -45,10 +45,12 @@ watch(() => (props.items ?? project.lines.value).at(-1), (next, previous) => {
   else unread.value = true;
 }, { flush: "post" });
 watch(() => props.items ?? project.activeRun.value?.key ?? project.historyDetail.value?.id, () => { following.value = true; unread.value = false; filter.value = "all"; });
+// A live log opened part-way starts at its latest line, like one that was open all along.
+onMounted(() => { if (!finished.value) follow(); });
 </script>
 
 <template>
-  <div class="activity-controls" role="group" aria-label="Filter activity">
+  <div v-if="allLines.length" class="activity-controls" role="group" aria-label="Filter activity">
     <button v-for="option in filters" :key="option.id" class="btn" :aria-pressed="filter === option.id" @click="filter = option.id">{{ option.label }}</button>
     <button v-if="unread && !finished" class="btn new-activity" @click="follow">New activity ↓</button>
   </div>

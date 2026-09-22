@@ -19,12 +19,15 @@ is the only place colour, radius and spacing are defined.
   finished, a real cost was measured, a saving was computed from a baseline.
   Never use green for decoration, for a heading, or for a number the backend
   could not verify.
-- **Blue (`--info`) means in flight, and only that** — the progress bar while a
-  run is streaming. It is never a link colour, never a button fill.
+- **Blue (`--info`) means in flight, and only that** — a live run's dot and its
+  current stage. It is never a link colour, never a button fill.
 - `--warn` is for consent, risk and missing prerequisites (untrusted project,
   CLI not installed, uncommitted changes). `--err` is for a failure that
   already happened.
-- Backgrounds are flat. No gradients, no glass, no blur. Primary actions use
+- Backgrounds are flat. No gradients, no glass, no blur. The one exception is
+  Launch's faint dot grid (`--dots`), which brightens to `--dots-lit` in a soft
+  circle under the cursor and across the whole grid while a folder is held over
+  the window. Primary actions use
   `--button` with dark text; neutral `--focus` rings identify keyboard focus.
 
 ## The mark
@@ -81,10 +84,10 @@ is the only place colour, radius and spacing are defined.
 - Icons are inline SVG in the file that needs them. No icon package.
 - The Project screen is a shell (`views/Project.vue`: sidebar, top bar) around
   one page at a time from `views/project/`: composer, live run, result, past
-  task, AI helpers. All state lives in `views/project/state.ts` and the pages
+  task, Agents. All state lives in `views/project/state.ts` and the pages
   `inject` it. A page renders; it does not own logic.
 - The sidebar holds only destinations that exist: New task, one row per live or
-  just-finished run, AI helpers, recent tasks, switch project. No entry for a
+  just-finished run, Agents, recent tasks, switch project. No entry for a
   feature that is not wired up. Runs are concurrent, so a row per run is the
   only honest listing; each carries its own dot, its own label taken from what
   was asked, and opens its own stream or result.
@@ -113,10 +116,12 @@ is the only place colour, radius and spacing are defined.
 - The composer separates writing and attachments from task settings. The AI,
   approach and working location stay visible while the settings are collapsed.
   “Run task” is the primary action, with a Ctrl+Enter hint on wider windows.
-- Launch uses a centered wordmark, a one-click "Continue" for the newest recent
-  project (with its branch and age), a smaller "Open another project" (Ctrl+O,
-  or drop a folder on the window), one merged project list (open ones marked with
-  a dot, arrow keys walk it) and a line of CLI status. Projects stay open while
+- Launch reads top to bottom: a centered wordmark; "Last opened" with a
+  one-click "Continue" for the newest recent project (with its branch and age);
+  "Projects", one merged list (open ones marked with a dot, arrow keys walk it)
+  whose last row opens a folder (Ctrl+O, or drop a folder on the window) — on
+  first run that row stands alone under "Get started"; and a slim footer with CLI
+  status on the left and Memory on the right. Projects stay open while
   another is on screen, so an open row says how many tasks it has running and
   refuses to close while busy. Switching project closes nothing. The workspace has a 240px sidebar (208px in smaller desktop
   windows), a 44px pane header and a compact status bar. Task history nests
@@ -192,9 +197,13 @@ draggable divider, and `Ctrl+\`` shows and hides it.
 
 - Transitions are 120ms ease, on colour and background only. Nothing moves,
   slides or bounces on mount.
-- The only looping animations in the app are the run progress bar and the
-  `Orb` (the dotted sphere in a live run's status pill). Both stop under
-  `prefers-reduced-motion`; the orb then shows one still frame.
+- The only looping animation in the app is the `Orb` (the dotted sphere in a
+  live run's status pill). Its mood follows the current activity: idle,
+  thinking, reading, editing, checking, failed, stopping. It stops under
+  `prefers-reduced-motion` and shows one still frame per mood.
+- A delivered steering message flies from the input into the orb, which
+  swells and flashes as it takes it. Only a delivered one; none under reduced
+  motion.
 - Every interactive element is a real `<button>` / `<a>` / `<input>`. Focus
   uses the global `:focus-visible` ring; never remove an outline without
   replacing it.
@@ -211,10 +220,17 @@ the mock's chrome for features that are not wired up yet.
 
 ## Task running and results
 
-- Running tasks lead with status and the request, then the orb, current activity
-  and Stop. The progress bar is indeterminate; it never claims a percentage.
-- The latest AI response has its own readable panel; earlier updates remain
-  available in a disclosure. Tool activity and steering follow below.
+- A running task reads as one thread. Every message the user sent carries the
+  same small "You" caption and the same 14px weight, earlier turns and the
+  current one alike, so nothing jumps when a run finishes.
+- Under the request sits one status card: the orb, the provider and current
+  stage, the current activity, the route's steps (running in `--info`, ran,
+  upcoming) and Stop. The provider is named there and nowhere else on the page.
+  Nothing claims a percentage.
+- What the AI has said streams straight under that card as part of the turn,
+  not in its own panel; earlier updates sit above it in a disclosure. Activity
+  is a closed disclosure below. The steer box is pinned to the bottom of the
+  pane, like a chat box.
 - Completed and saved tasks share a header with rerun and new-task actions,
   followed by Summary, Files, Details and Activity. Details show recorded
   execution steps, labelled usage, and direct links to changes and activity.

@@ -13,20 +13,15 @@
   font-size: 14px;
   font-weight: 600;
 }
+/* Same size as every earlier message in the thread, so a finished run doesn't jump when it lands. */
 .prompt {
   margin: 12px 0 0;
-  font-size: 20px;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: -0.02em;
   white-space: pre-line;
   overflow-wrap: anywhere;
 }
 .prompt.long {
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 1.5;
-  letter-spacing: 0;
-  color: var(--text-dim);
   max-height: 7.5em;
   overflow-y: auto;
 }
@@ -276,6 +271,10 @@
 .route .mono { display: block; font-size: 11px; }
 .step-number { display: grid; place-items: center; width: 28px; height: 28px; flex-shrink: 0; border: 1px solid var(--border-strong); border-radius: 999px; font-variant-numeric: tabular-nums; }
 .reason { margin: 16px 0 0; line-height: 1.6; }
+.route-context { margin-top: 12px; font-size: 12px; }
+.route-context p { margin: 8px 0 0; }
+.route-context ul { margin: 8px 0 0; padding-left: 18px; }
+.route-context li { margin-top: 4px; overflow-wrap: anywhere; }
 .tiles { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); border-radius: var(--r); }
 .tiles > div { padding: 18px; gap: 10px; }
 .detail-links { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }

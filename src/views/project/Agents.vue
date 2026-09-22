@@ -10,11 +10,11 @@ const {
 </script>
 
 <template>
-  <h2 class="title">AI helpers</h2>
+  <h2 class="title">Agents</h2>
   <p class="lede">The coding tools Orteca runs for you. It needs at least one that is set up and signed in.</p>
 
-  <div class="helper-refresh"><span class="note">{{ limitsCheckedAt ? 'Usage checked ' + new Date(limitsCheckedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'Usage has not been checked yet' }}</span><button class="btn" :disabled="limitsLoading" @click="loadLimits">{{ limitsLoading ? 'Refreshing…' : 'Refresh allowance' }}</button></div>
-  <p v-if="providerError" class="missing">Could not check the AI helpers.</p>
+  <div class="agents-refresh"><span class="note">{{ limitsCheckedAt ? 'Usage checked ' + new Date(limitsCheckedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'Usage has not been checked yet' }}</span><button class="btn" :disabled="limitsLoading" @click="loadLimits(true)">{{ limitsLoading ? 'Refreshing…' : 'Refresh allowance' }}</button></div>
+  <p v-if="providerError" class="missing">Could not check the agents.</p>
   <ul v-else class="card providers">
     <li v-for="p in rows" :key="p.id">
       <span class="dot" :class="{ ok: p.path && (p.auth === 'subscription' || p.auth === 'apiKey') }" aria-hidden="true"></span>
@@ -117,7 +117,7 @@ const {
   gap: 10px;
   margin: 12px 0 0;
 }
-.helper-refresh { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.agents-refresh { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .facts { flex-direction: column; gap: 8px; }
 .allowance { display: flex; flex-wrap: wrap; gap: 16px; }
 .allowance-window { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }

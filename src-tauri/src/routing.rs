@@ -122,16 +122,18 @@ impl Tier {
             // more than the difference.
             (ProviderId::Claude, Self::Cheapest) => ("sonnet", "low"),
             (ProviderId::Claude, Self::Standard) => ("sonnet", "high"),
-            // Opus 5, not Fable 5.1: twice the price for a lead that only shows
-            // on the hardest benchmarks.
+            // Opus (5.5 since 2026-09-22), not Fable 5.1: 2.5x the price for a
+            // lead that only shows on the hardest benchmarks.
             (ProviderId::Claude, Self::Deep) => ("opus", "high"),
             // Luna low planned the validation refactor and fixed the duration
-            // regression with full hidden-check quality (§4.3.6).
-            (ProviderId::Codex, Self::Cheapest) => ("gpt-5.6-luna", "low"),
-            (ProviderId::Codex, Self::Standard) => ("gpt-5.6-terra", "medium"),
-            // Sol, not Astra: half the price, and Astra has no SWE-bench Pro
-            // score yet.
-            (ProviderId::Codex, Self::Deep) => ("gpt-5.6-sol", "high"),
+            // regression with full hidden-check quality (§4.3.6, on 5.6 Luna).
+            (ProviderId::Codex, Self::Cheapest) => ("gpt-6-luna", "low"),
+            // GPT-6 Sol at medium, not a GPT-6 Terra (there is none): it costs
+            // what 5.6 Terra did per input token and less per output token.
+            (ProviderId::Codex, Self::Standard) => ("gpt-6-sol", "medium"),
+            // Sol, not Astra: a fifth of the price, and Astra has no SWE-bench
+            // Pro score yet.
+            (ProviderId::Codex, Self::Deep) => ("gpt-6-sol", "high"),
         };
         ModelChoice { model, effort }
     }
@@ -413,7 +415,7 @@ impl Route {
     /// without putting Astra on the user's allowance.
     pub fn work_model(&self, id: ProviderId) -> Option<ModelChoice> {
         let schema = (id == ProviderId::Codex && self.signals.schema_change).then_some(ModelChoice {
-            model: "gpt-5.6-sol",
+            model: "gpt-6-sol",
             effort: "medium",
         });
         // NAV_EFFORT runs Implement and Fix at another effort, for the
@@ -888,7 +890,11 @@ fn resolve<'a>(from: &str, spec: &str, tracked: &HashSet<&'a str>, all: &'a [Str
     } else {
         vec![spec.to_string()]
     };
-    const ENDINGS: &[&str] = &["", ".ts", ".js", ".vue", ".tsx", ".jsx", "/index.ts", "/index.js"];
+    const ENDINGS: &[&str] = &[
+        "", ".ts", ".js", ".vue", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs",
+        "/index.ts", "/index.js", "/index.vue", "/index.tsx", "/index.jsx", "/index.mts", "/index.cts",
+        "/index.mjs", "/index.cjs",
+    ];
     bases
         .iter()
         .flat_map(|base| ENDINGS.iter().map(move |end| format!("{base}{end}")))
@@ -1145,9 +1151,35 @@ pub fn classify(prompt: &str, repo: &RepoSignals) -> (Signals, Vec<String>) {
             .map_or_else(|| text.contains("lint"), |job| job.lint),
         blast_radius,
         prior_failures: repo.prior_failures,
-        intent: repo.intent,
+        // Without the classifier's reading, a plain question still gets an
+        // answer: the preview never calls it, and "what model are you" showed
+        // an edit and a test run.
+        intent: repo.intent.or_else(|| looks_like_question(&text).then_some(Intent::Question)),
     };
     (signals, hits)
+}
+
+/// A prompt that asks and orders nothing. English only, like every keyword
+/// here; any change verb means work, since a wrong Answer route edits nothing
+/// the user wanted edited.
+fn looks_like_question(text: &str) -> bool {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let opens = words.first().is_some_and(|w| {
+        ["what", "what's", "why", "how", "where", "which", "who", "when", "explain", "is", "are", "does", "do"]
+            .contains(w)
+    });
+    (opens || text.trim_end().ends_with('?'))
+        && !words.iter().any(|w| {
+            [
+                "fix", "add", "change", "rename", "update", "remove", "delete", "implement", "make",
+                "create", "refactor", "write", "move", "replace", "set", "bump", "correct", "reword",
+                "translate", "build", "run",
+            ]
+            .contains(w)
+        })
 }
 
 /// A prompt the keyword router reads as well as the classify call would: short
@@ -1564,6 +1596,9 @@ pub fn brief(
     prompt: &str,
     constraints: &[String],
     carried: &[StageNote],
+    // The Fix resumes the session that wrote the change, which already holds
+    // the task and the paths; sending them again is paying for them twice.
+    resumed: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -1630,11 +1665,13 @@ pub fn brief(
         Stage::Implement => {}
     }
 
-    out.push_str("Task:\n");
-    out.push_str(prompt.trim());
-    out.push('\n');
+    if !resumed {
+        out.push_str("Task:\n");
+        out.push_str(prompt.trim());
+        out.push('\n');
+    }
 
-    if !route.candidate_paths.is_empty() {
+    if !resumed && !route.candidate_paths.is_empty() {
         out.push_str(if stage == Stage::Answer {
             // Naming the files as the user's makes the model review them
             // ("this file is about...") instead of answering. Saying what not to
@@ -1890,6 +1927,22 @@ mod tests {
     }
 
     #[test]
+    fn module_links_resolve_modern_extensions_and_index_files() {
+        let paths = vec![
+            "src/features/checkout/client.mts".to_string(),
+            "src/features/inbox/index.vue".to_string(),
+            "src/features/legacy/index.cjs".to_string(),
+        ];
+        let tracked: HashSet<&str> = paths.iter().map(String::as_str).collect();
+        assert_eq!(
+            resolve("src/pages/checkout.ts", "../features/checkout/client", &tracked, &paths),
+            ["src/features/checkout/client.mts"]
+        );
+        assert_eq!(resolve("src/pages/home.ts", "../features/inbox", &tracked, &paths), ["src/features/inbox/index.vue"]);
+        assert_eq!(resolve("src/pages/home.ts", "../features/legacy", &tracked, &paths), ["src/features/legacy/index.cjs"]);
+    }
+
+    #[test]
     fn the_brief_says_what_the_first_files_hold() {
         let symbol = |name: &str, kind: &str| crate::codemap::Symbol { name: name.into(), kind: kind.into(), line: 1 };
         let controller = FileFacts {
@@ -1920,7 +1973,7 @@ mod tests {
             ..Default::default()
         };
         let r = route("fix the quote controller", Mode::Balanced, &signals);
-        let text = brief(&r, r.stages[0], "fix the quote controller", &[], &[]);
+        let text = brief(&r, r.stages[0], "fix the quote controller", &[], &[], false);
         assert!(
             text.contains("- app/Http/Controllers/QuoteController.php: class QuoteController (index, show); enum Status; functions helper\n"),
             "{text}"
@@ -1976,6 +2029,7 @@ mod tests {
             "make the header bold",
             &[],
             &[],
+            false,
         );
         assert!(brief.contains("do not write the patch"), "{brief}");
     }
@@ -2085,6 +2139,7 @@ mod tests {
             "Fix the typo in the README heading",
             &[],
             &[],
+            false,
         );
         assert!(
             brief.contains("one focused check"),
@@ -2122,6 +2177,7 @@ mod tests {
             "Fix the typo in the README heading",
             &[],
             &[],
+            false,
         );
         assert!(
             text.contains("Do not run those commands")
@@ -2233,12 +2289,12 @@ mod tests {
         assert_eq!(
             lean.review_model(ProviderId::Codex)
                 .map(|c| (c.model, c.effort)),
-            Some(("gpt-5.6-terra", "high"))
+            Some(("gpt-6-sol", "high"))
         );
         assert_eq!(
             r.review_model(ProviderId::Codex)
                 .map(|c| (c.model, c.effort)),
-            Some(("gpt-5.6-sol", "high"))
+            Some(("gpt-6-sol", "high"))
         );
     }
 
@@ -2254,9 +2310,9 @@ mod tests {
             balanced_route
                 .work_model(ProviderId::Codex)
                 .map(|choice| (choice.model, choice.effort)),
-            Some(("gpt-5.6-sol", "medium"))
+            Some(("gpt-6-sol", "medium"))
         );
-        assert!(brief(&balanced_route, Stage::Implement, prompt, &[], &[])
+        assert!(brief(&balanced_route, Stage::Implement, prompt, &[], &[], false)
             .contains("migration/schema agreement"));
 
         let local = RepoSignals {
@@ -2269,7 +2325,7 @@ mod tests {
             efficient
                 .work_model(ProviderId::Codex)
                 .map(|choice| (choice.model, choice.effort)),
-            Some(("gpt-5.6-sol", "medium"))
+            Some(("gpt-6-sol", "medium"))
         );
     }
 
@@ -2299,7 +2355,7 @@ mod tests {
         assert_eq!(
             lean.plan_model(ProviderId::Codex)
                 .map(|c| (c.model, c.effort)),
-            Some(("gpt-5.6-terra", "low"))
+            Some(("gpt-6-sol", "low"))
         );
         assert_eq!(
             r.plan_model(ProviderId::Codex),
@@ -2323,6 +2379,18 @@ mod tests {
             escalated.stages,
             [Stage::Plan, Stage::Implement, Stage::Review]
         );
+    }
+
+    /// No reading (the preview, a failed call): a plain question is still
+    /// answered, and a question that orders a change is still work.
+    #[test]
+    fn keywords_alone_answer_a_plain_question() {
+        let kind = |prompt| route(prompt, Mode::Balanced, &repo(REPO)).kind;
+        assert_eq!(kind("what model are you"), RouteKind::Answer);
+        assert_eq!(kind("does checkout retry a failed payment?"), RouteKind::Answer);
+        assert_ne!(kind("can you fix the typo?"), RouteKind::Answer);
+        assert_ne!(kind("why is login slow, make it faster"), RouteKind::Answer);
+        assert_ne!(kind("rename the button"), RouteKind::Answer);
     }
 
     /// The small model's reading picks the route in any language, and the
@@ -2419,7 +2487,7 @@ mod tests {
         );
         let standard = balanced("make the header bold", REPO);
         assert_eq!(standard.budget.preferred_tier, Tier::Standard);
-        let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[]);
+        let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[], false);
         assert!(fix.contains("did not pass") && fix.contains("runs again after this call"));
         assert!(
             !fix.contains("agent call"),
@@ -2516,12 +2584,18 @@ mod tests {
                 "verdict": "fail"
             })),
         };
-        let fix = brief(&r, Stage::Fix, "task", &[], &[failed]);
+        let fix = brief(&r, Stage::Fix, "task", &[], &[failed.clone()], false);
         // The command a passing check ran still says what must not break.
         assert!(fix.contains("cargo test") && !fix.contains("passing-suite-noise"));
         // Both ends of the failure survive; the middle does not.
         assert!(fix.contains("first-error") && fix.contains("last-error"));
         assert!(fix.contains("bytes cut") && !fix.contains(&noise));
+
+        // A Fix resuming the writing session is told the failure and what the
+        // user said, not the task and paths that session already holds.
+        let resumed = brief(&r, Stage::Fix, "the whole long task", &["keep it small".into()], &[failed], true);
+        assert!(!resumed.contains("the whole long task") && !resumed.contains("Start here"));
+        assert!(resumed.contains("first-error") && resumed.contains("keep it small"));
     }
 
     #[test]
@@ -2569,9 +2643,9 @@ mod tests {
         let r = route("fix the quote controller", Mode::Balanced, &signals);
         assert_eq!(r.prior_notes, ["Task: earlier 1"]);
         assert!(r.prior_notes_why[0].contains("task #1") && r.prior_notes_why[0].contains("QuoteController"));
-        let text = brief(&r, Stage::Implement, "fix the quote controller", &[], &[]);
+        let text = brief(&r, Stage::Implement, "fix the quote controller", &[], &[], false);
         assert!(text.contains("Task: earlier 1") && !text.contains("earlier 2"));
-        assert!(!brief(&r, Stage::Verify, "fix the quote controller", &[], &[]).contains("earlier 1"));
+        assert!(!brief(&r, Stage::Verify, "fix the quote controller", &[], &[], false).contains("earlier 1"));
 
         let r = route("rename the login page label", Mode::Balanced, &signals);
         assert!(r.prior_notes.is_empty(), "no shared file, no history");
@@ -2582,7 +2656,7 @@ mod tests {
     #[test]
     fn a_brief_names_paths_and_pastes_no_contents() {
         let r = balanced("fix the run.rs typo", REPO);
-        let text = brief(&r, Stage::Implement, "fix the run.rs typo", &[], &[]);
+        let text = brief(&r, Stage::Implement, "fix the run.rs typo", &[], &[], false);
         assert!(
             text.contains("src/run.rs"),
             "the candidate path was not named: {text}"
@@ -2609,6 +2683,7 @@ mod tests {
                 "redesign the storage subsystem",
                 &constraints,
                 &[],
+                false,
             );
             for c in &constraints {
                 assert!(text.contains(c.as_str()), "{} lost `{c}`", stage.name());
@@ -2633,6 +2708,7 @@ mod tests {
             "redesign the storage subsystem",
             &[],
             &[note],
+            false,
         );
         assert!(
             text.contains("no structured artifact"),
@@ -2681,6 +2757,7 @@ mod tests {
             "task",
             &[],
             std::slice::from_ref(&plan),
+            false,
         );
         assert!(implement.contains("private-plan-marker"));
         let fix = brief(
@@ -2689,6 +2766,7 @@ mod tests {
             "task",
             &[],
             &[plan.clone(), implementation.clone(), failed.clone()],
+            false,
         );
         assert!(
             fix.contains("boom")
@@ -2701,6 +2779,7 @@ mod tests {
             "task",
             &[],
             &[plan, implementation, failed],
+            false,
         );
         assert!(
             !review.contains("private-plan-marker")

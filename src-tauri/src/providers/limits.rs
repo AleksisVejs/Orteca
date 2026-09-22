@@ -52,6 +52,11 @@ const CLAUDE_ARGS: &[&str] = &[
     "--setting-sources",
     "project,local",
     "--strict-mcp-config",
+    // The same two the classify call runs with: no tool schemas billed on a
+    // call that uses none, and no session file left behind for each reading.
+    "--tools",
+    "",
+    "--no-session-persistence",
     "--max-turns",
     "1",
     // Newer CLIs send `/usage` to the model; keep that call on the cheapest one.
@@ -65,12 +70,15 @@ const CLAUDE_ARGS: &[&str] = &[
 /// has just finished has already been told what `/usage` would cost another
 /// haiku call and two seconds of CLI start-up to ask. The UI polls limits on a
 /// timer, so that call was being paid for over and over beside runs that
-/// answered it for free.
+/// answered it for free. A reading Orteca had to ask for is kept here too:
+/// the timer asking once a minute was sixty haiku calls an hour against the
+/// very allowance it reports.
 static STREAMED: Mutex<Option<(Instant, Vec<Window>)>> = Mutex::new(None);
 
-/// How long a streamed reading stands in for a fresh one. The windows it
-/// describes roll over five hours and seven days; minutes do not move them.
-const STREAMED_FOR: Duration = Duration::from_secs(5 * 60);
+/// How long a kept reading stands in for a fresh one. The windows it
+/// describes roll over five hours and seven days; minutes do not move them,
+/// and a run in between refreshes it for free.
+const STREAMED_FOR: Duration = Duration::from_secs(15 * 60);
 
 /// Keep a reading a run's stream carried. Called with every raw
 /// `rate_limit_event`, whatever its status.
@@ -79,9 +87,13 @@ pub fn remember(id: ProviderId, v: &Value) {
         return;
     }
     if let Some(windows) = parse_claude_event(v) {
-        if let Ok(mut latest) = STREAMED.lock() {
-            *latest = Some((Instant::now(), windows));
-        }
+        keep(windows);
+    }
+}
+
+fn keep(windows: Vec<Window>) {
+    if let Ok(mut latest) = STREAMED.lock() {
+        *latest = Some((Instant::now(), windows));
     }
 }
 
@@ -95,14 +107,15 @@ fn streamed(id: ProviderId) -> Option<Vec<Window>> {
     (at.elapsed() < STREAMED_FOR).then(|| windows.clone())
 }
 
-pub async fn read(id: ProviderId) -> Limits {
+/// `fresh` is the user asking: it skips the kept reading and pays for a new one.
+pub async fn read(id: ProviderId, fresh: bool) -> Limits {
     let none = |why: String| Limits {
         id,
         windows: Vec::new(),
         unavailable: Some(why),
     };
     // A run just told us. Asking again would start a process to be told the same.
-    if let Some(windows) = streamed(id) {
+    if let Some(windows) = streamed(id).filter(|_| !fresh) {
         return Limits {
             id,
             windows,
@@ -121,11 +134,16 @@ pub async fn read(id: ProviderId) -> Limits {
     })
     .await;
     match answer {
-        Ok(Ok(windows)) => Limits {
-            id,
-            windows,
-            unavailable: None,
-        },
+        Ok(Ok(windows)) => {
+            if id == ProviderId::Claude {
+                keep(windows.clone());
+            }
+            Limits {
+                id,
+                windows,
+                unavailable: None,
+            }
+        }
         Ok(Err(why)) => none(why),
         Err(_) => none(format!(
             "{} did not answer within {}s",

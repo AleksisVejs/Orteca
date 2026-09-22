@@ -55,7 +55,9 @@ What exists and works:
 - CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
 - A route's tier picks a real model and effort on both CLIs, and moves up a tier
   when that tier has stalled in the project's own history (§4.3.4)
-- Each plan's rolling limits are read from its CLI at no token cost; the
+- Each plan's rolling limits are read from its CLI (Codex free; Claude since
+  2.1.273 one haiku call, so a reading is kept 15 minutes and a run's own
+  stream refreshes it); the
   provider with the most left is picked until the user picks one, and the
   preview warns when a route may not fit in what is left (§4.3.5)
 - A run can work in a separate copy: a git worktree beside the repository on
@@ -309,7 +311,8 @@ then each was tried in a one-turn run whose `init` event or rollout was read.
 | codex | `-c skills.include_instructions=false` | yes | skills block (`~/.agents/skills`, `~/.codex/skills/.system`) gone |
 | codex | `-c features.plugins=false`, `-c features.apps=false` | yes | passed for certainty; nothing further visible in the rollout |
 | codex | `-c windows.sandbox="elevated"` | yes (`elevated` \| `unelevated`) | **required.** Without it `--ignore-user-config` leaves no Windows sandbox mode, and Codex silently runs `--sandbox workspace-write` as `read-only`: the first measured run could not read or edit anything yet exited 0 as `done`. Both values wrote in a probe. |
-| codex | `-c project_doc_max_bytes=0` | yes | does **not** drop the global `AGENTS.md`, and would drop the repo's. Not used. |
+| codex | `-c project_doc_max_bytes=0` | yes | does **not** drop the global `AGENTS.md`; drops the repo's, which is the point: the repo's file reaches a run only as imported Orteca memory. Used. Checked 2026-09-21: a repo `AGENTS.md` token showed in a reply without it, not with it. |
+| claude | env `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` | yes | drops the repo's `CLAUDE.md` (user's is already gone with `--setting-sources`). Used, for the same reason. Checked 2026-09-21 the same way. |
 
 Claude's `--bare` stays forbidden; nothing here needed it. Codex's global
 `~/.codex/AGENTS.md` has no switch short of `CODEX_HOME`, so it still loads: here
@@ -354,14 +357,19 @@ from the CLI refusing a wrong one.
 
 | Tier | Claude | $/M in · out | Codex | $/M in · out |
 |---|---|---:|---|---:|
-| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-5.6-luna`, `low` | 0.20 · 1.20 |
-| `standard` | `sonnet`, `high` | 2 · 10 | `gpt-5.6-terra`, `medium` | 2 · 12 |
-| `deep` | `opus` (Opus 5), `high` | 5 · 25 | `gpt-5.6-sol`, `high` | 4 · 20 |
+| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-6-luna`, `low` | 0.10 · 0.50 |
+| `standard` | `sonnet`, `high` | 2 · 10 | `gpt-6-sol`, `medium` | 2 · 10 |
+| `deep` | `opus` (Opus 5.5), `high` | 4 · 20 | `gpt-6-sol`, `high` | 2 · 10 |
 
 Considered and not chosen: Haiku 4.5 ($1 · $5, 200k, no effort control), Fable
 5.1 ($10 · $50), GPT-6 Astra ($10 · $50, out 2026-09-03, Codex's default and the
 model this account could not verify access to in §4.3.2), GPT-5.5 (retired for
-ChatGPT sign-in on 2026-08-31).
+ChatGPT sign-in on 2026-08-31). Rechecked 2026-09-22: Opus 5.5 replaced Opus 5
+behind the `opus` alias at a lower price, so nothing in code moved. GPT-6 Sol
+and Luna (openai.com/index/introducing-gpt-6-sol-and-luna, same day) replace
+their 5.6 namesakes at half the price; there is no GPT-6 Terra, so `standard`
+is Sol at `medium`, the price 5.6 Terra was. Astra still has no SWE-bench Pro
+score, so `deep` stays Sol. The §4.3.6 measurements were taken on 5.6 models.
 
 How it was chosen:
 

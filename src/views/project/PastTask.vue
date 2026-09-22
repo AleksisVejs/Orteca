@@ -13,7 +13,7 @@ import { visiblePath } from "../../path";
 // One finished task from the sidebar, laid out like the page after a run.
 const {
   historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE, TABS,
-  formatTokens, formatCost, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
+  formatTokens, formatCost, cacheHit, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
   removeError, historyRow, describeVerdict, appendActivity, stageLabel,
   task, picks, selectRun, anyRunning, focusTask, newTask, domId,
   reply, replyToPast, running, attachments, attachError, addAttachments, pasteImages, fileName,
@@ -236,6 +236,14 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
             · brief named <span class="mono">{{ route.candidatePaths.join(", ") }}</span>
           </template>
         </p>
+        <details v-if="route" class="route-context">
+          <summary>Route context</summary>
+          <p class="note">{{ route.tierReason }}</p>
+          <ul v-if="route.candidatePaths.length">
+            <li v-for="(path, i) in route.candidatePaths" :key="path"><span class="mono">{{ path }}</span><template v-if="route.candidateNotes?.[i]"> — {{ route.candidateNotes[i] }}</template></li>
+          </ul>
+          <p v-else class="note">No repository paths were supplied as route context.</p>
+        </details>
 
         </section>
 
@@ -250,6 +258,9 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
             <dd>{{ d.tokens !== null ? formatTokens(d.tokens) : "—" }}</dd>
             <dd v-if="d.tokens !== null" class="note">
               {{ formatTokens(d.uncachedTokens ?? 0) }} uncached · {{ formatTokens(d.cachedTokens ?? 0) }} cached
+            </dd>
+            <dd v-if="d.inputTokens != null && cacheHit(d.inputTokens, d.cachedTokens ?? 0) !== null" class="note" title="Share of input read from the provider's cache. Low means context was billed again.">
+              {{ cacheHit(d.inputTokens, d.cachedTokens ?? 0) }}% cache hit
             </dd>
           </div>
           <div>
@@ -293,6 +304,10 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
 
 <style scoped src="./result.css"></style>
 <style scoped>
+.route-context { margin-top: 12px; font-size: 12px; }
+.route-context p { margin: 8px 0 0; }
+.route-context ul { margin: 8px 0 0; padding-left: 18px; }
+.route-context li { margin-top: 4px; overflow-wrap: anywhere; }
 .name {
   margin-top: 10px;
   overflow: hidden;

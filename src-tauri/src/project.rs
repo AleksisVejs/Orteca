@@ -197,56 +197,94 @@ pub fn git_state(dir: &Path) -> GitState {
     let Some(root) = git(dir, &["rev-parse", "--show-toplevel"]) else {
         return GitState::default();
     };
-
-    let branch = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
-
-    let changes = git_changes(dir);
-    let dirty_count = changes.len();
-
-    let upstream = git(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
-    let counts = upstream
-        .as_ref()
-        .and_then(|_| git(dir, &["rev-list", "--left-right", "--count", "HEAD...@{u}"]))
+    // One status call answers branch, HEAD, upstream, ahead/behind and the
+    // changes; asking each separately was five git starts on every preview.
+    let status = git_output(dir, &["status", "--porcelain=v2", "--branch", "-z"])
+        .map(|text| parse_status(&text))
         .unwrap_or_default();
-    let mut counts = counts.split_whitespace().map(|n| n.parse().ok());
 
     let branches = git(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
         .unwrap_or_default()
         .lines()
-        .filter(|b| Some(*b) != branch.as_deref())
+        .filter(|b| Some(*b) != status.branch.as_deref())
         .map(String::from)
         .collect();
 
+    let dirty_count = status.changes.len();
     GitState {
         branches,
-        upstream,
-        ahead: counts.next().flatten(),
-        behind: counts.next().flatten(),
+        upstream: status.upstream,
+        ahead: status.ahead,
+        behind: status.behind,
         is_repo: true,
         root: Some(root),
-        branch,
-        head: git(dir, &["rev-parse", "HEAD"]),
+        branch: status.branch,
+        head: status.head,
         dirty: dirty_count > 0,
         dirty_count,
-        changes,
+        changes: status.changes,
     }
 }
 
 fn git_changes(dir: &Path) -> Vec<GitChange> {
-    let Ok(status) = git_output(dir, &["status", "--porcelain=v1", "-z"]) else {
-        return Vec::new();
-    };
-    let mut records = status.split('\0');
-    let mut changes = Vec::new();
+    git_output(dir, &["status", "--porcelain=v2", "-z"])
+        .map(|text| parse_status(&text).changes)
+        .unwrap_or_default()
+}
+
+/// What `git status --porcelain=v2 --branch -z` says.
+#[derive(Debug, Default, PartialEq)]
+struct Status {
+    head: Option<String>,
+    branch: Option<String>,
+    /// Only when git could compare against it: a gone upstream is no upstream.
+    upstream: Option<String>,
+    ahead: Option<usize>,
+    behind: Option<usize>,
+    changes: Vec<GitChange>,
+}
+
+fn parse_status(text: &str) -> Status {
+    let mut status = Status::default();
+    let mut upstream = None;
+    let mut records = text.split('\0');
     while let Some(record) = records.next() {
-        if record.len() < 4 { continue; }
-        let status = &record[..2];
-        let path = &record[3..];
-        changes.push(GitChange { path: path.replace('\\', "/"), status: status.to_string() });
-        // Rename and copy records include a second, old path after the new one.
-        if matches!(status.as_bytes().first(), Some(b'R' | b'C')) { records.next(); }
+        if let Some(header) = record.strip_prefix("# ") {
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                "branch.oid" if value != "(initial)" => status.head = Some(value.into()),
+                "branch.head" if value != "(detached)" => status.branch = Some(value.into()),
+                "branch.upstream" => upstream = Some(value.to_string()),
+                "branch.ab" => {
+                    let mut ab = value.split(' ').map(|n| n.trim_start_matches(['+', '-']).parse().ok());
+                    status.ahead = ab.next().flatten();
+                    status.behind = ab.next().flatten();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // Fields before the path: ordinary 8, rename/copy 9, unmerged 10.
+        let (xy, path) = match record.as_bytes().first() {
+            Some(b'1') => (record.get(2..4), record.splitn(9, ' ').nth(8)),
+            Some(b'2') => (record.get(2..4), record.splitn(10, ' ').nth(9)),
+            Some(b'u') => (record.get(2..4), record.splitn(11, ' ').nth(10)),
+            Some(b'?') => (Some("??"), record.get(2..)),
+            _ => continue,
+        };
+        // A rename's old path follows as its own record.
+        if record.starts_with('2') {
+            records.next();
+        }
+        if let (Some(xy), Some(path)) = (xy, path) {
+            // v1's spelling, which the screen and `discard` read: `.` is a space.
+            status.changes.push(GitChange { path: path.replace('\\', "/"), status: xy.replace('.', " ") });
+        }
     }
-    changes
+    if status.ahead.is_some() {
+        status.upstream = upstream;
+    }
+    status
 }
 
 /// One changed file. Line counts are `None` for a binary file or an untracked
@@ -1194,6 +1232,38 @@ mod tests {
         let dir = std::env::var("BENCH_DIR").unwrap();
         let needles: Vec<String> = serde_json::from_str(&std::env::var("BENCH_NEEDLES").unwrap()).unwrap();
         println!("FOUND {}", serde_json::to_string(&find_lines(Path::new(&dir), &needles)).unwrap());
+    }
+
+    #[test]
+    fn one_status_call_reads_branch_upstream_and_every_kind_of_change() {
+        let text = [
+            "# branch.oid 1234abcd",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +2 -3",
+            "1 .M N... 100644 100644 100644 aaa bbb src/a file.rs",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 new.rs",
+            "old.rs",
+            "u UU N... 100644 100644 100644 100644 aaa bbb ccc both.rs",
+            "? notes.txt",
+            "",
+        ]
+        .join("\0");
+        let status = parse_status(&text);
+        assert_eq!(status.head.as_deref(), Some("1234abcd"));
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((status.ahead, status.behind), (Some(2), Some(3)));
+        let changes: Vec<(&str, &str)> =
+            status.changes.iter().map(|c| (c.path.as_str(), c.status.as_str())).collect();
+        assert_eq!(
+            changes,
+            [("src/a file.rs", " M"), ("new.rs", "R "), ("both.rs", "UU"), ("notes.txt", "??")]
+        );
+
+        // No commits, detached, or an upstream git cannot compare against.
+        let bare = parse_status("# branch.oid (initial)\0# branch.head (detached)\0# branch.upstream origin/gone\0");
+        assert_eq!(bare, Status::default());
     }
 
     #[test]

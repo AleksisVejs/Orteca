@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from "vue";
 import VeloMark from "../components/VeloMark.vue";
-import AiHelpers from "./project/AiHelpers.vue";
+import Agents from "./project/Agents.vue";
 import Dock from "./project/Dock.vue";
 import PastTask from "./project/PastTask.vue";
 import TaskComposer from "./project/TaskComposer.vue";
@@ -41,7 +41,7 @@ const {
   view, running, result, runs, runLabel, selectRun, selectedRun, activeRun, anyRunning, runningCount,
   history, historyDetail, historyLine, showHistory, newTask, taskName,
   taskMenu, renameId, renaming, deleteAsk, askDelete, startRename, saveRename, removeTask, taskError,
-  rows, helpersPending, helpersReady, TONE, HISTORY_STATUS, OUTCOME,
+  rows, agentsPending, agentsReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
   git, gitOpen, gitAsk, gitBusy, gitLoading, gitRefreshError, gitError, gitNotice,
   commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
@@ -252,14 +252,14 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           </span>
         </button>
         <button
-          :class="{ on: view === 'helpers' }"
-          :aria-current="view === 'helpers' ? 'page' : undefined"
-          @click="view = 'helpers'"
+          :class="{ on: view === 'agents' }"
+          :aria-current="view === 'agents' ? 'page' : undefined"
+          @click="view = 'agents'"
         >
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="3" y="4" width="10" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 1v3M1 7v3m14-3v3M6 8h.01M10 8h.01M6 10.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
-          <span class="grow">AI helpers</span>
-          <span class="count" :class="{ warn: !helpersPending && helpersReady < rows.length }" :aria-label="helpersPending ? 'Checking availability' : `${helpersReady} of ${rows.length} ready`">
-            {{ helpersPending ? "…" : `${helpersReady}/${rows.length}` }}
+          <span class="grow">Agents</span>
+          <span class="count" :class="{ warn: !agentsPending && agentsReady < rows.length }" :aria-label="agentsPending ? 'Checking availability' : `${agentsReady} of ${rows.length} ready`">
+            {{ agentsPending ? "…" : `${agentsReady}/${rows.length}` }}
           </span>
         </button>
       </nav>
@@ -353,7 +353,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         <h1 class="workspace-tab">
           <span v-if="view === 'task' && (running || result)" class="dot" :class="running ? 'live' : result && TONE[result.status]" aria-hidden="true"></span>
           <svg v-else viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          {{ view === 'helpers' ? 'AI helpers' : view === 'history' ? 'Task history' : running ? 'Running task' : result ? 'Task result' : 'New task' }}
+          {{ view === 'agents' ? 'Agents' : view === 'history' ? 'Task history' : running ? 'Running task' : result ? 'Task result' : 'New task' }}
         </h1>
         <button
           v-if="git.isRepo"
@@ -488,7 +488,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <TaskComposer v-else />
           </template>
           <PastTask v-else-if="view === 'history'" />
-          <AiHelpers v-else />
+          <Agents v-else />
         </main>
         <template v-if="dockPrefs.open">
           <div
@@ -548,7 +548,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <template v-if="usage.status">
               <p class="usage-empty" role="status">{{ usage.status }}</p>
               <p v-if="usage.status === 'Unavailable'" class="note usage-reason">{{ usage.reason }}</p>
-              <button v-if="usage.status === 'Not installed' || usage.status === 'Sign in required'" class="btn" :popovertarget="domId(`usage-${usage.id}`)" popovertargetaction="hide" @click="view = 'helpers'">Open AI helpers</button>
+              <button v-if="usage.status === 'Not installed' || usage.status === 'Sign in required'" class="btn" :popovertarget="domId(`usage-${usage.id}`)" popovertargetaction="hide" @click="view = 'agents'">Open Agents</button>
             </template>
             <div v-for="(w, i) in usage.windows" :key="i" class="usage-detail" :class="{ low: w.left !== null && w.left <= 20 }">
               <div class="usage-detail-label"><span>{{ w.label }}</span><strong>{{ w.leftLabel }} {{ w.left === null ? 'unavailable' : 'left' }}</strong></div>
@@ -557,12 +557,12 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             </div>
             <footer class="usage-footer">
               <span class="note" role="status">{{ limitsLoading ? 'Refreshing…' : limitsCheckedAt ? `Checked ${new Date(limitsCheckedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Not checked yet' }}</span>
-              <button class="link" :disabled="limitsLoading" @click="loadLimits">Refresh usage</button>
+              <button class="link" :disabled="limitsLoading" @click="loadLimits(true)">Refresh usage</button>
             </footer>
             <p class="note usage-schedule">Updates when you open a project and after each task.</p>
           </section>
         </template>
-        <button class="usage-refresh" :disabled="limitsLoading" :title="limitsLoading ? 'Refreshing usage…' : 'Refresh plan usage'" :aria-label="limitsLoading ? 'Refreshing plan usage' : 'Refresh plan usage'" @click="loadLimits">
+        <button class="usage-refresh" :disabled="limitsLoading" :title="limitsLoading ? 'Refreshing usage…' : 'Refresh plan usage'" :aria-label="limitsLoading ? 'Refreshing plan usage' : 'Refresh plan usage'" @click="loadLimits(true)">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13 6a5 5 0 0 0-8.5-2L2 6m0-4v4h4M3 10a5 5 0 0 0 8.5 2L14 10m0 4v-4h-4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
       </div>

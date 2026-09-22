@@ -403,10 +403,12 @@ impl ModelOverride {
         let valid = match (id, self.model.as_str()) {
             (ProviderId::Claude, "sonnet" | "opus" | "fable") => standard.contains(&effort),
             (ProviderId::Claude, "haiku") => ["low", "medium", "high"].contains(&effort),
-            (ProviderId::Codex, "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra") => {
+            // ponytail: GPT-6 Sol/Luna levels copied from their 5.6 namesakes
+            // until models_cache.json lists them.
+            (ProviderId::Codex, "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra") => {
                 ["low", "medium", "high", "xhigh", "max", "ultra"].contains(&effort)
             }
-            (ProviderId::Codex, "gpt-5.6-luna") => standard.contains(&effort),
+            (ProviderId::Codex, "gpt-6-luna" | "gpt-5.6-luna") => standard.contains(&effort),
             (ProviderId::Codex, "gpt-5.5") => ["low", "medium", "high", "xhigh"].contains(&effort),
             _ => false,
         };
@@ -833,7 +835,7 @@ impl Launch {
     /// Pick a recorded session back up with everything the user has said since.
     /// The session already holds the history, so only the new words are sent.
     fn resume(id: ProviderId, session: &str, held: &[String], plan: &StagePlan) -> Self {
-        let mut argv = id.resume_args(session, plan.schema.as_deref());
+        let mut argv = id.resume_args(session, plan.schema.as_deref(), plan.stage.writes());
         // Without it a resumed session runs on the account's default model.
         if id == ProviderId::Codex {
             argv.extend(model_args(id, plan));
@@ -1039,6 +1041,8 @@ pub async fn stream(
         started: now_ms(),
     };
     let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
+    // Memory is standing instructions that outlive the run: global, then project.
+    state.constraints = store.memory_for_task(task_id).unwrap_or_default();
 
     // The whole decision, recorded before a single process starts. Without this
     // row a later milestone can see what a run cost but not what it was allowed
@@ -1165,7 +1169,7 @@ pub async fn stream(
                 ..ctx.clone()
             };
             let mut brief =
-                routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes);
+                routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes, false);
             brief.push_str(&attached_note(&ctx.attachments));
             brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref()));
             let payload = stage_payload(Stage::Review, index + 1, stages.len(), &review_ctx.plan, id);
@@ -1270,8 +1274,15 @@ pub async fn stream(
                 .take()
                 .filter(|r| r.model == ctx.plan.model(id).model);
             let words = resuming.as_ref().map_or(prompt.as_str(), |r| r.reply.as_str());
+            // A Fix resumes the writing session unless a follow-up's does.
+            let resumes_work = resuming.is_none() && stage == Stage::Fix && state.work_session.is_some();
             let mut brief =
-                routing::brief(&route, stage, words, &state.constraints, &state.notes);
+                routing::brief(&route, stage, words, &state.constraints, &state.notes, resumes_work);
+            // The resumed session may be a question's, told to change no file.
+            // Left unsaid, the model keeps to that and the reply edits nothing.
+            if resuming.is_some() && stage.writes() {
+                brief.insert_str(0, "This is new work, not the earlier question: you may change files now.\n\n");
+            }
             if id == ProviderId::Codex && stage == Stage::Implement && resuming.is_none() {
                 brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
             }
@@ -2978,7 +2989,13 @@ async fn attempt(
     let mut edit_snapshots = if ctx.id == ProviderId::Codex && ctx.plan.stage.writes() {
         crate::providers::codex_edits::EditSnapshots::capture(&ctx.dir)
     } else { None };
-    let mut run = match proc::spawn(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir) {
+    // The repo's `CLAUDE.md` files stay out too: what the agent is told from
+    // the project is what the user imported into Orteca's memory.
+    let env: &[(&str, PathBuf)] = match ctx.id {
+        ProviderId::Claude => &[("CLAUDE_CODE_DISABLE_CLAUDE_MDS", PathBuf::from("1"))],
+        ProviderId::Codex => &[],
+    };
+    let mut run = match proc::spawn_env(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir, env) {
         Ok(run) => run,
         Err(e) => {
             state.outcome.failure = Some(format!("could not start {}: {e}", ctx.id.program()));
@@ -4492,12 +4509,12 @@ ping -n 60 127.0.0.1 >nul
         assert!(codex.windows(4).any(|w| w
             == [
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-6-sol",
                 "-c",
                 "model_reasoning_effort=\"high\""
             ]));
         let resumed = Launch::resume(ProviderId::Codex, "abc-123", &[], &plan).argv;
-        assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-5.6-sol"]));
+        assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-6-sol"]));
 
         let efficient_review = StagePlan {
             model: Some("gpt-5.6-terra".into()),
@@ -4532,6 +4549,23 @@ ping -n 60 127.0.0.1 >nul
             effort: "ultra".into(),
         };
         assert!(unsupported_effort.validate(ProviderId::Codex).is_err());
+    }
+
+    /// Memory is standing instructions: a saved item reaches the brief.
+    #[tokio::test]
+    async fn a_saved_memory_item_is_in_the_brief() {
+        let store = Store::in_memory().unwrap();
+        let request = task_request(&store, "memory");
+        let dir = request.dir.clone();
+        let project = store.project(dir.to_str().unwrap()).unwrap();
+        store.add_memory(None, "end every reply with MEM-GLOBAL").unwrap();
+        store.add_memory(Some(project.id), "use tabs, MEM-PROJECT").unwrap();
+        answering_shim(&request, 1);
+        stream(&store, &Live::default(), request, |_| Ok(())).await;
+        let briefs = std::fs::read_to_string(dir.join("briefs.log")).unwrap();
+        let (g, p) = (briefs.find("MEM-GLOBAL").unwrap(), briefs.find("MEM-PROJECT").unwrap());
+        assert!(g < p, "global first, then project");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A shim that answers every call, logs the brief it was given, and exits.
@@ -5880,7 +5914,7 @@ ping -n 60 127.0.0.1 >nul
         assert!(!calls[0].contains("resume"), "{}", calls[0]);
         assert!(calls[1].starts_with("exec resume sess-1"), "{}", calls[1]);
         assert!(
-            calls[1].contains("gpt-5.6-terra"),
+            calls[1].contains("gpt-6-sol"),
             "the fix left the model that wrote the change: {}",
             calls[1]
         );
@@ -5982,6 +6016,7 @@ ping -n 60 127.0.0.1 >nul
         let log = std::fs::read_to_string(dir.join("argv.log")).unwrap();
         assert!(log.contains("--resume claude-1"), "{log}");
         assert!(log.contains("the quotes table"), "{log}");
+        assert!(log.contains("you may change files now"), "an answered question's session was told to change none: {log}");
         assert!(!log.contains("fix the typo"), "the resumed session already has the request: {log}");
         std::fs::remove_dir_all(&dir).unwrap();
 

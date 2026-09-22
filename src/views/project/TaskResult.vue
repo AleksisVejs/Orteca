@@ -14,7 +14,7 @@ const {
   removedCopies, confirmRemove, removeCopy, removeError, routeSteps, calls, tokens,
   comparison, changed, OUTCOME, TONE, TABS, resultTab, formatTokens, formatCost,
   formatDuration, newTask, editAgain, reply, sendReply, warmLeft,
-  git, openGit,
+  git, openGit, retryAt, waiting, waitForReset, cancelWait, formatWhen,
 } = inject(PROJECT)!;
 
 const selectedFile = ref<string | null>(null);
@@ -29,6 +29,7 @@ watch(() => result.value?.taskId, () => { selectedFile.value = null; });
   <section v-if="result" class="card outcome">
     <!-- Everything already said in this task, so a follow-up reads as one thread. -->
     <article v-for="(t, i) in activeRun?.turns ?? []" :key="i" class="turn">
+      <p class="who">You</p>
       <p class="said">{{ t.said }}</p>
       <Markdown v-if="t.summary" class="summary" :text="describeVerdict(t.summary) ?? t.summary" />
       <p v-else class="note">{{ t.failure ?? "No summary was reported." }}</p>
@@ -71,6 +72,14 @@ watch(() => result.value?.taskId, () => { selectedFile.value = null; });
     <div id="result-panel" class="panel" role="tabpanel" :aria-labelledby="`tab-${resultTab}`">
       <template v-if="resultTab === 'summary'">
         <p v-if="result.failure" class="missing">{{ result.failure }}</p>
+        <p v-if="waiting && waiting.prompt === activeRun?.prompt" class="note" role="status">
+          Carries on {{ formatWhen(waiting.at) }}, after {{ waiting.provider }}’s limit resets. Keep Orteca open.
+          <button class="link" @click="cancelWait">Cancel</button>
+        </p>
+        <p v-else-if="retryAt && activeRun" class="note">
+          {{ activeRun.provider }}’s limit resets {{ formatWhen(retryAt) }}.
+          <button class="link" @click="waitForReset(retryAt, activeRun)">Carry on then</button>
+        </p>
         <p v-if="switchedFrom" class="note switched" role="status">
           {{ switchedFrom }} ran out of plan usage, so {{ ranOn }} carried on with the same request.
         </p>
@@ -217,6 +226,14 @@ watch(() => result.value?.taskId, () => { selectedFile.value = null; });
             · brief named <span class="mono">{{ result.route.candidatePaths.join(", ") }}</span>
           </template>
         </p>
+        <details class="route-context">
+          <summary>Route context</summary>
+          <p class="note">{{ result.route.tierReason }}</p>
+          <ul v-if="result.route.candidatePaths.length">
+            <li v-for="(path, i) in result.route.candidatePaths" :key="path"><span class="mono">{{ path }}</span><template v-if="result.route.candidateNotes?.[i]"> — {{ result.route.candidateNotes[i] }}</template></li>
+          </ul>
+          <p v-else class="note">No repository paths were supplied as route context.</p>
+        </details>
 
         <!-- Every tile labelled, none faked when unknown. -->
         </section>
@@ -231,6 +248,7 @@ watch(() => result.value?.taskId, () => { selectedFile.value = null; });
             <dt class="note">{{ tokens ? "tokens" : "tokens unavailable" }}</dt>
             <dd>{{ tokens ? formatTokens(tokens.total) : "—" }}</dd>
             <dd v-if="tokens" class="note">{{ formatTokens(tokens.uncached) }} uncached · {{ formatTokens(tokens.cached) }} cached</dd>
+            <dd v-if="tokens && tokens.cacheHit !== null" class="note" title="Share of input read from the provider's cache. Low means context was billed again.">{{ tokens.cacheHit }}% cache hit</dd>
           </div>
           <div>
             <dt class="note">{{ tokens && tokens.cost !== null ? "cost, " + tokens.quality : "cost unavailable" }}</dt>

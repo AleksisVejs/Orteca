@@ -34,6 +34,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_check_passes.sql"),
     include_str!("../migrations/0009_drop_check_passes.sql"),
     include_str!("../migrations/0010_code_map.sql"),
+    include_str!("../migrations/0011_memory.sql"),
 ];
 
 /// Files past this are minified or generated, not something a task edits.
@@ -131,6 +132,10 @@ impl Store {
             .open(db_path.with_extension("owner"))?;
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Every streamed event is its own insert. Under WAL, NORMAL syncs at
+        // checkpoints instead of on each commit and still cannot corrupt the
+        // file; a power cut costs at most the last few events.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
         conn.execute("UPDATE tasks SET status = 'failed', ended_at = datetime('now'), summary = 'Interrupted when Orteca closed' WHERE status = 'running'", [])?;
@@ -278,11 +283,12 @@ impl Store {
         payload_json: &str,
     ) -> Result<i64> {
         let conn = self.0.lock().expect("store poisoned");
-        conn.execute(
+        // The hottest statement in the app: one per streamed event.
+        conn.prepare_cached(
             "INSERT INTO task_events (task_id, ts, stage, kind, provider, payload_json)
              VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5)",
-            params![task_id, stage, kind, provider, payload_json],
-        )?;
+        )?
+        .execute(params![task_id, stage, kind, provider, payload_json])?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -580,6 +586,64 @@ impl Store {
         Ok(())
     }
 
+    /// Global items first, then this project's, oldest first in each. `None`
+    /// lists the global items alone, for the screen before a project is open.
+    pub fn memory(&self, project_id: Option<i64>) -> Result<MemoryState> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id IS NULL, text FROM memory
+              WHERE project_id IS NULL OR project_id = ?1
+              ORDER BY project_id IS NOT NULL, id",
+        )?;
+        let items = stmt
+            .query_map([project_id], |r| Ok(MemoryItem { id: r.get(0)?, global: r.get(1)?, text: r.get(2)? }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tokens = tokens_of(items.iter().map(|i| i.text.as_str()));
+        Ok(MemoryState { items, limit: memory_limit(&conn)?, tokens })
+    }
+
+    /// What a run of this task is told: the memory items, global then project.
+    pub fn memory_for_task(&self, task_id: i64) -> Result<Vec<String>> {
+        let project_id: i64 =
+            self.0.lock().expect("store poisoned").query_row("SELECT project_id FROM tasks WHERE id = ?1", [task_id], |r| r.get(0))?;
+        Ok(self.memory(Some(project_id))?.items.into_iter().map(|i| i.text).collect())
+    }
+
+    /// `project_id` None adds a global item.
+    pub fn add_memory(&self, project_id: Option<i64>, text: &str) -> Result<()> {
+        let text = clean_memory(text)?;
+        let conn = self.0.lock().expect("store poisoned");
+        check_memory_fits(&conn, project_id, None, &text)?;
+        conn.execute("INSERT INTO memory (project_id, text) VALUES (?1, ?2)", params![project_id, text])?;
+        Ok(())
+    }
+
+    pub fn edit_memory(&self, id: i64, text: &str) -> Result<()> {
+        let text = clean_memory(text)?;
+        let conn = self.0.lock().expect("store poisoned");
+        let project_id: Option<i64> = conn
+            .query_row("SELECT project_id FROM memory WHERE id = ?1", [id], |r| r.get(0))
+            .map_err(|_| AppError::new(ErrorKind::NotFound, "that memory item is gone"))?;
+        check_memory_fits(&conn, project_id, Some(id), &text)?;
+        conn.execute("UPDATE memory SET text = ?2 WHERE id = ?1", params![id, text])?;
+        Ok(())
+    }
+
+    pub fn delete_memory(&self, id: i64) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute("DELETE FROM memory WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// 0 means no limit.
+    pub fn set_memory_limit(&self, limit: u32) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "INSERT INTO settings (key, value) VALUES ('memory_limit', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [limit.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Bring a project's code map up to date with its tracked files. Only a
     /// file whose mtime or size moved is read and parsed again, and a file no
     /// longer tracked loses its rows. Parsing happens outside the lock. Returns
@@ -640,14 +704,15 @@ impl Store {
                 params![project_id, path, mtime, size, lang.name()],
                 |r| r.get(0),
             )?;
+            // Cached: a first scan inserts tens of thousands of rows, and
+            // re-preparing each one was most of its time.
+            let mut symbol = tx.prepare_cached("INSERT INTO map_symbols (file_id, name, kind, line) VALUES (?1, ?2, ?3, ?4)")?;
             for s in &facts.defines {
-                tx.execute(
-                    "INSERT INTO map_symbols (file_id, name, kind, line) VALUES (?1, ?2, ?3, ?4)",
-                    params![id, s.name, s.kind, s.line],
-                )?;
+                symbol.execute(params![id, s.name, s.kind, s.line])?;
             }
+            let mut uses = tx.prepare_cached("INSERT INTO map_uses (file_id, name) VALUES (?1, ?2)")?;
             for name in &facts.uses {
-                tx.execute("INSERT INTO map_uses (file_id, name) VALUES (?1, ?2)", params![id, name])?;
+                uses.execute(params![id, name])?;
             }
         }
         tx.commit()?;
@@ -722,6 +787,30 @@ impl Store {
             notes.push(PastNote { id, note, files });
         }
         Ok(notes)
+    }
+
+    /// This project's last 30 settled runs as one digest for memory
+    /// suggestions: the user's own words (a reply's, not the exchange it
+    /// quotes), how the run ended, and what came back. Empty with no runs.
+    pub fn run_digest(&self, project_id: i64) -> Result<String> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT prompt, status, summary FROM tasks
+              WHERE project_id = ?1 AND status != 'running' ORDER BY id DESC LIMIT 30",
+        )?;
+        let rows = stmt.query_map([project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })?;
+        let mut digest = String::new();
+        for row in rows {
+            let (asked, status, summary) = row?;
+            let said = asked.rsplit("My reply:").next().unwrap_or(&asked).trim();
+            digest.push_str(&format!("- Asked: {}\n  Ended: {status}\n", cut(said, 300)));
+            if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+                digest.push_str(&format!("  Result: {}\n", cut(summary.trim(), 300)));
+            }
+        }
+        Ok(digest)
     }
 
     /// A project's runs, newest first. Token counts stay NULL where the
@@ -824,7 +913,7 @@ impl Store {
                     u.input_tokens + u.cached_input_tokens + u.output_tokens,
                     u.input_tokens + u.output_tokens, u.cached_input_tokens,
                     u.cost_usd, u.cost_quality, t.unknown_events, t.duration_ms,
-                    t.branch, t.worktree_path
+                    t.branch, t.worktree_path, u.input_tokens
                FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
               WHERE t.project_id = ?1 AND t.id = ?2",
                 params![project_id, task_id],
@@ -850,6 +939,7 @@ impl Store {
                         tokens: r.get(13)?,
                         uncached_tokens: r.get(14)?,
                         cached_tokens: r.get(15)?,
+                        input_tokens: r.get(22)?,
                         cost_usd: r.get(16)?,
                         cost_quality: r.get(17)?,
                         unknown_events: r.get(18)?,
@@ -954,6 +1044,8 @@ pub struct TaskDetail {
     pub tokens: Option<u64>,
     pub uncached_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// Uncached input alone, for the cache-hit share; output is not input.
+    pub input_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub cost_quality: Option<String>,
     pub unknown_events: u32,
@@ -1003,6 +1095,70 @@ fn row_to_project(row: &rusqlite::Row) -> rusqlite::Result<Project> {
     })
 }
 
+const DEFAULT_MEMORY_LIMIT: u32 = 1000;
+
+/// A memory item as the panel lists it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryItem {
+    pub id: i64,
+    pub global: bool,
+    pub text: String,
+}
+
+/// What a run sends and what the user allowed. `tokens` is characters / 4,
+/// an estimate, and counts the global and project items together.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryState {
+    pub items: Vec<MemoryItem>,
+    pub limit: u32,
+    pub tokens: u32,
+}
+
+fn tokens_of<'a>(texts: impl Iterator<Item = &'a str>) -> u32 {
+    texts.map(|t| t.chars().count() as u32).sum::<u32>().div_ceil(4)
+}
+
+fn memory_limit(conn: &Connection) -> Result<u32> {
+    let value: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = 'memory_limit'", [], |r| r.get(0))
+        .ok();
+    Ok(value.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MEMORY_LIMIT))
+}
+
+fn clean_memory(text: &str) -> Result<String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Err(AppError::new(ErrorKind::Invalid, "a memory item cannot be empty"));
+    }
+    Ok(text)
+}
+
+/// Refuse `text` when it would push what a run sends past the limit. A global
+/// item is measured against the global list alone, a project item against
+/// global plus its own project.
+// ponytail: a global item can still push some project past the limit; the
+// panel shows the true total, so it is visible, not silent.
+fn check_memory_fits(conn: &Connection, project_id: Option<i64>, replacing: Option<i64>, text: &str) -> Result<()> {
+    let limit = memory_limit(conn)?;
+    if limit == 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("SELECT text FROM memory WHERE (project_id IS NULL OR project_id IS ?1) AND id IS NOT ?2")?;
+    let mut all: Vec<String> = stmt
+        .query_map(params![project_id, replacing], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    all.push(text.to_string());
+    if tokens_of(all.iter().map(String::as_str)) > limit {
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "Memory is full. Shorten or remove something, or raise the limit.",
+        ));
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     let applied: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied as usize) {
@@ -1029,6 +1185,31 @@ mod tests {
             base_commit: None,
             dirty_at_start: false,
         }
+    }
+
+    #[test]
+    fn memory_keeps_scopes_apart_and_holds_the_limit() {
+        let store = Store::in_memory().unwrap();
+        let a = store.touch_project("C:/a", "a").unwrap();
+        let b = store.touch_project("C:/b", "b").unwrap();
+        store.add_memory(None, "global rule").unwrap();
+        store.add_memory(Some(a.id), "rule for a").unwrap();
+        store.add_memory(Some(b.id), "rule for b").unwrap();
+        let texts = |id: Option<i64>| store.memory(id).unwrap().items.into_iter().map(|i| i.text).collect::<Vec<_>>();
+        assert_eq!(texts(Some(a.id)), ["global rule", "rule for a"]);
+        assert_eq!(texts(Some(b.id)), ["global rule", "rule for b"]);
+
+        store.set_memory_limit(10).unwrap();
+        let err = store.add_memory(Some(a.id), &"x".repeat(60)).unwrap_err();
+        assert!(err.message.starts_with("Memory is full"));
+        let id = store.memory(Some(a.id)).unwrap().items[1].id;
+        assert!(store.edit_memory(id, &"x".repeat(60)).is_err());
+        store.set_memory_limit(0).unwrap();
+        store.add_memory(Some(a.id), &"x".repeat(60)).unwrap();
+        assert!(store.memory(Some(a.id)).unwrap().tokens > 10);
+
+        store.forget_project("C:/b").unwrap();
+        assert_eq!(store.memory(Some(a.id)).unwrap().items.len(), 3);
     }
 
     #[test]
@@ -1184,6 +1365,23 @@ mod tests {
         assert_eq!(got.len(), 1, "only this project's finished tasks");
         assert_eq!(got[0].files, ["src/offlineSync.ts"]);
         assert!(got[0].note.contains("same UUID") && got[0].note.contains("Files: src/offlineSync.ts"));
+    }
+
+    #[test]
+    fn run_digest_keeps_the_users_own_words_and_skips_running_work() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("a", "a").unwrap();
+        assert_eq!(store.run_digest(project.id).unwrap(), "", "no runs, nothing to suggest from");
+        let reply = store
+            .create_task(new_task(project.id, "Old ask\n\nYour answer:\nDone.\n\nMy reply:\nUse pnpm, not npm", "balanced"))
+            .unwrap();
+        store.finish_task_details(reply, "verifyFailed", "npm test failed", "[]", None, 0, None, 1).unwrap();
+        store.create_task(new_task(project.id, "still going", "balanced")).unwrap();
+
+        let digest = store.run_digest(project.id).unwrap();
+        assert!(digest.contains("Asked: Use pnpm, not npm") && !digest.contains("Old ask"));
+        assert!(digest.contains("Ended: verifyFailed") && digest.contains("Result: npm test failed"));
+        assert!(!digest.contains("still going"));
     }
 
     #[test]

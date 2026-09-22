@@ -388,6 +388,8 @@ export interface TaskDetail {
   tokens: number | null;
   uncachedTokens: number | null;
   cachedTokens: number | null;
+  /** Uncached input alone; `uncachedTokens` also counts output. */
+  inputTokens: number | null;
   costUsd: number | null;
   costQuality: CostQuality | null;
   unknownEvents: number;
@@ -409,3 +411,24 @@ export type Commit = {
   relative: string;
   when: string;
 };
+
+export interface MemoryItem {
+  id: number;
+  global: boolean;
+  text: string;
+}
+
+/** `tokens` is characters / 4: an estimate, always shown as one. 0 limit = none. */
+export interface MemoryState {
+  items: MemoryItem[];
+  limit: number;
+  tokens: number;
+}
+
+export interface MemoryProposal {
+  original: string;
+  bullets: string[];
+}
+
+/** `user` is ~/.claude/CLAUDE.md; the others are the project root's files. */
+export type ImportFile = "user" | "CLAUDE.md" | "AGENTS.md";

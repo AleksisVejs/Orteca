@@ -195,6 +195,8 @@ pub enum ProviderEvent {
         session_id: String,
     },
     Text(String),
+    /// The model's reasoning between steps. Shown while it runs, never the answer.
+    Thinking(String),
     ToolUse {
         name: String,
         summary: String,
@@ -267,6 +269,7 @@ impl ProviderEvent {
             Self::StageProgress { .. } => "stageProgress",
             Self::Started { .. } => "started",
             Self::Text(_) => "text",
+            Self::Thinking(_) => "thinking",
             Self::ToolUse { .. } => "toolUse",
             Self::ToolResult { .. } => "toolResult",
             Self::Usage(_) => "usage",
@@ -521,8 +524,8 @@ fn is_key(s: &str) -> bool {
 
 /// Resolve a program against PATH x PATHEXT.
 ///
-/// `CreateProcess` only ever appends `.exe`, so an npm shim — which is how
-/// both CLIs install on Windows — is invisible to a bare program name. The
+/// `CreateProcess` only ever appends `.exe`, so an npm shim - which is how
+/// both CLIs install on Windows - is invisible to a bare program name. The
 /// resolved path is also what the process runner will spawn in Milestone 4.
 pub fn which(program: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;

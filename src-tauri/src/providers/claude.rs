@@ -71,6 +71,10 @@ pub fn structured_output(v: &Value) -> Option<Value> {
 fn block(b: &Value) -> Option<ProviderEvent> {
     match b["type"].as_str()? {
         "text" => Some(ProviderEvent::Text(b["text"].as_str()?.to_string())),
+        // A redacted block has only a signature; nothing to show.
+        "thinking" => Some(b["thinking"].as_str()?.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| ProviderEvent::Thinking(t.to_string())),
         "tool_use" => {
             let name = b["name"].as_str()?;
             let editing = matches!(name, "Edit" | "Write" | "MultiEdit");
@@ -304,6 +308,15 @@ mod tests {
             edit_patch(&serde_json::json!({"structuredPatch":[{"oldStart":1}]})),
             None
         );
+    }
+
+    #[test]
+    fn thinking_is_kept_unless_redacted() {
+        assert_eq!(
+            super::block(&serde_json::json!({"type":"thinking", "thinking":"Check the router first.", "signature":"x"})),
+            Some(ProviderEvent::Thinking("Check the router first.".into()))
+        );
+        assert_eq!(super::block(&serde_json::json!({"type":"thinking", "thinking":"", "signature":"x"})), None);
     }
 
     fn summary(input: Value) -> String {

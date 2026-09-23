@@ -33,24 +33,12 @@ const mood = computed(() => {
   if (text.startsWith("Thinking")) return "think";
   return "idle";
 });
-// A delivered steer flies into the orb, which swallows it. Nothing flies if it wasn't delivered.
+// A delivered steer is swallowed by the orb. Nothing happens if it wasn't delivered.
 const orb = ref<InstanceType<typeof Orb> | null>(null);
-const steerInput = ref<HTMLTextAreaElement | null>(null);
-const flyer = ref<HTMLSpanElement | null>(null);
 async function send(now: boolean) {
   const text = instruction.value.trim();
-  const from = steerInput.value?.getBoundingClientRect();
   await instruct(now);
-  const el = flyer.value;
-  const to = orb.value?.canvas?.getBoundingClientRect();
-  if (!text || instruction.value || !from || !el || !to || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  el.textContent = text;
-  const x = to.left + to.width / 2 - el.offsetWidth / 2;
-  const y = to.top + to.height / 2 - el.offsetHeight / 2;
-  el.animate([
-    { transform: `translate(${from.left + 18}px, ${from.top + 14}px)`, opacity: 1 },
-    { transform: `translate(${x}px, ${y}px) scale(0.05)`, opacity: 0, filter: "blur(2px)" },
-  ], { duration: 650, easing: "cubic-bezier(0.55, 0, 0.75, 0.3)" }).finished.then(() => orb.value?.absorb(), () => {});
+  if (text && !instruction.value && !matchMedia("(prefers-reduced-motion: reduce)").matches) orb.value?.absorb();
 }
 
 // Enter sends, Shift+Enter breaks the line: the same as the reply box after.
@@ -92,7 +80,6 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
       <button class="btn" @click="answerWaitFor(true)">Run it</button>
     </div>
     <textarea
-      ref="steerInput"
       v-model="instruction"
       rows="1"
       aria-label="Additional instructions for this task"
@@ -143,7 +130,6 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
     </div>
     <p v-if="instructionError" class="missing err-line">{{ instructionError }}</p>
   </div>
-  <span ref="flyer" class="flyer" aria-hidden="true"></span>
 </template>
 
 <style scoped src="./result.css"></style>
@@ -185,20 +171,6 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
 .err-line {
   margin: 0;
   padding: 0 18px 12px;
-}
-
-.flyer {
-  position: fixed;
-  top: 0;
-  left: 0;
-  z-index: 10;
-  max-width: 40ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text);
-  opacity: 0;
-  pointer-events: none;
 }
 
 @media (max-width: 600px) {

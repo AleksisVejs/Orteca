@@ -38,8 +38,8 @@ async function loadGlobalTasks() {
 const state = useProject(props.opened, computed(() => props.active));
 provide(PROJECT, state);
 const {
-  view, running, result, runs, runLabel, selectRun, selectedRun, activeRun, anyRunning, runningCount,
-  history, historyDetail, historyLine, showHistory, newTask, taskName,
+  view, running, result, runLabel, activeRun, anyRunning, runningCount,
+  history, historyDetail, historyLine, showHistory, newTask, taskName, buildOn,
   taskMenu, renameId, renaming, deleteAsk, askDelete, startRename, saveRename, removeTask, taskError,
   rows, agentsPending, agentsReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
@@ -118,6 +118,11 @@ function toggleExpandedProject(path: string) {
 function toggleProjectSection(path: string) {
   emit("toggleProject", path);
 }
+
+/** The row for the task on screen, whether it opened from history or is still live. */
+const isOpen = (t: GlobalTaskSummary) => t.projectPath === props.opened.project.path && (
+  view.value === "history" ? historyDetail.value?.id === t.id
+    : view.value === "task" && !!activeRun.value && (activeRun.value.result?.taskId ?? activeRun.value.id) === t.id);
 
 function openTask(task: GlobalTaskSummary) {
   if (task.projectPath === props.opened.project.path) {
@@ -302,20 +307,6 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 
       <nav class="nav" aria-label="Project">
         <button
-          v-for="r in runs"
-          :key="r.key"
-          :class="{ on: view === 'task' && selectedRun === r.key }"
-          :aria-current="view === 'task' && selectedRun === r.key ? 'page' : undefined"
-          :title="r.prompt"
-          @click="selectRun(r.key)"
-        >
-          <span class="dot" :class="r.active ? 'live' : r.result ? TONE[r.result.status] : r.error ? 'bad' : ''" aria-hidden="true"></span>
-          <span class="task-copy">
-            <span class="task-title">{{ runLabel(r) }}</span>
-            <span class="task-caption">{{ r.active ? "Running now" : r.result ? OUTCOME[r.result.status] : "Couldn’t start" }} · {{ r.provider }}</span>
-          </span>
-        </button>
-        <button
           :class="{ on: view === 'agents' }"
           :aria-current="view === 'agents' ? 'page' : undefined"
           @click="view = 'agents'"
@@ -362,8 +353,8 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           />
           <button
             v-else
-            :class="{ on: t.projectPath === opened.project.path && view === 'history' && historyDetail?.id === t.id }"
-            :aria-current="t.projectPath === opened.project.path && view === 'history' && historyDetail?.id === t.id ? 'page' : undefined"
+            :class="{ on: isOpen(t) }"
+            :aria-current="isOpen(t) ? 'page' : undefined"
             :title="`${t.projectName}\n${t.title || t.prompt}\n${historyLine(t)}`"
             @click="openTask(t)"
           >
@@ -388,6 +379,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             </svg>
           </button>
           <div v-if="taskMenu === t.id" class="menu" role="menu" @click.stop>
+            <button role="menuitem" @click="closeMenu(); buildOn(t)">Use in a new task</button>
             <button role="menuitem" @click="startRename(t)">Rename</button>
             <button role="menuitem" class="danger" @click="askDelete(t)">Delete</button>
           </div>
@@ -476,8 +468,8 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           </button>
           <span v-if="git.upstream" class="git-remote note" :title="`${git.upstream}: ${git.behind ?? 'unknown'} incoming, ${git.ahead ?? 'unknown'} outgoing at the last fetch`">
             <span class="mono">{{ git.upstream }}</span>
-            <span>↓ {{ git.behind ?? '—' }}</span>
-            <span>↑ {{ git.ahead ?? '—' }}</span>
+            <span>↓ {{ git.behind ?? '-' }}</span>
+            <span>↑ {{ git.ahead ?? '-' }}</span>
             <span>at last fetch</span>
           </span>
           <span v-else class="git-remote note">Not published yet</span>
@@ -620,7 +612,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         <template v-for="usage in usageCounters" :key="usage.id">
           <button class="usage-counter" :popovertarget="domId(`usage-${usage.id}`)" :title="`${usage.name} usage details and reset times`">
             <span class="usage-name"><ProviderMark :id="usage.id" :size="12" />{{ usage.name }}</span>
-            <span v-if="usage.status" class="usage-unavailable">— {{ usage.status }}</span>
+            <span v-if="usage.status" class="usage-unavailable">- {{ usage.status }}</span>
             <template v-else>
               <span v-for="(w, i) in usage.windows.slice(0, 2)" :key="i" class="usage-window" :class="{ low: w.left !== null && w.left <= 20 }" :title="w.left === null ? `${w.label}: usage unavailable` : w.label">
                 <span class="window-label">{{ w.shortLabel }}</span>
@@ -889,6 +881,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 }
 .recent .menu button {
   padding: 6px 10px;
+  white-space: nowrap;
 }
 .recent .menu button:hover {
   background: var(--surface);

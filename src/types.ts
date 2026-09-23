@@ -116,7 +116,7 @@ export interface InstructionReceipt {
   disposition: InstructionDisposition;
 }
 
-/** A live detection. `path: null` means not installed — a state, not an error. */
+/** A live detection. `path: null` means not installed - a state, not an error. */
 export interface Detected {
   id: ProviderId;
   program: string;
@@ -235,7 +235,7 @@ export interface Route {
   reason: string;
   /** Why `budget.preferredTier`, the same way. */
   tierReason: string;
-  /** Paths named in the brief. Names only — never file contents. */
+  /** Paths named in the brief. Names only - never file contents. */
   candidatePaths: string[];
   /** What the first few of those define and use, same order. Absent on runs from before the code map. */
   candidateNotes?: string[];
@@ -290,6 +290,7 @@ export type ProviderEvent =
   | { kind: "stageProgress"; data: { stages: string[]; current: number[] } }
   | { kind: "started"; data: { sessionId: string } }
   | { kind: "text"; data: string }
+  | { kind: "thinking"; data: string }
   | { kind: "toolUse"; data: { name: string; summary: string; id?: string; changes?: FileEdit[] } }
   | { kind: "toolResult"; data: { id: string; changes: FileEdit[]; failed: boolean } }
   | { kind: "usage"; data: Usage }

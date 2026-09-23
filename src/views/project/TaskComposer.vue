@@ -14,7 +14,21 @@ const {
   limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
   remembering, rememberText, rememberError, remember,
   MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git, history,
+  taskName, referTask, TONE, HISTORY_STATUS,
 } = inject(PROJECT)!;
+
+// Any task that has ended; a failed one is often the context worth handing on.
+const pastTasks = computed(() => history.value.filter((t) => t.status !== "running"));
+const taskFilter = ref("");
+const shownTasks = computed(() => {
+  const q = taskFilter.value.trim().toLowerCase();
+  return q ? pastTasks.value.filter((t) => `#${t.id} ${taskName(t)}`.toLowerCase().includes(q)) : pastTasks.value;
+});
+function pickTask(t: (typeof pastTasks.value)[number]) {
+  document.getElementById(domId("task-refs"))?.hidePopover();
+  taskFilter.value = "";
+  void referTask(t);
+}
 
 // A run inherits only these explicit rules: global first, then this project.
 // Keep the receipt beside Run so the user can check the actual payload before
@@ -77,10 +91,10 @@ function formatDuration(milliseconds: number) {
         @keydown.ctrl.enter.prevent="run()"
       ></textarea>
 
-      <ul v-if="picks.length" class="attachments" aria-label="Elements pointed at">
+      <ul v-if="picks.length" class="attachments" aria-label="Elements and tasks picked">
         <li v-for="(pick, i) in picks" :key="pick.block" class="chip">
-          <span class="mono" :title="pick.block">⌖ {{ pick.label }}</span>
-          <button class="unattach" title="Remove this element" aria-label="Remove this element" @click="picks.splice(i, 1)">×</button>
+          <span class="mono" :title="pick.block">{{ pick.label.startsWith("#") ? "↩" : "⌖" }} {{ pick.label }}</span>
+          <button class="unattach" :title="`Remove ${pick.label}`" :aria-label="`Remove ${pick.label}`" @click="picks.splice(i, 1)">×</button>
         </li>
       </ul>
       <ul v-if="attachments.length" class="attachments" aria-label="Attached">
@@ -115,6 +129,27 @@ function formatDuration(milliseconds: number) {
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
           Folder
         </button>
+        <button v-if="pastTasks.length" class="icon" :popovertarget="domId('task-refs')" title="Build on an earlier task: its chat and final answer go with this one">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M6 4 2.5 7.5 6 11M3 7.5h6.5a4 4 0 0 1 4 4v1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          Task
+        </button>
+        <section :id="domId('task-refs')" class="task-refs" popover role="dialog" :aria-labelledby="domId('task-refs-title')">
+          <header class="refs-head">
+            <h2 :id="domId('task-refs-title')">Build on an earlier task</h2>
+            <p class="note">Its chat and final answer go with this task. The tool work does not.</p>
+          </header>
+          <input v-model="taskFilter" class="refs-filter" type="search" placeholder="Filter tasks…" aria-label="Filter tasks" />
+          <ul class="refs-list">
+            <li v-for="t in shownTasks" :key="t.id">
+              <button @click="pickTask(t)">
+                <span class="dot" :class="TONE[t.status]" aria-hidden="true"></span>
+                <span class="refs-title">{{ taskName(t) }}</span>
+                <span class="refs-meta">#{{ t.id }} · {{ HISTORY_STATUS[t.status] ?? t.status }}</span>
+              </button>
+            </li>
+            <li v-if="!shownTasks.length" class="note refs-empty">No task matches.</li>
+          </ul>
+        </section>
         <Memory :path="opened.project.path" :pop-id="domId('memory')" button-class="icon" @changed="loadMemory">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 2.5h8v11L8 10.8 4 13.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
           Memory
@@ -301,7 +336,7 @@ function formatDuration(milliseconds: number) {
             <td class="cap">{{ row.provider }}</td>
             <td class="num">{{ row.runs }}</td>
             <td class="num">{{ row.tokens.toLocaleString() }}</td>
-            <td class="num">{{ row.duration ? formatDuration(row.duration) : "— not recorded" }}</td>
+            <td class="num">{{ row.duration ? formatDuration(row.duration) : "not recorded" }}</td>
           </tr>
         </tbody>
       </table>
@@ -472,6 +507,82 @@ textarea:focus {
 }
 .shortcut {
   margin-left: auto;
+}
+.task-refs {
+  width: min(480px, calc(100vw - 24px));
+  max-height: min(520px, calc(100dvh - 60px));
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  color: var(--text);
+  font-size: 12px;
+}
+.task-refs:popover-open {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.task-refs::backdrop {
+  background: var(--overlay);
+}
+.refs-head h2 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.refs-head .note {
+  margin: 0;
+}
+.refs-filter {
+  min-height: 34px;
+  padding: 4px 10px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font: inherit;
+}
+.refs-filter:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.refs-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0 -8px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.refs-list button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition: background 120ms ease;
+}
+.refs-list button:hover,
+.refs-list button:focus-visible {
+  background: var(--surface-2);
+}
+.refs-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.refs-meta {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.refs-empty {
+  padding: 8px;
 }
 .count {
   min-width: 18px;

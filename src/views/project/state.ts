@@ -2,7 +2,7 @@
 // render it, and share one instance through provide/inject.
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import type { InjectionKey, Ref } from "vue";
-import { tidy } from "./picks";
+import { reference, tidy, forRouting } from "./picks";
 import { verificationSummary } from "./taskPresentation";
 import type { Pick } from "./picks";
 import {
@@ -124,7 +124,7 @@ function tokensOf(r: TaskResult | null) {
 }
 
 /** Every stage that ran, then the route's stages that did not. Stages run in
- *  order, so the ones that ran are the front of the route — unless a Fix ran,
+ *  order, so the ones that ran are the front of the route - unless a Fix ran,
  *  after which the run's own order is the whole story. */
 function routeStepsOf(r: TaskResult | null) {
   if (!r) return [];
@@ -193,9 +193,12 @@ export function exchangeOf(r: TaskResult, stream: ActivityLine[]): Exchange {
       model: t?.model ?? null,
       effort: t?.effort ?? null,
     },
-    messages: stream.filter((l) => l.kind === "text" || l.kind === "instruction"),
+    messages: storyOf(stream),
   };
 }
+
+/** The lines that tell how the agent got there, as the chat shows them. */
+export const storyOf = (lines: ActivityLine[]) => lines.filter((l) => ["text", "instruction", "thinking", "toolUse"].includes(l.kind));
 
 /** A live update; `file` is the full path it is about, shown by name and openable. */
 export type Activity = { text: string; file: string | null; id?: string; changes?: FileEdit[]; failed?: boolean };
@@ -203,6 +206,7 @@ export type ActivityLine = Omit<Activity, "file"> & { kind: string; file?: strin
 
 const EDIT_RE = /edit|write|patch|create|delete|move|rename|file_change|set-content|out-file|new-item|remove-item/;
 const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect/;
+const WEB_RE = /^web(search|fetch)$/i;
 
 // Several projects are open at once, each with its own copy of the workspace in
 // the document. Element ids have to be unique per project: a popover is targeted
@@ -483,7 +487,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         label: w.label,
         shortLabel: w.label === "5-hour" ? "5h" : w.label === "week (all models)" ? "week" : w.label,
         left,
-        leftLabel: left === null ? "—" : left > 0 && left < 1 ? "<1%" : `${Math.floor(left)}%`,
+        leftLabel: left === null ? "-" : left > 0 && left < 1 ? "<1%" : `${Math.floor(left)}%`,
         resets: resetWhen(w),
       };
     });
@@ -1285,6 +1289,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         },
         (id) => {
           live.id = id;
+          // The sidebar lists runs from the database, so the new row shows now, not at the end.
+          void loadHistory();
         },
         (early) => {
           live.checking = early;
@@ -1295,8 +1301,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         // A follow-up's prompt carries the whole exchange so the agent has the
         // context, but the route must be chosen from what the user just said:
         // read the blob, a classifier answers about the task at the top instead
-        // of the reply at the bottom.
-        opts.asked?.at(-1) ?? null,
+        // of the reply at the bottom. An earlier task handed in goes as its title alone.
+        opts.asked?.at(-1) ?? (forRouting(live.prompt) === live.prompt ? null : forRouting(live.prompt)),
       );
     } catch (e) {
       live.error = isAppError(e) ? e.message : String(e);
@@ -1354,6 +1360,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   /** What the live line and the log show: words, plus the file they are about when there is one. */
   function toolActivity(name: string, rawSummary: string): Activity {
+    if (WEB_RE.test(name)) return { text: friendlyToolUse(name, rawSummary), file: null };
     const summary = unwrapShell(rawSummary);
     const head = `${name} ${summary.trim().split(/\s+/)[0] ?? ""}`.toLowerCase();
     const kind = `${name} ${summary}`.toLowerCase();
@@ -1370,6 +1377,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     // Only the tool name and the command's first word decide "editing": a search
     // that mentions "write" somewhere is still a read.
     const head = `${name} ${summary.trim().split(/\s+/)[0] ?? ""}`.toLowerCase();
+    if (/^websearch$/i.test(name)) return `Searched the web: ${target}`;
+    if (/^webfetch$/i.test(name)) return `Opened ${target}`;
     if (EDIT_RE.test(head)) {
       return target ? `Editing ${target}` : "Editing files";
     }
@@ -1391,6 +1400,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         return say("Getting ready");
       case "text":
         return say("Thinking through the request");
+      case "thinking":
+        return say("Thinking");
       case "toolUse":
         return {
           ...toolActivity(event.data.name, event.data.summary),
@@ -1452,9 +1463,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     if (typeof v.verdict !== "string") return null;
     const ok = v.verdict === "pass";
     if (v.findings) {
-      return ok
-        ? "Review passed"
-        : `Review asked for changes: ${v.findings.map((f) => f.issue).join("; ")}`;
+      const issues = v.findings.map((f) => f.issue).join("; ");
+      if (ok) return issues ? `Review passed, with notes: ${issues}` : "Review passed";
+      return `Review asked for changes: ${issues}`;
     }
     const checks = v.checks ?? [];
     if (!checks.length) return ok ? "Checks passed" : "Checks didn’t pass: nothing was run";
@@ -1469,6 +1480,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         return null;
       case "text":
         return describeVerdict(event.data) ?? event.data;
+      case "thinking":
+        return event.data;
       case "toolUse":
         // Orteca's own checks report their result as the next line.
         if (event.data.name === "orteca") return null;
@@ -1767,7 +1780,33 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     });
   }
 
+  /** Hand an earlier task to the next one: the user's words and the final
+   *  answer, not the tool calls in between. */
+  async function referTask(t: TaskSummary) {
+    attachError.value = null;
+    if (picks.value.some((p) => p.label.startsWith(`#${t.id} `))) return;
+    try {
+      const d = await getTaskDetail(opened.project.path, t.id);
+      const files = changedOf({ diff: d.diff } as TaskResult).byRun.map((f) => f.path);
+      const said = splitExchanges(d).map((p) => p.said);
+      picks.value.push(reference(t.id, taskName(t), said, d.summary ?? noAnswer(d.status), files));
+    } catch (e) {
+      attachError.value = `Task #${t.id} could not be read: ${isAppError(e) ? e.message : String(e)}`;
+    }
+  }
+
+  /** From a task's menu: the composer, with that task already handed in and
+   *  whatever the user was writing left as it was. */
+  function buildOn(t: TaskSummary) {
+    selectRun(null);
+    focusTask();
+    void referTask(t);
+  }
+
   function showHistory(t: TaskSummary) {
+    // A task still on screen this session opens live, with its stream and steering box.
+    const live = runs.value.find((r) => (r.result?.taskId ?? r.id) === t.id);
+    if (live) return selectRun(live.key);
     view.value = "history";
     if (historyDetail.value?.id !== t.id) void openHistory(t);
   }
@@ -1949,6 +1988,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     ranOn,
     sendReply,
     replyToPast,
+    referTask,
+    buildOn,
     warmLeft,
     showHistory,
   };

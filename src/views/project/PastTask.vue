@@ -5,7 +5,7 @@ import ActivityLog from "./ActivityLog.vue";
 import TaskChat from "./TaskChat.vue";
 import ExchangeView from "./Exchange.vue";
 import Markdown from "../../components/Markdown.vue";
-import { PROJECT, exchangeOf, splitExchanges } from "./state";
+import { PROJECT, exchangeOf, splitExchanges, storyOf } from "./state";
 import type { Exchange } from "./state";
 import { split } from "./picks";
 import type { Route } from "../../types";
@@ -102,7 +102,7 @@ const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current
   routeSteps: routeSteps.value,
   durationMs: d.value?.durationMs ?? null,
   metrics: metrics.value,
-  messages: lines.value.filter((l) => l.kind === "text" || l.kind === "instruction"),
+  messages: storyOf(lines.value),
 }));
 </script>
 

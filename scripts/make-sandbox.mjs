@@ -3,7 +3,7 @@
 // Fixtures cover the parsers; they cannot cover a process that has to be
 // cancelled, steered, or made to produce a diff git reports oddly. This repo is
 // the other half of that: a real git tree, outside Orteca's own, seeded with the
-// cases `project::diff_since` is most likely to get wrong — a path with a space,
+// cases `project::diff_since` is most likely to get wrong - a path with a space,
 // a non-ASCII path git C-quotes, a binary file numstat writes as `-`, an ignored
 // file an agent can edit invisibly, and an untracked file that was already there
 // before any run. Its tests are slow on purpose, so a run lasts long enough to
@@ -40,7 +40,7 @@ const TRACKED = {
   "README.md": `# Orteca sandbox
 
 Throwaway. Every file here exists to be edited, broken or deleted by an agent
-under test. Put nothing real in it — \`node scripts/make-sandbox.mjs\` wipes and
+under test. Put nothing real in it - \`node scripts/make-sandbox.mjs\` wipes and
 rebuilds the whole directory.
 
 \`npm test\` is slow on purpose (~6s), so a run lasts long enough to cancel.
@@ -68,7 +68,7 @@ run under the sandbox, and working around it costs several turns.
 
   // Inert on purpose: enough for the trust scan to report a finding, with no
   // hook and no MCP server, so consenting to this repo executes nothing.
-  ".claude/settings.json": `{\n  "$comment": "Inert. No hooks — this repo is a trust-scan target, not a payload."\n}\n`,
+  ".claude/settings.json": `{\n  "$comment": "Inert. No hooks - this repo is a trust-scan target, not a payload."\n}\n`,
   ".mcp.json": `{\n  "mcpServers": {}\n}\n`,
 
   ".gitignore": "build/\n*.log\n",

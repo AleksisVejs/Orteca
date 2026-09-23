@@ -22,7 +22,7 @@ const allLines = computed(() => (props.items ?? project.lines.value).map((line) 
 const filter = ref("all");
 const filters = [{ id: "all", label: "All" }, { id: "messages", label: "Messages" }, { id: "edits", label: "Edits" }, { id: "checks", label: "Checks" }];
 const lines = computed(() => allLines.value.filter((line) => filter.value === "all"
-  || (filter.value === "messages" && ["text", "instruction", "failed"].includes(line.kind))
+  || (filter.value === "messages" && ["text", "thinking", "instruction", "failed"].includes(line.kind))
   || (filter.value === "edits" && (line.edits.length > 0 || line.failed))
   || (filter.value === "checks" && /test|check|lint|build|compil|verif|passed|failed/i.test(line.text))));
 const log = ref<HTMLOListElement | null>(null);
@@ -116,6 +116,9 @@ onMounted(() => { if (!finished.value) follow(); });
 .stream li.text {
   padding: 10px 0 6px;
   color: var(--text);
+}
+.stream li.thinking {
+  color: var(--text-faint);
 }
 .stream li.toolUse {
   font-family: var(--mono);

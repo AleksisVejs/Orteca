@@ -86,6 +86,8 @@ async function projectView(api = {}) {
     onFileDrop: async () => () => {},
     cancelTask: async () => {},
     tidy: s => s,
+    forRouting: s => s,
+    reference: () => ({ label: '', block: '' }),
     recentTasks: async () => [],
     gitStatus: async () => ({ ...gitState }),
     sendInstruction: async () => ({ disposition: 'live' }),
@@ -1015,7 +1017,7 @@ test('usage counters show remaining allowance for every window and preserve rese
   assert.ok(codex.windows[0].resets);
   assert.equal(codex.windows[1].left, 0, 'a reported zero is distinct from unknown');
   assert.equal(codex.windows[2].left, null);
-  assert.equal(codex.windows[2].leftLabel, '—');
+  assert.equal(codex.windows[2].leftLabel, '-');
   assert.equal(codex.windows[2].resets, null);
   assert.equal(state.headroom('codex'), null, 'an invalid window cannot guide provider selection');
 });

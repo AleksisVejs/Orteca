@@ -5,7 +5,8 @@ import ActivityLog from "./ActivityLog.vue";
 import TaskChat from "./TaskChat.vue";
 import SteerBox from "./SteerBox.vue";
 import ExchangeView from "./Exchange.vue";
-import { PROJECT, exchangeOf } from "./state";
+import Story from "./Story.vue";
+import { PROJECT, exchangeOf, storyOf } from "./state";
 import { visiblePath } from "../../path";
 
 // The task on screen, as one chat from the first message to the reply after it.
@@ -29,9 +30,8 @@ const replyHint = computed(() => warmLeft.value > 0
   : "A reply now starts over and reads the files again, so it costs more than one sent within 5 minutes of the run.");
 // Each earlier answer keeps its own proof; one read back from history has only its words.
 const earlier = computed(() => (activeRun.value?.turns ?? []).map((t) => ({ ...t, data: t.result ? exchangeOf(t.result, t.stream ?? []) : null })));
-// While it runs, the conversation in order: the agent's messages and every steer the user sent.
-const messages = computed(() => lines.value.filter((line) => line.kind === "text" || line.kind === "instruction"));
-const showActivity = ref(false);
+// While it runs, everything in order: what the agent says, thinks and does, and every steer.
+const messages = computed(() => storyOf(lines.value));
 
 const chat = ref<InstanceType<typeof TaskChat> | null>(null);
 const steer = ref<InstanceType<typeof SteerBox> | null>(null);
@@ -128,13 +128,7 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
         </p>
       </div>
 
-      <template v-for="(m, i) in messages" :key="i">
-        <div v-if="m.kind === 'instruction'" class="mine">
-          <p class="bubble">{{ m.text }}</p>
-          <p v-if="m.delivery" class="note" role="status">{{ m.delivery }}</p>
-        </div>
-        <Markdown v-else class="summary back" :text="m.text" />
-      </template>
+      <Story :lines="messages" />
 
       <!-- Result first, proof after: readable now, never labelled done. -->
       <section v-if="checking" class="back" aria-live="polite">
@@ -154,14 +148,6 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
           </details>
         </div>
       </section>
-
-      <!-- The tool calls behind the answer, at the thread's end on the right: where the finished answer keeps them. -->
-      <div class="live-proof">
-        <button class="proof-toggle" :aria-expanded="showActivity" :aria-controls="domId('run-activity')" @click="showActivity = !showActivity">
-          Activity<span class="count">{{ lines.length }}</span>
-        </button>
-      </div>
-      <div v-if="showActivity" :id="domId('run-activity')"><ActivityLog /></div>
     </template>
     <template v-if="running" #composer><SteerBox ref="steer" /></template>
 
@@ -243,11 +229,6 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
 <style scoped src="./result.css"></style>
 <style scoped src="./chat.css"></style>
 <style scoped>
-.live-proof {
-  display: flex;
-  justify-content: flex-end;
-}
-
 .early {
   padding: 16px 18px;
 }

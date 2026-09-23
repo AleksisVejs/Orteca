@@ -59,7 +59,7 @@ export const DEFAULTS: DockPrefs = {
 };
 
 /** The mono stacks offered in settings. All of them ship with Windows or the
- *  app — the workspace downloads no font. */
+ *  app - the workspace downloads no font. */
 export const FONTS = [
   { label: "System mono", value: 'ui-monospace, "Cascadia Code", "Consolas", monospace' },
   { label: "Cascadia Code", value: '"Cascadia Code", "Cascadia Mono", monospace' },

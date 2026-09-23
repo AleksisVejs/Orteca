@@ -1546,20 +1546,10 @@ pub async fn stream(
         } else {
             outcome.status()
         };
-    // The last stage that actually said something. A Review that asked for
-    // changes is the answer to the task, not the Verify that never ran. A
-    // finished route skips the checkers' JSON: the writer's words are the answer.
-    let summary = state
-        .notes
-        .iter()
-        .rev()
-        .map(|n| n.summary.clone())
-        .find(|s| {
-            !s.trim().is_empty()
-                && !(status == "done"
-                    && serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object()))
-        })
-        .unwrap_or_else(|| outcome.summary());
+    let mut summary = final_words(&state.notes, status == "done").unwrap_or_else(|| outcome.summary());
+    if status == "done" {
+        summary.push_str(&open_findings(&state.notes));
+    }
     // Read before this task closes, so it is never its own comparison. A
     // baseline that cannot be read is no baseline, not a failed run.
     let baseline = serde_json::to_value(route.kind).ok().and_then(|kind| {
@@ -1854,9 +1844,16 @@ async fn verify_locally(
         let mut focused_passed = false;
         if matches!(ran, Ran::Finished { passed: true, .. }) {
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
-                let args: Vec<&str> = focused.iter().map(String::as_str).collect();
-                let named = label(check, &args);
+                let parallel = parallel_focused(check, &focused[3..]);
+                let args: Vec<&str> = parallel.as_ref().unwrap_or(&focused).iter().map(String::as_str).collect();
+                let mut named = label(check, &args);
                 ran = run_check_twice(store, ctx, state, control, emit, &args, &check.dir, &named).await;
+                // A filter that caught nothing proves nothing: the files run as named.
+                if parallel.is_some() && matches!(&ran, Ran::Finished { output, .. } if output.contains("No tests executed")) {
+                    let args: Vec<&str> = focused.iter().map(String::as_str).collect();
+                    named = label(check, &args);
+                    ran = run_check_twice(store, ctx, state, control, emit, &args, &check.dir, &named).await;
+                }
                 if let Ran::Finished {
                     passed: true,
                     output,
@@ -1994,17 +1991,27 @@ async fn failed_before(
         ms: now_ms().saturating_sub(started),
     });
     let mut before = Vec::new();
+    // A test the run added has nothing to say about the base: a new file, or a
+    // file whose failing tests are all new. The run that added a test to
+    // SoftDeleteAuditTest spent 46s asking the base about it (2026-09-23).
+    let cases = failing_cases(&text);
+    let at_base: Vec<&str> = files
+        .iter()
+        .filter(|f| {
+            let Ok(old) = std::fs::read_to_string(copy.join(&sub).join(f)) else {
+                return false;
+            };
+            let names: Vec<&String> = cases.iter().filter(|(file, _)| file == *f).map(|(_, name)| name).collect();
+            let old = squash(&old);
+            names.is_empty() || names.iter().any(|name| old.contains(name.as_str()))
+        })
+        .map(String::as_str)
+        .collect();
     match made {
         Err(e) => say(format!("Could not ask the base commit: {}", e.message)),
-        // A test the run added has nothing to say about the base.
-        Ok(()) if files.iter().any(|f| copy.join(&sub).join(f).is_file()) => {
+        Ok(()) if !at_base.is_empty() => {
             let mut args = vec!["php", "artisan", "test"];
-            args.extend(
-                files
-                    .iter()
-                    .filter(|f| copy.join(&sub).join(f).is_file())
-                    .map(String::as_str),
-            );
+            args.extend(at_base);
             let shown = format!("before the change: {}", args.join(" "));
             if let Ran::Finished { passed, output } =
                 run_check(store, ctx, state, control, emit, &args, &copy.join(&sub), &shown).await
@@ -2020,26 +2027,68 @@ async fn failed_before(
     before
 }
 
-/// Test files a failed Laravel check names: outright in its argv, or as
-/// classes in its output (`FAILED  Tests\Feature\FooTest > it works`,
-/// `1) Tests\Unit\BarTest::test_x`), mapped the PSR-4 way to `tests/`.
+/// Test files a failed Laravel check names as failing classes in its output
+/// (`FAILED  Tests\Feature\FooTest > it works`, `1) Tests\Unit\BarTest::test_x`),
+/// mapped the PSR-4 way to `tests/`. A `PASS  Tests\...` header is not one.
+/// Only an output that names no failing class, such as a fatal error before
+/// any test ran, falls back to the files its argv named.
 fn failing_test_files(text: &str) -> Vec<String> {
     let text = strip_ansi(text);
-    let mut files: Vec<String> = text
-        .split_whitespace()
-        .filter(|word| word.starts_with("tests/") && word.ends_with(".php"))
-        .map(str::to_string)
-        .collect();
+    let mut files = Vec::new();
     for (at, _) in text.match_indices("Tests\\") {
+        let lead = text[..at].rsplit('\n').next().unwrap_or_default().trim_end();
+        let numbered = lead
+            .strip_suffix(')')
+            .is_some_and(|n| !n.is_empty() && n.trim_start().chars().all(|c| c.is_ascii_digit()));
+        if !(lead.ends_with("FAIL") || lead.ends_with("FAILED") || lead.ends_with("ERROR") || numbered) {
+            continue;
+        }
         let class: String = text[at + 6..]
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\\')
             .collect();
         files.push(format!("tests/{}.php", class.replace('\\', "/")));
     }
+    if files.is_empty() {
+        files = text
+            .split_whitespace()
+            .filter(|word| word.starts_with("tests/") && word.ends_with(".php"))
+            .map(str::to_string)
+            .collect();
+    }
     let mut seen = std::collections::HashSet::new();
     files.retain(|file| seen.insert(file.clone()));
     files
+}
+
+/// Each failing test a Laravel check names, as its file and its name squashed
+/// (see `squash`): `FAILED  Tests\Feature\FooTest > it ships` and
+/// `1) Tests\Feature\FooTest::test_it_ships with data set #0` both give
+/// `("tests/Feature/FooTest.php", "itships")`.
+fn failing_cases(text: &str) -> Vec<(String, String)> {
+    strip_ansi(text)
+        .lines()
+        .filter_map(|line| {
+            let at = line.find("Tests\\")?;
+            let lead = line[..at].trim_end();
+            let numbered = lead.strip_suffix(')').is_some_and(|n| !n.trim().is_empty() && n.trim().chars().all(|c| c.is_ascii_digit()));
+            if !(lead.ends_with("FAILED") || lead.ends_with("ERROR") || numbered) {
+                return None;
+            }
+            let rest = &line[at + 6..];
+            let (class, name) = rest.split_once(" > ").or_else(|| rest.split_once("::"))?;
+            let name = name.split(" with data set").next()?;
+            let name = squash(name);
+            let name = name.strip_prefix("test").unwrap_or(&name);
+            (!name.is_empty()).then(|| (format!("tests/{}.php", class.trim().replace('\\', "/")), name.to_string()))
+        })
+        .collect()
+}
+
+/// Lowercase letters and digits only, so Collision's `it ships`, PHPUnit's
+/// `test_it_ships` / `testItShips` and Pest's `it('ships')` all meet.
+fn squash(text: &str) -> String {
+    text.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
 /// A changed Laravel test is the cheapest useful tripwire before a broad
@@ -2085,6 +2134,37 @@ fn focused_php_check(root: &Path, check: &project::Check, changed: &[String]) ->
     Some(command)
 }
 
+/// The focused `files` as one ParaTest run, when the project's own suite runs
+/// `--parallel` (so its database already copes) and ParaTest is installed.
+/// ParaTest takes one path, so the files become a class filter. On
+/// RigInspectBE seven files took 38s one after another and 25s this way.
+// ponytail: from 4 files, a guess at where 8 processes' setup pays for
+// itself; measure a few before moving it.
+fn parallel_focused(check: &project::Check, files: &[String]) -> Option<Vec<String>> {
+    let dir = &check.dir;
+    if files.len() < 4 || !dir.join("vendor/brianium/paratest").is_dir() || check.test != ["composer", "test"] {
+        return None;
+    }
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("composer.json")).ok()?).ok()?;
+    if !manifest["scripts"]["test"].to_string().contains("--parallel") {
+        return None;
+    }
+    let classes: Vec<&str> = files
+        .iter()
+        .map(|file| Path::new(file).file_stem().and_then(|s| s.to_str()))
+        .collect::<Option<_>>()?;
+    // PHPUnit matches `Tests\Feature\FooTest::test_x`; anchored on both sides
+    // so FooTest does not also pull in BarFooTest or FooTestCase. A literal
+    // `\\` before the class matched nothing under ParaTest; `\b` does.
+    Some(vec![
+        "php".into(),
+        "artisan".into(),
+        "test".into(),
+        "--parallel".into(),
+        format!("--filter=/\\b({})::/", classes.join("|")),
+    ])
+}
+
 /// Test files a change under `app/` reaches, by plain text: ones that name a
 /// changed class, or that call a URI `routes/*.php` sends to a changed
 /// controller. This only picks what runs first; the full suite still runs.
@@ -2115,17 +2195,28 @@ fn affected_tests(dir: &Path, changed: &[String]) -> Vec<String> {
     }
     let mut files = Vec::new();
     collect_tests(dir, "tests", &mut files);
-    files.sort_by(|a, b| a.1.cmp(&b.1));
-    files
+    // Closest first, since only the first few run early: a test that calls a
+    // changed URI itself, then one that names a changed class, then one that
+    // only calls a path under it (`/api/equipment/5` for `/api/equipment`).
+    let mut ranked: Vec<(u8, String)> = files
         .into_iter()
-        .filter(|(_, path)| {
-            std::fs::read_to_string(dir.join(path)).is_ok_and(|text| {
-                classes.iter().any(|class| names(&text, class))
-                    || uris.iter().any(|uri| calls(&text, uri) || calls(&text, &uri[1..]))
-            })
+        .filter_map(|(_, path)| {
+            let text = std::fs::read_to_string(dir.join(&path)).ok()?;
+            let called = |exact: bool| uris.iter().any(|uri| calls(&text, uri, exact) || calls(&text, &uri[1..], exact));
+            let rank = if called(true) {
+                0
+            } else if classes.iter().any(|class| names(&text, class)) {
+                1
+            } else if called(false) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, path))
         })
-        .map(|(_, path)| path)
-        .collect()
+        .collect();
+    ranked.sort();
+    ranked.into_iter().map(|(_, path)| path).collect()
 }
 
 /// `word` appears in `text` as a whole identifier.
@@ -2146,11 +2237,13 @@ fn route_uri(line: &str) -> Option<String> {
     (!uri.is_empty()).then(|| uri.to_string())
 }
 
-/// A test calls `uri` when it quotes it whole or as the start of a longer path.
-fn calls(text: &str, uri: &str) -> bool {
+/// A test calls `uri` when it quotes it whole, with a query string, or, unless
+/// `exact`, as the start of a longer path.
+fn calls(text: &str, uri: &str, exact: bool) -> bool {
+    let ends: &[char] = if exact { &['?', '\'', '"'] } else { &['/', '?', '\'', '"'] };
     ['\'', '"'].iter().any(|quote| {
         text.match_indices(&format!("{quote}{uri}"))
-            .any(|(at, found)| text[at + found.len()..].starts_with(['/', '?', '\'', '"']))
+            .any(|(at, found)| text[at + found.len()..].starts_with(ends))
     })
 }
 
@@ -2239,10 +2332,34 @@ async fn run_check_twice(
     shown: &str,
 ) -> Ran {
     let first = run_check(store, ctx, state, control, emit, command, cwd, shown).await;
-    if !matches!(&first, Ran::Finished { passed: false, output } if !output.ends_with(TIMED_OUT)) {
+    let Ran::Finished { passed: false, output } = &first else {
+        return first;
+    };
+    if output.ends_with(TIMED_OUT) {
         return first;
     }
-    let again = run_check(store, ctx, state, control, emit, command, cwd, &format!("{shown}, again")).await;
+    // A Laravel suite that only runs tests reruns just the files that failed,
+    // the way a failing shard does: the whole suite again cost 72s on
+    // RigInspectBE for one flaky file (2026-09-23).
+    let files: Vec<String> = if runs_only_tests(cwd, command) {
+        failing_test_files(output)
+            .into_iter()
+            .filter(|file| cwd.join(file).is_file())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let rerun: Vec<&str> = if files.is_empty() {
+        command.to_vec()
+    } else {
+        ["php", "artisan", "test"].into_iter().chain(files.iter().map(String::as_str)).collect()
+    };
+    let again_shown = if files.is_empty() {
+        format!("{shown}, again")
+    } else {
+        format!("{shown}, again: {}", files.join(" "))
+    };
+    let again = run_check(store, ctx, state, control, emit, &rerun, cwd, &again_shown).await;
     if matches!(again, Ran::Finished { passed: true, .. }) {
         let event = ProviderEvent::Text(format!(
             "{shown} failed, then passed unchanged: a flaky test, so it counts as passed and buys no Fix"
@@ -2387,6 +2504,46 @@ async fn run_all(
         })
         .collect();
     Ok(ended)
+}
+
+/// Whether `command`, run in a Laravel app at `dir`, does nothing but run tests,
+/// so a pass of the files that failed is the whole verdict. `composer test`
+/// counts when every step of its script is `artisan test`, PHPUnit, ParaTest
+/// or `config:clear`, flags and `php -d` options allowed.
+fn runs_only_tests(dir: &Path, command: &[&str]) -> bool {
+    if !dir.join("artisan").is_file() {
+        return false;
+    }
+    let tests = |words: &[&str]| {
+        let mut words = words.iter().copied().skip_while(|w| *w == "@php" || *w == "php").peekable();
+        while words.next_if_eq(&"-d").is_some() {
+            words.next();
+        }
+        let words: Vec<&str> = words.collect();
+        matches!(
+            words.as_slice(),
+            ["artisan", "test", ..] | ["artisan", "config:clear", ..] | ["phpunit" | "vendor/bin/phpunit" | "vendor/bin/paratest", ..]
+        )
+    };
+    match command {
+        ["composer", "test"] => {
+            let Some(manifest) = std::fs::read_to_string(dir.join("composer.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            else {
+                return false;
+            };
+            let step = |entry: &serde_json::Value| {
+                entry.as_str().is_some_and(|e| tests(&e.split_whitespace().collect::<Vec<_>>()))
+            };
+            match &manifest["scripts"]["test"] {
+                one @ serde_json::Value::String(_) => step(one),
+                serde_json::Value::Array(all) => !all.is_empty() && all.iter().all(step),
+                _ => false,
+            }
+        }
+        _ => tests(command),
+    }
 }
 
 /// Test files split into up to `min(cores, 8)` groups of similar size, when
@@ -2731,6 +2888,54 @@ fn failed_before_run(remaining: Vec<Stage>) -> BudgetStop {
     }
 }
 
+/// The last stage that actually said something. A Review that asked for
+/// changes is the answer to the task, not the Verify that never ran. A
+/// finished route skips the checkers' JSON and every Verify - a failure a Fix
+/// then cured is history, not the answer: the writer's words are.
+fn final_words(notes: &[StageNote], done: bool) -> Option<String> {
+    notes.iter().rev().map(|n| (n.stage, &n.summary)).find_map(|(stage, s)| {
+        let checker = stage == Stage::Verify
+            || serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object());
+        (!s.trim().is_empty() && !(done && checker)).then(|| s.clone())
+    })
+}
+
+/// What the last Review said, for a finished run. A pass leaves its notes to
+/// the user; asked-for changes went to a Fix, and the writer's words above
+/// were written before either, so both are told.
+fn open_findings(notes: &[StageNote]) -> String {
+    let Some(review) = notes
+        .iter()
+        .rev()
+        .find(|n| n.stage == Stage::Review)
+        .and_then(|n| n.artifact.as_ref())
+    else {
+        return String::new();
+    };
+    let heading = match review["verdict"].as_str() {
+        Some("pass") => "The Review passed it but noted, and nothing fixed:",
+        Some("changes_requested") => "The Review asked for this, and a Fix changed it:",
+        _ => return String::new(),
+    };
+    let lines: Vec<String> = review["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| {
+            format!(
+                "- `{}:{}` {}",
+                f["file"].as_str().unwrap_or("?"),
+                f["line"],
+                f["issue"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\n\n{heading}\n{}", lines.join("\n"))
+}
+
 /// Every check in a Verify artifact that did not pass.
 fn failed_checks(artifact: &serde_json::Value) -> Vec<serde_json::Value> {
     artifact["checks"]
@@ -3034,6 +3239,25 @@ fn words(command: &str) -> Vec<String> {
     out
 }
 
+/// Leading `NAME=value` words set the command's environment, as a shell's
+/// prefix would: a benchmark is often steered by nothing else. The program
+/// is the first word after them.
+fn env_prefix(words: &[String]) -> (Vec<(&str, PathBuf)>, &[String]) {
+    let assigns = |w: &String| {
+        w.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let n = words.iter().take_while(|w| assigns(w)).count();
+    let env = words[..n]
+        .iter()
+        .filter_map(|w| w.split_once('='))
+        .map(|(name, value)| (name, PathBuf::from(value)))
+        .collect();
+    (env, &words[n..])
+}
+
 /// Why Orteca will not run a handed-over command, if it will not. The same
 /// guardrail the agent's own shell has, not a sandbox.
 fn refusal(command: &str, words: &[String]) -> Option<&'static str> {
@@ -3147,7 +3371,7 @@ async fn waited(
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
     let words = words(&command);
-    let reply = match refusal(&command, &words) {
+    let reply = match refusal(&command, env_prefix(&words).1) {
         Some(why) => {
             say(format!("Orteca did not run `{command}`: {why}"));
             format!("Orteca did not run `{command}`: {why} Finish without it, or hand over a command it can run.")
@@ -3257,12 +3481,13 @@ async fn run_waited(
     let say = |event: ProviderEvent| {
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
+    let (env, words) = env_prefix(words);
     let Some(program) = crate::providers::which(&words[0]) else {
         say(ProviderEvent::Text(format!("`{}` is not on PATH, so `{command}` did not run.", words[0])));
         return Some(format!("Orteca found no `{}` on PATH, so `{command}` did not run. Finish without it.", words[0]));
     };
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
-    let mut run = match proc::spawn_env(&program.to_string_lossy(), &args, &ctx.dir, &[]) {
+    let mut run = match proc::spawn_env(&program.to_string_lossy(), &args, &ctx.dir, &env) {
         Ok(run) => run,
         Err(e) => {
             say(ProviderEvent::Text(format!("`{command}` did not start: {e}")));
@@ -5257,12 +5482,58 @@ ping -n 60 127.0.0.1 >nul
 
     #[test]
     fn a_failed_laravel_check_names_its_test_files() {
-        let text = "php artisan test tests/Feature/NewTest.php\n\u{1b}[31m  FAILED  \u{1b}[39mTests\\Feature\\OrderTest > it ships\n\
+        // The argv and a passing class's header are not failures.
+        let text = "php artisan test tests/Feature/NewTest.php tests/Feature/ShopTest.php\n   PASS  Tests\\Feature\\ShopTest\n\
+                    \u{1b}[31m  FAILED  \u{1b}[39mTests\\Feature\\OrderTest > it ships\n\
                     1) Tests\\Unit\\Money\\PriceTest::test_rounds\n  FAILED  Tests\\Feature\\OrderTest > again\n";
+        assert_eq!(failing_test_files(text), ["tests/Feature/OrderTest.php", "tests/Unit/Money/PriceTest.php"]);
+        // A fatal error before any test ran names no class: the argv is all there is.
+        let fatal = "php artisan test tests/Feature/NewTest.php\nPHP Parse error: syntax error in NewTest.php on line 3\n";
+        assert_eq!(failing_test_files(fatal), ["tests/Feature/NewTest.php"]);
+
+        // Each failing test by name, so a base without it is not asked.
+        let text = "   PASS  Tests\\Feature\\ShopTest\n  FAILED  Tests\\Feature\\OrderTest > it ships   \n\
+                    1) Tests\\Unit\\PriceTest::test_rounds_up with data set #0\n";
         assert_eq!(
-            failing_test_files(text),
-            ["tests/Feature/NewTest.php", "tests/Feature/OrderTest.php", "tests/Unit/Money/PriceTest.php"]
+            failing_cases(text),
+            [("tests/Feature/OrderTest.php".to_string(), "itships".to_string()), ("tests/Unit/PriceTest.php".to_string(), "roundsup".to_string())]
         );
+        assert!(squash("public function test_it_ships(): void").contains("itships"));
+        assert!(squash("public function testItShips()").contains("itships"));
+    }
+
+    /// Only a suite that runs nothing but tests reruns just its failing files.
+    #[test]
+    fn only_a_tests_only_suite_reruns_just_its_failures() {
+        let dir = std::env::temp_dir().join(format!("orteca-tests-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let only = |script: &str| {
+            std::fs::write(dir.join("composer.json"), format!(r#"{{"scripts":{{"test":{script}}}}}"#)).unwrap();
+            runs_only_tests(&dir, &["composer", "test"])
+        };
+        assert!(!only(r#""@php artisan test""#), "no artisan, no Laravel app");
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        assert!(only(r#"["@php -d memory_limit=1G artisan test --parallel --processes=8"]"#));
+        assert!(only(r#"["@php artisan config:clear --ansi", "@php artisan test"]"#));
+        assert!(!only(r#"["@php artisan test", "vendor/bin/phpstan analyse"]"#), "a phpstan failure is not a test's");
+        assert!(!only(r#""@php artisan suite""#));
+        assert!(runs_only_tests(&dir, &["php", "artisan", "test", "tests/Feature/ATest.php"]));
+        assert!(!runs_only_tests(&dir, &["npm", "test"]));
+
+        // Focused files go through ParaTest only where the suite already does.
+        let check = project::Check { kind: "php", dir: dir.clone(), install: None, test: vec!["composer", "test"] };
+        let files: Vec<String> = ["A", "B", "C", "D"].iter().map(|c| format!("tests/Feature/{c}Test.php")).collect();
+        only(r#""@php artisan test --parallel""#);
+        assert_eq!(parallel_focused(&check, &files), None, "ParaTest is not installed");
+        std::fs::create_dir_all(dir.join("vendor/brianium/paratest")).unwrap();
+        assert_eq!(
+            parallel_focused(&check, &files).unwrap()[3..],
+            ["--parallel", r"--filter=/\b(ATest|BTest|CTest|DTest)::/"]
+        );
+        assert_eq!(parallel_focused(&check, &files[..3]), None, "too few files to pay for the setup");
+        only(r#""@php artisan test""#);
+        assert_eq!(parallel_focused(&check, &files), None, "the suite never runs in parallel");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A PHPUnit suite on in-memory SQLite, declared as `composer test`: two
@@ -5536,13 +5807,18 @@ ping -n 60 127.0.0.1 >nul
         write("tests/Feature/BlogApiTest.php", "<?php\nclass BlogApiTest { function test_it() { $this->getJson('/api/blog/1'); } }\n");
         write("tests/Feature/ShopTest.php", "<?php\nclass ShopTest { function test_it() { $this->getJson('/api/shop'); } }\n");
         write("tests/Feature/BloggerTest.php", "<?php\nclass BloggerTest { function test_it() { $this->getJson('/api/blogger'); } }\n");
+        // Calls the changed URI itself, so it runs before a sub-path's caller.
+        write("tests/Feature/ZBlogListTest.php", "<?php\nclass ZBlogListTest { function test_it() { $this->getJson('/api/blog?page=2'); } }\n");
         write("tests/Unit/SearchTest.php", "<?php\nclass SearchTest { function test_it() { new GlobalSearchService(); } }\n");
         let check = project::Check { kind: "php", dir: dir.clone(), install: None, test: vec!["composer", "test"] };
         let picked = |changed: &str| {
             focused_php_check(&dir, &check, &[changed.to_string()]).map(|argv| argv[3..].to_vec())
         };
 
-        assert_eq!(picked("app/Http/Controllers/Api/BlogController.php"), Some(vec!["tests/Feature/BlogApiTest.php".to_string()]));
+        assert_eq!(
+            picked("app/Http/Controllers/Api/BlogController.php"),
+            Some(vec!["tests/Feature/ZBlogListTest.php".to_string(), "tests/Feature/BlogApiTest.php".to_string()])
+        );
         assert_eq!(picked("app/Services/GlobalSearchService.php"), Some(vec!["tests/Unit/SearchTest.php".to_string()]));
         assert_eq!(picked("app/Services/Unrelated.php"), None);
         assert_eq!(picked("resources/css/app.css"), None);
@@ -6234,6 +6510,47 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(failed_summary(None), "");
     }
 
+    #[test]
+    fn a_cured_verify_failure_is_not_the_answer() {
+        let note = |stage, summary: &str| StageNote {
+            stage,
+            summary: summary.into(),
+            artifact: None,
+            model: None,
+            effort: None,
+            duration_ms: None,
+        };
+        let notes = [
+            note(Stage::Implement, "I changed the flow."),
+            note(Stage::Review, r#"{"verdict":"pass"}"#),
+            note(Stage::Verify, "`npm test` did not pass."),
+            note(Stage::Fix, r#"{"verdict":"fail"}"#),
+            note(Stage::Verify, r#"{"verdict":"pass"}"#),
+        ];
+        assert_eq!(final_words(&notes, true).as_deref(), Some("I changed the flow."));
+        // A run that stopped on the failure still says why.
+        assert_eq!(final_words(&notes[..3], false).as_deref(), Some("`npm test` did not pass."));
+    }
+
+    #[test]
+    fn a_passing_review_still_hands_over_its_notes() {
+        let review = |verdict| StageNote {
+            stage: Stage::Review,
+            summary: String::new(),
+            artifact: Some(serde_json::json!({
+                "findings": [{"severity": "low", "file": "a.vue", "line": 36, "issue": "stale copy", "fix": "x"}],
+                "verdict": verdict
+            })),
+            model: None,
+            effort: None,
+            duration_ms: None,
+        };
+        assert!(open_findings(&[review("pass")]).ends_with("- `a.vue:36` stale copy"));
+        // Asked-for changes went to a Fix, and the summary says so.
+        assert!(open_findings(&[review("changes_requested")]).contains("a Fix changed it:\n- `a.vue:36` stale copy"));
+        assert_eq!(open_findings(&[review("unknown")]), "");
+    }
+
     #[tokio::test]
     async fn a_changed_fix_gets_no_second_paid_attempt_when_verify_still_fails() {
         let store = Store::in_memory().unwrap();
@@ -6453,6 +6770,16 @@ ping -n 60 127.0.0.1 >nul
         assert!(refused("powershell -Command npm test"));
         assert!(refused("git.exe push origin main"));
         assert!(refused("Remove-Item build"));
+        // Leading assignments are the environment; the program comes after.
+        let all = words("ARMS=orteca-codex _X=\"a b\" node bench.mjs K=v");
+        let (env, rest) = env_prefix(&all);
+        assert_eq!(env, [("ARMS", PathBuf::from("orteca-codex")), ("_X", PathBuf::from("a b"))]);
+        assert_eq!(rest, ["node", "bench.mjs", "K=v"]);
+        assert_eq!(env_prefix(&words("1X=a node")).1, ["1X=a", "node"]);
+        let refused = |c: &str| refusal(c, env_prefix(&words(c)).1).is_some();
+        assert!(!refused("ARMS=codex node bench.mjs"));
+        assert!(refused("ARMS=codex"));
+        assert!(refused("X=1 git push origin main"));
     }
 
     #[test]
@@ -6491,7 +6818,7 @@ ping -n 60 127.0.0.1 >nul
                  const say=t=>console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:t}}}}));\
                  if(a.includes('resume'))say('Got it: '+i);\
                  else{{console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
-                 say('Starting the benchmark.\\nORTECA-WAIT: node -e \"console.log(40+2)\"');}}\
+                 say('Starting the benchmark.\\nORTECA-WAIT: ANSWER=42 node -e \"console.log(process.env.ANSWER)\"');}}\
                  console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));}});"
             ),
         )

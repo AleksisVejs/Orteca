@@ -1,7 +1,7 @@
 //! Running an agent CLI: spawn it inside a Job Object, read its JSONL stream,
 //! keep stdin open for steering, kill the whole tree on cancel.
 //!
-//! Provider-agnostic on purpose — `providers::claude` and `providers::codex`
+//! Provider-agnostic on purpose - `providers::claude` and `providers::codex`
 //! both emit newline-delimited JSON, they just disagree about the field names.
 
 pub mod job;
@@ -309,7 +309,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        panic!("grandchild {grandchild} survived cancel — job object is not working");
+        panic!("grandchild {grandchild} survived cancel - job object is not working");
     }
 
     #[tokio::test]

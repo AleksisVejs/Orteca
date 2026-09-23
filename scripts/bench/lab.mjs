@@ -71,9 +71,9 @@ export function summarise(rows) {
 
 export function markdownReport(rows) {
   const report = summarise(rows);
-  const cell = value => value == null ? '—' : value;
-  const time = value => value == null ? '—' : `${Math.round(value / 1000)}s`;
-  const ci = value => value == null ? '—' : `${Math.round(value[0] / 1000)}–${Math.round(value[1] / 1000)}s`;
+  const cell = value => value == null ? '-' : value;
+  const time = value => value == null ? '-' : `${Math.round(value / 1000)}s`;
+  const ci = value => value == null ? '-' : `${Math.round(value[0] / 1000)}–${Math.round(value[1] / 1000)}s`;
   return ['# Benchmark Lab report', '', 'Task-level cells; do not blend correctness, latency, and cost into one score.', '', '| Task | Arm | Complete | Hidden | Median wall | 95% CI | Uncached tokens | Calls | Verify | Review findings |', '| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |', ...report.map(row => `| ${row.taskId} | ${row.arm} | ${row.complete}/${row.runs} | ${row.hidden}/${row.runs} | ${time(row.medianWallMs)} | ${ci(row.wall95)} | ${cell(row.medianUncachedTokens)} | ${cell(row.calls)} | ${row.localVerifyPass}/${row.runs} | ${row.reviewFound}/${row.runs} |`), ''].join('\n');
 }
 

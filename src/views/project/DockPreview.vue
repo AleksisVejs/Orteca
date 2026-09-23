@@ -6,7 +6,7 @@ import { PROJECT } from "./state";
 import { CLOSING } from "./picks";
 import { findLines } from "../../api";
 
-// The dev server's own page, inside the workspace. Orteca does not start it —
+// The dev server's own page, inside the workspace. Orteca does not start it -
 // a terminal tab does, and the address it prints lands here.
 const props = defineProps<{ tab: Tab }>();
 const dock = inject(DOCK)!;

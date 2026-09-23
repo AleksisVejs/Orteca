@@ -141,6 +141,16 @@ fn json_value(value: Option<&Value>) -> Option<Value> {
 fn item(i: &Value) -> Option<ProviderEvent> {
     match i["type"].as_str()? {
         "agent_message" => Some(ProviderEvent::Text(i["text"].as_str()?.to_string())),
+        "reasoning" => Some(i["text"].as_str()?.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| ProviderEvent::Thinking(t.to_string())),
+        // Same name as Claude's tool, so the UI words both alike.
+        "web_search" => Some(ProviderEvent::ToolUse {
+            name: "WebSearch".into(),
+            summary: i["query"].as_str().unwrap_or_default().to_string(),
+            id: None,
+            changes: Vec::new(),
+        }),
         "command_execution" => Some(ProviderEvent::ToolUse {
             name: "Shell".into(),
             summary: i["command"].as_str().unwrap_or_default().to_string(),
@@ -172,7 +182,10 @@ fn item(i: &Value) -> Option<ProviderEvent> {
                     .collect()
             },
         }),
-        "error" => Some(failed(message_of(i))),
+        // An error *item* is a warning Codex carries on after ("Model metadata
+        // for `gpt-6-luna` not found", codex-cli 0.155.1). Reading it as a
+        // failure stopped every run at its first line. A real failure is a
+        // top-level `error` or `turn.failed`, and a bad exit still fails.
         _ => None,
     }
 }
@@ -237,6 +250,22 @@ mod tests {
             matches!(&parse_line(&value)[0], ProviderEvent::ToolUse { name, changes, .. }
             if name == "Edit failed" && changes.is_empty())
         );
+    }
+
+    #[test]
+    fn reasoning_and_web_searches_are_kept() {
+        let item = |item: Value| parse_line(&serde_json::json!({"type":"item.completed", "item": item}));
+        assert_eq!(
+            item(serde_json::json!({"type":"reasoning", "text":" **Looking** at it "})),
+            [ProviderEvent::Thinking("**Looking** at it".into())]
+        );
+        assert!(item(serde_json::json!({"type":"reasoning", "text":""})).is_empty());
+        // A warning item is not a failure; a top-level error is.
+        assert!(item(serde_json::json!({"type":"error", "message":"Model metadata for `x` not found."})).is_empty());
+        assert!(matches!(&parse_line(&serde_json::json!({"type":"error", "message":"connection lost"}))[0],
+            ProviderEvent::Failed { .. }));
+        assert!(matches!(&item(serde_json::json!({"type":"web_search", "query":"tauri 2 tray"}))[0],
+            ProviderEvent::ToolUse { name, summary, .. } if name == "WebSearch" && summary == "tauri 2 tray"));
     }
 
     #[test]

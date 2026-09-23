@@ -243,7 +243,7 @@ export const ptyClose = (id: number) => invoke<void>("pty_close", { id });
 export const onPtyData = (id: number, fn: (chunk: string) => void) =>
   listen<string>(`pty:${id}`, (e) => fn(e.payload));
 
-/** The shell ended on its own — the tab stays, holding what it printed. */
+/** The shell ended on its own - the tab stays, holding what it printed. */
 export const onPtyExit = (id: number, fn: () => void) =>
   listen<null>(`pty-exit:${id}`, () => fn());
 

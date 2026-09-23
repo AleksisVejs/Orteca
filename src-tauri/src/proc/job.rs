@@ -1,5 +1,5 @@
 //! Win32 Job Object. Owning one guarantees the whole process tree dies when it
-//! drops — `Child::kill()` only kills the direct child and orphans `node -> bash
+//! drops - `Child::kill()` only kills the direct child and orphans `node -> bash
 //! -> npm`, which is how agent CLIs are built.
 
 use std::io;

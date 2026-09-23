@@ -3,6 +3,7 @@ import { computed, inject, ref } from "vue";
 import { parseHistoryPatch } from "./historyPatch";
 import { unfinishedSummary } from "./taskPresentation";
 import Markdown from "../../components/Markdown.vue";
+import Story from "./Story.vue";
 import { PROJECT } from "./state";
 import type { Exchange } from "./state";
 
@@ -65,14 +66,11 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
       <button v-if="editable" class="link edit" :disabled="editDisabled" title="Back to the composer with these words, to change them and run again" @click="emit('editAgain')">Edit</button>
     </div>
 
-    <!-- The conversation on the way, kept as it was while the run went. -->
-    <template v-for="(m, i) in talk" :key="i">
-      <div v-if="m.kind === 'instruction'" class="mine">
-        <p class="bubble">{{ m.text }}</p>
-        <p v-if="m.delivery" class="note">{{ m.delivery }}</p>
-      </div>
-      <Markdown v-else class="summary back" :text="m.text" />
-    </template>
+    <!-- The way there, as it streamed; folded so the answer reads first. -->
+    <details v-if="talk.length" class="story back">
+      <summary class="note">How it got there · {{ talk.length }} {{ talk.length === 1 ? "step" : "steps" }}</summary>
+      <div class="story-body"><Story :lines="talk" /></div>
+    </details>
 
     <!-- The answer, in the place the last message streamed into; the facts and proof under it. -->
     <article class="back answer">
@@ -81,7 +79,7 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
       <Markdown v-if="d.summary" class="summary" :text="describeVerdict(d.summary) ?? d.summary" />
       <p v-else-if="!d.failure" class="note">No summary was reported.</p>
       <p v-if="d.status === 'cancelled'" class="note caveat">
-        Stopped part-way. Anything the agent had already written is still on disk — Orteca reverts nothing.
+        Stopped part-way. Anything the agent had already written is still on disk - Orteca reverts nothing.
       </p>
       <slot name="after" />
       <p v-if="d.unknownEvents" class="note caveat" role="status">
@@ -165,7 +163,7 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
               <summary>Route context</summary>
               <p class="note">{{ d.route.tierReason }}</p>
               <ul v-if="d.route.candidatePaths.length">
-                <li v-for="(path, i) in d.route.candidatePaths" :key="path"><span class="mono">{{ path }}</span><template v-if="d.route.candidateNotes?.[i]"> — {{ d.route.candidateNotes[i] }}</template></li>
+                <li v-for="(path, i) in d.route.candidatePaths" :key="path"><span class="mono">{{ path }}</span><template v-if="d.route.candidateNotes?.[i]"> - {{ d.route.candidateNotes[i] }}</template></li>
               </ul>
               <p v-else class="note">No repository paths were supplied as route context.</p>
             </details>
@@ -175,18 +173,18 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
           <dl class="tiles">
             <div>
               <dt class="note">{{ d.metrics.callsUsed === null ? "agent calls unavailable" : d.metrics.callsUsed === 1 ? "agent call" : "agent calls" }}<template v-if="d.metrics.turns !== null"> · {{ d.metrics.turns }} turns</template></dt>
-              <dd>{{ d.metrics.callsUsed ?? "—" }}</dd>
+              <dd>{{ d.metrics.callsUsed ?? "-" }}</dd>
               <dd class="note">{{ d.metrics.ran.join(" → ") || "none" }}</dd>
             </div>
             <div>
               <dt class="note">{{ d.metrics.tokens ? "tokens" : "tokens unavailable" }}</dt>
-              <dd>{{ d.metrics.tokens ? formatTokens(d.metrics.tokens.total) : "—" }}</dd>
+              <dd>{{ d.metrics.tokens ? formatTokens(d.metrics.tokens.total) : "-" }}</dd>
               <dd v-if="d.metrics.tokens" class="note">{{ formatTokens(d.metrics.tokens.uncached) }} uncached · {{ formatTokens(d.metrics.tokens.cached) }} cached</dd>
               <dd v-if="d.metrics.tokens && d.metrics.tokens.cacheHit !== null" class="note" title="Share of input read from the provider's cache. Low means context was billed again.">{{ d.metrics.tokens.cacheHit }}% cache hit</dd>
             </div>
             <div>
               <dt class="note">{{ d.metrics.cost !== null ? "cost, " + d.metrics.costQuality : "cost unavailable" }}</dt>
-              <dd :class="{ good: d.metrics.cost !== null }">{{ d.metrics.cost !== null ? formatCost(d.metrics.cost) : "—" }}</dd>
+              <dd :class="{ good: d.metrics.cost !== null }">{{ d.metrics.cost !== null ? formatCost(d.metrics.cost) : "-" }}</dd>
             </div>
             <div>
               <dt class="note">elapsed</dt>
@@ -194,7 +192,7 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
             </div>
             <div>
               <dt class="note">model reported by provider{{ d.metrics.effort ? ` · ${d.metrics.effort} effort` : "" }}</dt>
-              <dd class="model">{{ d.metrics.model ?? "—" }}</dd>
+              <dd class="model">{{ d.metrics.model ?? "-" }}</dd>
             </div>
           </dl>
           <slot name="details-end" />
@@ -224,6 +222,9 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
 /* The proof sits beside the facts it backs. */
 .proof { display: flex; gap: 14px; margin-left: auto; }
 .answer { scroll-margin-top: 16px; }
+.story > summary { cursor: pointer; width: fit-content; }
+.story > summary:hover { color: var(--text-dim); }
+.story-body { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
 
 .mine .edit {
   font-size: 11px;

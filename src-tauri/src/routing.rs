@@ -447,6 +447,10 @@ impl Route {
                 choice = Tier::Standard.model(id);
                 choice.effort = "high";
             }
+            // Risky work is Guarded, so a Standard route's Review is low
+            // stakes: Sol high spent $0.25 on one low finding, over a
+            // $0.53 Implement.
+            ProviderId::Codex if self.kind == RouteKind::Standard => choice.effort = "medium",
             ProviderId::Codex => {}
         }
         Some(choice)
@@ -1649,7 +1653,10 @@ pub fn brief(
         ),
         Stage::Fix => out.push_str(
             "An earlier stage of this task did not pass; what it found is below. Fix that and \
-             nothing beyond it, then run the focused checks that prove the fix. Return only \
+             nothing beyond it, then run the focused checks that prove the fix. Every input \
+             the finding does not name keeps behaving as it did: when the fix moves a limit \
+             or a default, also check a value just past it, so an over-correction fails. \
+             Return only \
              the structured result: every check you ran, whether it passed, and what it \
              printed. `pass` means at least one check ran and every check passed. The check \
              that failed runs again after this call.\n\n",
@@ -1657,7 +1664,10 @@ pub fn brief(
         Stage::Answer => out.push_str(
             "Answer the question below about this project. Read what you need, change no \
              file, and reply in the language it was asked in. Stop reading as soon as you \
-             can answer; do not search again to double-check. Explain it like to a \
+             can answer; do not search again to double-check. A cause or a claim about \
+             what code does must come from the code or output you read: when the question \
+             is why something happened, read the part that decided it before answering, and \
+             never state a cause you only guessed. Explain it like to a \
              five-year-old: small words, short sentences, only what matters, a few short \
              paragraphs at most. Lead with the answer. Plain text only: no markdown, no \
              headings, no bold, no [[links]]; name a file only when the reader needs it.\n\n",
@@ -1668,8 +1678,16 @@ pub fn brief(
             "If a command will take more than about two minutes, such as a benchmark or a full \
              build, do not run it yourself: end your reply with the line \
              `ORTECA-WAIT: <command>` and stop. Orteca runs it, one program with its arguments \
-             and no shell, and sends you its output when it ends.\n\n",
+             and no shell, and sends you its output when it ends. Leading `NAME=value` words \
+             set its environment variables. Keep every option the task names, such as which \
+             variant to run, in that command.\n\n",
         ),
+    }
+    // Windows' default policy blocks npm.ps1; a Fix spent two tries finding out.
+    if matches!(stage, Stage::Verify | Stage::Fix) {
+        out.push_str(
+            "Run npm and npx as `npm.cmd` and `npx.cmd`: PowerShell blocks their .ps1 shims.\n\n",
+        );
     }
 
     if !resumed {
@@ -2119,7 +2137,7 @@ mod tests {
             "fix the typo in the header component and redesign the page",
             "corrige la faute de frappe dans le readme",
             "make the header bold",
-            "corrige l'erreur — typo dans le README",
+            "corrige l'erreur - typo dans le README",
         ] {
             assert!(!keywords_suffice(read), "{read}");
         }
@@ -2302,6 +2320,12 @@ mod tests {
             r.review_model(ProviderId::Codex)
                 .map(|c| (c.model, c.effort)),
             Some(("gpt-6-sol", "high"))
+        );
+        let plain = route("show the Finnish before the tile builder", Mode::Balanced, &local);
+        assert_eq!(plain.kind, RouteKind::Standard);
+        assert_eq!(
+            plain.review_model(ProviderId::Codex).map(|c| (c.model, c.effort)),
+            Some(("gpt-6-sol", "medium"))
         );
     }
 

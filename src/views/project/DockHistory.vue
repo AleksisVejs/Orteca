@@ -6,7 +6,7 @@ import { parseHistoryPatch } from "./historyPatch";
 import type { Commit } from "../../types";
 
 // The repository's own history. One thing on screen at a time: the list, or
-// the commit you picked. Git does the wording for "3 hours ago" — computing it
+// the commit you picked. Git does the wording for "3 hours ago" - computing it
 // here would drift from what every other git tool says. What the working tree
 // holds above the newest commit sits at the top of the list: it is the part of
 // the history still being written.

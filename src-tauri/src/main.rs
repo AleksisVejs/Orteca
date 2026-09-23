@@ -363,11 +363,21 @@ impl Scanned {
 /// classifier answers about the task at the top instead of the reply at the
 /// bottom. "ELI5" after a finished change was read as more of the change, ran
 /// an Implement stage that rightly edited nothing, and turned a done task into
-/// "Couldn't finish".
+/// "Couldn't finish". The reply alone is too little, though: "okay, do that"
+/// has no "that", was read as a question, and ran read-only. So the route
+/// reads the last answer and the reply, never the task above them.
 fn routing_words(prompt: &str, asked: Option<&str>) -> Option<String> {
-    asked
-        .and_then(run::clean_prompt)
-        .or_else(|| run::clean_prompt(prompt))
+    let Some(reply) = asked.and_then(run::clean_prompt) else {
+        return run::clean_prompt(prompt);
+    };
+    let answer = prompt
+        .rsplit_once("\n\nMy reply:\n")
+        .and_then(|(before, _)| before.rsplit_once("Your answer:\n"))
+        .and_then(|(_, answer)| run::clean_prompt(answer));
+    Some(match answer {
+        Some(answer) => format!("Your answer:\n{answer}\n\nMy reply:\n{reply}"),
+        None => reply,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -477,12 +487,8 @@ async fn begin(
     // router decides, never a failed run. The same call names the task, so a
     // title costs no extra call; a prompt keywords already read gets none.
     //
-    // A follow-up reads only what the user just said. The prompt it runs on
-    // carries the whole exchange so the agent has the context, and a classifier
-    // handed that reads the task at the top instead of the reply at the bottom:
-    // "ELI5" after a finished change was routed as more of the change, ran an
-    // Implement stage that rightly edited nothing, and the finished task turned
-    // into "Couldn't finish".
+    // A follow-up reads the last answer and what the user just said, not the
+    // task at the top: see `routing_words`.
     let reading = match (
         routing_words(&prompt, asked.as_deref()),
         providers::which(provider.program()),
@@ -1440,7 +1446,19 @@ Done, 85 tests pass.
 
 My reply:
 ELI5";
-        assert_eq!(routing_words(blob, Some("ELI5")).unwrap(), "ELI5");
+        assert_eq!(
+            routing_words(blob, Some("ELI5")).unwrap(),
+            "Your answer:\nDone, 85 tests pass.\n\nMy reply:\nELI5"
+        );
+        // "do that" keeps the answer that says what "that" is.
+        let proposal = "why no builder?\n\nYour answer:\nShow Finnish first, then tiles.\n\n\
+                        My reply:\nOkay do that\n\nFiles changed so far: a.vue";
+        assert_eq!(
+            routing_words(proposal, Some("Okay do that")).unwrap(),
+            "Your answer:\nShow Finnish first, then tiles.\n\nMy reply:\nOkay do that"
+        );
+        // A first ask's `asked` is the prompt itself: no answer to carry.
+        assert_eq!(routing_words("add a list", Some("add a list")).unwrap(), "add a list");
         // A first ask has no reply of its own, so the whole prompt is the route's.
         assert_eq!(routing_words(blob, None).unwrap(), blob);
         // Blank is not words. The prompt still routes the run rather than nothing.
@@ -1519,8 +1537,12 @@ ELI5";
             Ok(db) => Store::open(std::path::Path::new(&db)).unwrap(),
             Err(_) => Store::in_memory().unwrap(),
         };
-        store.touch_project(&key, "bench").unwrap();
+        let project = store.touch_project(&key, "bench").unwrap();
         store.set_trusted(&key, true).unwrap();
+        // The app maps a project when it is opened, so a run only rescans what
+        // moved. Mapped here, off the clock, or every arm times a cold parse
+        // (22-33s on RigInspectBE) no user waits for.
+        store.scan_map(project.id, &dir, &project::tracked_paths(&dir)).unwrap();
         if let Ok(item) = std::env::var("BENCH_MEMORY") {
             store.add_memory(None, &item).unwrap();
         }

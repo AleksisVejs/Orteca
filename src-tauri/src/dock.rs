@@ -2,7 +2,7 @@
 //! directory listing for the file tree, and one text file in and out for the
 //! code tab. Everything here is gated on a trusted project and confined to it.
 //!
-//! The PTY child goes in a Job Object for the same reason `proc` does it — a
+//! The PTY child goes in a Job Object for the same reason `proc` does it - a
 //! shell spawns `npm -> node -> vite`, and closing a tab has to take the whole
 //! tree with it, not just the shell.
 
@@ -85,7 +85,7 @@ fn shell_command(shell: &str, cwd: &Path) -> Result<CommandBuilder> {
 
 /// Where a terminal opens: the folder itself, or the folder holding the file,
 /// and never in the `\\?\` form `canonicalize` returns. No shell works out of
-/// that form — cmd refuses it and defaults to the Windows directory, and
+/// that form - cmd refuses it and defaults to the Windows directory, and
 /// PowerShell starts on a provider-qualified path where `npm` cannot find the
 /// project's own binaries.
 fn shell_cwd(target: &Path) -> PathBuf {
@@ -228,7 +228,7 @@ pub fn pty_close(id: u32, terminals: State<Terminals>) -> Result<()> {
     Ok(())
 }
 
-/// One directory's children, folders first. `.git` stays hidden — it is the one
+/// One directory's children, folders first. `.git` stays hidden - it is the one
 /// folder in a repository that nobody opens a file from.
 #[tauri::command(async)]
 pub fn list_dir(path: String, sub: String, store: State<Store>) -> Result<Vec<Entry>> {
@@ -289,7 +289,7 @@ pub fn read_text(path: String, file: String, store: State<Store>) -> Result<Stri
     if size > MAX_TEXT_BYTES {
         return Err(AppError::new(
             ErrorKind::Invalid,
-            format!("That file is {} MB — too big to open here.", size / 1024 / 1024),
+            format!("That file is {} MB - too big to open here.", size / 1024 / 1024),
         ));
     }
     let bytes = std::fs::read(&target)?;

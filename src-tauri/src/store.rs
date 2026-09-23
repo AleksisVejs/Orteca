@@ -489,7 +489,9 @@ impl Store {
     /// `done` on the same route kind, provider and mode, and reported usage.
     /// Tokens exclude cache reads, so a warm cache does not read as less work. `None`
     /// below five of them: a median of two runs is an anecdote, and the screen
-    /// shows absolute numbers until there is more.
+    /// shows absolute numbers until there is more. A continued task (a `turn`
+    /// event) is left out here and in `stalled_tiers`: its totals and status
+    /// span turns on different routes, and its row keeps only the last one.
     pub fn baseline(
         &self,
         task_id: i64,
@@ -505,6 +507,7 @@ impl Store {
                 AND t.id != ?1 AND t.status = 'done' AND t.calls_used IS NOT NULL
                 AND u.input_tokens IS NOT NULL AND u.provider = ?3
                 AND json_extract(t.route_json, '$.kind') = ?2
+                AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = 'turn')
               ORDER BY t.id DESC LIMIT 20",
         )?;
         let rows = stmt
@@ -550,7 +553,8 @@ impl Store {
                  WHERE t.id IN (SELECT id FROM tasks WHERE project_id = ?1 ORDER BY id DESC LIMIT 50)
                    AND u.provider = ?2
                    AND t.mode = ?3
-                   AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed'))
+                   AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed')
+                   AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = 'turn'))
              SELECT kind, tier FROM (
                 SELECT *, FIRST_VALUE(model) OVER (PARTITION BY kind, tier ORDER BY id DESC) AS latest
                   FROM runs)
@@ -1730,6 +1734,14 @@ mod tests {
             None
         );
 
+        // A continued task spans routes, so it is no evidence for this one.
+        let continued = run(project.id, "implementOnce", "codex", "done", 1);
+        store.append_event(continued, "answer", "turn", "codex", "{}").unwrap();
+        assert_eq!(
+            store.baseline(current, "implementOnce", "codex").unwrap(),
+            None
+        );
+
         run(project.id, "implementOnce", "codex", "done", 500);
         assert_eq!(
             store.baseline(current, "implementOnce", "codex").unwrap(),
@@ -1774,6 +1786,10 @@ mod tests {
             Vec::new(),
             "one stall in four finished runs is not a pattern"
         );
+
+        let continued = run("implementOnce", "cheapest", "codex", "reviewRejected");
+        store.append_event(continued, "answer", "turn", "codex", "{}").unwrap();
+        assert_eq!(stalled(), Vec::new(), "a continued task spans routes");
 
         run("implementOnce", "cheapest", "codex", "reviewRejected");
         assert_eq!(stalled(), [(RouteKind::ImplementOnce, Tier::Cheapest)]);

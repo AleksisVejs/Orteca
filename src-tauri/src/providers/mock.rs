@@ -2,7 +2,7 @@
 //!
 //! Tests never invoke a provider CLI: neither is installed on the dev machine,
 //! and a real run would spend the user's subscription. Only the *process* is
-//! faked here — normalisation is the same code a live run goes through.
+//! faked here - normalisation is the same code a live run goes through.
 //!
 //! Provenance: `*-run.jsonl` are written to the event shapes verified in
 //! `docs/architecture.md`. `claude-auth-failure.jsonl` and

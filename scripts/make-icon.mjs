@@ -1,4 +1,4 @@
-// Generates the whole src-tauri/icons set from src/assets/velo.png — the one
+// Generates the whole src-tauri/icons set from src/assets/velo.png - the one
 // source of truth for the mark. The PNG is white on transparent, so it is
 // composited onto the dark rounded tile from the brand icon; a bare white fox
 // would vanish on a light taskbar.
@@ -93,7 +93,7 @@ function decodePng(file) {
   return { w, h, px };
 }
 
-/** Crop to the mark's alpha bounding box — the source PNG has loose padding. */
+/** Crop to the mark's alpha bounding box - the source PNG has loose padding. */
 function trim(src) {
   let x0 = src.w;
   let y0 = src.h;

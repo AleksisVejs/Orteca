@@ -1,49 +1,35 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onMounted, ref, watch } from "vue";
-import { parseHistoryPatch } from "./historyPatch";
-import { verificationSummary, unfinishedSummary, savedArtifacts } from "./taskPresentation";
-import Markdown from "../../components/Markdown.vue";
+import { computed, inject } from "vue";
+import { verificationSummary, savedArtifacts } from "./taskPresentation";
 import ActivityLog from "./ActivityLog.vue";
-import { PROJECT } from "./state";
-import type { ActivityLine } from "./state";
-import { split, tidy } from "./picks";
-import type { ProviderEvent, Route } from "../../types";
+import TaskChat from "./TaskChat.vue";
+import ExchangeView from "./Exchange.vue";
+import Markdown from "../../components/Markdown.vue";
+import { PROJECT, exchangeOf, splitExchanges } from "./state";
+import type { Exchange } from "./state";
+import { split } from "./picks";
+import type { Route } from "../../types";
 import { visiblePath } from "../../path";
 
 // One finished task from the sidebar, laid out like the page after a run: the same chat.
 const {
-  historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE, TABS,
-  formatTokens, formatCost, cacheHit, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
-  removeError, describeVerdict, appendActivity, stageLabel,
-  task, picks, selectRun, anyRunning, focusTask, newTask, domId,
-  reply, replyToPast, running, attachments, attachError, addAttachments, pasteImages, fileName,
-  git, openGit,
+  historyDetail, historyDetailLoading, historyDetailError,
+  cacheHit, formatPayload, removedCopies, confirmRemove, removeCopy,
+  removeError, linesOf, task, picks, selectRun, anyRunning, focusTask, domId,
+  replyToPast, git, openGit, describeVerdict,
 } = inject(PROJECT)!;
 
-const tab = ref<(typeof TABS)[number]["id"]>("summary");
-watch(() => historyDetail.value?.id, () => (tab.value = "summary"));
-// The answer is always shown, so "summary" means no proof section is open.
-const proofTabs = TABS.filter((t) => t.id !== "summary");
-const tabsRow = ref<HTMLDivElement | null>(null);
-async function toggleTab(id: typeof tab.value) {
-  tab.value = tab.value === id ? "summary" : id;
-  if (tab.value === "summary") return;
-  await nextTick();
-  tabsRow.value?.scrollIntoView({ block: "start" });
-}
-// A copy's work is on its branch; a follow-up would start without it.
-const canReply = computed(() => !!d.value?.summary && !d.value.worktreePath);
-// Like any chat, it opens at the latest message.
-const chat = ref<HTMLDivElement | null>(null);
-function toBottom() {
-  const pane = chat.value?.parentElement;
-  if (pane) pane.scrollTop = pane.scrollHeight;
-}
-onMounted(toBottom);
-watch(() => historyDetail.value?.id, toBottom, { flush: "post" });
-
 const d = computed(() => historyDetail.value);
+// One chat per task: every reply is its own exchange, each with the proof it logged.
+const parts = computed(() => (d.value ? splitExchanges(d.value) : []));
+const earlier = computed(() => parts.value.slice(0, -1).map((p) => {
+  const lines = linesOf(p.events);
+  return { ...p, lines, data: p.result ? exchangeOf(p.result, lines) : null };
+}));
+const current = computed(() => parts.value.at(-1) ?? null);
 const route = computed(() => (d.value?.route ?? null) as Route | null);
+// A copy's work is on its branch; a follow-up would start without it.
+const canReply = computed(() => !!d.value && !d.value.worktreePath && d.value.status !== "running");
 
 const changed = computed(() => {
   const diff = d.value?.diff ?? [];
@@ -54,10 +40,16 @@ const changed = computed(() => {
   };
 });
 
-// Stages are not saved as such; the event log says which ran, in order.
+// Stages are not saved as such; the event log says which ran, in order. The
+// classify reply and the pre-run notes (stamped with the first stage before it
+// starts) are not a stage running.
+const PRE_RUN = new Set(["routing", "turn"]);
 const ran = computed(() => {
   const out: string[] = [];
-  for (const e of d.value?.events ?? []) if (e.stage && out.at(-1) !== e.stage) out.push(e.stage);
+  for (const e of current.value?.events ?? []) {
+    if (!e.stage || e.stage === "classify" || PRE_RUN.has(e.kind)) continue;
+    if (out.at(-1) !== e.stage) out.push(e.stage);
+  }
   return out;
 });
 const routeSteps = computed(() => {
@@ -66,293 +58,128 @@ const routeSteps = computed(() => {
   return [...steps, ...route.value.stages.slice(steps.length).map((stage) => ({ stage, ran: false }))];
 });
 
-// The same plain-English lines the live log showed, rebuilt from the saved events.
-const lines = computed(() => {
-  const items: ActivityLine[] = [];
-  for (const e of d.value?.events ?? []) {
-    const ev = e.payload as ProviderEvent;
-    if (typeof ev === "object" && ev !== null && "kind" in ev) appendActivity(items, ev);
-  }
-  return items;
+const metrics = computed(() => {
+  const t = d.value;
+  return {
+    callsUsed: t?.callsUsed ?? null,
+    turns: null,
+    ran: ran.value,
+    tokens: t?.tokens == null ? null : {
+      total: t.tokens,
+      uncached: t.uncachedTokens ?? 0,
+      cached: t.cachedTokens ?? 0,
+      cacheHit: t.inputTokens != null ? cacheHit(t.inputTokens, t.cachedTokens ?? 0) : null,
+    },
+    cost: t?.costUsd ?? null,
+    costQuality: t?.costQuality ?? null,
+    model: t?.model ?? null,
+    effort: null,
+  };
 });
+
+// The same plain-English lines the live log showed, rebuilt from the saved events.
+const lines = computed(() => linesOf(current.value?.events ?? []));
 
 function editAgain() {
   if (!d.value) return;
-  const { picks: again, rest } = split(d.value.prompt);
+  // A reply is edited as what was typed; the first request keeps its picked files.
+  const { picks: again, rest } = split(parts.value.length > 1 ? current.value!.said : d.value.prompt);
   task.value = rest;
   picks.value = again;
   selectRun(null);
   focusTask();
 }
-const selectedFile = ref<string | null>(null);
-const parsedPatch = computed(() => parseHistoryPatch(d.value?.patchText ?? ""));
-const selectedPath = computed(() => changed.value.byRun.some((f) => f.path === selectedFile.value) ? selectedFile.value : changed.value.byRun[0]?.path);
-const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path === selectedPath.value));
-const verification = computed(() => verificationSummary(savedArtifacts(d.value?.events ?? [])));
-watch(() => d.value?.id, () => { selectedFile.value = null; });
+// A task logged before each reply kept its result falls back to the task row.
+const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current.value.result, lines.value) : ({
+  status: d.value?.status ?? "failed",
+  failure: null,
+  summary: d.value?.summary ?? null,
+  unknownEvents: d.value?.unknownEvents ?? 0,
+  changed: changed.value,
+  patchText: d.value?.patchText ?? null,
+  verification: verificationSummary(savedArtifacts(current.value?.events ?? [])),
+  route: route.value,
+  routeSteps: routeSteps.value,
+  durationMs: d.value?.durationMs ?? null,
+  metrics: metrics.value,
+  messages: lines.value.filter((l) => l.kind === "text" || l.kind === "instruction"),
+}));
 </script>
 
 <template>
   <p v-if="historyDetailLoading" class="note" aria-live="polite">Loading task details…</p>
   <p v-else-if="historyDetailError" class="missing" role="alert">Task details unavailable.</p>
   <p v-else-if="!d" class="note">Pick a task on the left.</p>
-  <div v-else ref="chat" class="chat">
-    <div class="thread">
-      <div class="mine">
-        <h1 class="bubble" :class="{ long: tidy(d.prompt).length > 600 }">{{ tidy(d.prompt) }}</h1>
-      </div>
-
-      <!-- The answer: what happened first, its proof one click away. -->
-      <article class="back answer">
-        <div class="head">
-          <span class="dot" :class="TONE[d.status]" aria-hidden="true"></span>
-          <h2 class="status">
-            {{ route?.kind === "answer" && d.status === "done" ? "Answered" : HISTORY_STATUS[d.status] ?? d.status }}
-          </h2>
-          <span class="note">{{ formatDuration(d.durationMs) }} · {{ d.startedAt.slice(0, 16) }} UTC</span>
-        </div>
-        <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(d.status) }}</span></div>
-
-        <Markdown v-if="d.summary" class="summary" :text="describeVerdict(d.summary) ?? d.summary" />
-        <p v-else class="note">No summary was reported.</p>
-        <p v-if="d.status === 'cancelled'" class="note caveat">
-          Stopped part-way. Anything the agent had already written is still on disk — Orteca reverts nothing.
-        </p>
-        <div v-if="d.worktreePath" class="copy" role="status">
-          <p class="note">Worked in a separate copy on branch <span class="mono">{{ d.branch }}</span>.</p>
-          <button v-if="d.branch && git.branches.includes(d.branch)" class="btn" :popovertarget="domId('project-git')" popovertargetaction="show" @click="openGit('merge', d.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
-          <template v-if="!removedCopies.includes(d.id)">
-            <p class="note mono">{{ visiblePath(d.worktreePath) }}</p>
-            <button
-              class="btn"
-              :class="{ confirming: confirmRemove === d.id }"
-              :disabled="anyRunning"
-              @click="removeCopy(d.id)"
-            >
-              {{ confirmRemove === d.id ? "Yes, delete the copy folder" : "Remove copy" }}
-            </button>
-            <button v-if="confirmRemove === d.id" class="link" @click="confirmRemove = null">Keep it</button>
+  <TaskChat
+    v-else
+    :task-key="d.id"
+    id-prefix="past"
+    :prompt="current?.said ?? ''"
+    :data="data"
+    :can-reply="canReply"
+    reply-note="Rereads the files"
+    reply-hint="This task is over, so a reply reads the files again rather than picking up where it left off. It goes on in this same task."
+    :edit-disabled="anyRunning"
+    @send="replyToPast"
+    @edit-again="editAgain"
+  >
+    <template #earlier>
+      <template v-for="(t, i) in earlier" :key="i">
+        <ExchangeView v-if="t.data" :id-prefix="`past-turn-${i}`" :prompt="t.said" :data="t.data" earlier>
+          <template #activity>
+            <ActivityLog :items="t.lines" :patch-text="t.result?.patchText" :root="d.worktreePath ?? undefined" :finished="true" :dirty-at-start="t.result?.dirtyAtStart" />
           </template>
-          <p v-else class="note">Copy removed. The branch is still there.</p>
-          <p v-if="removeError" class="missing">{{ removeError }}</p>
-        </div>
-        <p v-if="d.unknownEvents" class="note caveat" role="status">
-          {{ d.unknownEvents }} provider event{{ d.unknownEvents === 1 ? "" : "s" }} were not recognized and remain in the saved task log.
-        </p>
+        </ExchangeView>
+        <!-- Logged before each reply kept its result: the words survive, the proof was not saved. -->
+        <template v-else>
+          <p class="bubble">{{ t.said }}</p>
+          <Markdown v-for="(m, j) in t.lines.filter((l) => l.kind === 'text')" :key="j" class="summary back" :text="describeVerdict(m.text) ?? m.text" />
+          <p class="note turn-end">Details for this reply were not saved.</p>
+        </template>
+      </template>
+    </template>
 
-        <!-- Nothing open is the resting state; a second click folds the section away again. -->
-        <div ref="tabsRow" class="tabs">
+    <template #after>
+      <div v-if="d.worktreePath" class="copy" role="status">
+        <p class="note">Worked in a separate copy on branch <span class="mono">{{ d.branch }}</span>.</p>
+        <button v-if="d.branch && git.branches.includes(d.branch)" class="btn" :popovertarget="domId('project-git')" popovertargetaction="show" @click="openGit('merge', d.branch)">Merge into {{ git.branch ?? 'current checkout' }}</button>
+        <template v-if="!removedCopies.includes(d.id)">
+          <p class="note mono">{{ visiblePath(d.worktreePath) }}</p>
           <button
-            v-for="t in proofTabs"
-            :key="t.id"
-            :aria-expanded="tab === t.id"
-            :aria-controls="domId('past-panel')"
-            :class="{ on: tab === t.id }"
-            @click="toggleTab(t.id)"
+            class="btn"
+            :class="{ confirming: confirmRemove === d.id }"
+            :disabled="anyRunning"
+            @click="removeCopy(d.id)"
           >
-            {{ t.label }}<span v-if="t.id === 'files'" class="count">{{ changed.byRun.length }}</span>
+            {{ confirmRemove === d.id ? "Yes, delete the copy folder" : "Remove copy" }}
           </button>
-        </div>
+          <button v-if="confirmRemove === d.id" class="link" @click="confirmRemove = null">Keep it</button>
+        </template>
+        <p v-else class="note">Copy removed. The branch is still there.</p>
+        <p v-if="removeError" class="missing">{{ removeError }}</p>
+      </div>
+    </template>
 
-        <div v-if="tab !== 'summary'" :id="domId('past-panel')" class="panel">
-      <template v-if="tab === 'files'">
-        <div v-if="changed.byRun.length" class="file-review">
-          <ul class="review-files" aria-label="Changed files">
-            <li v-for="f in changed.byRun" :key="f.path">
-              <button :aria-pressed="selectedPath === f.path" @click="selectedFile = f.path">
-                <span class="mono file-path">{{ f.path }}</span>
-                <span class="note">{{ parsedPatch.files.find((p) => p.path === f.path)?.status ?? 'Status unavailable' }} · <template v-if="f.added !== null && f.deleted !== null">+{{ f.added }} −{{ f.deleted }}</template><template v-else>Counts unavailable</template></span>
-                <span v-if="f.origin === 'both'" class="note">Includes pre-existing changes</span>
-                <span v-else-if="f.origin === null" class="note">Change origin unknown</span>
-              </button>
-            </li>
-          </ul>
-          <section class="review-patch" aria-label="Selected file changes" tabindex="0">
-            <h2 class="label mono">{{ selectedPath }}</h2>
-            <p v-if="changed.byRun.find((f) => f.path === selectedPath)?.origin === 'both'" class="note">This patch includes changes already present before the task.</p>
-            <template v-if="selectedPatch">
-              <p v-for="note in selectedPatch.notes" :key="note" class="note">{{ note }}</p>
-              <div v-for="(line, i) in selectedPatch.lines" :key="i" class="patch-line" :class="line.kind"><span class="line-number">{{ line.before ?? '' }}</span><span class="line-number">{{ line.after ?? '' }}</span><code>{{ line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : line.kind === 'hunk' ? '@@ ' : ' ' }}{{ line.text }}</code></div>
-              <p v-if="!selectedPatch.lines.length && !selectedPatch.notes.length" class="note">No text changes recorded.</p>
-            </template>
-            <p v-else class="note">This file’s patch is unavailable or was truncated.</p>
-          </section>
-        </div>
-        <p v-else class="note">No files changed.</p>
-        <p class="note caveat">Only files Git can see are listed. Line counts may include pre-existing changes.</p>
-        <p v-if="changed.unknown" class="note caveat">Some changes could not be attributed to this task.</p>
-        <p v-if="changed.beforeRun.length" class="note caveat">Already changed before this task and left untouched: <span class="mono">{{ changed.beforeRun.map((f) => f.path).join(', ') }}</span></p>
-        <p v-for="notice in parsedPatch.notices" :key="notice" class="note">{{ notice }}</p>
-        <details v-if="d.patchText" class="code-view"><summary>View full patch</summary><pre>{{ d.patchText }}</pre></details>
-      </template>
-
-      <template v-else-if="tab === 'details'">
-        <section class="execution" aria-label="Execution">
-          <div class="section-heading"><h2 class="label">Execution</h2><span class="note">Steps taken for this task</span></div>
-        <ol v-if="routeSteps.length" class="route">
-          <template v-for="(step, i) in routeSteps" :key="i">
-            <li v-if="i" class="arrow" aria-hidden="true">→</li>
-            <li :class="{ ran: step.ran }"><span class="step-number" aria-hidden="true">{{ i + 1 }}</span><div>
-              {{ stageLabel(step.stage) }}<small>{{ step.ran ? "Ran" : "Not started" }}</small></div>
-            </li>
-          </template>
-        </ol>
-        <p v-if="route" class="note reason">
-          {{ route.reason }}
-          <template v-if="route.candidatePaths.length">
-            · brief named <span class="mono">{{ route.candidatePaths.join(", ") }}</span>
-          </template>
-        </p>
-        <details v-if="route" class="route-context">
-          <summary>Route context</summary>
-          <p class="note">{{ route.tierReason }}</p>
-          <ul v-if="route.candidatePaths.length">
-            <li v-for="(path, i) in route.candidatePaths" :key="path"><span class="mono">{{ path }}</span><template v-if="route.candidateNotes?.[i]"> — {{ route.candidateNotes[i] }}</template></li>
-          </ul>
-          <p v-else class="note">No repository paths were supplied as route context.</p>
-        </details>
-
-        </section>
-
-        <dl class="tiles">
-          <div>
-            <dt class="note">{{ d.callsUsed === null ? "agent calls unavailable" : d.callsUsed === 1 ? "agent call" : "agent calls" }}</dt>
-            <dd>{{ d.callsUsed ?? "—" }}</dd>
-            <dd class="note">{{ ran.join(" → ") || "none" }}</dd>
-          </div>
-          <div>
-            <dt class="note">{{ d.tokens !== null ? "tokens" : "tokens unavailable" }}</dt>
-            <dd>{{ d.tokens !== null ? formatTokens(d.tokens) : "—" }}</dd>
-            <dd v-if="d.tokens !== null" class="note">
-              {{ formatTokens(d.uncachedTokens ?? 0) }} uncached · {{ formatTokens(d.cachedTokens ?? 0) }} cached
-            </dd>
-            <dd v-if="d.inputTokens != null && cacheHit(d.inputTokens, d.cachedTokens ?? 0) !== null" class="note" title="Share of input read from the provider's cache. Low means context was billed again.">
-              {{ cacheHit(d.inputTokens, d.cachedTokens ?? 0) }}% cache hit
-            </dd>
-          </div>
-          <div>
-            <dt class="note">{{ d.costUsd !== null ? "cost, " + d.costQuality : "cost unavailable" }}</dt>
-            <dd :class="{ good: d.costUsd !== null }">{{ d.costUsd !== null ? formatCost(d.costUsd) : "—" }}</dd>
-          </div>
-          <div>
-            <dt class="note">elapsed</dt>
-            <dd>{{ formatDuration(d.durationMs) }}</dd>
-          </div>
-          <div>
-            <dt class="note">model reported by provider</dt>
-            <dd class="model">{{ d.model ?? "—" }}</dd>
-          </div>
-
-        </dl>
-        <div class="detail-links">
-          <section class="detail-section"><h2 class="label">Changes</h2><p><strong>{{ changed.byRun.length }}</strong> Git-visible files changed</p><p class="note">Review recorded changes and their patches.</p><button class="btn" @click="tab = 'files'">View changed files</button></section>
-          <section class="detail-section"><h2 class="label">Execution activity</h2><p>Follow the work step by step.</p><p class="note">Agent messages, tool activity and recorded edits.</p><button class="btn" @click="tab = 'activity'">View activity</button></section>
-        </div>
-
-      </template>
-
-      <template v-else>
-        <ActivityLog :items="lines" :patch-text="d.patchText" :root="d.worktreePath ?? undefined" :finished="true" :dirty-at-start="d.dirtyAtStart" />
-        <details class="code-view log">
-          <summary>View full task log · {{ d.events.length }} events</summary>
-          <ol>
-            <li v-for="event in d.events" :key="event.id">
-              <span class="mono">{{ event.stage ?? "run" }} · {{ event.kind }}</span>
-              <pre>{{ formatPayload(event.payload) }}</pre>
-            </li>
-          </ol>
-        </details>
-      </template>
-        </div>
-      </article>
-    </div>
-
-    <!-- The chat box: reply to carry on, or start again. -->
-    <div class="composer-bar">
-      <!-- A copy's work is on its branch; a follow-up would start without it. -->
-      <div v-if="canReply" class="reply">
-        <label class="hidden-label" :for="domId('past-reply')">Reply</label>
-        <textarea
-          :id="domId('past-reply')"
-          v-model="reply"
-          rows="2"
-          spellcheck="false"
-          placeholder="Reply, or ask for something more…"
-          :disabled="running"
-          @paste="pasteImages"
-          @keydown.ctrl.enter.prevent="replyToPast"
-        ></textarea>
-        <ul v-if="attachments.length" class="attachments" aria-label="Attached">
-          <li v-for="path in attachments" :key="path" class="chip">
-            <span class="mono" :title="path">{{ fileName(path) }}</span>
-            <button
-              class="unattach"
-              :title="`Remove ${fileName(path)}`"
-              :aria-label="`Remove ${fileName(path)}`"
-              @click="attachments = attachments.filter((p) => p !== path)"
-            >
-              ×
-            </button>
+    <template #activity>
+      <ActivityLog :items="lines" :patch-text="data.patchText" :root="d.worktreePath ?? undefined" :finished="true" :dirty-at-start="d.dirtyAtStart" />
+      <details class="code-view log">
+        <summary>View full task log · {{ d.events.length }} events</summary>
+        <ol>
+          <li v-for="event in d.events" :key="event.id">
+            <span class="mono">{{ event.stage ?? "run" }} · {{ event.kind }}</span>
+            <pre>{{ formatPayload(event.payload) }}</pre>
           </li>
-        </ul>
-        <p v-if="attachError" class="attach-error">{{ attachError }}</p>
-        <div class="reply-controls">
-          <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
-            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
-            Attach
-          </button>
-          <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
-            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          </button>
-          <span class="shortcut note">Ctrl + Enter</span>
-          <button class="btn primary" :disabled="running || !reply.trim()" @click="replyToPast">Reply</button>
-        </div>
-      </div>
-      <div class="next">
-        <p v-if="canReply" class="note reply-cost">
-          This task is over, so a reply reads the files again rather than picking up
-          where it left off. It goes on in this same task.
-        </p>
-        <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
-        <button class="btn" :class="{ primary: !canReply }" @click="newTask">New task</button>
-      </div>
-    </div>
-  </div>
+        </ol>
+      </details>
+    </template>
+
+    <template v-if="d.status === 'running'" #no-reply>Still running. It takes a reply once it finishes.</template>
+  </TaskChat>
 </template>
 
-<style scoped src="./result.css"></style>
+<!-- Slot content is styled here, in the scope it was written in. -->
 <style scoped src="./chat.css"></style>
 <style scoped>
-.answer .outcome-summary { margin: 8px 0 16px; }
-.answer .tabs { margin-top: 8px; scroll-margin-top: 16px; }
-.composer-bar .reply {
-  margin: 0;
-  background: var(--surface);
-}
-.next {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 8px;
-}
-.next .reply-cost {
-  flex: 1;
-  margin: 0;
-}
-.next .btn {
-  flex-shrink: 0;
-  padding: 5px 14px;
-  font-size: 12px;
-}
-@media (max-width: 600px) {
-  .next { flex-wrap: wrap; }
-  .next .reply-cost { flex-basis: 100%; }
-}
-.route-context { margin-top: 12px; font-size: 12px; }
-.route-context p { margin: 8px 0 0; }
-.route-context ul { margin: 8px 0 0; padding-left: 18px; }
-.route-context li { margin-top: 4px; overflow-wrap: anywhere; }
 .log {
   margin-top: 12px;
 }

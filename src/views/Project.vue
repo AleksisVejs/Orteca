@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from "vue";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
+import ProviderMark from "../components/ProviderMark.vue";
 import VeloMark from "../components/VeloMark.vue";
 import Agents from "./project/Agents.vue";
 import Dock from "./project/Dock.vue";
+import CurrentTask from "./project/CurrentTask.vue";
 import PastTask from "./project/PastTask.vue";
 import TaskComposer from "./project/TaskComposer.vue";
-import TaskResult from "./project/TaskResult.vue";
-import TaskRun from "./project/TaskRun.vue";
 import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
 import { globalTasks, workingPatch } from "../api";
@@ -43,8 +44,37 @@ const {
   rows, agentsPending, agentsReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
   git, gitOpen, gitAsk, gitBusy, gitLoading, gitRefreshError, gitError, gitNotice,
-  commitMessage, targetBranch, newBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
+  commitMessage, drafting, draftCommit, targetBranch, newBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
+  formatDuration,
 } = state;
+
+// The pane heading names the task on screen; its dot carries the outcome, the tooltip the rest.
+const heading = computed(() => {
+  const d = historyDetail.value;
+  if (view.value === "history" && d) {
+    const row = history.value.find((t) => t.id === d.id);
+    const answered = (d.route as { kind?: string } | null)?.kind === "answer" && d.status === "done";
+    return {
+      name: row ? taskName(row) : d.prompt.split("\n")[0],
+      tone: TONE[d.status] ?? "",
+      status: answered ? "Answered" : HISTORY_STATUS[d.status] ?? d.status,
+      meta: `${formatDuration(d.durationMs)} · ${d.startedAt.slice(0, 16)} UTC`,
+    };
+  }
+  const r = activeRun.value;
+  if (view.value !== "task" || !r || !(r.active || r.result)) return null;
+  const id = r.result?.taskId ?? r.id;
+  const row = history.value.find((t) => t.id === id);
+  const who = r.provider === "codex" ? "Codex" : "Claude";
+  if (r.active || !r.result) return { name: row ? taskName(row) : runLabel(r), tone: "live", status: "Running", meta: who };
+  const answered = r.result.route.kind === "answer" && r.result.status === "done";
+  return {
+    name: row ? taskName(row) : runLabel(r),
+    tone: TONE[r.result.status] ?? "",
+    status: answered ? "Answered" : OUTCOME[r.result.status],
+    meta: `${who} · ${formatDuration(r.result.durationMs)}`,
+  };
+});
 
 onMounted(loadGlobalTasks);
 watch(history, () => void loadGlobalTasks());
@@ -100,6 +130,28 @@ function openTask(task: GlobalTaskSummary) {
 // The launch screen lists every open project and says which are busy, so a run
 // left going in another one is never invisible.
 watch(runningCount, (count) => emit("busy", count), { immediate: true });
+// A run that ends while Orteca is in the background flashes the taskbar until it is looked at.
+watch(runningCount, (count, before) => {
+  if (count < before && !document.hasFocus()) void getCurrentWindow().requestUserAttention(UserAttentionType.Informational);
+});
+// A new task starting: the box it was typed in glides down to where it steers,
+// rather than the page swapping under it. Runs before the swap, while that box is there.
+watch(() => view.value === "task" && !!(running.value || result.value), (chat, was) => {
+  const from = document.getElementById(domId("task"))?.closest(".ask")?.getBoundingClientRect();
+  if (!chat || was || !from || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  void nextTick(() => {
+    const box = document.getElementById(domId("task-composer"))?.querySelector<HTMLElement>(".composer");
+    const to = box?.getBoundingClientRect();
+    if (!box || !to?.width) return;
+    box.animate(
+      [
+        { transform: `translate(${from.left - to.left}px, ${from.top - to.top}px)`, width: `${from.width}px`, height: `${from.height}px`, overflow: "hidden" },
+        { transform: "none", width: `${to.width}px`, height: `${to.height}px`, overflow: "hidden" },
+      ],
+      { duration: 360, easing: "cubic-bezier(0.2, 0, 0, 1)" },
+    );
+  });
+});
 
 const gitTrigger = ref<HTMLButtonElement | null>(null);
 const gitPanel = ref<HTMLElement | null>(null);
@@ -362,10 +414,14 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
 
     <div class="main">
       <header class="topbar">
-        <h1 class="workspace-tab">
-          <span v-if="view === 'task' && (running || result)" class="dot" :class="running ? 'live' : result && TONE[result.status]" aria-hidden="true"></span>
-          <svg v-else viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          {{ view === 'agents' ? 'Agents' : view === 'history' ? 'Task history' : running ? 'Running task' : result ? 'Task result' : 'New task' }}
+        <h1 v-if="heading" class="workspace-tab" :title="`${heading.name}\n${heading.status} · ${heading.meta}`">
+          <span :id="domId('task-dot')" class="dot" :class="heading.tone" aria-hidden="true"></span>
+          <span class="tab-name">{{ heading.name }}</span>
+          <span class="hidden-label"> · {{ heading.status }}</span>
+        </h1>
+        <h1 v-else class="workspace-tab">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+          {{ view === 'agents' ? 'Agents' : view === 'history' ? 'Task history' : 'New task' }}
         </h1>
         <span class="project-name">{{ opened.project.name }}</span>
         <button
@@ -466,7 +522,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
                 <p :id="domId('git-scope')" class="note">{{ gitQuestion(gitAsk) }}</p>
                 <template v-if="gitAsk === 'commit'">
                   <label :for="domId('commit-message')" class="label">Commit message</label>
-                  <input :id="domId('commit-message')" v-model="commitMessage" class="git-input" placeholder="Describe these changes" :disabled="!!gitBusy" :aria-describedby="domId('git-scope')" required />
+                  <input :id="domId('commit-message')" v-model="commitMessage" class="git-input" placeholder="Describe these changes" :disabled="!!gitBusy || drafting":aria-describedby="domId('git-scope')" required />
                 </template>
                 <template v-if="gitAsk === 'branch'">
                   <label :for="domId('new-branch')" class="label">Branch name</label>
@@ -491,6 +547,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
                     {{ gitBusy ? gitProgress : gitSubmitLabel(gitAsk) }}
                   </button>
                   <button type="button" class="btn" :disabled="!!gitBusy" @click="openGit()">Cancel</button>
+                  <button v-if="gitAsk === 'commit'" type="button" class="link git-new" :disabled="!!gitBusy || drafting" title="Drafted by the cheapest model from your uncommitted changes" @click="draftCommit">{{ drafting ? 'Writing…' : 'Write it for me' }}</button>
                   <button v-if="gitAsk === 'switch'" type="button" class="link git-new" :disabled="!!gitBusy" @click="openGit('branch')">New branch…</button>
                 </div>
               </form>
@@ -524,8 +581,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       <div ref="split" class="split" :class="[dockPrefs.side, { dragging }]">
         <main class="content" :class="{ composing: view === 'task' && !running && !result, chatting: (view === 'task' && (running || !!result)) || view === 'history' }">
           <template v-if="view === 'task'">
-            <TaskRun v-if="running" />
-            <TaskResult v-else-if="result" />
+            <CurrentTask v-if="running || result" />
             <TaskComposer v-else />
           </template>
           <PastTask v-else-if="view === 'history'" />
@@ -563,7 +619,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
         <template v-for="usage in usageCounters" :key="usage.id">
           <button class="usage-counter" :popovertarget="domId(`usage-${usage.id}`)" :title="`${usage.name} usage details and reset times`">
-            <span class="usage-name">{{ usage.name }}</span>
+            <span class="usage-name"><ProviderMark :id="usage.id" :size="12" />{{ usage.name }}</span>
             <span v-if="usage.status" class="usage-unavailable">— {{ usage.status }}</span>
             <template v-else>
               <span v-for="(w, i) in usage.windows.slice(0, 2)" :key="i" class="usage-window" :class="{ low: w.left !== null && w.left <= 20 }" :title="w.left === null ? `${w.label}: usage unavailable` : w.label">
@@ -966,6 +1022,15 @@ h1 {
 }
 .workspace-tab svg {
   color: var(--text-faint);
+}
+.workspace-tab .dot {
+  flex-shrink: 0;
+}
+.tab-name {
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .project-name {
   min-width: 0;
@@ -1523,6 +1588,11 @@ h1 {
 .usage-refresh:disabled {
   opacity: 0.5;
   cursor: default;
+}
+.usage-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .usage-name,
 .usage-window strong {

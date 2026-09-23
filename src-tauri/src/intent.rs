@@ -212,6 +212,30 @@ pub async fn run_rules(id: ProviderId, program: &str, digest: &str, saved: &[Str
     propose_rules(id, program, RUNS_INSTRUCTION, &request).await
 }
 
+const COMMIT_INSTRUCTION: &str = "You write a git commit message for the patch you are given. Reply with one line and nothing else: an imperative summary of what the change does, at most 72 characters, no trailing period, no quotes, no prefix like feat:.";
+
+/// The most of a patch the small model reads. The rest is cut, not summarised.
+// ponytail: a byte cap, not a token count; a huge change gets a subject from its first files only.
+const COMMIT_PATCH_CHARS: usize = 40_000;
+
+/// A one-line commit subject a small model drafts from `patch`. Empty when it
+/// gave none; the user edits it before anything is committed either way.
+pub async fn commit_message(id: ProviderId, program: &str, patch: &str) -> String {
+    let patch: String = patch.chars().take(COMMIT_PATCH_CHARS).collect();
+    let mut events = Vec::new();
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, COMMIT_INSTRUCTION, &format!("Patch:\n{patch}"), &mut events))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    parse_commit(&reply)
+}
+
+fn parse_commit(reply: &str) -> String {
+    let line = reply.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    line.trim_matches(['*', '_', '`', '"', '\'', ' ']).to_string()
+}
+
 async fn propose_rules(id: ProviderId, program: &str, instruction: &str, request: &str) -> Vec<String> {
     let mut events = Vec::new();
     let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, instruction, request, &mut events))
@@ -316,6 +340,12 @@ mod tests {
 -
 not a rule"), ["Use tabs.", "Be brief"]);
         assert!(args_with(ProviderId::Claude, MEMORY_INSTRUCTION).join(" ").contains("--tools  --system-prompt"));
+    }
+
+    #[test]
+    fn reads_the_commit_subject_from_the_first_line() {
+        assert_eq!(parse_commit("\n`Add commit drafts`\nbecause..."), "Add commit drafts");
+        assert_eq!(parse_commit(""), "");
     }
 
     /// Spends a few cents: proposes rules from the real ~/.claude/CLAUDE.md.

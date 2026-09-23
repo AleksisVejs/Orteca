@@ -222,6 +222,12 @@ pub enum ProviderEvent {
         kind: FailureKind,
         message: String,
     },
+    /// Runner-owned: a command the agent handed Orteca to run. `asking` is
+    /// true while it waits for the user's go-ahead, false once it runs.
+    Wait {
+        command: String,
+        asking: bool,
+    },
 }
 
 /// A provider-recorded edit. Missing patch means the CLI only named the file.
@@ -266,6 +272,7 @@ impl ProviderEvent {
             Self::Usage(_) => "usage",
             Self::Done { .. } => "done",
             Self::Failed { .. } => "failed",
+            Self::Wait { .. } => "wait",
         }
     }
 }

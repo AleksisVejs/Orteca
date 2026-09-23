@@ -1,9 +1,9 @@
 // The little markdown agents answer in: paragraphs, headings, bullet and
-// numbered lists, fenced code, **bold** and `code`. Parsed to plain data so
+// numbered lists, fenced code, **bold**, `code` and web links. Parsed to plain data so
 // the page builds elements from it; agent text never becomes HTML.
 // ponytail: no tables, italics or block quotes; add them when an agent's reply needs them.
 
-export type Span = { kind: "text" | "bold" | "code"; text: string };
+export type Span = { kind: "text" | "bold" | "code"; text: string } | { kind: "link"; text: string; href: string };
 export type ListItem = { depth: number; marker: string; spans: Span[] };
 export type Block =
   | { kind: "p"; lines: Span[][] }
@@ -14,10 +14,14 @@ export type Block =
 export function inline(text: string): Span[] {
   const spans: Span[] = [];
   let last = 0;
-  for (const m of text.matchAll(/\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\([^)\s]*\)/g)) {
+  // A web address, bare or behind [words](...), becomes a link; any other
+  // [words](target) keeps its words only. Trailing punctuation stays text.
+  for (const m of text.matchAll(/\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]*)\)|(https?:\/\/[^\s<>"]*[^\s<>".,;:!?')\]])/g)) {
     if (m.index > last) spans.push({ kind: "text", text: text.slice(last, m.index) });
     if (m[1] !== undefined) spans.push({ kind: "bold", text: m[1] });
     else if (m[2] !== undefined) spans.push({ kind: "code", text: m[2] });
+    else if (m[5] !== undefined) spans.push({ kind: "link", text: m[5], href: m[5] });
+    else if (/^https?:\/\//.test(m[4] ?? "")) spans.push({ kind: "link", text: m[3] ?? "", href: m[4] ?? "" });
     else spans.push({ kind: "text", text: m[3] ?? "" });
     last = m.index + m[0].length;
   }

@@ -70,6 +70,10 @@ drop, Ctrl+`) check the `active` flag before answering.
   failed there the Fix is stopped and the run ends `verifyFailed`. A PHPUnit suite on in-memory SQLite (no ParaTest) runs as
   up to 8 parallel shards, each with its own Laravel manifests and `storage/`
   tree; a failing shard's tests rerun in one process and that is the verdict.
+  An Implement turn that ends `ORTECA-WAIT: <command>` hands Orteca a slow
+  command (`run::waited`): asked first unless the user picked "Run them", the
+  deny list applies, the whole output goes to `<git dir>/orteca/`, and the
+  session resumes with a digest. A message meanwhile resumes it read-only.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the

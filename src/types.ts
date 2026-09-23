@@ -294,7 +294,9 @@ export type ProviderEvent =
   | { kind: "toolResult"; data: { id: string; changes: FileEdit[]; failed: boolean } }
   | { kind: "usage"; data: Usage }
   | { kind: "done"; data: { result: string; structured: unknown } }
-  | { kind: "failed"; data: { kind: FailureKind; message: string } };
+  | { kind: "failed"; data: { kind: FailureKind; message: string } }
+  /** A command the agent handed Orteca to run; `asking` while it waits for the user's OK. */
+  | { kind: "wait"; data: { command: string; asking: boolean } };
 
 /** `run`: clean before the run. `beforeRun`: already changed, untouched by
  *  the run. `both`: already changed, and changed again. */

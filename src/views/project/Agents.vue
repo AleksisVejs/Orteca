@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { inject } from "vue";
+import ProviderMark from "../../components/ProviderMark.vue";
 import { PROJECT } from "./state";
 
 // The coding CLIs Orteca drives: installed, signed in, and how much plan is left.
@@ -18,7 +19,7 @@ const {
   <ul v-else class="card providers">
     <li v-for="p in rows" :key="p.id">
       <span class="dot" :class="{ ok: p.path && (p.auth === 'subscription' || p.auth === 'apiKey') }" aria-hidden="true"></span>
-      <span class="who">{{ p.program }}</span>
+      <span class="who"><ProviderMark :id="p.id" :size="16" />{{ p.program }}</span>
       <template v-if="p.pending">
         <span class="note grow">checking…</span>
       </template>
@@ -96,6 +97,9 @@ const {
   border-top: 1px solid var(--border);
 }
 .who {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-width: 64px;
   font-family: var(--mono);
   font-size: 12px;

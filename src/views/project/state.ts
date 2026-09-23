@@ -3,6 +3,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import type { InjectionKey, Ref } from "vue";
 import { tidy } from "./picks";
+import { verificationSummary } from "./taskPresentation";
 import type { Pick } from "./picks";
 import {
   addMemory,
@@ -13,6 +14,7 @@ import {
   detectProviders,
   getTaskDetail,
   gitAction,
+  draftCommitMessage,
   gitStatus,
   installProvider,
   isAppError,
@@ -27,6 +29,7 @@ import {
   renameTask,
   deleteTask,
   sendInstruction,
+  answerWait,
   signInProvider,
   startTask,
 } from "../../api";
@@ -46,13 +49,153 @@ import type {
   ProviderId,
   Preflight,
   Resume,
+  FileStat,
+  Route,
   TaskDetail,
+  TaskEvent,
   TaskResult,
   TaskSummary,
 } from "../../types";
 
-/** One finished exchange: what the user said, and what came back. */
-export type Turn = { said: string; summary: string; failure: string | null };
+/** One finished exchange: what the user said, and what came back. One that
+ *  finished on screen keeps its whole result and stream, so its proof stays its
+ *  own after a reply; one read back from the database has only the words.
+ *  `files` counts only what the run itself changed. */
+export type Turn = {
+  said: string;
+  summary: string | null;
+  failure: string | null;
+  status?: TaskSummary["status"];
+  files?: number;
+  result?: TaskResult;
+  stream?: ActivityLine[];
+};
+
+/** Everything one exchange's answer and its proof show, live or from history. */
+export type Exchange = {
+  status: string;
+  failure: string | null;
+  summary: string | null;
+  unknownEvents: number;
+  changed: { byRun: FileStat[]; beforeRun: FileStat[]; unknown: boolean };
+  patchText: string | null;
+  verification: string;
+  route: Route | null;
+  routeSteps: Array<{ stage: string; ran: boolean; asked?: string | null }>;
+  durationMs: number | null;
+  metrics: {
+    callsUsed: number | null;
+    turns: number | null;
+    ran: string[];
+    tokens: { total: number; uncached: number; cached: number; cacheHit: number | null } | null;
+    cost: number | null;
+    costQuality: string | null;
+    model: string | null;
+    effort: string | null;
+  };
+  /** What was said on the way: the agent's messages and the user's steers. */
+  messages: ActivityLine[];
+};
+
+/** Share of input read from the provider's cache, as a whole percent. A low
+ *  figure on a resumed or long run means the context is being billed again.
+ *  null when there was no input to share out. */
+export function cacheHit(uncachedInput: number, cachedInput: number): number | null {
+  const input = uncachedInput + cachedInput;
+  return input > 0 ? Math.round((cachedInput / input) * 100) : null;
+}
+
+/** Never a number without a label, and never a zero standing in for unknown. */
+function tokensOf(r: TaskResult | null) {
+  const usage = r?.usage;
+  if (!usage) return null;
+  return {
+    total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
+    uncached: usage.inputTokens + usage.outputTokens,
+    cached: usage.cachedInputTokens,
+    cacheHit: cacheHit(usage.inputTokens, usage.cachedInputTokens),
+    output: usage.outputTokens,
+    cost: usage.costUsd,
+    quality: usage.costQuality,
+    model: usage.model,
+    // The last stage a model ran; the reported model is the last one too.
+    effort: [...(r?.stages ?? [])].reverse().find((s) => s.effort)?.effort ?? null,
+  };
+}
+
+/** Every stage that ran, then the route's stages that did not. Stages run in
+ *  order, so the ones that ran are the front of the route — unless a Fix ran,
+ *  after which the run's own order is the whole story. */
+function routeStepsOf(r: TaskResult | null) {
+  if (!r) return [];
+  const ran = r.stages.map((s) => ({
+    stage: s.stage,
+    ran: true,
+    asked: s.model && s.effort ? `${s.model}, ${s.effort}` : null,
+  }));
+  if (ran.some((s) => s.stage === "fix")) return ran;
+  return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false, asked: null }))];
+}
+
+/** The diff split by whose change it is. A file untouched since before the
+ *  run is the user's, and is neither listed nor counted as this run's work. */
+function changedOf(r: TaskResult | null) {
+  const diff = r?.diff ?? [];
+  return {
+    byRun: diff.filter((f) => f.origin !== "beforeRun"),
+    beforeRun: diff.filter((f) => f.origin === "beforeRun"),
+    unknown: !!r?.dirtyAtStart && diff.some((f) => f.origin === null),
+  };
+}
+
+/** A saved task's log cut into its exchanges: the first request, then one per
+ *  reply, each with its own events and the result the run logged when it
+ *  ended. One logged before results were kept per reply has `result: null`. */
+export function splitExchanges(d: TaskDetail) {
+  const parts: Array<{ said: string; events: TaskEvent[]; result: TaskResult | null }> = [
+    { said: tidy(d.prompt), events: [], result: null },
+  ];
+  for (const e of d.events) {
+    const last = parts[parts.length - 1]!;
+    if (e.kind === "turn") {
+      const data = (e.payload as { data?: { said?: string | null; prompt?: string } } | null)?.data;
+      // An older turn logged only the recap sent to the CLI; the user's words are its "My reply".
+      const recap = data?.prompt ?? "";
+      const said = data?.said ?? recap.match(/My reply:\n([\s\S]*?)(?:\n\nFiles changed so far: [^\n]*)?$/)?.[1] ?? recap;
+      parts.push({ said: tidy(said), events: [], result: null });
+    } else if (e.kind === "exchange") last.result = e.payload as TaskResult;
+    else last.events.push(e);
+  }
+  return parts;
+}
+
+/** One live result, and the stream it came with, as the chat shows it. */
+export function exchangeOf(r: TaskResult, stream: ActivityLine[]): Exchange {
+  const t = tokensOf(r);
+  return {
+    status: r.status,
+    failure: r.failure,
+    summary: r.summary,
+    unknownEvents: r.unknownEvents,
+    changed: changedOf(r),
+    patchText: r.patchText,
+    verification: verificationSummary(r.stages),
+    route: r.route,
+    routeSteps: routeStepsOf(r),
+    durationMs: r.durationMs,
+    metrics: {
+      callsUsed: r.callsUsed,
+      turns: r.turnsUsed ?? null,
+      ran: r.stages.map((s) => s.stage),
+      tokens: t,
+      cost: t?.cost ?? null,
+      costQuality: t?.quality ?? null,
+      model: t?.model ?? null,
+      effort: t?.effort ?? null,
+    },
+    messages: stream.filter((l) => l.kind === "text" || l.kind === "instruction"),
+  };
+}
 
 /** A live update; `file` is the full path it is about, shown by name and openable. */
 export type Activity = { text: string; file: string | null; id?: string; changes?: FileEdit[]; failed?: boolean };
@@ -152,6 +295,16 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     { id: "currentTree", label: "This folder", hint: "Change the files you have open" },
     { id: "worktree", label: "Separate copy", hint: "Work in a copy on a new branch and leave this folder alone" },
   ];
+
+  // A slow command the agent hands over (`ORTECA-WAIT:`): run it at once, or
+  // ask first. Remembered, since it is a standing choice about trust.
+  const WAIT_KEY = "orteca.autoWait";
+  const autoWait = ref(false);
+  try { autoWait.value = localStorage.getItem(WAIT_KEY) === "1"; } catch { /* no storage: ask first */ }
+  function chooseAutoWait(on: boolean) {
+    autoWait.value = on;
+    try { localStorage.setItem(WAIT_KEY, on ? "1" : "0"); } catch { /* kept for this session */ }
+  }
 
   const installed = computed(() => providers.value.filter((p) => p.path));
   const missing = computed(() => providers.value.filter((p) => !p.path));
@@ -554,6 +707,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     instruction: string;
     sending: boolean;
     instructionError: string | null;
+    /** The command the agent handed over, while it waits for the user's OK. */
+    waitAsk?: string | null;
   };
   // Newest first. Every run still going is kept; finished ones are capped,
   // since the database holds them and the sidebar lists them from there.
@@ -629,7 +784,10 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     live.sending = true;
     live.instructionError = null;
     try {
-      const receipt = await sendInstruction(taskId.value, text, applyNow);
+      // The steer box shares the reply box's attachments: only one of them is ever on screen.
+      // ponytail: shared across runs too, so an unsent one shows on another run's steer box; per-run if that confuses.
+      const attached = attachments.value;
+      const receipt = await sendInstruction(taskId.value, text, applyNow, attached);
       if (receipt.disposition === "tooLate") {
         live.instructionError = "The run finished before it could take that instruction.";
         return;
@@ -638,12 +796,27 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       // would file them among the things the agent said.
       const delivery = receipt.disposition === "held" ? "Queued for next step"
         : receipt.disposition === "resumed" ? "Applied · step restarted" : "Delivered to the running agent";
-      live.stream.push({ kind: "instruction", text, file: null, delivery });
+      const count = attached.length ? ` · ${attached.length} attached` : "";
+      live.stream.push({ kind: "instruction", text, file: null, delivery: delivery + count });
       live.instruction = "";
+      attachments.value = attachments.value.filter((p) => !attached.includes(p));
     } catch (e) {
       live.instructionError = isAppError(e) ? e.message : String(e);
     } finally {
       live.sending = false;
+    }
+  }
+
+  /** The command the run on screen is waiting on the user's OK for. */
+  const waitAsk = computed(() => activeRun.value?.waitAsk ?? null);
+  async function answerWaitFor(run: boolean) {
+    const live = activeRun.value;
+    if (!live?.waitAsk || live.id === null) return;
+    live.waitAsk = null;
+    try {
+      await answerWait(live.id, run);
+    } catch (e) {
+      live.instructionError = isAppError(e) ? e.message : String(e);
     }
   }
 
@@ -779,6 +952,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const gitError = ref<string | null>(null);
   const gitNotice = ref<string | null>(null);
   const commitMessage = ref("");
+  const drafting = ref(false);
   /** The existing branch a merge or switch names. */
   const targetBranch = ref("");
   const newBranch = ref("");
@@ -853,6 +1027,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         return `Start a new branch from ${g.branch ?? "this detached HEAD"} and switch to it?${g.dirty ? " Uncommitted changes come along." : ""}`;
       case "discard":
         return discardPath.value === "" ? `Revert all ${n(g.dirtyCount, "changed file")}? This permanently removes uncommitted changes.` : `Revert ${discardPath.value}? This permanently removes its uncommitted changes.`;
+    }
+  }
+
+  async function draftCommit() {
+    if (drafting.value || gitBusy.value) return;
+    drafting.value = true;
+    gitError.value = null;
+    try {
+      commitMessage.value = await draftCommitMessage(opened.project.path);
+    } catch (e) {
+      gitError.value = isAppError(e) ? e.message : String(e);
+    } finally {
+      drafting.value = false;
     }
   }
 
@@ -1038,7 +1225,11 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     if (carry) {
       // The exchange it answers stays on the page, above the new one.
       if (carry.result) {
-        carry.turns.push({ said: saidIn(carry), summary: carry.result.summary, failure: carry.result.failure });
+        const r = carry.result;
+        carry.turns.push({
+          said: saidIn(carry), summary: r.summary, failure: r.failure, status: r.status,
+          files: changedOf(r).byRun.length, result: r, stream: carry.stream,
+        });
       }
       Object.assign(carry, {
         id: null,
@@ -1055,6 +1246,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         error: null,
         activity: { text: "Getting ready", file: null },
         stopping: false,
+        waitAsk: null,
       });
     } else {
       runs.value = [live, ...runs.value].filter((r, i) => r.active || i < KEPT_FINISHED);
@@ -1064,7 +1256,6 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitLoading.value = false;
     gitAsk.value = null;
     view.value = "task";
-    resultTab.value = "summary";
     try {
       live.result = await startTask(
         opened.project.path,
@@ -1082,6 +1273,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
             live.activity = { text: event.data.current.map((i) => stageLabel(event.data.stages[i] ?? "Working")).join(" + "), file: null };
             return;
           }
+          if (event.kind === "wait") live.waitAsk = event.data.asking ? event.data.command : null;
           const activity = activityFor(event);
           if (activity !== null) live.activity = activity;
           appendActivity(live.stream, event);
@@ -1097,6 +1289,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         (early) => {
           live.checking = early;
         },
+        autoWait.value,
         opts.resume ?? null,
         opts.continueTask ?? null,
         // A follow-up's prompt carries the whole exchange so the agent has the
@@ -1110,12 +1303,16 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     } finally {
       live.active = false;
       live.stopping = false;
+      live.waitAsk = null;
       live.checking = null;
       live.id = null;
       if (selectedRun.value === live.key) {
         if (tick !== null) clearTimeout(tick);
         tickWhileWarm();
+        // A steer still being typed when the run ended becomes the reply, not lost.
+        if (live.instruction.trim() && !reply.value.trim()) reply.value = live.instruction;
       }
+      live.instruction = "";
       await loadHistory();
       void refreshGit();
       // The run just spent some of a limit; the next pick should know.
@@ -1205,6 +1402,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         return say("Putting on the finishing touches");
       case "failed":
         return say(`Couldn’t finish: ${event.data.message}`);
+      case "wait":
+        return say(event.data.asking ? "Waiting for your OK to run a command" : `Waiting on ${actionTarget(event.data.command)}`);
       default:
         return null;
     }
@@ -1276,6 +1475,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         return friendlyToolUse(event.data.name, event.data.summary);
       case "failed":
         return event.data.message;
+      case "wait":
+        return event.data.asking ? `Asks to run: ${event.data.command}` : `Running ${event.data.command}. Ask anything meanwhile.`;
       default:
         return null;
     }
@@ -1283,31 +1484,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   const lines = computed(() => stream.value);
 
-  /** Never a number without a label, and never a zero standing in for unknown. */
-  const tokens = computed(() => {
-    const usage = result.value?.usage;
-    if (!usage) return null;
-    return {
-      total: usage.inputTokens + usage.cachedInputTokens + usage.outputTokens,
-      uncached: usage.inputTokens + usage.outputTokens,
-      cached: usage.cachedInputTokens,
-      cacheHit: cacheHit(usage.inputTokens, usage.cachedInputTokens),
-      output: usage.outputTokens,
-      cost: usage.costUsd,
-      quality: usage.costQuality,
-      model: usage.model,
-      // The last stage a model ran; the reported model is the last one too.
-      effort: [...(result.value?.stages ?? [])].reverse().find((s) => s.effort)?.effort ?? null,
-    };
-  });
-
-  /** Share of input read from the provider's cache, as a whole percent. A low
-   *  figure on a resumed or long run means the context is being billed again.
-   *  null when there was no input to share out. */
-  function cacheHit(uncachedInput: number, cachedInput: number): number | null {
-    const input = uncachedInput + cachedInput;
-    return input > 0 ? Math.round((cachedInput / input) * 100) : null;
+  /** The same plain-English lines the live log showed, rebuilt from saved events. */
+  function linesOf(events: TaskEvent[]): ActivityLine[] {
+    const items: ActivityLine[] = [];
+    for (const e of events) {
+      // The classify call's reply is Orteca's own bookkeeping; the live run never showed it.
+      if (e.stage === "classify") continue;
+      const ev = e.payload as ProviderEvent;
+      if (typeof ev === "object" && ev !== null && "kind" in ev) appendActivity(items, ev);
+    }
+    return items;
   }
+
+  const tokens = computed(() => tokensOf(result.value));
 
   function formatCost(cost: number): string {
     return cost > 0 && cost < 0.0001 ? "<$0.0001" : "$" + cost.toFixed(4);
@@ -1371,20 +1560,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     };
   });
 
-  /** Every stage that ran, then the route's stages that did not. Stages run in
-   *  order, so the ones that ran are the front of the route — unless a Fix ran,
-   *  after which the run's own order is the whole story. */
-  const routeSteps = computed(() => {
-    const r = result.value;
-    if (!r) return [];
-    const ran = r.stages.map((s) => ({
-      stage: s.stage,
-      ran: true,
-      asked: s.model && s.effort ? `${s.model}, ${s.effort}` : null,
-    }));
-    if (ran.some((s) => s.stage === "fix")) return ran;
-    return [...ran, ...r.route.stages.slice(ran.length).map((stage) => ({ stage, ran: false, asked: null }))];
-  });
+  const routeSteps = computed(() => routeStepsOf(result.value));
 
   /** This run against the median of comparable finished runs here. Only for a
    *  run that finished, only once the backend has a baseline, and always
@@ -1398,16 +1574,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     return { ...r.baseline, change, size: Math.abs(change) };
   });
 
-  /** The diff split by whose change it is. A file untouched since before the
-   *  run is the user's, and is neither listed nor counted as this run's work. */
-  const changed = computed(() => {
-    const diff = result.value?.diff ?? [];
-    return {
-      byRun: diff.filter((f) => f.origin !== "beforeRun"),
-      beforeRun: diff.filter((f) => f.origin === "beforeRun"),
-      unknown: !!result.value?.dirtyAtStart && diff.some((f) => f.origin === null),
-    };
-  });
+  const changed = computed(() => changedOf(result.value));
 
   const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, running: "Running" };
 
@@ -1442,15 +1609,6 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   // The main pane shows one thing at a time; the sidebar picks which.
   const view = ref<"task" | "history" | "agents">("task");
   const optionsOpen = ref(false);
-
-  type ResultTab = "summary" | "files" | "details" | "activity";
-  const resultTab = ref<ResultTab>("summary");
-  const TABS: Array<{ id: ResultTab; label: string }> = [
-    { id: "summary", label: "Summary" },
-    { id: "files", label: "Files" },
-    { id: "details", label: "Details" },
-    { id: "activity", label: "Activity" },
-  ];
 
   /** Dot colour per status: green only for a finished run, blue only while one is going. */
   const TONE: Partial<Record<TaskSummary["status"], string>> = {
@@ -1556,15 +1714,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     });
   }
 
+  // A run that failed or was stopped takes a reply too; the agent is told it gave no answer.
+  const noAnswer = (status: string, failure?: string | null) =>
+    `(No answer: the run ended as ${HISTORY_STATUS[status as TaskSummary["status"]] ?? status}${failure ? `. ${failure}` : ""}.)`;
+
   async function sendReply() {
     const live = activeRun.value;
     const r = live?.result;
-    if (!live || live.active || !r?.summary) return;
+    if (!live || live.active || !r) return;
     await followUp({
       taskId: r.taskId,
       inCopy: !!r.worktree,
-      summary: r.summary,
-      files: r.diff.map((f) => f.path),
+      summary: r.summary ?? noAnswer(r.status, r.failure),
+      files: changedOf(r).byRun.map((f) => f.path),
       resume: r.resume,
       asked: live.asked.length ? live.asked : [live.prompt],
       carry: live,
@@ -1577,16 +1739,31 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
    *  the same task row, and opens with the exchange it is answering. */
   async function replyToPast() {
     const d = historyDetail.value;
-    if (!d?.summary) return;
+    if (!d || d.status === "running") return;
+    // Every exchange so far comes along, each with the proof it logged.
+    const parts = splitExchanges(d);
+    const turns: Turn[] = parts.map((p, i) => {
+      const r = p.result ?? undefined;
+      const latest = i === parts.length - 1;
+      return {
+        said: p.said,
+        summary: r ? r.summary : latest ? d.summary : null,
+        failure: r?.failure ?? null,
+        status: r?.status ?? (latest ? d.status : undefined),
+        files: changedOf(r ?? (latest ? ({ diff: d.diff } as TaskResult) : null)).byRun.length,
+        result: r,
+        stream: linesOf(p.events),
+      };
+    });
     await followUp({
       taskId: d.id,
       inCopy: !!d.worktreePath,
-      summary: d.summary,
-      files: d.diff.map((f) => f.path),
+      summary: d.summary ?? noAnswer(d.status),
+      files: changedOf({ diff: d.diff } as TaskResult).byRun.map((f) => f.path),
       resume: null,
-      asked: [d.prompt],
+      asked: [d.prompt, ...parts.slice(1).map((p) => p.said)],
       carry: null,
-      turns: [{ said: d.prompt, summary: d.summary, failure: null }],
+      turns,
     });
   }
 
@@ -1614,6 +1791,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     MODES,
     isolation,
     ISOLATIONS,
+    autoWait,
+    chooseAutoWait,
     installed,
     missing,
     rows,
@@ -1662,6 +1841,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     remember,
     runs,
     runLabel,
+    linesOf,
     said,
     selectRun,
     selectedRun,
@@ -1684,6 +1864,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     steering,
     instruct,
     stopRun,
+    waitAsk,
+    answerWaitFor,
     history,
     historyError,
     historyDetail,
@@ -1715,6 +1897,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitError,
     gitNotice,
     commitMessage,
+    drafting,
+    draftCommit,
     targetBranch,
     newBranch,
     discardPath,
@@ -1755,8 +1939,6 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     AUTH,
     view,
     optionsOpen,
-    resultTab,
-    TABS,
     TONE,
     agentsPending,
     agentsReady,

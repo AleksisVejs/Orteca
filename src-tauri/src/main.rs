@@ -193,6 +193,8 @@ async fn start_task(
     attachments: Vec<String>,
     resume: Option<run::Resume>,
     continue_task: Option<i64>,
+    // Run a command the agent hands over without asking first.
+    auto_wait: bool,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
     checking: tauri::ipc::Channel<run::TaskResult>,
@@ -212,19 +214,7 @@ async fn start_task(
         }
         _ => None,
     };
-    // Checked before anything is recorded: a path that is gone would only
-    // surface as an agent failing to read it.
-    let attachments = attachments
-        .iter()
-        .map(|path| {
-            let p = std::path::PathBuf::from(path);
-            if p.is_absolute() && p.exists() {
-                Ok(p)
-            } else {
-                Err(AppError::new(ErrorKind::Invalid, format!("Attachment not found: {path}")))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let attachments = existing(&attachments)?;
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app
@@ -232,6 +222,7 @@ async fn start_task(
         .app_data_dir()
         .ok()
         .map(|dir| dir.join("recordings"));
+    let said = asked.clone();
     let mut request = begin(
         &app.state::<Store>(),
         recordings,
@@ -247,7 +238,9 @@ async fn start_task(
     )
     .await?;
     request.attachments = attachments;
+    request.said = said;
     request.resume = resume;
+    request.auto_wait = auto_wait;
     request.checking = Some(Box::new(move |result| {
         let _ = checking.send(result.clone());
     }));
@@ -286,6 +279,7 @@ async fn send_instruction(
     task_id: i64,
     text: String,
     apply_now: bool,
+    attachments: Vec<String>,
     live: State<'_, run::Live>,
 ) -> Result<run::InstructionReceipt> {
     let Some(text) = run::clean_prompt(&text) else {
@@ -294,7 +288,29 @@ async fn send_instruction(
             "Type the instruction first.",
         ));
     };
-    live.instruct(task_id, text, apply_now).await
+    live.instruct(task_id, text, apply_now, existing(&attachments)?).await
+}
+
+/// Attachments, checked before anything is recorded: a path that is gone would
+/// only surface as an agent failing to read it.
+fn existing(attachments: &[String]) -> Result<Vec<std::path::PathBuf>> {
+    attachments
+        .iter()
+        .map(|path| {
+            let p = std::path::PathBuf::from(path);
+            if p.is_absolute() && p.exists() {
+                Ok(p)
+            } else {
+                Err(AppError::new(ErrorKind::Invalid, format!("Attachment not found: {path}")))
+            }
+        })
+        .collect()
+}
+
+/// Run, or not, the command a run's agent handed Orteca (`ORTECA-WAIT:`).
+#[tauri::command]
+fn answer_wait(task_id: i64, run: bool, live: State<run::Live>) -> Result<()> {
+    live.send(task_id, run::Control::Wait { run })
 }
 
 fn codex_acl_refusal() -> AppError {
@@ -674,8 +690,10 @@ fn prepare_run(
         attachments: Vec::new(),
         resume: None,
         continued: continued.is_some(),
+        said: None,
         timings: Vec::new(),
         checking: None,
+        auto_wait: false,
     })
 }
 
@@ -780,6 +798,24 @@ fn open_file(path: String, file: String, reveal: bool, store: State<Store>) -> R
     Ok(())
 }
 
+/// Open a web link from an agent's reply in the default browser. Only http(s),
+/// and nothing a command line could split or quote: the text came from a model.
+#[tauri::command]
+fn open_url(url: String) -> Result<()> {
+    if !web_url(&url) {
+        return Err(AppError::new(ErrorKind::Invalid, "Orteca only opens http and https links."));
+    }
+    std::process::Command::new("rundll32").arg("url.dll,FileProtocolHandler").arg(&url).spawn()?;
+    Ok(())
+}
+
+fn web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && url.len() > "https://".len()
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+}
+
 /// Anything Windows would run rather than open: PATHEXT plus the usual extras.
 fn is_program(file: &std::path::Path) -> bool {
     let Some(ext) = file.extension().map(|e| format!(".{}", e.to_string_lossy()).to_ascii_uppercase()) else {
@@ -819,6 +855,25 @@ async fn git_action(
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?
+}
+
+/// A commit subject the cheapest model drafts from the uncommitted patch.
+/// Commits nothing: the user edits and confirms it in the git panel.
+#[tauri::command]
+async fn draft_commit_message(path: String, store: State<'_, Store>) -> Result<String> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    let patch = tauri::async_runtime::spawn_blocking(move || project::working_patch(&dir))
+        .await
+        .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
+    if patch.trim().is_empty() {
+        return Err(AppError::new(ErrorKind::Invalid, "No changes to describe."));
+    }
+    let (id, program) = any_cli()?;
+    let message = intent::commit_message(id, &program, &patch).await;
+    if message.is_empty() {
+        return Err(AppError::new(ErrorKind::Io, "Could not draft a message. Write one instead."));
+    }
+    Ok(message)
 }
 
 pub(crate) fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
@@ -1271,6 +1326,7 @@ fn main() {
             save_pasted_image,
             cancel_task,
             send_instruction,
+            answer_wait,
             trust_project,
             forget_project,
             memory,
@@ -1289,8 +1345,10 @@ fn main() {
             provider_limits,
             remove_worktree,
             open_file,
+            open_url,
             git_action,
             git_status,
+            draft_commit_message,
             cancel_provider_operation,
             dock::pty_open,
             dock::pty_write,
@@ -1318,6 +1376,17 @@ mod tests {
         assert!(is_program(std::path::Path::new("run.ps1")));
         assert!(!is_program(std::path::Path::new("app/Models/User.php")));
         assert!(!is_program(std::path::Path::new("Makefile")));
+    }
+
+    #[test]
+    fn only_plain_web_links_are_opened() {
+        assert!(web_url("https://cursor.com/"));
+        assert!(web_url("HTTP://aider.chat/?a=1&b=2"));
+        assert!(!web_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!web_url("javascript:alert(1)"));
+        assert!(!web_url("https://"));
+        assert!(!web_url("https://x.com/a b"));
+        assert!(!web_url("https://x.com/\" --evil"));
     }
 
     #[tokio::test]
@@ -1464,7 +1533,7 @@ ELI5";
         fn json<T: serde::de::DeserializeOwned>(s: String) -> T {
             serde_json::from_value(serde_json::Value::String(s)).unwrap()
         }
-        let request = begin(
+        let mut request = begin(
             &store,
             None,
             key,
@@ -1479,6 +1548,9 @@ ELI5";
         )
         .await
         .unwrap();
+        // Nobody is there to answer "run this command?", so a handed-over
+        // command would wait forever.
+        request.auto_wait = true;
         let begun = t0.elapsed().as_millis() as u64;
         let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
         // Wall time from the prompt, classify and scan included, which is what

@@ -168,10 +168,15 @@ pub enum Control {
     /// single-stage run never reaches - it ends the process and resumes the
     /// session carrying the instruction.
     Instruct {
+        /// Already naming `attachments`, so every route to the agent carries them.
         text: String,
         apply_now: bool,
+        /// Files and folders sent with it, for Claude's `--add-dir` from here on.
+        attachments: Vec<PathBuf>,
         reply: oneshot::Sender<InstructionReceipt>,
     },
+    /// The user's answer to a command the agent asked Orteca to run.
+    Wait { run: bool },
 }
 
 /// What actually happened to an instruction, returned only after the run loop
@@ -238,13 +243,15 @@ impl Live {
         task_id: i64,
         text: String,
         apply_now: bool,
+        attachments: Vec<PathBuf>,
     ) -> crate::error::Result<InstructionReceipt> {
         let (reply, answer) = oneshot::channel();
         self.send(
             task_id,
             Control::Instruct {
-                text,
+                text: format!("{text}{}", attached_note(&attachments)),
                 apply_now,
+                attachments,
                 reply,
             },
         )?;
@@ -742,11 +749,17 @@ pub struct Request {
     /// A reply that continues `task_id` rather than opening a task of its own:
     /// its usage adds to the task's, and its prompt is logged as a new turn.
     pub continued: bool,
+    /// What the user just typed, when `prompt` recaps a follow-up. Logged with
+    /// the turn, so history shows their words rather than the recap.
+    pub said: Option<String>,
     /// What ran before this request existed, such as the classify call.
     pub timings: Vec<Timing>,
     /// Handed the change, as a `checking` result, once its focused tests
     /// pass and while the full suite still runs.
     pub checking: Option<OnChecking>,
+    /// Run a command the agent hands over (`ORTECA-WAIT:`) without asking the
+    /// user first. The blocked-command list applies either way.
+    pub auto_wait: bool,
 }
 
 pub type OnChecking = Box<dyn Fn(&TaskResult) + Send + Sync>;
@@ -888,6 +901,7 @@ struct Context {
     attachments: Vec<PathBuf>,
     /// When `stream` began, in Unix milliseconds.
     started: u64,
+    auto_wait: bool,
 }
 
 impl Context {
@@ -942,6 +956,8 @@ struct State {
     /// Apply-now arrived before Codex identified its session. Restart as soon
     /// as the Started event supplies the ID instead of dropping the request.
     apply_now_pending: bool,
+    /// What the user attached while it ran, on top of `Context::attachments`.
+    attachments: Vec<PathBuf>,
     /// The last writing or answering session, for a follow-up.
     resume_point: Option<Resume>,
     timings: Vec<Timing>,
@@ -967,6 +983,7 @@ impl State {
             held: Vec::new(),
             session: None,
             apply_now_pending: false,
+            attachments: Vec::new(),
             resume_point: None,
             timings,
         }
@@ -985,6 +1002,7 @@ impl State {
     fn absorb(&mut self, side: State) {
         self.timings.extend(side.timings);
         self.constraints.extend(side.constraints);
+        self.attachments.extend(side.attachments);
         self.outcome.cancelled |= side.outcome.cancelled;
         if let Some(failure) = side.outcome.failure {
             self.outcome.failure.get_or_insert(failure);
@@ -1025,8 +1043,10 @@ pub async fn stream(
         attachments,
         mut resume,
         continued,
+        said,
         timings,
         checking,
+        auto_wait,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -1047,6 +1067,7 @@ pub async fn stream(
         final_stage: true,
         attachments,
         started: now_ms(),
+        auto_wait,
     };
     let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
     // Memory is standing instructions that outlive the run: global, then project.
@@ -1056,7 +1077,7 @@ pub async fn stream(
     // row a later milestone can see what a run cost but not what it was allowed
     // to cost, and cannot tell a good route from a lucky one.
     if continued {
-        let turn = serde_json::json!({ "kind": "turn", "data": { "prompt": prompt } });
+        let turn = serde_json::json!({ "kind": "turn", "data": { "prompt": prompt, "said": said } });
         let _ = note(store, &ctx, "turn", &turn.to_string());
     }
     if let Err(e) = note(store, &ctx, "routing", &routing_payload(&route)) {
@@ -1561,7 +1582,7 @@ pub async fn stream(
         outcome.failure = Some(format!("could not finish task record: {}", e.message));
     }
 
-    TaskResult {
+    let result = TaskResult {
         task_id,
         status,
         summary,
@@ -1582,7 +1603,14 @@ pub async fn stream(
         resume: state.resume_point.filter(|_| worktree.is_none()),
         worktree,
         timings: state.timings,
+    };
+    // The task row keeps only the latest answer. Each exchange's own result goes
+    // in the log too, so a task replied to later still shows what every answer
+    // did. A log that cannot take it costs that proof, never the run.
+    if let Ok(json) = serde_json::to_string(&result) {
+        let _ = store.append_event(task_id, "run", "exchange", id.program(), &json);
     }
+    result
 }
 
 /// What `stages[index]` asks of the CLI.
@@ -2323,11 +2351,13 @@ async fn run_all(
                 }
                 // No agent is running to take it; the next brief carries it, as
                 // it carries any instruction that arrived between stages.
-                Control::Instruct { text, reply, .. } => {
+                Control::Instruct { text, reply, attachments, .. } => {
                     state.constraints.push(text.clone());
+                    state.attachments.extend(attachments);
                     let _ = note(store, ctx, "instruction", &instruction(&text, InstructionDisposition::Held));
                     let _ = reply.send(InstructionReceipt { disposition: InstructionDisposition::Held });
                 }
+                Control::Wait { .. } => {}
             },
             () = &mut deadline, if !timed_out => { timed_out = true; runs.iter().for_each(proc::Run::cancel); }
         }
@@ -2929,6 +2959,20 @@ fn attachment_args(id: ProviderId, attachments: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a running Claude can already open every one of these: inside the
+/// repo, or in a folder it was granted for an earlier attachment.
+// ponytail: a plain `starts_with`, so `c:\` against `C:\` only costs a needless restart.
+fn reachable(ctx: &Context, state: &State, paths: &[PathBuf]) -> bool {
+    let granted: Vec<&Path> = ctx
+        .attachments
+        .iter()
+        .chain(&state.attachments)
+        .filter_map(|p| if p.is_dir() { Some(p.as_path()) } else { p.parent() })
+        .chain([ctx.dir.as_path()])
+        .collect();
+    paths.iter().all(|p| granted.iter().any(|g| p.starts_with(g)))
+}
+
 /// Run one process to its end. Says whether the task is finished or is being
 /// picked back up somewhere else.
 /// One stage's provider process, and any it is restarted as.
@@ -2942,10 +2986,366 @@ async fn call(
 ) {
     loop {
         match attempt(store, ctx, state, control, emit, launch).await {
-            Next::Ended => break,
             Next::Restart(again) => launch = again,
+            // A turn that handed Orteca a slow command goes on once it has run.
+            Next::Ended => match waited(store, ctx, state, control, emit).await {
+                Some(again) => launch = again,
+                None => break,
+            },
         }
     }
+}
+
+/// The last line of a turn that hands Orteca a slow command to run.
+const WAIT_MARK: &str = "ORTECA-WAIT:";
+
+// ponytail: one hour for every waited command; make it per project when a benchmark needs longer.
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The command a turn's last line hands to Orteca, if it ends with one.
+fn wait_command(said: &str) -> Option<String> {
+    let last = said.trim_end().lines().last()?.trim().trim_matches('`');
+    let command = last.strip_prefix(WAIT_MARK)?.trim().trim_matches('`').trim();
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+/// A command line split the way it will run: on spaces, double quotes
+/// grouping. There is no shell.
+fn words(command: &str) -> Vec<String> {
+    let (mut out, mut word, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+    for c in command.chars() {
+        if c.is_whitespace() && !quoted {
+            if started {
+                out.push(std::mem::take(&mut word));
+                started = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            quoted = !quoted;
+        } else {
+            word.push(c);
+        }
+        started = true;
+    }
+    if started {
+        out.push(word);
+    }
+    out
+}
+
+/// Why Orteca will not run a handed-over command, if it will not. The same
+/// guardrail the agent's own shell has, not a sandbox.
+fn refusal(command: &str, words: &[String]) -> Option<&'static str> {
+    let Some(first) = words.first() else {
+        return Some("there is no command in it.");
+    };
+    if command.contains(['&', '|', ';', '<', '>']) {
+        return Some("Orteca runs one program with its arguments. There is no shell, so no `&&`, pipes or redirects.");
+    }
+    let program = Path::new(first)
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().to_lowercase());
+    if ["cmd", "powershell", "pwsh", "bash", "sh", "wsl"].contains(&program.as_str()) {
+        return Some("a shell would run anything at all. Hand over the program itself.");
+    }
+    let line = std::iter::once(program)
+        .chain(words[1..].iter().map(|w| w.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    CLAUDE_DENY_COMMANDS
+        .iter()
+        .map(|rule| rule.trim_end_matches(":*").to_lowercase())
+        .any(|rule| line == rule || line.starts_with(&format!("{rule} ")))
+        .then_some("it is on Orteca's blocked-command list.")
+}
+
+/// What the agent is sent of a waited command's output: how it began, every
+/// line after that which names a problem, and how it ended. The log keeps
+/// every line, and the agent is told where.
+#[derive(Default)]
+struct Digest {
+    head: Vec<String>,
+    // ponytail: the first 100 problem lines only; a noisy suite's later ones are in the log.
+    hits: Vec<(usize, String)>,
+    tail: std::collections::VecDeque<(usize, String)>,
+    total: usize,
+    saved: bool,
+}
+
+impl Digest {
+    const HEAD: usize = 30;
+    const HITS: usize = 100;
+    const TAIL: usize = 150;
+
+    fn push(&mut self, line: &str) {
+        let line = strip_ansi(line);
+        let line = match line.char_indices().nth(300) {
+            Some((at, _)) => format!("{}…", &line[..at]),
+            None => line,
+        };
+        let n = self.total;
+        self.total += 1;
+        if self.head.len() < Self::HEAD {
+            self.head.push(line);
+            return;
+        }
+        let lower = line.to_lowercase();
+        if self.hits.len() < Self::HITS
+            && ["error", "fail", "panic", "warn", "exception", "fatal"].iter().any(|w| lower.contains(w))
+        {
+            self.hits.push((n, line.clone()));
+        }
+        self.tail.push_back((n, line));
+        if self.tail.len() > Self::TAIL {
+            self.tail.pop_front();
+        }
+    }
+
+    fn render(&self) -> String {
+        let tail_from = self.tail.front().map_or(self.total, |(n, _)| *n);
+        let hits: Vec<String> = self
+            .hits
+            .iter()
+            .filter(|(n, _)| *n < tail_from)
+            .map(|(n, line)| format!("{}: {line}", n + 1))
+            .collect();
+        let mut parts = vec![self.head.join("\n")];
+        if !hits.is_empty() {
+            parts.push(format!("... lines further on that name a problem, by line number:\n{}", hits.join("\n")));
+        }
+        if tail_from > self.head.len() {
+            parts.push(format!("... the last {} lines:", self.tail.len()));
+        }
+        parts.push(self.tail.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n"));
+        parts.retain(|part| !part.is_empty());
+        parts.join("\n")
+    }
+}
+
+/// A turn that ended by handing Orteca a slow command: run it, then resume the
+/// session with what it printed. The agent's process is gone meanwhile, so
+/// the wait costs no tokens. `None` when the turn handed nothing over, or the
+/// run is over.
+async fn waited(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+) -> Option<Launch> {
+    let open = state.outcome.finished && state.outcome.failure.is_none() && !state.outcome.cancelled;
+    // Only a turn that may run commands and ends in prose: an artifact stage's
+    // last word is its JSON.
+    if !open || !ctx.plan.stage.writes() || ctx.plan.schema.is_some() {
+        return None;
+    }
+    let command = wait_command(&state.outcome.summary())?;
+    state.session.as_ref()?;
+    let say = |text: String| {
+        let event = ProviderEvent::Text(text);
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    };
+    let words = words(&command);
+    let reply = match refusal(&command, &words) {
+        Some(why) => {
+            say(format!("Orteca did not run `{command}`: {why}"));
+            format!("Orteca did not run `{command}`: {why} Finish without it, or hand over a command it can run.")
+        }
+        None => match go_ahead(store, ctx, state, control, emit, &command).await? {
+            false => {
+                say(format!("You chose not to run `{command}`."));
+                format!("The user chose not to run `{command}`. Finish without it, and tell them how to run it themselves.")
+            }
+            true => run_waited(store, ctx, state, control, emit, &command, &words).await?,
+        },
+    };
+    // The next turn must prove its own completion, as after any resume.
+    state.outcome.done = false;
+    state.outcome.finished = false;
+    Some(Launch::fix(ctx.id, state.session.as_deref()?, &reply, &ctx.plan))
+}
+
+/// Whether the command may run: at once in auto mode, else when the user
+/// answers. A question meanwhile is answered. `None` is a Stop.
+async fn go_ahead(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    command: &str,
+) -> Option<bool> {
+    if ctx.auto_wait {
+        return Some(true);
+    }
+    let event = ProviderEvent::Wait { command: command.to_string(), asking: true };
+    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    loop {
+        match control.recv().await? {
+            Control::Wait { run } => return Some(run),
+            Control::Instruct { text, reply, attachments, .. } => {
+                state.attachments.extend(attachments);
+                ask_meanwhile(store, ctx, state, control, emit, command, text, reply).await;
+            }
+            Control::Cancel => stop(store, ctx, state),
+        }
+        if state.outcome.cancelled || state.outcome.failure.is_some() {
+            return None;
+        }
+    }
+}
+
+/// A Stop with no process of Orteca's to kill.
+fn stop(store: &Store, ctx: &Context, state: &mut State) {
+    if let Err(e) = note(store, ctx, "cancel", CANCEL_PAYLOAD) {
+        state.outcome.failure = Some(format!("could not record the stop: {}", e.message));
+    }
+    state.outcome.cancelled = true;
+}
+
+/// A question while Orteca holds the agent's command: the session is resumed
+/// read-only to answer it, and the command goes on meanwhile.
+#[allow(clippy::too_many_arguments)]
+async fn ask_meanwhile(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    command: &str,
+    text: String,
+    reply: oneshot::Sender<InstructionReceipt>,
+) {
+    // Later stages carry it, as they carry every instruction.
+    state.constraints.push(text.clone());
+    let _ = note(store, ctx, "instruction", &instruction(&text, InstructionDisposition::Live));
+    let _ = reply.send(InstructionReceipt { disposition: InstructionDisposition::Live });
+    let Some(session) = state.session.clone() else {
+        return;
+    };
+    let asking = Context {
+        plan: StagePlan { stage: Stage::Answer, schema: None, ..ctx.plan.clone() },
+        ..ctx.clone()
+    };
+    let brief = format!(
+        "Orteca is still running `{command}` for you. Meanwhile the user asks:\n{text}\n\n\
+         Answer that, briefly. Change no file and do not run `{command}` yourself: Orteca \
+         sends you its output when it ends."
+    );
+    state.outcome.done = false;
+    state.outcome.finished = false;
+    let mut launch = Some(Launch::fix(ctx.id, &session, &brief, &asking.plan));
+    while let Some(next) = launch.take() {
+        if let Next::Restart(again) = attempt(store, &asking, state, control, emit, next).await {
+            launch = Some(again);
+        }
+    }
+}
+
+/// Run the command to its end, its whole output into the log, and say what
+/// the agent is sent of it. `None` when the run was stopped meanwhile.
+async fn run_waited(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    command: &str,
+    words: &[String],
+) -> Option<String> {
+    let say = |event: ProviderEvent| {
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    };
+    let Some(program) = crate::providers::which(&words[0]) else {
+        say(ProviderEvent::Text(format!("`{}` is not on PATH, so `{command}` did not run.", words[0])));
+        return Some(format!("Orteca found no `{}` on PATH, so `{command}` did not run. Finish without it.", words[0]));
+    };
+    let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+    let mut run = match proc::spawn_env(&program.to_string_lossy(), &args, &ctx.dir, &[]) {
+        Ok(run) => run,
+        Err(e) => {
+            say(ProviderEvent::Text(format!("`{command}` did not start: {e}")));
+            return Some(format!("`{command}` did not start: {e}. Finish without it."));
+        }
+    };
+    // Nothing will ever type into it.
+    run.close_stdin();
+    say(ProviderEvent::Wait { command: command.to_string(), asking: false });
+    let log = project::orteca_dir(&ctx.dir).and_then(|dir| {
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("wait-{}-{}.log", ctx.task_id, now_ms())))
+    });
+    let lines = std::mem::replace(&mut run.lines, mpsc::unbounded_channel().1);
+    let mut reading = tokio::spawn(read_waited(lines, log.clone()));
+    let started = now_ms();
+    let deadline = tokio::time::sleep(WAIT_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut timed_out = false;
+    let (code, digest) = loop {
+        tokio::select! {
+            read = &mut reading => break read.unwrap_or_default(),
+            () = &mut deadline, if !timed_out => { timed_out = true; run.cancel(); }
+            Some(action) = control.recv() => match action {
+                Control::Cancel => { stop(store, ctx, state); run.cancel(); }
+                Control::Instruct { text, reply, attachments, .. } => {
+                    state.attachments.extend(attachments);
+                    ask_meanwhile(store, ctx, state, control, emit, command, text, reply).await;
+                    if state.outcome.cancelled || state.outcome.failure.is_some() {
+                        run.cancel();
+                    }
+                }
+                Control::Wait { .. } => {}
+            },
+        }
+    };
+    if state.outcome.cancelled || state.outcome.failure.is_some() {
+        return None;
+    }
+    let took = now_ms().saturating_sub(started);
+    state.timings.push(Timing { label: command.to_string(), ms: took });
+    let verdict = match (timed_out, code) {
+        (true, _) => format!("stopped by Orteca after {} minutes", WAIT_TIMEOUT.as_secs() / 60),
+        (false, Some(code)) => format!("exit code {code}"),
+        (false, None) => "ended without an exit code".to_string(),
+    };
+    let after = format!("{}m {}s", took / 60_000, took / 1000 % 60);
+    say(ProviderEvent::Text(format!("`{command}` finished: {verdict}, after {after}.")));
+    let whole = match log.filter(|_| digest.saved) {
+        Some(path) => format!(
+            "All {} lines of output are in {}; search it if you need more than this.",
+            digest.total,
+            path.display()
+        ),
+        None => "Orteca could not save the whole output; this is all of it that is left.".to_string(),
+    };
+    Some(format!("Orteca ran `{command}`: {verdict}, after {after}. {whole}\n\n{}", digest.render()))
+}
+
+/// Every line of a waited command into its log and its digest, until it ends.
+async fn read_waited(mut lines: mpsc::UnboundedReceiver<Line>, log: Option<PathBuf>) -> (Option<i32>, Digest) {
+    use std::io::Write;
+    // ponytail: blocking writes on a runtime worker, buffered; spawn_blocking if a chatty command stalls others.
+    let mut file = log
+        .and_then(|path| std::fs::File::create(path).ok())
+        .map(std::io::BufWriter::new);
+    let (mut code, mut digest) = (None, Digest::default());
+    while let Some(line) = lines.recv().await {
+        let text = match line {
+            Line::Exit(exit) => {
+                code = exit;
+                continue;
+            }
+            Line::Text(text) => text,
+            Line::Json(value) => value.to_string(),
+        };
+        if let Some(out) = &mut file {
+            let _ = writeln!(out, "{text}");
+        }
+        digest.push(&text);
+    }
+    digest.saved = file.is_some_and(|mut out| out.flush().is_ok());
+    (code, digest)
 }
 
 /// A model call and a local check at once, each reading its own channel. A
@@ -2994,7 +3394,7 @@ async fn attempt(
     launch: Launch,
 ) -> Next {
     let mut argv = launch.argv;
-    argv.extend(attachment_args(ctx.id, &ctx.attachments));
+    argv.extend(attachment_args(ctx.id, &[ctx.attachments.as_slice(), &state.attachments].concat()));
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Counted before the spawn can fail: a process Orteca tried to start is a
     // call it spent, and hiding the failures would flatter the metric.
@@ -3222,16 +3622,31 @@ async fn answer(
         Control::Instruct {
             text,
             apply_now,
+            attachments,
             reply,
         } => {
             // Every later stage's brief repeats this, whether the running
             // provider took it live, held it, or finished before it landed. An
             // instruction never silently expires.
             state.constraints.push(text.clone());
+            let out_of_reach = !reachable(ctx, state, &attachments);
+            state.attachments.extend(attachments);
             // A resume needs a session to resume, and a provider only reports
             // one once it has started talking. Without it the instruction waits
             // rather than appearing to have been applied.
             let disposition = match ctx.id.steering() {
+                // A running Claude opens only the folders it started with, so a
+                // file outside them means picking its session back up with the
+                // folder added. The work so far stays as it is.
+                Steering::Live if out_of_reach => {
+                    state.held.push(text.clone());
+                    if state.session.is_some() {
+                        InstructionDisposition::Resumed
+                    } else {
+                        state.apply_now_pending = true;
+                        InstructionDisposition::Held
+                    }
+                }
                 Steering::Live => {
                     // Straight down stdin, mid-turn. The only way this fails is
                     // a run whose stdin Orteca has already closed, which means
@@ -3267,6 +3682,8 @@ async fn answer(
                 None
             }
         }
+        // Nothing is waiting on a go-ahead while the agent itself runs.
+        Control::Wait { .. } => None,
     }
 }
 
@@ -3281,7 +3698,8 @@ fn restart_held(ctx: &Context, state: &mut State, run: &proc::Run) -> Option<Nex
     if state.held.is_empty() {
         return None;
     }
-    let launch = Launch::resume(ctx.id, session, &state.held, &ctx.plan);
+    // For Codex this is `Launch::resume`; Claude also needs its opening as a stream-json message.
+    let launch = Launch::fix(ctx.id, session, &state.held.join("\n"), &ctx.plan);
     state.held.clear();
     state.apply_now_pending = false;
     // The next attempt must prove its own completion. Keeping this true from
@@ -3465,8 +3883,10 @@ mod tests {
             attachments: Vec::new(),
             resume: None,
             continued: false,
+            said: None,
             timings: Vec::new(),
             checking: None,
+            auto_wait: false,
             id: ProviderId::Codex,
             program: dir.join("fake.cmd"),
             dir,
@@ -3612,6 +4032,37 @@ process.stdin.on('end', () => {
         );
         // Logged, not shown: the UI has no shape for an event nobody parsed.
         assert!(!emitted.borrow().contains(&"unknown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reply overwrites the task row's answer, so each exchange logs its own
+    /// result, and the turn logs the user's words rather than the recap.
+    #[tokio::test]
+    async fn every_exchange_keeps_its_own_result_in_the_log() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "exchange-log");
+        request.continued = true;
+        request.said = Some("make it blue".into());
+        let dir = request.dir.clone();
+        let task = request.task_id;
+        std::fs::write(
+            &request.program,
+            "@echo off
+             echo {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"all blue\"}}
+             echo {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}
+             exit /b 0
+",
+        )
+        .unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        let payloads = store.event_payloads(task);
+        let turn = payloads.iter().find(|v| v["kind"] == "turn").expect("no turn logged");
+        assert_eq!(turn["data"]["said"], "make it blue");
+        let exchange = payloads.iter().find(|v| v["taskId"] == task).expect("no exchange logged");
+        assert_eq!(exchange["status"], result.status);
+        assert_eq!(exchange["summary"], result.summary);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4050,7 +4501,7 @@ ping -n 60 127.0.0.1 >nul
                 // The first text means the shared turn is under way.
                 wait_for_kind(&mut hearing, "text").await;
                 let receipt = live
-                    .instruct(task, "also tidy up".into(), false)
+                    .instruct(task, "also tidy up".into(), false, Vec::new())
                     .await
                     .unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Live);
@@ -4107,7 +4558,7 @@ ping -n 60 127.0.0.1 >nul
             }),
             async {
                 wait_for_kind(&mut hearing, "done").await;
-                live.instruct(task, "one more thing".into(), false)
+                live.instruct(task, "one more thing".into(), false, Vec::new())
                     .await
                     .unwrap()
             }
@@ -4122,6 +4573,57 @@ ping -n 60 127.0.0.1 >nul
             .expect("the late instruction was not logged");
         assert_eq!(payload["data"]["applied"], "tooLate");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A running Claude cannot open a folder it did not start with, so a steer
+    /// that attaches one resumes the session with that folder added, and the
+    /// agent is told where the file is.
+    #[tokio::test]
+    async fn a_steer_attaching_a_file_outside_reach_resumes_claude_with_its_folder() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "steer-attach");
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        let task = request.task_id;
+        let outside = std::env::temp_dir().join(format!("orteca-steer-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let shot = outside.join("shot.png");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        // The first process works until it is killed; the resumed one says
+        // whether it was granted a folder and what it was sent.
+        std::fs::write(dir.join("fake.js"), concat!(
+            "const a=process.argv.slice(2);",
+            "if(!a.includes('--resume')){",
+            "console.log(JSON.stringify({type:'system',subtype:'init',session_id:'sess-a'}));",
+            "console.log(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'working'}]}}));",
+            "process.stdin.resume();",
+            "}else{let buf='';process.stdin.setEncoding('utf8');process.stdin.on('data',d=>{buf+=d;",
+            "if(!buf.includes('\\n'))return;const text=JSON.parse(buf.split('\\n')[0]).message.content;",
+            "console.log(JSON.stringify({type:'result',subtype:'success',result:(a.includes('--add-dir')?'granted ':'')+text,",
+            "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));});",
+            "process.stdin.on('end',()=>process.exit(0));}",
+        )).unwrap();
+
+        let live = Live::default();
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
+        let (result, ()) = tokio::join!(
+            stream(&store, &live, request, move |e| {
+                let _ = heard.send(e.kind());
+                Ok(())
+            }),
+            async {
+                wait_for_kind(&mut hearing, "text").await;
+                let receipt = live.instruct(task, "look at this".into(), false, vec![shot.clone()]).await.unwrap();
+                assert_eq!(receipt.disposition, InstructionDisposition::Resumed);
+            }
+        );
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert!(result.summary.starts_with("granted look at this"), "{}", result.summary);
+        assert!(result.summary.contains(&shot.display().to_string()), "the agent was not told where it is");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     /// A checkpoint provider has no stdin to speak down, so an instruction
@@ -4161,7 +4663,7 @@ ping -n 60 127.0.0.1 >nul
             }),
             async {
                 wait_for_kind(&mut hearing, "text").await;
-                let receipt = live.instruct(task, "use tabs".into(), false).await.unwrap();
+                let receipt = live.instruct(task, "use tabs".into(), false, Vec::new()).await.unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Held);
             }
         );
@@ -4216,7 +4718,7 @@ ping -n 60 127.0.0.1 >nul
             async {
                 wait_for_kind(&mut hearing, "text").await;
                 let receipt = live
-                    .instruct(task, "make it faster".into(), true)
+                    .instruct(task, "make it faster".into(), true, Vec::new())
                     .await
                     .unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Resumed);
@@ -4281,7 +4783,7 @@ ping -n 60 127.0.0.1 >nul
             }),
             async {
                 wait_for_kind(&mut hearing, "text").await;
-                let receipt = live.instruct(task, "hurry".into(), true).await.unwrap();
+                let receipt = live.instruct(task, "hurry".into(), true, Vec::new()).await.unwrap();
                 assert_eq!(receipt.disposition, InstructionDisposition::Held);
             }
         );
@@ -5580,7 +6082,7 @@ ping -n 60 127.0.0.1 >nul
                 // instruction to a running agent and not a race with start-up.
                 wait_for_kind(&mut hearing, "text").await;
                 let _ = live
-                    .instruct(task, "never touch the public API".into(), false)
+                    .instruct(task, "never touch the public API".into(), false, Vec::new())
                     .await;
             }
         );
@@ -5934,6 +6436,76 @@ ping -n 60 127.0.0.1 >nul
             "the fix left the model that wrote the change: {}",
             calls[1]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_handed_over_command_is_read_split_and_guarded() {
+        assert_eq!(
+            wait_command("Starting it.\n`ORTECA-WAIT: node bench.mjs \"a b\"`\n").as_deref(),
+            Some("node bench.mjs \"a b\"")
+        );
+        assert_eq!(wait_command("ORTECA-WAIT: npm test\nthen more"), None);
+        assert_eq!(words("node  bench.mjs \"a b\" \"\""), ["node", "bench.mjs", "a b", ""]);
+        let refused = |c: &str| refusal(c, &words(c)).is_some();
+        assert!(!refused("npm run bench"));
+        assert!(refused("npm test && git push"));
+        assert!(refused("powershell -Command npm test"));
+        assert!(refused("git.exe push origin main"));
+        assert!(refused("Remove-Item build"));
+    }
+
+    #[test]
+    fn a_digest_keeps_the_start_the_problems_and_the_end() {
+        let mut digest = Digest::default();
+        for n in 1..=1000 {
+            digest.push(&if n == 500 { "test x FAILED".to_string() } else { format!("line {n}") });
+        }
+        let text = digest.render();
+        assert!(text.starts_with("line 1\n") && text.contains("line 30\n"), "{text}");
+        assert!(!text.contains("line 31\n") && !text.contains("line 850\n"));
+        assert!(text.contains("500: test x FAILED"));
+        assert!(text.contains("line 851\n") && text.ends_with("line 1000"));
+        // A short output goes whole, with nothing marked as left out.
+        let mut short = Digest::default();
+        ["a", "b"].iter().for_each(|line| short.push(line));
+        assert_eq!(short.render(), "a\nb");
+    }
+
+    /// A turn that ends `ORTECA-WAIT:` has Orteca run the command, then the
+    /// same session goes on with its output.
+    #[tokio::test]
+    async fn a_handed_over_command_runs_and_its_output_resumes_the_session() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "wait");
+        request.auto_wait = true;
+        let dir = request.dir.clone();
+        std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\" %*\r\n").unwrap();
+        let log = dir.join("argv.log").to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            dir.join("fake.js"),
+            format!(
+                "const fs=require('fs');const a=process.argv.slice(2);let i='';\
+                 process.stdin.setEncoding('utf8');process.stdin.on('data',d=>i+=d);\
+                 process.stdin.on('end',()=>{{fs.appendFileSync('{log}',a.join(' ')+'\\n');\
+                 const say=t=>console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:t}}}}));\
+                 if(a.includes('resume'))say('Got it: '+i);\
+                 else{{console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
+                 say('Starting the benchmark.\\nORTECA-WAIT: node -e \"console.log(40+2)\"');}}\
+                 console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));}});"
+            ),
+        )
+        .unwrap();
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert!(result.summary.contains("exit code 0"), "{}", result.summary);
+        assert!(result.summary.trim_end().ends_with("\n\n42"), "{}", result.summary);
+        let calls = std::fs::read_to_string(dir.join("argv.log")).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].starts_with("exec resume sess-1"), "{}", calls[1]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

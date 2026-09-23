@@ -1662,7 +1662,14 @@ pub fn brief(
              paragraphs at most. Lead with the answer. Plain text only: no markdown, no \
              headings, no bold, no [[links]]; name a file only when the reader needs it.\n\n",
         ),
-        Stage::Implement => {}
+        // `run::waited` reads this line. Implement only: the stages with an
+        // artifact end in JSON, and the rest run no commands.
+        Stage::Implement => out.push_str(
+            "If a command will take more than about two minutes, such as a benchmark or a full \
+             build, do not run it yourself: end your reply with the line \
+             `ORTECA-WAIT: <command>` and stop. Orteca runs it, one program with its arguments \
+             and no shell, and sends you its output when it ends.\n\n",
+        ),
     }
 
     if !resumed {

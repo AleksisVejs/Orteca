@@ -60,7 +60,123 @@
 .composer-bar > .missing {
   margin: 0 0 8px;
 }
+/* One box for steering and replying, so a run ending changes what it says, not where it is. */
+.composer {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  transition: border-color 120ms ease;
+}
+.composer:focus-within {
+  border-color: var(--focus);
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  max-height: 12em;
+  padding: 14px 18px 4px;
+  background: none;
+  color: var(--text);
+  border: none;
+  font: inherit;
+  resize: none;
+  field-sizing: content;
+}
+.composer textarea::placeholder {
+  color: var(--text-faint);
+}
+.composer textarea:focus {
+  outline: none;
+}
+.composer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px 18px;
+}
+.composer-row .btn {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  font-size: 12px;
+}
+.composer-row .icon {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  transition: background 120ms ease, color 120ms ease;
+}
+.composer-row .icon:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* A finished exchange above the current one: its outcome in a line, then a hairline. */
+.turn-end {
+  margin: 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
 
 @media (max-width: 600px) {
   .bubble { max-width: 90%; }
+}
+
+/* A route's steps, the same line while it runs and after: ran, running, or not reached. */
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.steps li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.steps li::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+.steps .ran { color: var(--text-dim); }
+.steps .ran::before { background: var(--text-dim); border-color: var(--text-dim); }
+.steps .running { color: var(--text); }
+.steps .running::before { background: var(--info); border-color: var(--info); }
+
+/* The work behind the answer, folded away at the thread's end, the same spot while running and after. */
+.proof-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: 12px;
+  color: var(--text-faint);
+  border-bottom: 1px solid transparent;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.proof-toggle:hover,
+.proof-toggle[aria-expanded="true"],
+.proof-toggle[aria-pressed="true"] {
+  color: var(--text);
+}
+.proof-toggle[aria-expanded="true"],
+.proof-toggle[aria-pressed="true"] {
+  border-bottom-color: var(--text);
+}
+.proof-toggle .count {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }

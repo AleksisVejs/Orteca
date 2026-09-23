@@ -39,3 +39,14 @@ test('a heading and a link keep their words only', () => {
   assert.equal(h.kind, 'h');
   assert.equal(p.lines[0].map(s => s.text).join(''), 'See the file.');
 });
+
+test('web addresses become links, other targets stay words', () => {
+  const [p] = parseMarkdown('Cursor: https://cursor.com/ and [docs](https://docs.cursor.com/x). See [file](src/a.ts), or https://aider.chat.');
+  const links = p.lines[0].filter(s => s.kind === 'link').map(s => [s.text, s.href]);
+  assert.deepEqual(links, [
+    ['https://cursor.com/', 'https://cursor.com/'],
+    ['docs', 'https://docs.cursor.com/x'],
+    ['https://aider.chat', 'https://aider.chat'],
+  ]);
+  assert.equal(p.lines[0].map(s => s.text).join(''), 'Cursor: https://cursor.com/ and docs. See file, or https://aider.chat.');
+});

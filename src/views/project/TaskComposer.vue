@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, onMounted, ref } from "vue";
 import Memory from "./Memory.vue";
+import ProviderMark from "../../components/ProviderMark.vue";
 import { PROJECT } from "./state";
 import { isAppError, memory } from "../../api";
 import type { MemoryState } from "../../types";
@@ -8,7 +9,7 @@ import type { MemoryState } from "../../types";
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
   task, picks, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
-  schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
+  schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation, autoWait, chooseAutoWait,
   installed, provider, providerPicked, previewing, preview, previewError,
   limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
   remembering, rememberText, rememberError, remember,
@@ -126,7 +127,7 @@ function formatDuration(milliseconds: number) {
         </button>
       </div>
 
-      <button class="options" :aria-expanded="optionsOpen" aria-controls="task-options" @click="optionsOpen = !optionsOpen">
+      <button class="options" :aria-expanded="optionsOpen" :aria-controls="domId('task-options')" @click="optionsOpen = !optionsOpen">
         <span class="options-label">Task settings</span>
         <span class="settings-summary">
           <span :title="opened.project.path">{{ opened.project.name }}</span> ·
@@ -137,10 +138,13 @@ function formatDuration(milliseconds: number) {
         <svg :class="{ expanded: optionsOpen }" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
 
-      <div v-show="optionsOpen" id="task-options" class="option-panel">
-        <div v-if="installed.length" class="helper-options" role="group" aria-labelledby="helper-label">
-          <span id="helper-label" class="option-label">AI helper</span>
-          <div class="segments provider-options">
+      <div v-show="optionsOpen" :id="domId('task-options')" class="option-panel">
+        <div v-if="installed.length" class="setting" role="group" :aria-labelledby="domId('helper-label')">
+          <div class="setting-text">
+            <span :id="domId('helper-label')" class="option-label">AI helper</span>
+            <span class="setting-hint">{{ providerPicked ? "You pick the model and how hard it thinks" : "Orteca picks the helper, model and reasoning" }}</span>
+          </div>
+          <div class="segments">
             <button
               class="seg"
               :class="{ on: !providerPicked }"
@@ -158,38 +162,41 @@ function formatDuration(milliseconds: number) {
               :aria-pressed="providerPicked && provider === p.id"
               @click="chooseProvider(p.id)"
             >
-              {{ p.id === 'claude' ? 'Claude' : 'Codex' }}
+              <ProviderMark :id="p.id" />{{ p.id === 'claude' ? 'Claude' : 'Codex' }}
             </button>
           </div>
-          <div v-if="providerPicked" class="model-options">
-            <label>
-              <span class="option-label">Model</span>
-              <span class="select-field">
-                <select :value="modelChoices[provider].model" @change="chooseModel(($event.target as HTMLSelectElement).value)">
-                  <option v-for="item in MODELS[provider]" :key="item.id" :value="item.id">{{ item.label }}</option>
-                </select>
-                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m5 6 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
-              </span>
-            </label>
-            <label class="reasoning-field">
-              <span class="option-label">Reasoning</span>
-              <span class="select-field">
-                <select v-model="modelChoices[provider].effort" @change="schedulePreview">
-                  <option
-                    v-for="effort in MODELS[provider].find((item) => item.id === modelChoices[provider].model)?.efforts"
-                    :key="effort"
-                    :value="effort"
-                  >
-                    {{ effort === 'xhigh' ? 'Extra high' : effort === 'max' ? 'Maximum' : effort.charAt(0).toUpperCase() + effort.slice(1) }}
-                  </option>
-                </select>
-                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m5 6 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
-              </span>
-            </label>
-          </div>
         </div>
-        <div>
-          <span class="option-label">Approach</span>
+        <template v-if="installed.length && providerPicked">
+          <label class="setting sub">
+            <span class="setting-text"><span class="option-label">Model</span></span>
+            <span class="select-field">
+              <select :value="modelChoices[provider].model" @change="chooseModel(($event.target as HTMLSelectElement).value)">
+                <option v-for="item in MODELS[provider]" :key="item.id" :value="item.id">{{ item.label }}</option>
+              </select>
+              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m5 6 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </span>
+          </label>
+          <label class="setting sub">
+            <span class="setting-text"><span class="option-label">Reasoning</span></span>
+            <span class="select-field">
+              <select v-model="modelChoices[provider].effort" @change="schedulePreview">
+                <option
+                  v-for="effort in MODELS[provider].find((item) => item.id === modelChoices[provider].model)?.efforts"
+                  :key="effort"
+                  :value="effort"
+                >
+                  {{ effort === 'xhigh' ? 'Extra high' : effort === 'max' ? 'Maximum' : effort.charAt(0).toUpperCase() + effort.slice(1) }}
+                </option>
+              </select>
+              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m5 6 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </span>
+          </label>
+        </template>
+        <div class="setting" role="group" :aria-labelledby="domId('mode-label')">
+          <div class="setting-text">
+            <span :id="domId('mode-label')" class="option-label">Approach</span>
+            <span class="setting-hint">{{ MODES.find((m) => m.id === mode)?.hint }}</span>
+          </div>
           <div class="segments">
             <button
               v-for="m in MODES"
@@ -204,8 +211,11 @@ function formatDuration(milliseconds: number) {
             </button>
           </div>
         </div>
-        <div>
-          <span class="option-label">Working location</span>
+        <div class="setting" role="group" :aria-labelledby="domId('isolation-label')">
+          <div class="setting-text">
+            <span :id="domId('isolation-label')" class="option-label">Working location</span>
+            <span class="setting-hint">{{ ISOLATIONS.find((w) => w.id === isolation)?.hint }}</span>
+          </div>
           <div class="segments">
             <button
               v-for="w in ISOLATIONS"
@@ -217,6 +227,32 @@ function formatDuration(milliseconds: number) {
               @click="isolation = w.id; schedulePreview()"
             >
               {{ w.label }}
+            </button>
+          </div>
+        </div>
+        <div class="setting" role="group" :aria-labelledby="domId('wait-label')">
+          <div class="setting-text">
+            <span :id="domId('wait-label')" class="option-label">Slow commands</span>
+            <span class="setting-hint">{{ autoWait ? "Runs them at once. Blocked ones, like git push, are still refused" : "Asks before it runs a long command" }}</span>
+          </div>
+          <div class="segments">
+            <button
+              class="seg"
+              :class="{ on: !autoWait }"
+              :aria-pressed="!autoWait"
+              title="When the agent hands Orteca a slow command, ask before running it"
+              @click="chooseAutoWait(false)"
+            >
+              Ask me
+            </button>
+            <button
+              class="seg"
+              :class="{ on: autoWait }"
+              :aria-pressed="autoWait"
+              title="Run it at once. Blocked commands, like git push or rm, are still refused"
+              @click="chooseAutoWait(true)"
+            >
+              Run them
             </button>
           </div>
         </div>
@@ -461,21 +497,42 @@ textarea:focus {
 }
 
 .option-panel {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 18px 24px;
-  padding: 18px;
+  padding: 0 18px;
   border-top: 1px solid var(--border);
 }
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 0;
+}
+.setting + .setting {
+  border-top: 1px solid var(--border);
+}
+.setting.sub {
+  padding-left: 14px;
+}
+.setting-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
 .option-label {
-  display: block;
-  margin-bottom: 5px;
   font-size: 12px;
+  color: var(--text);
+}
+.sub .option-label {
   color: var(--text-dim);
+}
+.setting-hint {
+  font-size: 11px;
+  color: var(--text-faint);
 }
 .segments {
   display: flex;
-  flex-wrap: wrap;
+  flex-shrink: 0;
   gap: 2px;
   padding: 2px;
   background: var(--bg);
@@ -483,9 +540,13 @@ textarea:focus {
   border-radius: var(--r-sm);
 }
 .seg {
-  flex: 1;
-  padding: 4px 11px;
-  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 4px 12px;
+  min-height: 28px;
+  white-space: nowrap;
   border-radius: var(--r-sm);
   font-size: 12px;
   color: var(--text-faint);
@@ -508,38 +569,11 @@ textarea:focus {
   padding: 12px 18px;
   border-top: 1px solid var(--border);
 }
-.helper-options {
-  grid-column: 1 / -1;
-  min-width: 0;
-  padding-bottom: 18px;
-  border-bottom: 1px solid var(--border);
-}
-.provider-options {
-  flex-wrap: nowrap;
-}
-.model-options {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  margin-top: 8px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-}
-.model-options label {
-  min-width: 0;
-  padding: 8px;
-}
-.reasoning-field {
-  border-left: 1px solid var(--border);
-}
-.model-options .option-label {
-  margin: 0 6px 2px;
-  color: var(--text-faint);
-  font-size: 11px;
-}
 .select-field {
   display: block;
   position: relative;
+  flex-shrink: 0;
+  width: 200px;
 }
 .select-field svg {
   position: absolute;
@@ -549,14 +583,14 @@ textarea:focus {
   pointer-events: none;
   color: var(--text-faint);
 }
-.model-options select {
+.select-field select {
   appearance: none;
   width: 100%;
-  min-height: 32px;
-  padding: 4px 28px 4px 6px;
+  min-height: 34px;
+  padding: 4px 28px 4px 10px;
   color: var(--text);
   background: var(--bg);
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--r-sm);
   font: inherit;
   font-size: 12px;
@@ -564,27 +598,25 @@ textarea:focus {
   text-overflow: ellipsis;
   transition: background 120ms ease;
 }
-.model-options select:hover {
+.select-field select:hover {
   background: var(--surface-2);
 }
-.model-options select:focus-visible {
+.select-field select:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
-@container (max-width: 440px) {
-  .option-panel {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
+@container (max-width: 520px) {
+  .setting {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
   }
-}
-@container (max-width: 340px) {
-  .model-options {
-    grid-template-columns: minmax(0, 1fr);
+  .select-field {
+    width: auto;
   }
-  .reasoning-field {
-    border-left: none;
-    border-top: 1px solid var(--border);
+  .seg {
+    flex: 1;
   }
 }
 

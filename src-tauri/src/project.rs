@@ -1210,6 +1210,12 @@ fn clip(line: &str) -> String {
     format!("{} … {}", chars[..70].iter().collect::<String>(), chars[chars.len() - 90..].iter().collect::<String>())
 }
 
+/// Where a run keeps its own files: inside the git directory, which git never
+/// lists as a change. A copy's git directory is its own, beside the main one.
+pub fn orteca_dir(dir: &Path) -> Option<PathBuf> {
+    Some(PathBuf::from(git(dir, &["rev-parse", "--absolute-git-dir"])?).join("orteca"))
+}
+
 /// Run git and return trimmed stdout, or `None` if git failed or isn't there.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let text = git_output(dir, args).ok()?.trim().to_string();

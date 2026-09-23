@@ -44,6 +44,10 @@ is the only place colour, radius and spacing are defined.
   The fox fills about 70% of it; size the box accordingly.
 - Replacing the logo is one step: overwrite that PNG (8-bit RGBA, square,
   non-interlaced) and run `node scripts/make-icon.mjs`.
+- Provider logos (`src/assets/claude.png`, `codex.png`, 64px square) render
+  only through `ProviderMark.vue`, beside the provider's name: the Agents
+  list, the AI helper picker and the status bar usage counters. Claude keeps
+  its orange; the OpenAI knot is a mask in the surrounding text colour.
 
 ## Shape and spacing
 
@@ -93,9 +97,8 @@ is the only place colour, radius and spacing are defined.
   was asked, and opens its own stream or result.
 - A status dot is green for done, `--err` for failed, `--warn` for checks that
   did not pass, blue while running, and neutral otherwise.
-- A result shows what happened first; route, metrics, files and activity sit
-  one tab away. Results sit directly on the page, with horizontally scrollable
-  tabs when space is tight. The header's branch control combines change and
+- A result shows what happened first; route, metrics, files and activity open
+  in one modal over the chat, so reading them never moves the conversation. The header's branch control combines change and
   sync status with a native Git popover. Forms, progress, errors and success
   stay in that popover without moving the workspace. Fetch runs on one click;
   actions that change files or publish work show their scope before submission.
@@ -111,7 +114,8 @@ is the only place colour, radius and spacing are defined.
   heading shows what the user typed, never the recap sent to the CLI. A reply
   that had to open its own task — one whose run worked in a separate copy —
   gets its own row, because that is what happened. The reply box carries the
-  composer's affordances: attach, add folder, paste, drop, Ctrl+Enter.
+  composer's affordances: attach, add folder, paste, drop. Enter sends and
+  Shift+Enter breaks the line, the same as the steer box.
 - A finished task in the sidebar takes a reply too, on the same terms. It opens
   a run showing the exchange it answers, and goes on in that same task. Its
   provider session is long cold, so the box says the reply reads the files again
@@ -130,7 +134,8 @@ is the only place colour, radius and spacing are defined.
   windows), a 44px pane header and a compact status bar. Task history nests
   under the current project and shows each task’s status and provider.
 - The pane header identifies the current screen with a tab-like treatment.
-  It is a heading, not a tab control. The footer reports the real project path,
+  It is a heading, not a tab control. On a task it is the task's name with its
+  status dot; the outcome words, provider, duration and date are its tooltip. The footer reports the real project path,
   provider allowances and running state. Do not add decorative terminal panes,
   fake resource readings or destinations for features that do not exist.
 - Claude and Codex usage counters show percentage **remaining**, labelled by
@@ -199,7 +204,10 @@ draggable divider, and `Ctrl+\`` shows and hides it.
 ## Motion and access
 
 - Transitions are 120ms ease, on colour and background only. Nothing moves,
-  slides or bounces on mount.
+  slides or bounces on mount. One exception: when the chat box swaps between
+  reply and steer, it eases to its new height and the orb's status line fades
+  in as the orb grows into place; a new task's box glides from where it was
+  typed down to the chat box (none under reduced motion).
 - The only looping animation in the app is the `Orb` (the dotted sphere in a
   live run's status pill). Its mood follows the current activity: idle,
   thinking, reading, editing, checking, failed, stopping. It stops under
@@ -231,14 +239,25 @@ the mock's chrome for features that are not wired up yet.
 - The chat box is pinned to the pane's bottom edge and holds the live state as
   one unit: the orb, the provider and current stage, the current activity, the
   route's steps (running in `--info`, ran, upcoming), Stop, then the steer
-  input. The provider is named there and nowhere else. Nothing claims a
+  input, which takes attachments like the reply box. On Claude, one outside
+  the folders the run can open restarts the step, and the box says so first.
+  The provider is named there and nowhere else. Nothing claims a
   percentage. The pane follows new messages unless the reader scrolled up.
-- A finished run stays the same chat. Its answer is the agent's message: status
-  dot, outcome and provider, the outcome line, the summary and any caveats,
-  then a Files / Details / Activity row whose sections open in place (none open
-  by default; a second click folds one away). The pinned box becomes the reply
-  box, with the reply-cost note, "Edit and run again" and "New task" under it.
-  Reply is the primary action when a reply is possible, otherwise New task is.
+- A finished run stays the same chat. Its answer stays where the last message
+  streamed, with no header above it: the summary and any caveats, then one
+  footer line — files changed, verification, remaining work — with Files /
+  Details / Activity opening the proof modal. The status lives in the pane
+  header's dot, which the orb settles into. The pinned box stays where it was
+  and becomes the reply box; the reply cost is a short note in its row, the
+  full sentence its tooltip. A failed or stopped run takes a reply too. "Edit"
+  sits under the user's own bubble. Reply is the primary action when a reply is
+  possible, otherwise New task is. Every answer keeps its own proof: an
+  earlier exchange that finished on screen ends in the same footer, led by its
+  own status dot, then a hairline. The log keeps each
+  exchange's result as an `exchange` event, so history shows every answer with
+  its own proof; one logged before that shows its words and says the rest was
+  not saved. A just-finished run stays scrolled to the bottom; a task
+  opened fresh starts at the top of an answer too long to fit.
   A past task from the sidebar is the same chat. Details show recorded execution
   steps, labelled usage, and direct links to changes and activity.
 - Live execution comes from runner-owned stage events, including parallel stages

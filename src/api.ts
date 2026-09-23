@@ -113,7 +113,10 @@ export const previewTask = (path: string, prompt: string, provider: ProviderId, 
 export const openFile = (path: string, file: string, reveal: boolean) =>
   invoke<void>("open_file", { path, file, reveal });
 
-export const renameTask = (path: string, taskId: number, title: string) =>
+/** Opens an http(s) link from an agent's reply in the default browser. */
+export const openUrl = (url: string) => invoke<void>("open_url", { url });
+
+export const renameTask =(path: string, taskId: number, title: string) =>
   invoke<void>("rename_task", { path, taskId, title });
 
 export const deleteTask = (path: string, taskId: number) =>
@@ -126,6 +129,11 @@ export const removeWorktree =(path: string, taskId: number) =>
  *  the branch to merge. Returns the git state after it. */
 export const gitAction = (path: string, action: GitAction, input = "") =>
   invoke<GitState>("git_action", { path, action, input });
+
+/** A one-line commit subject the cheapest model drafts from the uncommitted
+ *  patch. Commits nothing. */
+export const draftCommitMessage = (path: string) =>
+  invoke<string>("draft_commit_message", { path });
 
 /** Refresh local Git state without fetching or planning an AI task. */
 export const gitStatus = (path: string) => invoke<GitState>("git_status", { path });
@@ -154,6 +162,8 @@ export const startTask = (
   onTask: (taskId: number) => void,
   // The change, once its focused tests pass and while the full suite runs.
   onChecking: (result: TaskResult) => void,
+  // Run a command the agent hands over (`ORTECA-WAIT:`) without asking first.
+  autoWait: boolean,
   resume: (Resume & { reply: string }) | null = null,
   // A reply that goes on in this task instead of opening a new one.
   continueTask: number | null = null,
@@ -170,8 +180,12 @@ export const startTask = (
   task.onmessage = onTask;
   const checking = new Channel<TaskResult>();
   checking.onmessage = onChecking;
-  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, model, events, task, checking });
+  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, autoWait, model, events, task, checking });
 };
+
+/** Runs, or declines, the command a run's agent is waiting on. */
+export const answerWait = (taskId: number, run: boolean) =>
+  invoke<void>("answer_wait", { taskId, run });
 
 /**
  * Stops a run and the whole process tree under it. Throws if the run has
@@ -185,9 +199,10 @@ export const cancelTask = (taskId: number) =>
  * Sends a mid-task instruction. A live provider takes it straight away; a
  * checkpoint one holds it unless `applyNow`, which restarts its session with
  * the instruction rather than waiting for a boundary that may never come.
+ * Claude restarts too when an attachment is outside the folders it can open.
  */
-export const sendInstruction = (taskId: number, text: string, applyNow: boolean) =>
-  invoke<InstructionReceipt>("send_instruction", { taskId, text, applyNow });
+export const sendInstruction = (taskId: number, text: string, applyNow: boolean, attachments: string[]) =>
+  invoke<InstructionReceipt>("send_instruction", { taskId, text, applyNow, attachments });
 
 /** Installs the CLI with npm. Resolves with the fresh detection, or throws. */
 export const installProvider = (provider: ProviderId) =>

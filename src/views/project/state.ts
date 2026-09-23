@@ -779,7 +779,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const gitError = ref<string | null>(null);
   const gitNotice = ref<string | null>(null);
   const commitMessage = ref("");
-  const mergeBranch = ref("");
+  /** The existing branch a merge or switch names. */
+  const targetBranch = ref("");
+  const newBranch = ref("");
   const discardPath = ref("");
   let gitRequest = 0;
 
@@ -824,7 +826,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitAsk.value = action;
     gitError.value = null;
     gitNotice.value = null;
-    if (action === "merge") mergeBranch.value = branch || git.value.branches[0] || "";
+    if (action === "merge" || action === "switch") targetBranch.value = branch || git.value.branches[0] || "";
     if (action === "discard") discardPath.value = branch;
   }
 
@@ -844,7 +846,11 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
           ? `Send ${n(g.ahead, "commit")} to ${remote}? Others will see them.`
           : `Publish ${g.branch ?? "this branch"} to the remote for the first time? Others will see it.`;
       case "merge":
-        return `Bring ${mergeBranch.value || "a branch"} into ${g.branch ?? "this detached HEAD"}? If they change the same lines, Orteca stops and changes nothing.`;
+        return `Bring ${targetBranch.value || "a branch"} into ${g.branch ?? "this detached HEAD"}? If they change the same lines, Orteca stops and changes nothing.`;
+      case "switch":
+        return `Check out ${targetBranch.value || "a branch"}? ${g.dirty ? "Uncommitted changes come along; Git stops if they would be overwritten." : "Your files change to match it."}`;
+      case "branch":
+        return `Start a new branch from ${g.branch ?? "this detached HEAD"} and switch to it?${g.dirty ? " Uncommitted changes come along." : ""}`;
       case "discard":
         return discardPath.value === "" ? `Revert all ${n(g.dirtyCount, "changed file")}? This permanently removes uncommitted changes.` : `Revert ${discardPath.value}? This permanently removes its uncommitted changes.`;
     }
@@ -852,9 +858,12 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   async function runGit(action: GitAction) {
     if (gitDisabledReason(action) || (action !== "fetch" && gitAsk.value !== action)) return;
-    const input = action === "merge" ? mergeBranch.value : action === "commit" ? commitMessage.value.trim() : action === "discard" ? discardPath.value : "";
-    if (action === "commit" && !input) return;
-    if (action === "merge" && !git.value.branches.includes(input)) return;
+    const input = action === "merge" || action === "switch" ? targetBranch.value
+      : action === "commit" ? commitMessage.value.trim()
+      : action === "branch" ? newBranch.value.trim()
+      : action === "discard" ? discardPath.value : "";
+    if ((action === "commit" || action === "branch") && !input) return;
+    if ((action === "merge" || action === "switch") && !git.value.branches.includes(input)) return;
     ++gitRequest;
     gitBusy.value = action;
     gitError.value = null;
@@ -862,6 +871,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     try {
       git.value = await gitAction(opened.project.path, action, input);
       if (action === "commit") commitMessage.value = "";
+      if (action === "branch") newBranch.value = "";
       if (action !== "fetch") gitAsk.value = null;
       gitNotice.value = {
         fetch: "Fetched. Remote status is up to date.",
@@ -870,6 +880,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         push: "Pushed to the remote.",
         merge: `Merged ${input}.`,
         discard: input ? `Reverted ${input}.` : "Reverted all uncommitted changes.",
+        switch: `Switched to ${input}.`,
+        branch: `Created and switched to ${input}.`,
       }[action];
     } catch (e) {
       gitError.value = isAppError(e) ? e.message : String(e);
@@ -1703,7 +1715,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     gitError,
     gitNotice,
     commitMessage,
-    mergeBranch,
+    targetBranch,
+    newBranch,
     discardPath,
     gitQuestion,
     gitDisabledReason,

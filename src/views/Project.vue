@@ -11,7 +11,6 @@ import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
 import { globalTasks, workingPatch } from "../api";
 import type { GitAction, GlobalTaskSummary, OpenedProject } from "../types";
-import { visiblePath } from "../path";
 import { parseHistoryPatch } from "./project/historyPatch";
 
 // The shell: sidebar, top bar and whichever page the sidebar picked.
@@ -44,7 +43,7 @@ const {
   rows, agentsPending, agentsReady, TONE, HISTORY_STATUS, OUTCOME,
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
   git, gitOpen, gitAsk, gitBusy, gitLoading, gitRefreshError, gitError, gitNotice,
-  commitMessage, mergeBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
+  commitMessage, targetBranch, newBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
 } = state;
 
 onMounted(loadGlobalTasks);
@@ -112,12 +111,16 @@ const selectedGitPatch = computed(() => parseHistoryPatch(gitPatch.value).files.
 watch(() => git.value.changes, (changes) => {
   if (!changes.some((change) => change.path === selectedGitPath.value)) selectedGitPath.value = changes[0]?.path ?? null;
 }, { immediate: true });
-const gitActions: Array<{ id: GitAction; label: string; busy: string }> = [
-  { id: "commit", label: "Commit", busy: "Committing…" },
-  { id: "pull", label: "Pull", busy: "Pulling…" },
-  { id: "push", label: "Push", busy: "Pushing…" },
-  { id: "merge", label: "Merge", busy: "Merging…" },
-];
+const GIT_LABELS: Record<GitAction, [label: string, busy: string]> = {
+  fetch: ["Fetch", "Fetching…"],
+  pull: ["Pull", "Pulling…"],
+  push: ["Push", "Pushing…"],
+  commit: ["Commit", "Committing…"],
+  merge: ["Merge a branch", "Merging…"],
+  discard: ["Revert", "Reverting…"],
+  switch: ["Switch branch", "Switching…"],
+  branch: ["New branch", "Creating branch…"],
+};
 const gitStatusLabel = (status: string) => {
   if (status === "??") return "Untracked";
   if (status.includes("A")) return "Added";
@@ -126,10 +129,19 @@ const gitStatusLabel = (status: string) => {
   if (status.includes("C")) return "Copied";
   return status[0] !== " " ? "Staged" : "Modified";
 };
-const gitActionLabel = (action: GitAction) => action === "push" && !git.value.upstream
-  ? "Publish branch" : gitActions.find((a) => a.id === action)?.label ?? "Fetch";
-const gitProgress = computed(() => gitBusy.value === "fetch" ? "Fetching…"
-  : gitActions.find((a) => a.id === gitBusy.value)?.busy);
+const splitPath = (path: string) => {
+  const cut = path.lastIndexOf("/") + 1;
+  return { dir: path.slice(0, cut), name: path.slice(cut) };
+};
+const gitActionLabel = (action: GitAction) => action === "push" && !git.value.upstream ? "Publish" : GIT_LABELS[action][0];
+const gitProgress = computed(() => gitBusy.value ? GIT_LABELS[gitBusy.value][1] : "");
+const gitSubmitLabel = (action: GitAction) => ({
+  commit: `Commit ${git.value.dirtyCount} file${git.value.dirtyCount === 1 ? "" : "s"}`,
+  discard: "Revert changes",
+  merge: `Merge ${targetBranch.value || "branch"}`,
+  switch: `Switch to ${targetBranch.value || "branch"}`,
+  branch: "Create and switch",
+} as Partial<Record<GitAction, string>>)[action] ?? gitActionLabel(action);
 
 function positionGit() {
   if (gitTrigger.value) gitPosition.value = { top: `${gitTrigger.value.getBoundingClientRect().bottom + 8}px` };
@@ -161,7 +173,7 @@ watch(gitAsk, async (action, previous) => {
   if (!gitOpen.value) return;
   const target = action ? ".git-confirm input, .git-confirm select, .git-confirm button:not(:disabled)"
     : restoreFocus ? ".git-actions button:not(:disabled)" : null;
-  if (target) (gitPanel.value?.querySelector<HTMLElement>(target) ?? gitPanel.value?.querySelector<HTMLElement>(".git-close"))?.focus();
+  if (target) (gitPanel.value?.querySelector<HTMLElement>(target) ?? gitPanel.value?.querySelector<HTMLElement>(".git-head .git-icon"))?.focus();
 });
 onMounted(() => window.addEventListener("resize", positionGit));
 onUnmounted(() => window.removeEventListener("resize", positionGit));
@@ -355,6 +367,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           <svg v-else viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
           {{ view === 'agents' ? 'Agents' : view === 'history' ? 'Task history' : running ? 'Running task' : result ? 'Task result' : 'New task' }}
         </h1>
+        <span class="project-name">{{ opened.project.name }}</span>
         <button
           v-if="git.isRepo"
           ref="gitTrigger"
@@ -389,19 +402,108 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </button>
       </header>
 
-      <section :id="domId('project-git')" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" aria-labelledby="git-title" @toggle="toggleGit" @keydown.esc.stop="closeGit">
-        <div class="git-heading">
-          <h2 id="git-title">Git</h2>
-          <button type="button" class="git-close" aria-label="Close Git actions" title="Close Git actions" @click="closeGit">
+      <section :id="domId('project-git')" ref="gitPanel" class="git-panel" :style="gitPosition" popover role="dialog" :aria-labelledby="domId('git-title')" @toggle="toggleGit" @keydown.esc.stop="closeGit">
+        <h2 :id="domId('git-title')" class="git-sr">Git</h2>
+        <header class="git-head">
+          <button
+            type="button"
+            class="git-branch"
+            :class="{ on: gitAsk === 'switch' || gitAsk === 'branch' }"
+            :disabled="!!gitDisabledReason('switch')"
+            :title="gitDisabledReason('switch') || 'Switch or create a branch'"
+            :aria-expanded="gitAsk === 'switch' || gitAsk === 'branch'"
+            @click="openGit(gitAsk === 'switch' || gitAsk === 'branch' ? null : 'switch')"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="4" cy="3" r="1.5" fill="none" stroke="currentColor" /><circle cx="12" cy="4" r="1.5" fill="none" stroke="currentColor" /><circle cx="4" cy="13" r="1.5" fill="none" stroke="currentColor" /><path d="M4 4.5v7M12 5.5C12 9 4 7 4 11" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
+            <span class="mono">{{ git.branch ?? "detached HEAD" }}</span>
+            <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="m3 4.5 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <span v-if="git.upstream" class="git-remote note" :title="`${git.upstream}: ${git.behind ?? 'unknown'} incoming, ${git.ahead ?? 'unknown'} outgoing at the last fetch`">
+            <span class="mono">{{ git.upstream }}</span>
+            <span>↓ {{ git.behind ?? '—' }}</span>
+            <span>↑ {{ git.ahead ?? '—' }}</span>
+            <span>at last fetch</span>
+          </span>
+          <span v-else class="git-remote note">Not published yet</span>
+          <div class="git-sync" role="group" aria-label="Sync with the remote">
+            <button class="btn" :disabled="!!gitDisabledReason('fetch')" :title="gitDisabledReason('fetch') || 'Check the remote for new commits; your files stay as they are'" @click="runGit('fetch')">Fetch</button>
+            <button class="btn" :disabled="!!gitDisabledReason('pull')" :title="gitDisabledReason('pull') || gitQuestion('pull')" @click="openGit('pull')">Pull</button>
+            <button class="btn" :disabled="!!gitDisabledReason('push')" :title="gitDisabledReason('push') || gitQuestion('push')" @click="openGit('push')">{{ gitActionLabel('push') }}</button>
+          </div>
+          <button type="button" class="git-icon" aria-label="Close Git" title="Close Git" @click="closeGit">
             <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
           </button>
-        </div>
-        <p class="git-current mono">{{ git.branch ?? "detached HEAD" }}</p>
-        <p class="note" :class="{ 'git-dirty': git.dirty }">{{ git.dirty ? `${git.dirtyCount} changed file${git.dirtyCount === 1 ? '' : 's'}` : 'Working tree clean' }}</p>
-        <div class="git-workspace">
+        </header>
+
+        <div class="git-body">
+          <aside class="git-side">
+            <div class="git-side-head">
+              <span class="label">Changes</span>
+              <span v-if="git.dirty" class="git-count">{{ git.dirtyCount }}</span>
+              <button v-if="git.dirty" class="link danger-link" :disabled="!!gitDisabledReason('discard')" :title="gitDisabledReason('discard')" @click="openGit('discard')">Revert all</button>
+            </div>
+            <ul v-if="git.changes.length" class="git-changes" aria-label="Changed files">
+              <li v-for="change in git.changes" :key="change.path" :class="{ selected: selectedGitPath === change.path }">
+                <button class="git-file" :title="change.path" :aria-pressed="selectedGitPath === change.path" @click="selectedGitPath = change.path">
+                  <span class="git-status mono" :class="gitStatusLabel(change.status).toLowerCase()" :title="gitStatusLabel(change.status)">{{ gitStatusLabel(change.status)[0] }}</span>
+                  <span class="git-name">{{ splitPath(change.path).name }}</span>
+                  <span class="git-dir mono">{{ splitPath(change.path).dir }}</span>
+                </button>
+                <button class="git-icon git-revert" :disabled="!!gitDisabledReason('discard')" :aria-label="`Revert ${change.path}`" :title="gitDisabledReason('discard') || `Revert ${change.path}`" @click="openGit('discard', change.path)">
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3.5 6.5h6a3.5 3.5 0 0 1 0 7H6M3.5 6.5 6 4M3.5 6.5 6 9" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                </button>
+              </li>
+            </ul>
+            <p v-else class="git-clean note">Working tree clean</p>
+
+            <div class="git-compose">
+              <div v-if="!gitAsk" class="git-actions" role="group" aria-label="Git actions">
+                <button class="btn" :disabled="!!gitDisabledReason('commit')" :title="gitDisabledReason('commit')" @click="openGit('commit')">{{ git.dirty ? `Commit ${git.dirtyCount} file${git.dirtyCount === 1 ? '' : 's'}…` : 'Nothing to commit' }}</button>
+                <button class="btn" :disabled="!!gitDisabledReason('merge')" :title="gitDisabledReason('merge')" @click="openGit('merge')">Merge…</button>
+              </div>
+              <form v-else class="git-confirm" @submit.prevent="runGit(gitAsk!)">
+                <h3>{{ gitActionLabel(gitAsk) }}</h3>
+                <p :id="domId('git-scope')" class="note">{{ gitQuestion(gitAsk) }}</p>
+                <template v-if="gitAsk === 'commit'">
+                  <label :for="domId('commit-message')" class="label">Commit message</label>
+                  <input :id="domId('commit-message')" v-model="commitMessage" class="git-input" placeholder="Describe these changes" :disabled="!!gitBusy" :aria-describedby="domId('git-scope')" required />
+                </template>
+                <template v-if="gitAsk === 'branch'">
+                  <label :for="domId('new-branch')" class="label">Branch name</label>
+                  <input :id="domId('new-branch')" v-model="newBranch" class="git-input mono" placeholder="feature/my-change" spellcheck="false" :disabled="!!gitBusy" :aria-describedby="domId('git-scope')" required />
+                </template>
+                <fieldset v-if="gitAsk === 'merge' || gitAsk === 'switch'" class="git-branches" :disabled="!!gitBusy">
+                  <legend class="label">{{ gitAsk === 'merge' ? 'Branch to merge' : 'Local branches' }}</legend>
+                  <label v-for="b in git.branches" :key="b" class="mono" :class="{ selected: targetBranch === b }">
+                    <input v-model="targetBranch" type="radio" :name="domId('git-target')" :value="b" required />
+                    <span>{{ b }}</span>
+                  </label>
+                  <p v-if="!git.branches.length" class="note">No other local branches.</p>
+                </fieldset>
+                <p v-if="gitDisabledReason(gitAsk) && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason(gitAsk) }}</p>
+                <div class="git-buttons">
+                  <button
+                    type="submit"
+                    class="btn"
+                    :class="gitAsk === 'discard' ? 'danger' : 'git-yes'"
+                    :disabled="!!gitDisabledReason(gitAsk) || (gitAsk === 'commit' && !commitMessage.trim()) || (gitAsk === 'branch' && !newBranch.trim()) || ((gitAsk === 'merge' || gitAsk === 'switch') && !git.branches.includes(targetBranch))"
+                  >
+                    {{ gitBusy ? gitProgress : gitSubmitLabel(gitAsk) }}
+                  </button>
+                  <button type="button" class="btn" :disabled="!!gitBusy" @click="openGit()">Cancel</button>
+                  <button v-if="gitAsk === 'switch'" type="button" class="link git-new" :disabled="!!gitBusy" @click="openGit('branch')">New branch…</button>
+                </div>
+              </form>
+              <p v-if="running" class="note" role="status">Git actions are available when the task finishes.</p>
+              <p v-if="gitError" class="git-error" role="alert">{{ gitError }}</p>
+              <p v-if="gitRefreshError" class="git-error" role="alert">Could not refresh Git status: {{ gitRefreshError }}</p>
+              <p v-if="gitBusy || gitNotice" class="note" role="status">{{ gitProgress || gitNotice }}</p>
+            </div>
+          </aside>
+
           <section class="git-diff" aria-label="Selected file changes">
             <template v-if="selectedGitPath">
-              <h3 class="mono">{{ selectedGitPath }}</h3>
+              <h3><span class="mono">{{ selectedGitPath }}</span></h3>
               <template v-if="selectedGitPatch">
                 <p v-for="note in selectedGitPatch.notes" :key="note" class="note">{{ note }}</p>
                 <div v-for="(line, index) in selectedGitPatch.lines" :key="index" class="patch-line" :class="line.kind"><span class="line-number">{{ line.before ?? '' }}</span><span class="line-number">{{ line.after ?? '' }}</span><code>{{ line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : line.kind === 'hunk' ? '@@ ' : ' ' }}{{ line.text }}</code></div>
@@ -409,79 +511,18 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
               <p v-else class="note">No text comparison is available for this file.</p>
             </template>
             <p v-else-if="gitPatchError" class="git-error" role="alert">Could not load changes: {{ gitPatchError }}</p>
-            <p v-else class="note git-diff-empty">Select a changed file to review its diff.</p>
+            <p v-else class="git-diff-empty">{{ git.dirty ? 'Select a changed file to review its diff.' : 'Nothing to review.' }}</p>
           </section>
-          <aside class="git-sidebar">
-            <ul v-if="git.changes.length" class="git-changes" aria-label="Changed files">
-              <li v-for="change in git.changes" :key="change.path" :class="{ selected: selectedGitPath === change.path }">
-                <button class="mono git-change-path" :title="`Show changes in ${change.path}`" :aria-pressed="selectedGitPath === change.path" @click="selectedGitPath = change.path">{{ change.path }}</button>
-                <span class="note">{{ gitStatusLabel(change.status) }}</span>
-                <button class="link danger-link" :disabled="!!gitDisabledReason('discard')" @click="openGit('discard', change.path)">Revert</button>
-              </li>
-            </ul>
-            <div class="git-remote">
-              <div>
-                <span v-if="git.upstream" class="mono">{{ git.upstream }}</span>
-                <span v-else class="note">No tracking branch</span>
-                <p v-if="git.upstream" class="note">{{ git.behind ?? '—' }} incoming · {{ git.ahead ?? '—' }} outgoing · at last fetch</p>
-              </div>
-              <button class="btn" :disabled="!!gitDisabledReason('fetch')" :title="gitDisabledReason('fetch') || 'Check the remote for new commits; your files stay as they are'" @click="runGit('fetch')">{{ gitBusy === 'fetch' ? 'Fetching…' : 'Fetch' }}</button>
-            </div>
-            <div v-if="!gitAsk" class="git-actions" role="group" aria-label="Git actions">
-              <div v-for="action in gitActions" :key="action.id" :title="gitDisabledReason(action.id)">
-                <button class="btn" :disabled="!!gitDisabledReason(action.id)" @click="openGit(action.id)">{{ gitActionLabel(action.id) }}</button>
-                <span v-if="gitDisabledReason(action.id) && !running && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason(action.id) }}</span>
-              </div>
-              <div :title="gitDisabledReason('discard')">
-                <button class="btn danger" :disabled="!!gitDisabledReason('discard')" @click="openGit('discard')">Revert all</button>
-                <span v-if="gitDisabledReason('discard') && !running && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason('discard') }}</span>
-              </div>
-            </div>
-            <form v-else class="git-confirm" @submit.prevent="runGit(gitAsk!)">
-          <h3>{{ gitActionLabel(gitAsk) }}</h3>
-          <p id="git-scope" class="note">{{ gitQuestion(gitAsk) }}</p>
-          <label v-if="gitAsk === 'commit'" for="commit-message" class="label">Commit message</label>
-          <input
-            v-if="gitAsk === 'commit'"
-            id="commit-message"
-            v-model="commitMessage"
-            class="git-input"
-            placeholder="Describe these changes"
-            :disabled="!!gitBusy"
-            aria-describedby="git-scope"
-            required
-          />
-          <label v-if="gitAsk === 'merge'" for="merge-branch" class="label">Branch to merge</label>
-          <select v-if="gitAsk === 'merge'" id="merge-branch" v-model="mergeBranch" class="git-input mono" :disabled="!!gitBusy" aria-describedby="git-scope" required>
-            <option disabled value="">Choose a branch</option>
-            <option v-for="b in git.branches" :key="b" :value="b">{{ b }}</option>
-          </select>
-          <p v-if="gitDisabledReason(gitAsk) && !gitBusy && !gitLoading" class="note">{{ gitDisabledReason(gitAsk) }}</p>
-          <div class="git-buttons">
-            <button
-              type="submit"
-              class="btn git-yes"
-              :disabled="!!gitDisabledReason(gitAsk) || (gitAsk === 'commit' && !commitMessage.trim()) || (gitAsk === 'merge' && !git.branches.includes(mergeBranch))"
-            >
-              {{ gitBusy ? gitProgress : gitAsk === 'commit' ? 'Commit all changes' : gitAsk === 'discard' ? 'Revert changes' : gitActionLabel(gitAsk) }}
-            </button>
-            <button type="button" class="btn" :disabled="!!gitBusy" @click="openGit()">Back</button>
-          </div>
-            </form>
-            <p v-if="running" class="note" role="status">Git actions are available when the task finishes.</p>
-            <p v-if="gitError" class="git-error" role="alert">{{ gitError }}</p>
-            <p v-if="gitRefreshError" class="git-error" role="alert">Could not refresh Git status: {{ gitRefreshError }}</p>
-            <p v-if="gitBusy || gitNotice" class="note git-notice" role="status">{{ gitProgress || gitNotice }}</p>
-            <footer class="git-footer">
-              <span class="note">{{ gitLoading ? 'Refreshing status…' : 'Local repository status' }}</span>
-              <button class="link" :disabled="anyRunning || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
-            </footer>
-          </aside>
         </div>
+
+        <footer class="git-footer">
+          <span class="note">{{ gitLoading ? 'Refreshing status…' : 'Local repository status' }}</span>
+          <button class="link" :disabled="anyRunning || !!gitBusy || gitLoading" @click="refreshGit">Refresh</button>
+        </footer>
       </section>
 
       <div ref="split" class="split" :class="[dockPrefs.side, { dragging }]">
-        <main class="content" :class="{ composing: view === 'task' && !running && !result }">
+        <main class="content" :class="{ composing: view === 'task' && !running && !result, chatting: (view === 'task' && (running || !!result)) || view === 'history' }">
           <template v-if="view === 'task'">
             <TaskRun v-if="running" />
             <TaskResult v-else-if="result" />
@@ -518,7 +559,6 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 7.2 8 2l6 5.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /><path d="M3.6 6.4v6.1c0 .5.4.9.9.9h7c.5 0 .9-.4.9-.9V6.4M6.6 13.4V9.6h2.8v3.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
         Start screen
       </button>
-      <span class="mono grow" :title="visiblePath(opened.project.path)">{{ visiblePath(opened.project.path) }}</span>
       <span v-if="anyRunning" class="status-item"><span class="dot live" aria-hidden="true"></span>{{ runningCount === 1 ? "Task running" : `${runningCount} tasks running` }}</span>
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
         <template v-for="usage in usageCounters" :key="usage.id">
@@ -927,6 +967,14 @@ h1 {
 .workspace-tab svg {
   color: var(--text-faint);
 }
+.project-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+}
 .git-trigger {
   display: inline-flex;
   align-items: center;
@@ -951,17 +999,16 @@ h1 {
   white-space: nowrap;
 }
 .git-trigger:hover,
-.git-trigger.on,
-.git-close:hover {
+.git-trigger.on {
   background: var(--surface-2);
 }
 .git-panel {
   inset: 56px 12px auto auto;
-  width: min(860px, calc(100vw - 24px));
-  max-height: calc(100dvh - v-bind('gitPosition.top') - 16px);
+  width: min(900px, calc(100vw - 24px));
+  height: min(600px, calc(100dvh - v-bind('gitPosition.top') - 16px));
   margin: 0;
   overflow: hidden;
-  padding: 16px;
+  padding: 0;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border-strong);
@@ -972,98 +1019,340 @@ h1 {
   display: flex;
   flex-direction: column;
 }
-.git-heading,
-.git-remote,
-.git-footer {
+.git-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.git-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  min-height: 48px;
+  padding: 8px 8px 8px 10px;
+  border-bottom: 1px solid var(--border);
 }
-.git-heading h2,
-.git-confirm h3 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-}
-.git-close {
+.git-branch {
   display: inline-flex;
+  flex-shrink: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+}
+.git-branch svg {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.git-branch .mono {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-branch:hover:not(:disabled),
+.git-branch.on,
+.git-icon:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.git-remote {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.git-remote .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+}
+.git-sync {
+  display: flex;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.git-sync .btn,
+.git-sync .btn:disabled {
+  border-color: var(--border-strong);
+  border-radius: 0;
+}
+.git-sync .btn + .btn {
+  margin-left: -1px;
+}
+.git-sync .btn:first-child {
+  border-radius: var(--r-sm) 0 0 var(--r-sm);
+}
+.git-sync .btn:last-child {
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.git-sync .btn:hover:not(:disabled) {
+  position: relative;
+}
+.git-icon {
+  display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: center;
   min-width: 32px;
   min-height: 32px;
   border-radius: var(--r-sm);
+  color: var(--text-faint);
 }
-.git-panel p {
-  margin: 6px 0 0;
-  overflow-wrap: anywhere;
+.git-body {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
 }
-.git-panel .git-current {
-  color: var(--text);
-}
-.git-dirty {
-  color: var(--warn);
-}
-.git-remote {
-  margin: 12px 0;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border);
-}
-.git-remote > div {
+.git-side {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  overflow-wrap: anywhere;
+  min-height: 0;
+  border-right: 1px solid var(--border);
 }
-.git-remote .btn {
-  flex-shrink: 0;
+.git-side-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 12px 4px;
+}
+.git-side-head .label {
+  margin: 0;
+}
+.git-side-head .link {
+  margin-left: auto;
+}
+.git-count {
+  padding: 0 7px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 18px;
 }
 .git-changes {
-  display: grid;
-  gap: 6px;
+  flex: 1;
+  min-height: 0;
   margin: 0;
-  padding: 0;
+  padding: 0 6px 8px;
   overflow-y: auto;
   list-style: none;
 }
 .git-changes li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: flex;
   align-items: center;
-  gap: 8px;
-}
-.git-change-path {
-  min-width: 0;
-  padding: 3px 4px;
   border-radius: var(--r-sm);
+}
+.git-changes li:hover,
+.git-changes li.selected {
+  background: var(--surface-2);
+}
+.git-changes li:not(:hover, :focus-within, .selected) .git-revert {
+  opacity: 0;
+}
+.git-file {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 6px;
   color: var(--text);
   text-align: left;
 }
-.git-change-path:hover,
-.git-changes .selected .git-change-path {
-  background: var(--surface-2);
+.git-status {
+  flex-shrink: 0;
+  width: 1ch;
+  color: var(--text-faint);
+  font-weight: 600;
 }
-.git-change-path {
+.git-status.added,
+.git-status.untracked {
+  color: var(--syntax-string);
+}
+.git-status.deleted {
+  color: var(--syntax-number);
+}
+.git-status.modified,
+.git-status.staged {
+  color: var(--syntax-attr);
+}
+.git-status.renamed,
+.git-status.copied {
+  color: var(--syntax-name);
+}
+.git-name,
+.git-dir {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.git-diff {
-  min-height: 300px;
+.git-name {
+  flex: 0 1 auto;
+  min-width: 4ch;
+}
+.git-dir {
+  flex: 1 1 0;
+  min-width: 0;
+  color: var(--text-faint);
+}
+.git-revert {
+  min-width: 28px;
+  min-height: 28px;
+}
+.git-revert:hover:not(:disabled) {
+  color: var(--err);
+}
+.git-clean {
+  flex: 1;
   margin: 0;
+  padding: 4px 12px;
+}
+.git-compose {
+  display: grid;
+  gap: 8px;
+  max-height: 65%;
+  padding: 12px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+.git-compose p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.git-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.git-confirm {
+  display: grid;
+  gap: 8px;
+}
+.git-confirm h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.git-confirm .label {
+  margin: 4px 0 0;
+}
+.git-branches {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  max-height: 180px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  border: 0;
+}
+.git-branches legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+.git-branches label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.git-branches label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-branches label:hover,
+.git-branches label.selected {
+  background: var(--surface-2);
+}
+.git-branches input {
+  margin: 0;
+  accent-color: var(--text);
+}
+.git-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.git-new {
+  margin-left: auto;
+}
+.git-panel .btn {
+  font-size: 12px;
+}
+.git-yes {
+  color: var(--warn);
+}
+.git-panel .btn.danger {
+  color: var(--err);
+}
+.git-input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font: inherit;
+}
+.git-input.mono {
+  font-family: var(--mono);
+}
+.git-input::placeholder {
+  color: var(--text-faint);
+}
+.git-dirty {
+  color: var(--warn);
+}
+.danger-link {
+  color: var(--err);
+}
+.git-error {
+  font-size: 12px;
+  color: var(--err);
+  white-space: pre-wrap;
+}
+.git-diff {
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
   background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
 }
 .git-diff h3 {
   position: sticky;
   top: 0;
+  z-index: 1;
   margin: 0;
-  padding: 8px;
+  padding: 8px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 400;
 }
-.git-diff .note { padding: 0 8px; }
+.git-diff > .note,
+.git-diff > .git-error {
+  margin: 0;
+  padding: 8px 12px;
+}
 .git-diff .patch-line {
   display: grid;
   grid-template-columns: 6ch 6ch minmax(max-content, 1fr);
@@ -1095,89 +1384,26 @@ h1 {
 }
 .git-diff-empty {
   display: grid;
-  min-height: 280px;
+  height: 100%;
+  margin: 0;
   place-items: center;
-  margin: 0 !important;
   color: var(--text-faint);
-}
-.git-workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 270px;
-  flex: 1;
-  min-height: 0;
-  gap: 16px;
-  margin-top: 14px;
-}
-.git-sidebar {
-  min-width: 0;
-  overflow-y: auto;
-  padding-left: 16px;
-  border-left: 1px solid var(--border);
-}
-.danger-link {
-  color: var(--err);
-}
-.git-actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-.git-actions .btn {
-  width: 100%;
-}
-.git-actions .note {
-  display: block;
-  margin-top: 4px;
-}
-.git-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
-}
-.git-panel .btn {
-  font-size: 12px;
-}
-.git-confirm .label {
-  display: block;
-  margin: 12px 0 6px;
-}
-.git-yes {
-  color: var(--warn);
-}
-.git-input {
-  width: 100%;
-  min-width: 0;
-  padding: 6px 10px;
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font: inherit;
-}
-.git-input::placeholder {
-  color: var(--text-faint);
-}
-.git-error {
-  font-size: 12px;
-  color: var(--err);
-  white-space: pre-wrap;
-}
-.git-panel .git-error,
-.git-panel .git-notice {
-  margin-top: 16px;
 }
 .git-footer {
-  margin-top: 16px;
-  padding-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
   border-top: 1px solid var(--border);
 }
 @media (max-width: 720px) {
-  .git-panel { overflow-y: auto; }
-  .git-workspace { grid-template-columns: 1fr; }
-  .git-diff { min-height: 220px; max-height: 320px; }
-  .git-sidebar { padding-left: 0; border-left: 0; }
+  .git-panel { height: auto; max-height: calc(100dvh - v-bind('gitPosition.top') - 16px); overflow-y: auto; }
+  .git-head { flex-wrap: wrap; }
+  .git-body { grid-template-columns: 1fr; }
+  .git-side { border-right: 0; border-bottom: 1px solid var(--border); }
   .git-changes { max-height: 180px; }
+  .git-diff { min-height: 220px; max-height: 320px; }
 }
 
 .split {
@@ -1238,6 +1464,12 @@ h1 {
 .content.composing {
   display: flex;
 }
+/* A live run, its result and a past task are a chat: the box sits on the pane's bottom edge, so no bottom padding. */
+.content.chatting {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
 .statusbar {
   grid-column: 1 / -1;
   display: flex;
@@ -1267,6 +1499,7 @@ h1 {
   align-items: center;
   gap: 4px;
   min-width: 0;
+  margin-left: auto;
 }
 .usage-counter,
 .usage-refresh,
@@ -1455,9 +1688,6 @@ h1 {
   .statusbar {
     flex-wrap: wrap;
     gap: 4px 12px;
-  }
-  .statusbar > .grow {
-    flex-basis: 100%;
   }
   .content {
     padding: 24px 20px 48px;

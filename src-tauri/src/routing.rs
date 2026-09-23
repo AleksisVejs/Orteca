@@ -113,8 +113,8 @@ impl Tier {
         }
     }
 
-    // ponytail: pinned Codex slugs go stale when OpenAI retires a model; read
-    // `~/.codex/models_cache.json` if that starts happening between releases.
+    // A Codex slug that retires gives way to Codex's own choice at run time:
+    // `providers::codex_replacement`.
     pub fn model(self, id: ProviderId) -> ModelChoice {
         let (model, effort) = match (id, self) {
             // Sonnet 5 at low effort, not Haiku 4.5: Haiku is half the price but

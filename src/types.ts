@@ -74,7 +74,7 @@ export interface GitChange {
   status: string;
 }
 
-export type GitAction = "fetch" | "pull" | "commit" | "push" | "merge" | "discard";
+export type GitAction = "fetch" | "pull" | "commit" | "push" | "merge" | "discard" | "switch" | "branch";
 
 export interface TrustFinding {
   path: string;

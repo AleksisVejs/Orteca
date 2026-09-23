@@ -137,6 +137,26 @@ test('Git forms require submission, preserve drafts, and reject invalid input', 
   assert.deepEqual(sent[1], ['C:/repo', 'merge', 'feature']);
 });
 
+test('Branch switch and create go through their forms with a valid target', async () => {
+  const sent = [];
+  const { state } = await projectView({ gitAction: async (...args) => { sent.push(args); return { ...gitState }; } });
+  await state.runGit('switch');
+  state.openGit('switch', 'missing-branch');
+  await state.runGit('switch');
+  assert.equal(sent.length, 0, 'a missing branch cannot be switched to');
+  state.openGit('switch');
+  assert.equal(state.targetBranch.value, 'feature');
+  await state.runGit('switch');
+  state.openGit('branch');
+  state.newBranch.value = '   ';
+  await state.runGit('branch');
+  state.newBranch.value = ' fix/login ';
+  await state.runGit('branch');
+  assert.deepEqual(sent, [['C:/repo', 'switch', 'feature'], ['C:/repo', 'branch', 'fix/login']]);
+  assert.equal(state.newBranch.value, '');
+  assert.match(state.gitNotice.value, /fix\/login/);
+});
+
 test('Fetch runs immediately without tracking and keeps an open commit draft', async () => {
   const sent = [];
   const { state } = await projectView({ gitAction: async (...args) => { sent.push(args); return { ...gitState, behind: 2 }; } });

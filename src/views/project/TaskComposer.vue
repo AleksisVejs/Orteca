@@ -9,7 +9,7 @@ import type { MemoryState } from "../../types";
 const {
   task, picks, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
   schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation,
-  installed, provider, providerPicked, pickedFor, previewing, preview, previewError,
+  installed, provider, providerPicked, previewing, preview, previewError,
   limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
   remembering, rememberText, rememberError, remember,
   MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git, history,
@@ -62,13 +62,6 @@ function formatDuration(milliseconds: number) {
 <template>
   <section class="composer" aria-labelledby="composer-title">
     <h2 id="composer-title" class="hero">Start a new task</h2>
-    <p class="lede">Ask a question, fix a bug, or build something new.</p>
-
-    <dl class="task-context" aria-label="Task destination">
-      <div><dt>Project</dt><dd :title="opened.project.path">{{ opened.project.name }}</dd></div>
-      <div><dt>Working location</dt><dd>{{ isolation === 'worktree' ? 'Separate copy · new branch' : 'Current folder' }}<span class="mono">{{ isolation === 'worktree' ? 'from ' : '' }}{{ git.branch ?? 'Branch unavailable' }}</span></dd></div>
-      <div><dt>AI helper</dt><dd>{{ providerPicked ? (provider === 'codex' ? 'Codex' : 'Claude') : 'Auto · ' + (provider === 'codex' ? 'Codex' : 'Claude') }}<span>{{ providerPicked ? modelChoices[provider].model ?? 'Automatic model' : 'Chosen from available allowance' }}</span></dd></div>
-    </dl>
 
     <section class="ask card" :class="{ dragging }">
       <label class="hidden-label" :for="domId('task')">Describe your task</label>
@@ -117,8 +110,9 @@ function formatDuration(milliseconds: number) {
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
           Attach
         </button>
-        <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
+        <button class="icon" title="Attach a folder" @click="addAttachments(true)">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+          Folder
         </button>
         <Memory :path="opened.project.path" :pop-id="domId('memory')" button-class="icon" @changed="loadMemory">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 2.5h8v11L8 10.8 4 13.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
@@ -135,6 +129,8 @@ function formatDuration(milliseconds: number) {
       <button class="options" :aria-expanded="optionsOpen" aria-controls="task-options" @click="optionsOpen = !optionsOpen">
         <span class="options-label">Task settings</span>
         <span class="settings-summary">
+          <span :title="opened.project.path">{{ opened.project.name }}</span> ·
+          <span class="mono">{{ isolation === 'worktree' ? 'from ' : '' }}{{ git.branch ?? 'no branch' }}</span> ·
           <template v-if="installed.length">{{ providerPicked ? (provider === 'claude' ? 'Claude' : 'Codex') : "Auto" }} · </template>
           {{ MODES.find((m) => m.id === mode)?.label }} · {{ ISOLATIONS.find((w) => w.id === isolation)?.label }}
         </span>
@@ -246,7 +242,6 @@ function formatDuration(milliseconds: number) {
           <button v-if="alternative" class="link" @click="switchTo(alternative)">use {{ alternative }} instead</button>
           <button v-if="limitWarning.startsAt && canRun" class="link" @click="waitForReset(limitWarning.startsAt)">start it after the reset</button>
         </span>
-        <span v-if="pickedFor && !providerPicked" class="note">{{ pickedFor }}</span>
         <!-- Two agents editing one folder is allowed, but what each one changed
              stops being separable, so the composer says so before the click. -->
         <span v-if="anyRunning && isolation === 'currentTree'" class="missing" role="status">
@@ -331,17 +326,12 @@ function formatDuration(milliseconds: number) {
 .route-history .num { text-align: right; }
 .route-history > .note { margin: 10px 0 0; }
 .hero {
-  margin: 0;
+  margin: 0 0 24px;
   font-size: 20px;
   line-height: 1.25;
   font-weight: 600;
   letter-spacing: -0.03em;
   text-wrap: balance;
-  text-align: center;
-}
-.lede {
-  margin: 8px 0 24px;
-  color: var(--text-dim);
   text-align: center;
 }
 
@@ -357,12 +347,14 @@ textarea {
   display: block;
   width: 100%;
   min-height: 128px;
+  max-height: 50vh;
   padding: 18px 18px 8px;
   background: none;
   color: var(--text);
   border: none;
   font: inherit;
-  resize: vertical;
+  field-sizing: content;
+  resize: none;
 }
 textarea::placeholder {
   color: var(--text-faint);
@@ -616,9 +608,4 @@ textarea:focus {
     margin-left: auto;
   }
 }
-.task-context { display: flex; flex-wrap: wrap; gap: 16px 24px; margin: 0 0 24px; padding: 16px 0; border-block: 1px solid var(--border); }
-.task-context > div { flex: 1 1 140px; min-width: 0; }
-.task-context dt { color: var(--text-faint); font-size: 12px; margin-bottom: 6px; }
-.task-context dd { margin: 0; overflow-wrap: anywhere; }
-.task-context dd span { display: block; margin-top: 4px; color: var(--text-dim); font-size: 12px; }
 </style>

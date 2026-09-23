@@ -364,6 +364,18 @@ impl Store {
         Ok(())
     }
 
+    /// This provider has run a model before, and never this one. Asked before
+    /// the run's usage is recorded; the first model a provider runs is not news.
+    pub fn is_new_model(&self, provider: &str, model: &str) -> Result<bool> {
+        let conn = self.0.lock().expect("store poisoned");
+        Ok(conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM usage WHERE provider = ?1 AND model IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM usage WHERE provider = ?1 AND model = ?2)",
+            params![provider, model],
+            |r| r.get(0),
+        )?)
+    }
+
     /// A continued task's usage: this turn added to what the task already
     /// spent. Each turn is its own process, so costs add too. A turn with no
     /// numbers leaves the total unavailable, never smaller than it was.
@@ -517,7 +529,9 @@ impl Store {
     /// `failed` is left out, because a rate limit or an expired sign-in says
     /// nothing about the model. Mode is kept apart because the two modes run
     /// different tiers. A run that needed fixes and then finished is not a
-    /// stall: fixing until the checks pass is how a route works.
+    /// stall: fixing until the checks pass is how a route works. Only runs on
+    /// the model a route kind and tier last ran on count: when an alias moves
+    /// to a new model, that model starts without the old one's record.
     // ponytail: a Codex implement that changed nothing is `failed` and so not
     // counted; split failure kinds into their own column if that hides stalls.
     pub fn stalled_tiers(
@@ -528,15 +542,22 @@ impl Store {
     ) -> Result<Vec<(RouteKind, Tier)>> {
         let conn = self.0.lock().expect("store poisoned");
         let mut stmt = conn.prepare(
-            "SELECT json_extract(t.route_json, '$.kind'), json_extract(t.route_json, '$.budget.preferredTier')
-               FROM tasks t JOIN usage u ON u.task_id = t.id
-              WHERE t.id IN (SELECT id FROM tasks WHERE project_id = ?1 ORDER BY id DESC LIMIT 50)
-                AND u.provider = ?2
-                AND t.mode = ?3
-                AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed')
-              GROUP BY 1, 2
+            "WITH runs AS (
+                SELECT json_extract(t.route_json, '$.kind') AS kind,
+                       json_extract(t.route_json, '$.budget.preferredTier') AS tier,
+                       t.id, t.status, u.model
+                  FROM tasks t JOIN usage u ON u.task_id = t.id
+                 WHERE t.id IN (SELECT id FROM tasks WHERE project_id = ?1 ORDER BY id DESC LIMIT 50)
+                   AND u.provider = ?2
+                   AND t.mode = ?3
+                   AND t.status IN ('done', 'budgetReached', 'reviewRejected', 'verifyFailed'))
+             SELECT kind, tier FROM (
+                SELECT *, FIRST_VALUE(model) OVER (PARTITION BY kind, tier ORDER BY id DESC) AS latest
+                  FROM runs)
+              WHERE model IS latest
+              GROUP BY kind, tier
              HAVING COUNT(*) >= 5
-                AND 5 * SUM(t.status != 'done') >= 2 * COUNT(*)",
+                AND 5 * SUM(status != 'done') >= 2 * COUNT(*)",
         )?;
         let rows = stmt
             .query_map(params![project_id, provider, mode], |r| {
@@ -1774,6 +1795,28 @@ mod tests {
             Vec::new(),
             "evidence older than the last 50 runs ages out"
         );
+
+        let on = |model: &str, status: &str| {
+            let task = run("planned", "deep", "codex", status);
+            let usage = Usage {
+                model: Some(model.into()),
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cost_usd: None,
+                cost_quality: CostQuality::Unavailable,
+            };
+            store.record_usage(task, None, "codex", Some(&usage)).unwrap();
+        };
+        for status in ["done", "done", "done", "budgetReached", "budgetReached"] {
+            on("old", status);
+        }
+        assert_eq!(stalled(), [(RouteKind::Planned, Tier::Deep)]);
+        assert!(store.is_new_model("codex", "new").unwrap());
+        assert!(!store.is_new_model("codex", "old").unwrap());
+        on("new", "done");
+        assert_eq!(stalled(), Vec::new(), "a new model starts with a clean record");
     }
 
     #[test]

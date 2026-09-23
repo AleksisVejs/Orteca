@@ -380,10 +380,18 @@ pub struct StagePlan {
 }
 
 impl StagePlan {
+    /// A retired Codex slug gives way to Codex's own choice, so the stage log
+    /// and the price name the model that actually ran.
     fn model(&self, id: ProviderId) -> ModelOverride {
         let choice = self.tier.model(id);
+        let model = self.model.clone().unwrap_or_else(|| choice.model.into());
+        if id == ProviderId::Codex {
+            if let Some((model, effort)) = crate::providers::codex_replacement(&model) {
+                return ModelOverride { model, effort };
+            }
+        }
         ModelOverride {
-            model: self.model.clone().unwrap_or_else(|| choice.model.into()),
+            model,
             effort: self.effort.clone().unwrap_or_else(|| choice.effort.into()),
         }
     }
@@ -1428,6 +1436,14 @@ pub async fn stream(
 
     live.close(task_id);
 
+    if let Some(model) = outcome.usage.as_ref().and_then(|u| u.model.as_deref()) {
+        if store.is_new_model(id.program(), model).unwrap_or(false) {
+            let event = ProviderEvent::Text(format!(
+                "New model detected: {model}. Its record here starts fresh."
+            ));
+            let _ = record(store, task_id, ctx.plan.stage.name(), id, &event);
+        }
+    }
     // A run that never reported usage has no honest number; this writes the
     // `unavailable` row rather than leaving the task looking free.
     let recorded = if continued {

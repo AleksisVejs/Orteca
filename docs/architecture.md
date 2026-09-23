@@ -398,7 +398,11 @@ How it was chosen:
    One turn on an unpriced model leaves the whole run's cost `unavailable`.
 6. **Claude aliases follow the account**, and the id that ran comes back in
    `modelUsage`. Codex has no aliases, so its slugs are pinned in
-   `routing::Tier::model` and must be updated when one is retired. Each `stage`
+   `routing::Tier::model`. A slug missing from `~/.codex/models_cache.json`
+   gives way to that list's first `list` model at its default effort, and
+   the stage records and prices that model; update the pin when it happens.
+   The first run on a model a provider has not run before logs "New model
+   detected" in its task log. Each `stage`
    event records the model and effort Orteca asked for, which is the only record
    of it for Codex.
 
@@ -414,7 +418,9 @@ plan limit allows on a checked route, which evidence always outranks (§4.3.5).
   a rate limit or sign-in failure says nothing about the model. Modes are kept
   apart because Efficient's tighter ceilings stop runs Balanced would finish.
   A run that needed its Fix call counts as a stall of the tier it started on,
-  however it ended.
+  however it ended. Only runs on the model the route kind and tier last ran
+  on count, so a model that moves in behind an alias starts with a clean
+  record.
 - Orteca never tries a cheaper tier to see what happens: that is spending on its
   own initiative on a worse chance of success. Evidence ages out with the
   project's last 50 runs, and only then is a skipped tier tried again.

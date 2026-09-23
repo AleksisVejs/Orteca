@@ -126,6 +126,29 @@ impl Usage {
     }
 }
 
+/// When Codex no longer offers `slug`: its own first choice and that model's
+/// default effort, from the model list it caches for the account. `None` while
+/// the slug is offered or the list cannot be read.
+pub fn codex_replacement(slug: &str) -> Option<(String, String)> {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".codex")))?;
+    let text = std::fs::read_to_string(home.join("models_cache.json")).ok()?;
+    let cache: Value = serde_json::from_str(&text).ok()?;
+    let models = cache["models"].as_array()?;
+    if models.iter().any(|m| m["slug"] == slug) {
+        return None;
+    }
+    let top = models
+        .iter()
+        .filter(|m| m["visibility"] == "list")
+        .min_by_key(|m| m["priority"].as_i64().unwrap_or(i64::MAX))?;
+    Some((
+        top["slug"].as_str()?.to_string(),
+        top["default_reasoning_level"].as_str()?.to_string(),
+    ))
+}
+
 /// What keeps a Codex run to what Orteca and the repository supply (§4.3.3).
 /// An empty `CODEX_HOME` would be cleaner but signs the user out, so the
 /// user's `config.toml` - plugins, MCP servers, notify, proxy - is skipped

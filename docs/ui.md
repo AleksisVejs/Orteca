@@ -100,6 +100,9 @@ is the only place colour, radius and spacing are defined.
   stay in that popover without moving the workspace. Fetch runs on one click;
   actions that change files or publish work show their scope before submission.
   Results link directly to Commit or Merge with the task's branch selected.
+  The popover's header is the branch (it opens switch and new-branch), the
+  remote counts and a joined Fetch / Pull / Push group; changes sit left with
+  commit and merge under them, and the selected file's diff fills the right.
   Git status refreshes when the popover opens, after tasks and on demand;
   incoming and outgoing counts explicitly reflect the last fetch.
 - A reply continues the run it answers: same sidebar row, same page, the
@@ -220,20 +223,24 @@ the mock's chrome for features that are not wired up yet.
 
 ## Task running and results
 
-- A running task reads as one thread. Every message the user sent carries the
-  same small "You" caption and the same 14px weight, earlier turns and the
-  current one alike, so nothing jumps when a run finishes.
-- Under the request sits one status card: the orb, the provider and current
-  stage, the current activity, the route's steps (running in `--info`, ran,
-  upcoming) and Stop. The provider is named there and nowhere else on the page.
-  Nothing claims a percentage.
-- What the AI has said streams straight under that card as part of the turn,
-  not in its own panel; earlier updates sit above it in a disclosure. Activity
-  is a closed disclosure below. The steer box is pinned to the bottom of the
-  pane, like a chat box.
-- Completed and saved tasks share a header with rerun and new-task actions,
-  followed by Summary, Files, Details and Activity. Details show recorded
-  execution steps, labelled usage, and direct links to changes and activity.
+- A running task is a chat, in a centred column capped at 820px. What the user
+  sent — the request, earlier turns, every steer — is a right-aligned
+  `--surface-2` bubble; a steer's delivery receipt sits under its bubble. What
+  the AI said is plain text on the page, each message in order. Activity is a
+  closed "Activity · N events" disclosure under the request.
+- The chat box is pinned to the pane's bottom edge and holds the live state as
+  one unit: the orb, the provider and current stage, the current activity, the
+  route's steps (running in `--info`, ran, upcoming), Stop, then the steer
+  input. The provider is named there and nowhere else. Nothing claims a
+  percentage. The pane follows new messages unless the reader scrolled up.
+- A finished run stays the same chat. Its answer is the agent's message: status
+  dot, outcome and provider, the outcome line, the summary and any caveats,
+  then a Files / Details / Activity row whose sections open in place (none open
+  by default; a second click folds one away). The pinned box becomes the reply
+  box, with the reply-cost note, "Edit and run again" and "New task" under it.
+  Reply is the primary action when a reply is possible, otherwise New task is.
+  A past task from the sidebar is the same chat. Details show recorded execution
+  steps, labelled usage, and direct links to changes and activity.
 - Live execution comes from runner-owned stage events, including parallel stages
   and added Fix steps. A stage that ran is labelled Ran, not Passed.
 - Completion shows changed-file count, the latest structured verification result,

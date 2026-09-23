@@ -1,18 +1,19 @@
 <script setup lang="ts">
-import { computed, inject, ref } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ActivityLog from "./ActivityLog.vue";
 import FileLink from "./FileLink.vue";
 import Markdown from "../../components/Markdown.vue";
 import Orb from "../../components/Orb.vue";
 import { PROJECT } from "./state";
 
-// The page while a run is going. Stop and steering are the only other things worth doing.
+// The page while a run is going, laid out as a chat: what was said scrolls above,
+// and the orb, Stop and steering sit together in the box pinned at the bottom.
 const {
   activeRun, said, describeVerdict, currentActivity, fileError, taskId, stopping, stopRun,
   instruction, sending, instructionError, steering, instruct, checking, lines, ranOn, stageLabel,
 } = inject(PROJECT)!;
-const responses = computed(() => lines.value.filter((line) => line.kind === "text"));
-const response = computed(() => responses.value.at(-1)?.text);
+// The conversation in order: the agent's messages and every steer the user sent.
+const messages = computed(() => lines.value.filter((line) => line.kind === "text" || line.kind === "instruction"));
 const stage = computed(() => activeRun.value?.progress?.current.map((i) => stageLabel(activeRun.value!.progress!.stages[i] ?? "Working")).join(" + "));
 // The route's steps, told apart only by what the runner reported: running, ran, or not reached yet.
 const steps = computed(() => {
@@ -52,181 +53,147 @@ async function send(now: boolean) {
     { transform: `translate(${x}px, ${y}px) scale(0.05)`, opacity: 0, filter: "blur(2px)" },
   ], { duration: 650, easing: "cubic-bezier(0.55, 0, 0.75, 0.3)" }).finished.then(() => orb.value?.absorb(), () => {});
 }
-const receipt = computed(() => [...lines.value].reverse().find((line) => line.kind === "instruction")?.delivery);
+
+// Like any chat, new messages keep the pane at the bottom, unless the reader scrolled up.
+const chat = ref<HTMLDivElement | null>(null);
+const pane = () => chat.value?.parentElement;
+let pinned = true;
+function onPaneScroll() {
+  const p = pane();
+  if (p) pinned = p.scrollHeight - p.scrollTop - p.clientHeight < 48;
+}
+function toBottom() {
+  const p = pane();
+  if (p) p.scrollTop = p.scrollHeight;
+}
+onMounted(() => {
+  pane()?.addEventListener("scroll", onPaneScroll, { passive: true });
+  toBottom();
+});
+onBeforeUnmount(() => pane()?.removeEventListener("scroll", onPaneScroll));
+watch(() => `${lines.value.length}:${lines.value.at(-1)?.text.length}:${!!checking.value}`, () => { if (pinned) toBottom(); }, { flush: "post" });
+watch(() => activeRun.value?.key, () => { pinned = true; toBottom(); }, { flush: "post" });
 </script>
 
 <template>
-  <!-- Everything already said in this task, so a follow-up reads as one thread. -->
-  <article v-for="(t, i) in activeRun?.turns ?? []" :key="i" class="turn">
-    <p class="who">You</p>
-    <p class="said">{{ t.said }}</p>
-    <Markdown v-if="t.summary" class="summary" :text="describeVerdict(t.summary) ?? t.summary" />
-    <p v-else class="note">{{ t.failure ?? "No summary was reported." }}</p>
-  </article>
+  <div ref="chat" class="chat">
+    <div class="thread">
+      <!-- Everything already said in this task, so a follow-up reads as one conversation. -->
+      <template v-for="(t, i) in activeRun?.turns ?? []" :key="i">
+        <p class="bubble">{{ t.said }}</p>
+        <Markdown v-if="t.summary" class="summary back" :text="describeVerdict(t.summary) ?? t.summary" />
+        <p v-else class="note back">{{ t.failure ?? "No summary was reported." }}</p>
+      </template>
 
-  <p class="who">You</p>
-  <h1 class="prompt" :class="{ long: said.length > 140 }">{{ said }}</h1>
-  <p v-if="activeRun?.attachments.length" class="note attached">
-    {{ activeRun.attachments.length }} attached {{ activeRun.attachments.length === 1 ? "item" : "items" }}
-  </p>
-
-  <!-- One card for "what is it doing": who, which step, what right now, and Stop. -->
-  <section class="card now" role="status" aria-live="polite">
-    <Orb ref="orb" :size="64" :mood="mood" />
-    <div class="grow current">
-      <strong>{{ ranOn === "codex" ? "Codex" : "Claude" }} · {{ stopping ? "Stopping" : stage ?? "Running" }}</strong>
-      <p>
-        {{ currentActivity.text }}
-        <FileLink v-if="currentActivity.file" :file="currentActivity.file" />
-      </p>
-      <ol v-if="steps.length > 1" class="steps" aria-label="Steps">
-        <li v-for="(s, i) in steps" :key="i" :class="s.state" :aria-current="s.state === 'running' ? 'step' : undefined">
-          {{ s.name }}<span class="hidden-label"> · {{ s.state === "running" ? "Running" : s.state === "ran" ? "Ran" : "Upcoming" }}</span>
-        </li>
-      </ol>
-    </div>
-    <button class="btn" :disabled="taskId === null || stopping" @click="stopRun">
-      {{ stopping ? "Stopping…" : "Stop" }}
-    </button>
-  </section>
-  <p v-if="fileError" class="missing">{{ fileError }}</p>
-
-  <!-- Result first, proof after: readable now, never labelled done. -->
-  <section v-if="checking" class="block" aria-live="polite">
-    <h2 class="label">The change · still checking</h2>
-    <div class="card early">
-      <p class="note">Its focused tests passed. The full test suite is still running, and this is not done until it passes.</p>
-      <ul class="files">
-        <li v-for="f in checking.diff.filter((f) => f.origin !== 'beforeRun')" :key="f.path">
-          <span class="mono grow">{{ f.path }}</span>
-          <span v-if="f.added !== null" class="note">+{{ f.added }} &minus;{{ f.deleted }}</span>
-          <span v-else class="note">new or binary</span>
-        </li>
-      </ul>
-      <details v-if="checking.patchText" class="code-view">
-        <summary>View patch</summary>
-        <pre>{{ checking.patchText }}</pre>
-      </details>
-    </div>
-  </section>
-
-  <!-- What it has said so far, oldest first, straight under the card: part of the turn, not a panel. -->
-  <section v-if="response" class="block" aria-label="Latest AI response">
-    <details v-if="responses.length > 1" class="previous-updates">
-      <summary>Earlier updates · {{ responses.length - 1 }}</summary>
-      <Markdown v-for="(line, i) in responses.slice(0, -1)" :key="i" class="summary" :text="line.text" />
-    </details>
-    <Markdown class="summary" :text="response" />
-  </section>
-
-  <!-- Closed by default; mounted on open so the log starts at its latest line. -->
-  <details class="block activity" @toggle="showActivity = ($event.target as HTMLDetailsElement).open">
-    <summary><span class="label">Activity</span><span class="note">{{ lines.length }} events</span></summary>
-    <ActivityLog v-if="showActivity" />
-  </details>
-
-  <!-- Pinned to the bottom of the pane, like a chat box: always in reach while the thread scrolls. -->
-  <div class="steer-bar">
-    <div class="steer">
-      <input
-        ref="steerInput"
-        v-model="instruction"
-        type="text"
-        aria-label="Additional instructions for this task"
-        spellcheck="false"
-        placeholder="Steer: add context or change direction…"
-        :disabled="taskId === null || sending"
-        @keyup.enter="send(false)"
-      />
-      <div class="steer-row">
-        <button class="btn primary" :disabled="taskId === null || sending || !instruction.trim()" @click="send(false)">
-          {{ steering === "live" ? "Send to agent" : "Send for next step" }}
-        </button>
-        <button
-          v-if="steering === 'checkpoint'"
-          class="btn"
-          :disabled="taskId === null || sending || !instruction.trim()"
-          @click="send(true)"
-        >
-          Apply now
-        </button>
-        <span class="note">
-          <template v-if="steering === 'live'">Delivered to the running agent.</template>
-          <template v-else>Used on the next step. “Apply now” restarts that step and keeps anything already changed.</template>
-        </span>
+      <div class="mine">
+        <h1 class="bubble" :class="{ long: said.length > 600 }">{{ said }}</h1>
+        <p v-if="activeRun?.attachments.length" class="note">
+          {{ activeRun.attachments.length }} attached {{ activeRun.attachments.length === 1 ? "item" : "items" }}
+        </p>
       </div>
-      <p v-if="receipt" class="note receipt" role="status">{{ receipt }}</p>
-      <p v-if="instructionError" class="missing err-line">{{ instructionError }}</p>
+
+      <!-- The tool calls behind the answer, folded away the way a chat folds its "worked for…" line. -->
+      <details class="activity" @toggle="showActivity = ($event.target as HTMLDetailsElement).open">
+        <summary>Activity · {{ lines.length }} events</summary>
+        <ActivityLog v-if="showActivity" />
+      </details>
+
+      <template v-for="(m, i) in messages" :key="i">
+        <div v-if="m.kind === 'instruction'" class="mine">
+          <p class="bubble">{{ m.text }}</p>
+          <p v-if="m.delivery" class="note" role="status">{{ m.delivery }}</p>
+        </div>
+        <Markdown v-else class="summary back" :text="m.text" />
+      </template>
+
+      <!-- Result first, proof after: readable now, never labelled done. -->
+      <section v-if="checking" class="back" aria-live="polite">
+        <h2 class="label">The change · still checking</h2>
+        <div class="card early">
+          <p class="note">Its focused tests passed. The full test suite is still running, and this is not done until it passes.</p>
+          <ul class="files">
+            <li v-for="f in checking.diff.filter((f) => f.origin !== 'beforeRun')" :key="f.path">
+              <span class="mono grow">{{ f.path }}</span>
+              <span v-if="f.added !== null" class="note">+{{ f.added }} &minus;{{ f.deleted }}</span>
+              <span v-else class="note">new or binary</span>
+            </li>
+          </ul>
+          <details v-if="checking.patchText" class="code-view">
+            <summary>View patch</summary>
+            <pre>{{ checking.patchText }}</pre>
+          </details>
+        </div>
+      </section>
     </div>
+
+    <!-- The chat box: what the agent is doing now, Stop, and steering, as one pinned unit. -->
+    <div class="composer-bar">
+      <p v-if="fileError" class="missing">{{ fileError }}</p>
+      <div class="composer">
+        <div class="now" role="status" aria-live="polite">
+          <Orb ref="orb" :size="40" :mood="mood" />
+          <div class="grow current">
+            <strong>{{ ranOn === "codex" ? "Codex" : "Claude" }} · {{ stopping ? "Stopping" : stage ?? "Running" }}</strong>
+            <p>
+              {{ currentActivity.text }}
+              <FileLink v-if="currentActivity.file" :file="currentActivity.file" />
+            </p>
+            <ol v-if="steps.length > 1" class="steps" aria-label="Steps">
+              <li v-for="(s, i) in steps" :key="i" :class="s.state" :aria-current="s.state === 'running' ? 'step' : undefined">
+                {{ s.name }}<span class="hidden-label"> · {{ s.state === "running" ? "Running" : s.state === "ran" ? "Ran" : "Upcoming" }}</span>
+              </li>
+            </ol>
+          </div>
+          <button class="btn" :disabled="taskId === null || stopping" @click="stopRun">
+            {{ stopping ? "Stopping…" : "Stop" }}
+          </button>
+        </div>
+        <input
+          ref="steerInput"
+          v-model="instruction"
+          type="text"
+          aria-label="Additional instructions for this task"
+          spellcheck="false"
+          placeholder="Steer: add context or change direction…"
+          :disabled="taskId === null || sending"
+          @keyup.enter="send(false)"
+        />
+        <div class="steer-row">
+          <span class="note grow">
+            <template v-if="steering === 'live'">Delivered to the running agent.</template>
+            <template v-else>Used on the next step. “Apply now” restarts that step and keeps anything already changed.</template>
+          </span>
+          <button
+            v-if="steering === 'checkpoint'"
+            class="btn"
+            :disabled="taskId === null || sending || !instruction.trim()"
+            @click="send(true)"
+          >
+            Apply now
+          </button>
+          <button class="btn primary" :disabled="taskId === null || sending || !instruction.trim()" @click="send(false)">
+            {{ steering === "live" ? "Send to agent" : "Send for next step" }}
+          </button>
+        </div>
+        <p v-if="instructionError" class="missing err-line">{{ instructionError }}</p>
+      </div>
+    </div>
+    <span ref="flyer" class="flyer" aria-hidden="true"></span>
   </div>
-  <span ref="flyer" class="flyer" aria-hidden="true"></span>
 </template>
 
+<style scoped src="./chat.css"></style>
 <style scoped>
-.prompt {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
-.prompt.long {
-  max-height: 7.5em;
-  overflow-y: auto;
-}
-.attached {
-  margin: 4px 0 0;
-}
-
-.now {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-top: 16px;
-  padding: 16px 18px;
-}
-.now strong {
-  font-weight: 500;
-  color: var(--text-dim);
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.now .btn {
-  flex-shrink: 0;
-  border-radius: 999px;
-}
-.current { min-width: 0; }
-.current p { margin: 6px 0 0; color: var(--text-dim); overflow-wrap: anywhere; }
-
-.steps {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 16px;
-  margin: 10px 0 0;
-  padding: 0;
-  list-style: none;
-  font-size: 12px;
+.activity {
   color: var(--text-faint);
 }
-.steps li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.activity > summary {
+  width: fit-content;
+  font-size: 12px;
+  cursor: pointer;
 }
-.steps li::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-}
-.steps .ran { color: var(--text-dim); }
-.steps .ran::before { background: var(--text-dim); border-color: var(--text-dim); }
-.steps .running { color: var(--text); }
-.steps .running::before { background: var(--info); border-color: var(--info); }
-
-.block {
-  margin-top: 24px;
+.activity[open] > summary {
+  margin-bottom: 12px;
 }
 
 .early {
@@ -257,37 +224,62 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
   font-variant-numeric: tabular-nums;
 }
 
-.summary { color: var(--text-dim); }
-.previous-updates { margin-bottom: 16px; color: var(--text-dim); }
-.previous-updates summary { cursor: pointer; font-size: 12px; }
-.previous-updates .summary { padding-bottom: 12px; border-bottom: 1px solid var(--border); }
-
-.activity > summary {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  cursor: pointer;
-}
-.activity > summary .label { margin: 0; }
-.activity[open] > summary { margin-bottom: 12px; }
-
-/* Sticks to the bottom of the scrolling pane; its own background hides the thread passing under it. */
-.steer-bar {
-  position: sticky;
-  bottom: 0;
-  margin-top: 32px;
-  padding: 12px 0 16px;
-  background: var(--bg);
-}
-.steer {
+.composer {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r);
 }
-.steer:focus-within {
+.composer:focus-within {
   border-color: var(--focus);
 }
-.steer input {
+.now {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.now strong {
+  font-weight: 500;
+  color: var(--text-dim);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.now .btn {
+  flex-shrink: 0;
+  border-radius: 999px;
+}
+.current { min-width: 0; }
+.current p { margin: 2px 0 0; font-size: 12px; color: var(--text-faint); overflow-wrap: anywhere; }
+
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.steps li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.steps li::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+.steps .ran { color: var(--text-dim); }
+.steps .ran::before { background: var(--text-dim); border-color: var(--text-dim); }
+.steps .running { color: var(--text); }
+.steps .running::before { background: var(--info); border-color: var(--info); }
+
+.composer input {
   display: block;
   width: 100%;
   padding: 14px 18px 4px;
@@ -296,20 +288,20 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
   border: none;
   font: inherit;
 }
-.steer input::placeholder {
+.composer input::placeholder {
   color: var(--text-faint);
 }
-.steer input:focus {
+.composer input:focus {
   outline: none;
 }
 .steer-row {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 10px 12px 12px;
+  padding: 10px 12px 12px 18px;
 }
 .steer-row .btn {
+  flex-shrink: 0;
   padding: 5px 14px;
   font-size: 12px;
 }
@@ -317,7 +309,6 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
   margin: 0;
   padding: 0 18px 12px;
 }
-.receipt { padding: 0 18px 12px; margin: 0; }
 
 .flyer {
   position: fixed;
@@ -334,7 +325,8 @@ const receipt = computed(() => [...lines.value].reverse().find((line) => line.ki
 }
 
 @media (max-width: 600px) {
-  .now { gap: 8px; padding: 12px; }
-  .steer-row .note { flex-basis: 100%; }
+  .now { gap: 8px; padding: 10px 12px; }
+  .steer-row { flex-wrap: wrap; }
+  .steer-row .note { flex-basis: 100%; white-space: normal; }
 }
 </style>

@@ -183,12 +183,6 @@ button {
   margin-bottom: 24px;
   border-bottom: 1px solid var(--border);
 }
-/* Marks who is speaking in the thread; only the user is named, the answer is set off by its colour. */
-.who {
-  margin: 0 0 4px;
-  font-size: 11px;
-  color: var(--text-faint);
-}
 .turn .said {
   margin: 0 0 12px;
   font-size: 14px;

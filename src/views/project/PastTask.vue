@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref, watch } from "vue";
+import { computed, inject, nextTick, onMounted, ref, watch } from "vue";
 import { parseHistoryPatch } from "./historyPatch";
 import { verificationSummary, unfinishedSummary, savedArtifacts } from "./taskPresentation";
 import Markdown from "../../components/Markdown.vue";
@@ -10,11 +10,11 @@ import { split, tidy } from "./picks";
 import type { ProviderEvent, Route } from "../../types";
 import { visiblePath } from "../../path";
 
-// One finished task from the sidebar, laid out like the page after a run.
+// One finished task from the sidebar, laid out like the page after a run: the same chat.
 const {
   historyDetail, historyDetailLoading, historyDetailError, HISTORY_STATUS, TONE, TABS,
   formatTokens, formatCost, cacheHit, formatDuration, formatPayload, removedCopies, confirmRemove, removeCopy,
-  removeError, historyRow, describeVerdict, appendActivity, stageLabel,
+  removeError, describeVerdict, appendActivity, stageLabel,
   task, picks, selectRun, anyRunning, focusTask, newTask, domId,
   reply, replyToPast, running, attachments, attachError, addAttachments, pasteImages, fileName,
   git, openGit,
@@ -22,6 +22,25 @@ const {
 
 const tab = ref<(typeof TABS)[number]["id"]>("summary");
 watch(() => historyDetail.value?.id, () => (tab.value = "summary"));
+// The answer is always shown, so "summary" means no proof section is open.
+const proofTabs = TABS.filter((t) => t.id !== "summary");
+const tabsRow = ref<HTMLDivElement | null>(null);
+async function toggleTab(id: typeof tab.value) {
+  tab.value = tab.value === id ? "summary" : id;
+  if (tab.value === "summary") return;
+  await nextTick();
+  tabsRow.value?.scrollIntoView({ block: "start" });
+}
+// A copy's work is on its branch; a follow-up would start without it.
+const canReply = computed(() => !!d.value?.summary && !d.value.worktreePath);
+// Like any chat, it opens at the latest message.
+const chat = ref<HTMLDivElement | null>(null);
+function toBottom() {
+  const pane = chat.value?.parentElement;
+  if (pane) pane.scrollTop = pane.scrollHeight;
+}
+onMounted(toBottom);
+watch(() => historyDetail.value?.id, toBottom, { flush: "post" });
 
 const d = computed(() => historyDetail.value);
 const route = computed(() => (d.value?.route ?? null) as Route | null);
@@ -77,91 +96,25 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
   <p v-if="historyDetailLoading" class="note" aria-live="polite">Loading task details…</p>
   <p v-else-if="historyDetailError" class="missing" role="alert">Task details unavailable.</p>
   <p v-else-if="!d" class="note">Pick a task on the left.</p>
-  <section v-else class="card outcome">
-    <header class="result-header">
-    <div class="result-heading">
-    <div class="head">
-      <span class="dot" :class="TONE[d.status]" aria-hidden="true"></span>
-      <h2 class="status">
-        {{ route?.kind === "answer" && d.status === "done" ? "Answered" : HISTORY_STATUS[d.status] ?? d.status }}
-      </h2>
-      <span class="note">{{ formatDuration(d.durationMs) }} · {{ d.startedAt.slice(0, 16) }} UTC</span>
-    </div>
-    <div v-if="historyRow?.title" class="name" :title="historyRow.title">{{ historyRow.title }}</div>
-    <h1 class="prompt" :class="{ long: tidy(d.prompt).length > 140 }">{{ tidy(d.prompt) }}</h1>
-    <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(d.status) }}</span></div>
+  <div v-else ref="chat" class="chat">
+    <div class="thread">
+      <div class="mine">
+        <h1 class="bubble" :class="{ long: tidy(d.prompt).length > 600 }">{{ tidy(d.prompt) }}</h1>
+      </div>
 
-    </div>
-    <div class="actions">
-      <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
-      <button class="btn primary" @click="newTask">New task</button>
-    </div>
-    </header>
+      <!-- The answer: what happened first, its proof one click away. -->
+      <article class="back answer">
+        <div class="head">
+          <span class="dot" :class="TONE[d.status]" aria-hidden="true"></span>
+          <h2 class="status">
+            {{ route?.kind === "answer" && d.status === "done" ? "Answered" : HISTORY_STATUS[d.status] ?? d.status }}
+          </h2>
+          <span class="note">{{ formatDuration(d.durationMs) }} · {{ d.startedAt.slice(0, 16) }} UTC</span>
+        </div>
+        <div class="outcome-summary"><span>{{ changed.byRun.length }} files changed</span><span>{{ verification }}</span><span>{{ unfinishedSummary(d.status) }}</span></div>
 
-    <div class="tabs" role="tablist" aria-label="Past task">
-      <button
-        v-for="t in TABS"
-        :id="`past-tab-${t.id}`"
-        :key="t.id"
-        role="tab"
-        :aria-selected="tab === t.id"
-        aria-controls="past-panel"
-        :class="{ on: tab === t.id }"
-        @click="tab = t.id"
-      >
-        {{ t.label }}<span v-if="t.id === 'files'" class="count">{{ changed.byRun.length }}</span>
-      </button>
-    </div>
-
-    <div id="past-panel" class="panel" role="tabpanel" :aria-labelledby="`past-tab-${tab}`">
-      <template v-if="tab === 'summary'">
         <Markdown v-if="d.summary" class="summary" :text="describeVerdict(d.summary) ?? d.summary" />
         <p v-else class="note">No summary was reported.</p>
-        <!-- A copy's work is on its branch; a follow-up would start without it. -->
-        <template v-if="d.summary && !d.worktreePath">
-          <div class="reply">
-            <label class="hidden-label" :for="domId('past-reply')">Reply</label>
-            <textarea
-              :id="domId('past-reply')"
-              v-model="reply"
-              rows="2"
-              spellcheck="false"
-              placeholder="Reply, or ask for something more…"
-              :disabled="running"
-              @paste="pasteImages"
-              @keydown.ctrl.enter.prevent="replyToPast"
-            ></textarea>
-            <ul v-if="attachments.length" class="attachments" aria-label="Attached">
-              <li v-for="path in attachments" :key="path" class="chip">
-                <span class="mono" :title="path">{{ fileName(path) }}</span>
-                <button
-                  class="unattach"
-                  :title="`Remove ${fileName(path)}`"
-                  :aria-label="`Remove ${fileName(path)}`"
-                  @click="attachments = attachments.filter((p) => p !== path)"
-                >
-                  ×
-                </button>
-              </li>
-            </ul>
-            <p v-if="attachError" class="attach-error">{{ attachError }}</p>
-            <div class="reply-controls">
-              <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
-                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
-                Attach
-              </button>
-              <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
-                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-              </button>
-              <span class="shortcut note">Ctrl + Enter</span>
-              <button class="btn" :disabled="running || !reply.trim()" @click="replyToPast">Reply</button>
-            </div>
-          </div>
-          <p class="note reply-cost">
-            This task is over, so a reply reads the files again rather than picking up
-            where it left off. It goes on in this same task.
-          </p>
-        </template>
         <p v-if="d.status === 'cancelled'" class="note caveat">
           Stopped part-way. Anything the agent had already written is still on disk — Orteca reverts nothing.
         </p>
@@ -186,9 +139,23 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
         <p v-if="d.unknownEvents" class="note caveat" role="status">
           {{ d.unknownEvents }} provider event{{ d.unknownEvents === 1 ? "" : "s" }} were not recognized and remain in the saved task log.
         </p>
-      </template>
 
-      <template v-else-if="tab === 'files'">
+        <!-- Nothing open is the resting state; a second click folds the section away again. -->
+        <div ref="tabsRow" class="tabs">
+          <button
+            v-for="t in proofTabs"
+            :key="t.id"
+            :aria-expanded="tab === t.id"
+            :aria-controls="domId('past-panel')"
+            :class="{ on: tab === t.id }"
+            @click="toggleTab(t.id)"
+          >
+            {{ t.label }}<span v-if="t.id === 'files'" class="count">{{ changed.byRun.length }}</span>
+          </button>
+        </div>
+
+        <div v-if="tab !== 'summary'" :id="domId('past-panel')" class="panel">
+      <template v-if="tab === 'files'">
         <div v-if="changed.byRun.length" class="file-review">
           <ul class="review-files" aria-label="Changed files">
             <li v-for="f in changed.byRun" :key="f.path">
@@ -296,26 +263,96 @@ watch(() => d.value?.id, () => { selectedFile.value = null; });
           </ol>
         </details>
       </template>
+        </div>
+      </article>
     </div>
 
-
-  </section>
+    <!-- The chat box: reply to carry on, or start again. -->
+    <div class="composer-bar">
+      <!-- A copy's work is on its branch; a follow-up would start without it. -->
+      <div v-if="canReply" class="reply">
+        <label class="hidden-label" :for="domId('past-reply')">Reply</label>
+        <textarea
+          :id="domId('past-reply')"
+          v-model="reply"
+          rows="2"
+          spellcheck="false"
+          placeholder="Reply, or ask for something more…"
+          :disabled="running"
+          @paste="pasteImages"
+          @keydown.ctrl.enter.prevent="replyToPast"
+        ></textarea>
+        <ul v-if="attachments.length" class="attachments" aria-label="Attached">
+          <li v-for="path in attachments" :key="path" class="chip">
+            <span class="mono" :title="path">{{ fileName(path) }}</span>
+            <button
+              class="unattach"
+              :title="`Remove ${fileName(path)}`"
+              :aria-label="`Remove ${fileName(path)}`"
+              @click="attachments = attachments.filter((p) => p !== path)"
+            >
+              ×
+            </button>
+          </li>
+        </ul>
+        <p v-if="attachError" class="attach-error">{{ attachError }}</p>
+        <div class="reply-controls">
+          <button class="icon" title="Attach files or images. You can also paste or drop them." aria-label="Attach files or images" @click="addAttachments(false)">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+            Attach
+          </button>
+          <button class="icon" title="Attach a folder" aria-label="Add folder" @click="addAttachments(true)">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+          </button>
+          <span class="shortcut note">Ctrl + Enter</span>
+          <button class="btn primary" :disabled="running || !reply.trim()" @click="replyToPast">Reply</button>
+        </div>
+      </div>
+      <div class="next">
+        <p v-if="canReply" class="note reply-cost">
+          This task is over, so a reply reads the files again rather than picking up
+          where it left off. It goes on in this same task.
+        </p>
+        <button class="btn" :disabled="anyRunning" @click="editAgain">Edit and run again</button>
+        <button class="btn" :class="{ primary: !canReply }" @click="newTask">New task</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped src="./result.css"></style>
+<style scoped src="./chat.css"></style>
 <style scoped>
+.answer .outcome-summary { margin: 8px 0 16px; }
+.answer .tabs { margin-top: 8px; scroll-margin-top: 16px; }
+.composer-bar .reply {
+  margin: 0;
+  background: var(--surface);
+}
+.next {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+.next .reply-cost {
+  flex: 1;
+  margin: 0;
+}
+.next .btn {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  font-size: 12px;
+}
+@media (max-width: 600px) {
+  .next { flex-wrap: wrap; }
+  .next .reply-cost { flex-basis: 100%; }
+}
 .route-context { margin-top: 12px; font-size: 12px; }
 .route-context p { margin: 8px 0 0; }
 .route-context ul { margin: 8px 0 0; padding-left: 18px; }
 .route-context li { margin-top: 4px; overflow-wrap: anywhere; }
-.name {
-  margin-top: 10px;
-  overflow: hidden;
-  font-size: 12px;
-  color: var(--text-dim);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .log {
   margin-top: 12px;
 }

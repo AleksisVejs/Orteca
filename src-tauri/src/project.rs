@@ -51,6 +51,8 @@ pub enum GitAction {
     Push,
     Merge,
     Discard,
+    Switch,
+    Branch,
 }
 
 /// A potential agent configuration source, or a path the scan could not inspect.
@@ -1062,7 +1064,8 @@ pub fn drop_base_copy(repo: &Path, copy: &Path) {
 }
 
 /// Runs as the user, with their identity and their hooks: this is their
-/// commit, not a run's. `input` is the commit message or the branch to merge.
+/// commit, not a run's. `input` is the commit message, the branch to merge or
+/// switch to, or the name of a new branch.
 pub fn git_action(dir: &Path, action: GitAction, input: &str) -> Result<()> {
     match action {
         GitAction::Fetch => git_run(dir, &["fetch"], "Git could not fetch"),
@@ -1090,6 +1093,21 @@ pub fn git_action(dir: &Path, action: GitAction, input: &str) -> Result<()> {
         }
         GitAction::Merge => merge(dir, input),
         GitAction::Discard => discard(dir, input),
+        // `switch` carries uncommitted work along and refuses when it would
+        // overwrite any, so nothing of the user's is lost either way.
+        GitAction::Switch => {
+            if !git_state(dir).branches.iter().any(|b| b == input) {
+                return Err(AppError::new(ErrorKind::Invalid, "That branch does not exist here."));
+            }
+            git_run(dir, &["switch", input], "Git could not switch branch")
+        }
+        GitAction::Branch => {
+            let name = input.trim();
+            if name.starts_with('-') || git(dir, &["check-ref-format", "--branch", name]).is_none() {
+                return Err(AppError::new(ErrorKind::Invalid, "That is not a valid branch name."));
+            }
+            git_run(dir, &["switch", "-c", name], "Git could not create the branch")
+        }
     }
     .map(drop)
 }
@@ -1478,6 +1496,35 @@ mod tests {
 
         git_action(&dir, GitAction::Merge, "clean").unwrap();
         assert!(dir.join("b.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn branches_are_created_and_switched_without_losing_work() {
+        let dir = temp_dir("git-switch");
+        let run = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        git_action(&dir, GitAction::Commit, "base").unwrap();
+
+        for bad in ["", "-f", "two words", "a..b"] {
+            assert!(git_action(&dir, GitAction::Branch, bad).is_err(), "created {bad:?}");
+        }
+        git_action(&dir, GitAction::Branch, " feature ").unwrap();
+        assert_eq!(git_state(&dir).branch.as_deref(), Some("feature"));
+        assert!(git_action(&dir, GitAction::Branch, "main").is_err(), "an existing branch was recreated");
+
+        assert!(git_action(&dir, GitAction::Switch, "--help").is_err());
+        std::fs::write(dir.join("a.txt"), "unsaved\n").unwrap();
+        git_action(&dir, GitAction::Switch, "main").unwrap();
+        let state = git_state(&dir);
+        assert_eq!((state.branch.as_deref(), state.dirty), (Some("main"), true), "uncommitted work was not carried");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "unsaved\n");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

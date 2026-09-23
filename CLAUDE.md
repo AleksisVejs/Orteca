@@ -110,8 +110,9 @@ never the store. Colors and spacing come from `src/styles/tokens.css`, and
   "CLI missing" is a first-class UI state, not an error.
 - **Never run a destructive git command** (`push --force`, `reset --hard`, `clean -fd`).
   Orteca changes the user's repo only when the user asks and confirms: the git bar's
-  fetch, `pull --ff-only`, commit, plain push and a clean-tree merge that aborts on
-  a clash (`project::git_action`). Nothing there may force, reset or discard work.
+  fetch, `pull --ff-only`, commit, plain push, `switch` / `switch -c` (git refuses
+  to overwrite work) and a clean-tree merge that aborts on a clash
+  (`project::git_action`). Nothing there may force, reset or discard work.
 - **Every metric carries a `cost_quality`** of `exact` | `estimated` | `unavailable`.
   Nothing reaches the UI unlabelled, and there is no savings percentage until a project
   has a real baseline. Codex reports tokens but no cost — Orteca prices them from

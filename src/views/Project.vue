@@ -560,7 +560,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
                 <p :id="domId('git-scope')" class="note">{{ gitQuestion(gitAsk) }}</p>
                 <template v-if="gitAsk === 'commit'">
                   <label :for="domId('commit-message')" class="label">Commit message</label>
-                  <input :id="domId('commit-message')" v-model="commitMessage" class="git-input" placeholder="Describe these changes" :disabled="!!gitBusy || drafting":aria-describedby="domId('git-scope')" required />
+                  <textarea :id="domId('commit-message')" v-model="commitMessage" class="git-input git-message" rows="6" placeholder="Describe these changes" :disabled="!!gitBusy || drafting" :aria-describedby="domId('git-scope')" required />
                 </template>
                 <template v-if="gitAsk === 'branch'">
                   <label :for="domId('new-branch')" class="label">Branch name</label>
@@ -1426,6 +1426,9 @@ h1 {
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   font: inherit;
+}
+.git-message {
+  resize: vertical;
 }
 .git-input.mono {
   font-family: var(--mono);

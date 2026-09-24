@@ -293,18 +293,19 @@ pub async fn run_rules(id: ProviderId, program: &str, digest: &str, saved: &[Str
     propose_rules(id, program, RUNS_INSTRUCTION, &request).await
 }
 
-const COMMIT_INSTRUCTION: &str = "You write a git commit message for the patch you are given. Reply with one line and nothing else: an imperative summary of what the change does, at most 72 characters, no trailing period, no quotes, no prefix like feat:.";
+const COMMIT_INSTRUCTION: &str = "You write a git commit message for the change you are given. First line: an imperative summary of the whole change, at most 72 characters, no trailing period, no prefix like feat:. Then a blank line, then one line per distinct change starting with `- `: a plain sentence saying what changed and why, naming the area it touches. Cover every file in the file list, including files whose patch was cut; group small related edits into one line. Reply with the message only, no quotes and no code fences.";
 
-/// The most of a patch the small model reads. The rest is cut, not summarised.
-// ponytail: a byte cap, not a token count; a huge change gets a subject from its first files only.
+/// The most of a patch the small model reads. The rest is cut, not summarised,
+/// but every file still reaches it by name.
+// ponytail: a byte cap, not a token count; a huge change is described past the cut from file names only.
 const COMMIT_PATCH_CHARS: usize = 40_000;
 
-/// A one-line commit subject a small model drafts from `patch`. Empty when it
-/// gave none; the user edits it before anything is committed either way.
+/// A commit message - subject, blank line, bullets - a small model drafts from
+/// `patch`. Empty when it gave none; the user edits it before anything is
+/// committed either way.
 pub async fn commit_message(id: ProviderId, program: &str, patch: &str) -> String {
-    let patch: String = patch.chars().take(COMMIT_PATCH_CHARS).collect();
     let mut events = Vec::new();
-    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, COMMIT_INSTRUCTION, None, &format!("Patch:\n{patch}"), &mut events))
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, COMMIT_INSTRUCTION, None, &commit_request(patch), &mut events))
         .await
         .ok()
         .flatten()
@@ -312,9 +313,27 @@ pub async fn commit_message(id: ProviderId, program: &str, patch: &str) -> Strin
     parse_commit(&reply)
 }
 
+/// Every changed file by name, then as much of the patch as fits.
+fn commit_request(patch: &str) -> String {
+    let files: Vec<&str> = patch
+        .lines()
+        .filter_map(|l| l.strip_prefix("diff --git ")?.rsplit_once(" b/").map(|(_, b)| b))
+        .collect();
+    let cut: String = patch.chars().take(COMMIT_PATCH_CHARS).collect();
+    let note = if cut.len() < patch.len() { " (cut short; describe the rest from the file list)" } else { "" };
+    format!("Files changed ({}):\n{}\n\nPatch{note}:\n{cut}", files.len(), files.join("\n"))
+}
+
 fn parse_commit(reply: &str) -> String {
-    let line = reply.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    line.trim_matches(['*', '_', '`', '"', '\'', ' ']).to_string()
+    let lines: Vec<&str> = reply.lines().map(str::trim_end).filter(|l| !l.trim_start().starts_with("```")).collect();
+    let text = lines.join("\n");
+    let text = text.trim();
+    let (subject, body) = text.split_once('\n').unwrap_or((text, ""));
+    let subject = subject.trim_matches(['*', '_', '`', '"', '\'', ' ']);
+    match body.trim() {
+        "" => subject.to_string(),
+        body => format!("{subject}\n\n{body}"),
+    }
 }
 
 async fn propose_rules(id: ProviderId, program: &str, instruction: &str, request: &str) -> Vec<String> {
@@ -440,9 +459,18 @@ not a rule"), ["Use tabs.", "Be brief"]);
     }
 
     #[test]
-    fn reads_the_commit_subject_from_the_first_line() {
-        assert_eq!(parse_commit("\n`Add commit drafts`\nbecause..."), "Add commit drafts");
+    fn reads_the_commit_subject_and_body() {
+        assert_eq!(parse_commit("\n`Add commit drafts`\n"), "Add commit drafts");
+        assert_eq!(
+            parse_commit("```\n\"Add commit drafts\"\n\n- Draft a body\n- List every file\n```"),
+            "Add commit drafts\n\n- Draft a body\n- List every file"
+        );
         assert_eq!(parse_commit(""), "");
+        // A file past the cut still reaches the model by name.
+        let patch = format!("diff --git a/a.rs b/a.rs\n+{}\ndiff --git a/src/b c.ts b/src/b c.ts\n+x\n", "y".repeat(COMMIT_PATCH_CHARS));
+        let request = commit_request(&patch);
+        assert!(request.starts_with("Files changed (2):\na.rs\nsrc/b c.ts\n"));
+        assert!(request.contains("cut short"));
     }
 
     /// Spends a few cents: proposes rules from the real ~/.claude/CLAUDE.md.

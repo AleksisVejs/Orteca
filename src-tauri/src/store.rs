@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_code_map.sql"),
     include_str!("../migrations/0011_memory.sql"),
     include_str!("../migrations/0012_trust_fingerprint.sql"),
+    include_str!("../migrations/0013_task_log.sql"),
 ];
 
 /// Files past this are minified or generated, not something a task edits.
@@ -83,6 +84,17 @@ pub struct NewTask<'a> {
     pub branch: Option<&'a str>,
     pub base_commit: Option<&'a str>,
     pub dirty_at_start: bool,
+}
+
+/// What `log_task` writes once a run ends.
+pub struct TaskLog<'a> {
+    pub task_type: &'a str,
+    pub ruleset: &'a str,
+    pub turns: u32,
+    /// Tool calls before the first edit; `None` when nothing was edited.
+    pub tools_before_edit: Option<u32>,
+    /// `pass`, `fail` or `none`: the last check that ran, or none ran.
+    pub gate: &'a str,
 }
 
 pub struct Store(Mutex<Connection>, #[allow(dead_code)] Option<std::fs::File>);
@@ -177,6 +189,12 @@ impl Store {
     /// started and must be readable afterwards whatever became of the run.
     pub fn create_task(&self, task: NewTask) -> Result<i64> {
         let conn = self.0.lock().expect("store poisoned");
+        // Asking the same thing again says the earlier answer was not kept.
+        conn.execute(
+            "UPDATE tasks SET verdict = 'retried'
+              WHERE project_id = ?1 AND prompt = ?2 AND verdict IS NULL AND status != 'running'",
+            params![task.project_id, task.prompt],
+        )?;
         conn.execute(
             "INSERT INTO tasks
                 (project_id, prompt, title, mode, route_json, status, branch,
@@ -682,6 +700,104 @@ impl Store {
         Ok(())
     }
 
+    /// The type a task last ran as, which its follow-up keeps by default.
+    pub fn task_type(&self, task_id: i64) -> Result<Option<String>> {
+        let conn = self.0.lock().expect("store poisoned");
+        match conn.query_row("SELECT task_type FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)) {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            other => Ok(other?),
+        }
+    }
+
+    /// One window-anchoring ping and what it cost.
+    pub fn record_ping(&self, provider: &str, ok: bool, usage: Option<&Usage>) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "INSERT INTO pings (provider, ok, input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4)",
+            params![provider, ok, usage.map(|u| u.input_tokens + u.cached_input_tokens), usage.map(|u| u.output_tokens)],
+        )?;
+        Ok(())
+    }
+
+    /// A plain setting, `None` when never set.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.0.lock().expect("store poisoned");
+        match conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)) {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            other => Ok(Some(other?)),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The user's own wording of a project's profile. `None` sends the detected one.
+    pub fn profile(&self, project_id: i64) -> Result<Option<String>> {
+        let conn = self.0.lock().expect("store poisoned");
+        Ok(conn.query_row("SELECT profile FROM projects WHERE id = ?1", [project_id], |r| r.get(0))?)
+    }
+
+    pub fn set_profile(&self, project_id: i64, text: Option<&str>) -> Result<()> {
+        let text = text.map(str::trim).filter(|t| !t.is_empty());
+        self.0
+            .lock()
+            .expect("store poisoned")
+            .execute("UPDATE projects SET profile = ?2 WHERE id = ?1", params![project_id, text])?;
+        Ok(())
+    }
+
+    /// How a run was set up and how its checks ended, beside its status.
+    pub fn log_task(&self, task_id: i64, log: &TaskLog) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "UPDATE tasks SET task_type = ?2, ruleset = ?3, turns = COALESCE(turns, 0) + ?4,
+                    tools_before_edit = COALESCE(tools_before_edit, ?5), gate = ?6
+              WHERE id = ?1",
+            params![task_id, log.task_type, log.ruleset, log.turns, log.tools_before_edit, log.gate],
+        )?;
+        Ok(())
+    }
+
+    /// The files a task's agent read and changed, for ranking later tasks.
+    pub fn record_files(&self, task_id: i64, read: &[String], edited: &[String]) -> Result<()> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut insert = conn.prepare(
+            "INSERT INTO task_files (task_id, path, edited) VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_id, path) DO UPDATE SET edited = MAX(edited, excluded.edited)",
+        )?;
+        for (paths, edited) in [(read, false), (edited, true)] {
+            for path in paths {
+                insert.execute(params![task_id, path, edited])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `accepted` (merged) or `rejected` (rewound): what the user did with it.
+    pub fn set_verdict(&self, task_id: i64, verdict: &str) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "UPDATE tasks SET verdict = ?2 WHERE id = ?1",
+            params![task_id, verdict],
+        )?;
+        Ok(())
+    }
+
+    /// The user committed on top of `head`: the finished work that was built
+    /// on it and not already judged is kept.
+    pub fn accept_tasks(&self, project_id: i64, head: &str) -> Result<()> {
+        self.0.lock().expect("store poisoned").execute(
+            "UPDATE tasks SET verdict = 'accepted'
+              WHERE project_id = ?1 AND base_commit = ?2 AND verdict IS NULL
+                AND patch_text IS NOT NULL AND status != 'running' AND worktree_path IS NULL",
+            params![project_id, head],
+        )?;
+        Ok(())
+    }
+
     /// Bring a project's code map up to date with its tracked files. Only a
     /// file whose mtime or size moved is read and parsed again, and a file no
     /// longer tracked loses its rows. Parsing happens outside the lock. Returns
@@ -804,9 +920,18 @@ impl Store {
                 r.get::<_, Option<String>>(3)?,
             ))
         })?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut read: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut files = conn.prepare(
+            "SELECT f.task_id, f.path FROM task_files f JOIN tasks t ON t.id = f.task_id
+              WHERE t.project_id = ?1 AND f.edited = 0",
+        )?;
+        for row in files.query_map([project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (task, path) = row?;
+            read.entry(task).or_default().push(path);
+        }
         let mut notes = Vec::new();
-        for row in rows {
-            let (id, asked, summary, diff) = row?;
+        for (id, asked, summary, diff) in rows {
             let summary = summary.unwrap_or_default();
             let files: Vec<String> = diff
                 .and_then(|d| serde_json::from_str::<Vec<FileStat>>(&d).ok())
@@ -822,7 +947,7 @@ impl Store {
                 let shown: Vec<&str> = files.iter().take(6).map(String::as_str).collect();
                 note.push_str(&format!("\n  Files: {}", shown.join(", ")));
             }
-            notes.push(PastNote { id, note, files });
+            notes.push(PastNote { id, note, files, prompt: asked, read: read.remove(&id).unwrap_or_default() });
         }
         Ok(notes)
     }
@@ -875,6 +1000,41 @@ impl Store {
                 tokens: r.get(10)?, uncached_tokens: r.get(11)?, cached_tokens: r.get(12)?,
                 cost_usd: r.get(13)?, cost_quality: r.get(14)?, unknown_events: r.get(15)?,
                 duration_ms: r.get(16)?, patch_available: r.get(17)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How a project's runs were set up and ended, newest first. `file_recall`
+    /// is the share of edited files the route's `candidatePaths` named.
+    pub fn task_log(&self, project_id: i64, limit: u32) -> Result<Vec<TaskLogRow>> {
+        let conn = self.0.lock().expect("store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.started_at, t.status, t.task_type, u.provider, u.model,
+                    json_extract(t.route_json, '$.budget.preferredTier'), t.gate, t.verdict,
+                    u.input_tokens + u.cached_input_tokens + u.output_tokens,
+                    u.cost_usd, u.cost_quality, t.tools_before_edit,
+                    json_extract(c.payload_json, '$.data.source'),
+                    CASE WHEN c.id IS NULL THEN NULL
+                         WHEN json_extract(c.payload_json, '$.data.clarify') IS NULL THEN 'none'
+                         WHEN json_extract(c.payload_json, '$.data.clarify.answered') THEN 'answered'
+                         ELSE 'skipped' END,
+                    (SELECT CAST(SUM(EXISTS (SELECT 1 FROM json_each(t.route_json, '$.candidatePaths') p
+                                              WHERE p.value = f.path)) AS REAL) / COUNT(*)
+                       FROM task_files f WHERE f.task_id = t.id AND f.edited = 1)
+               FROM tasks t LEFT JOIN usage u ON u.task_id = t.id
+               LEFT JOIN task_events c ON c.id = (SELECT MAX(id) FROM task_events
+                                                   WHERE task_id = t.id AND kind = 'classified')
+              WHERE t.project_id = ?1
+              ORDER BY t.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit], |r| {
+            Ok(TaskLogRow {
+                id: r.get(0)?, started_at: r.get(1)?, status: r.get(2)?, task_type: r.get(3)?,
+                provider: r.get(4)?, model: r.get(5)?, tier: r.get(6)?, gate: r.get(7)?,
+                verdict: r.get(8)?, tokens: r.get(9)?, cost_usd: r.get(10)?,
+                cost_quality: r.get(11)?, tools_before_edit: r.get(12)?,
+                classified_by: r.get(13)?, clarify: r.get(14)?, file_recall: r.get(15)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1050,6 +1210,28 @@ pub struct GlobalTaskSummary {
     pub task: TaskSummary,
     pub project_path: String,
     pub project_name: String,
+}
+
+/// One task as the Stats page reads it. NULL where the run predates the log.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskLogRow {
+    pub id: i64,
+    pub started_at: String,
+    pub status: String,
+    pub task_type: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub tier: Option<String>,
+    pub gate: Option<String>,
+    pub verdict: Option<String>,
+    pub tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub cost_quality: Option<String>,
+    pub tools_before_edit: Option<u32>,
+    pub classified_by: Option<String>,
+    pub clarify: Option<String>,
+    pub file_recall: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1768,6 +1950,30 @@ mod tests {
                 median_calls: 1
             })
         );
+    }
+
+    #[test]
+    fn the_task_log_reads_tier_classification_and_file_recall() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let route = r#"{"kind":"implementOnce","budget":{"preferredTier":"standard"},"candidatePaths":["a.rs","b.rs"]}"#;
+        let routed = store
+            .create_task(NewTask { route_json: Some(route), ..new_task(project.id, "p", "balanced") })
+            .unwrap();
+        let note = r#"{"kind":"classified","data":{"source":"classifier","clarify":{"question":"q","answered":false}}}"#;
+        store.append_event(routed, "classify", "classified", "claude", note).unwrap();
+        store.record_files(routed, &["b.rs".into()], &["a.rs".into(), "c.rs".into()]).unwrap();
+        let bare = store.create_task(new_task(project.id, "p", "balanced")).unwrap();
+        let note = r#"{"kind":"classified","data":{"source":"command","clarify":null}}"#;
+        store.append_event(bare, "classify", "classified", "claude", note).unwrap();
+
+        let log = store.task_log(project.id, 10).unwrap();
+        assert_eq!(log.iter().map(|r| r.id).collect::<Vec<_>>(), [bare, routed]);
+        let (b, r) = (&log[0], &log[1]);
+        assert_eq!((b.tier.as_deref(), b.classified_by.as_deref(), b.clarify.as_deref()), (None, Some("command"), Some("none")));
+        assert_eq!(b.file_recall, None, "edited nothing");
+        assert_eq!((r.tier.as_deref(), r.classified_by.as_deref(), r.clarify.as_deref()), (Some("standard"), Some("classifier"), Some("skipped")));
+        assert_eq!(r.file_recall, Some(0.5), "a.rs named, c.rs not; a read file does not count");
     }
 
     /// Two stalls in five finished runs of one route kind, tier and provider.

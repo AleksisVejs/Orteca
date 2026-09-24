@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::codemap::FileFacts;
-use crate::intent::Intent;
+use crate::intent::{Intent, TaskType};
 use crate::providers::ProviderId;
 
 /// Two modes, as decided in the architecture. `Efficient` shifts every route
@@ -136,6 +136,16 @@ impl Tier {
             (ProviderId::Codex, Self::Deep) => ("gpt-6-sol", "high"),
         };
         ModelChoice { model, effort }
+    }
+}
+
+/// What `claude --fallback-model` switches to while `model` is overloaded or
+/// unavailable. The CLI tries the primary again at each new turn.
+pub fn claude_fallback(model: &str) -> Option<&'static str> {
+    match model {
+        "haiku" | "opus" => Some("sonnet"),
+        "sonnet" | "fable" => Some("opus"),
+        _ => None,
     }
 }
 
@@ -382,6 +392,9 @@ pub struct Route {
     /// What each stage would have preferred to run on, recorded and not acted
     /// on. See `Capability::preferred_provider`.
     pub preferred_providers: Vec<ProviderId>,
+    /// Picks the ruleset and the tools; see `TaskType`.
+    #[serde(default)]
+    pub task_type: TaskType,
 }
 
 impl Route {
@@ -652,6 +665,9 @@ pub struct PastNote {
     pub note: String,
     /// Every file the task changed.
     pub files: Vec<String>,
+    /// What was asked, and the files the agent read without changing.
+    pub prompt: String,
+    pub read: Vec<String>,
 }
 
 /// The repository side of the decision. Collected once, cheaply, before the
@@ -686,6 +702,12 @@ pub struct RepoSignals {
     /// The small model's semantic job classification. Keywords are used only
     /// when this is absent because the call failed or was not made.
     pub job: Option<crate::intent::Job>,
+    /// The classifier's or a `/command`'s type. `None` reads it off the route.
+    pub task_type: Option<TaskType>,
+    /// Files changed in the same commits, per file, and how far the history
+    /// is trusted (0 with too few commits, up to 1).
+    pub co_change: HashMap<String, Vec<(String, u32)>>,
+    pub co_change_weight: f64,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -750,7 +772,7 @@ fn stem(path: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.join("_"))
 }
 
-fn is_test(path: &str) -> bool {
+pub fn is_test(path: &str) -> bool {
     path.to_ascii_lowercase()
         .split(['/', '.', '_', '-'])
         .any(|w| TEST_WORDS.contains(&w))
@@ -916,6 +938,10 @@ const TEST_SLOTS: usize = 2;
 /// runs with `scripts/bench/navstats.mjs --recall`.
 const SEEDS: usize = 4;
 const HOP: f64 = 3.0;
+/// What a file changed in the same commits as a seed is worth, and what a
+/// file an earlier task on the same words changed (read counts half).
+const CO_HOP: f64 = 3.0;
+const LEARNED: f64 = 1.0;
 
 /// Tracked paths the prompt is about, most likely first, and how many of them
 /// matched a word of the prompt. Path text, git history and the code map: no
@@ -1047,6 +1073,48 @@ fn candidates(prompt: &str, repo: &RepoSignals) -> (usize, Vec<String>) {
         let extra = linked.iter().filter_map(|(p, s)| by_path.get(p).map(|p| (*s, *p))).collect();
         add(&mut scored, extra);
     }
+
+    let by_path: HashMap<&str, &String> = repo.tracked_paths.iter().map(|p| (p.as_str(), p)).collect();
+    // Files that change in the same commits as the likeliest ones: a locale
+    // and its sibling, a controller and its routes. As far as history is trusted.
+    if repo.co_change_weight > 0.0 {
+        let mut seeds: Vec<(f64, &String)> = scored.iter().filter(|(_, p)| !is_test(p)).copied().collect();
+        seeds.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let mut linked: HashMap<&String, f64> = HashMap::new();
+        for (_, seed) in seeds.iter().take(SEEDS) {
+            for (other, _) in repo.co_change.get(seed.as_str()).into_iter().flatten() {
+                if let Some(p) = by_path.get(other.as_str()) {
+                    *linked.entry(*p).or_default() += CO_HOP * unit * repo.co_change_weight;
+                }
+            }
+        }
+        for (score, path) in &mut scored {
+            *score += linked.get(path).copied().unwrap_or_default();
+        }
+        add(&mut scored, linked.into_iter().map(|(p, s)| (s, p)).collect());
+    }
+    // Files earlier tasks read or changed, when they were asked about this
+    // prompt's rarer words.
+    let mut learned: HashMap<&String, f64> = HashMap::new();
+    for past in &repo.past {
+        let theirs = self::nouns(&past.prompt);
+        let shared: f64 = nouns.iter().zip(&weights).filter(|(n, _)| theirs.contains(n)).map(|(_, w)| *w).sum();
+        if shared < unit {
+            continue;
+        }
+        for (files, worth) in [(&past.files, LEARNED), (&past.read, LEARNED / 2.0)] {
+            for file in files {
+                if let Some(p) = by_path.get(file.as_str()) {
+                    let score = learned.entry(*p).or_default();
+                    *score = (*score + worth * unit).min(2.0 * LEARNED * unit);
+                }
+            }
+        }
+    }
+    for (score, path) in &mut scored {
+        *score += learned.get(path).copied().unwrap_or_default();
+    }
+    add(&mut scored, learned.into_iter().map(|(p, s)| (s, p)).collect());
 
     let all_stems = stems(false);
     let tests = repo
@@ -1428,7 +1496,13 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
     chosen.truncate(3);
     let (prior_notes, prior_notes_why): (Vec<String>, Vec<String>) =
         chosen.into_iter().map(|(_, note, why)| (note, why)).unzip();
+    let task_type = repo.task_type.unwrap_or(match intent {
+        Some(Intent::Chat) => TaskType::Chat,
+        _ if kind == RouteKind::Answer => TaskType::Question,
+        _ => TaskType::CodeChange,
+    });
     Route {
+        task_type,
         kind,
         mode,
         stages,
@@ -1591,11 +1665,31 @@ fn forwarded(stage: Stage, artifact: &serde_json::Value) -> String {
             let Some(output) = check["output"].as_str() else {
                 continue;
             };
-            let kept = if passed { String::new() } else { clip(output, CHECK_OUTPUT) };
+            let kept = if passed { String::new() } else { clip(&failing_lines(output), CHECK_OUTPUT) };
             check["output"] = serde_json::Value::String(kept);
         }
     }
     artifact.to_string()
+}
+
+/// The lines of a failing check's output that say what failed: a location
+/// (`file.ext:12`, `file.ts(12,5)`) or an error word. The whole output when
+/// none do, since a runner this does not know may say it some other way.
+pub fn failing_lines(output: &str) -> String {
+    const WORDS: &[&str] = &["error", "fail", "expected", "assert", "panicked", "exception", "✗", "×"];
+    let located = |line: &str| {
+        line.split_whitespace().any(|w| {
+            w.char_indices().any(|(i, c)| {
+                (c == ':' || c == '(') && w[..i].contains('.') && w[i + 1..].starts_with(|d: char| d.is_ascii_digit())
+            })
+        })
+    };
+    let kept: Vec<&str> = output
+        .lines()
+        .filter(|line| located(line) || WORDS.iter().any(|w| line.to_lowercase().contains(w)))
+        .take(40)
+        .collect();
+    if kept.is_empty() { output.to_string() } else { kept.join("\n") }
 }
 
 /// The prompt one stage is given.
@@ -1678,6 +1772,11 @@ pub fn brief(
              project: read no file and run no command. When it holds an earlier exchange, \
              reply only to the part after the last `My reply:`; the rest is what was said \
              before. Reply in the language it was written in, briefly, in plain text.\n\n",
+        ),
+        Stage::Answer if route.task_type == TaskType::Plan => out.push_str(
+            "Plan the work below. Read what you need and change no file. Reply with numbered \
+             steps, the files each step touches, and the risks, then stop: the user approves \
+             the plan before anything changes. Reply in the language it was asked in.\n\n",
         ),
         Stage::Answer => out.push_str(
             "Answer the question below. Read what you need, change no file, and reply in \
@@ -2664,9 +2763,9 @@ mod tests {
         let fix = brief(&r, Stage::Fix, "task", &[], std::slice::from_ref(&failed), false);
         // The command a passing check ran still says what must not break.
         assert!(fix.contains("cargo test") && !fix.contains("passing-suite-noise"));
-        // Both ends of the failure survive; the middle does not.
+        // The lines that say what failed survive; the rest does not.
         assert!(fix.contains("first-error") && fix.contains("last-error"));
-        assert!(fix.contains("bytes cut") && !fix.contains(&noise));
+        assert!(!fix.contains(&noise));
 
         // A Fix resuming the writing session is told the failure and what the
         // user said, not the task and paths that session already holds.
@@ -2702,6 +2801,8 @@ mod tests {
     #[test]
     fn earlier_work_is_carried_only_where_it_touched_the_files_the_prompt_is_about() {
         let past = |id, files: &[&str]| PastNote {
+            prompt: String::new(),
+            read: Vec::new(),
             id,
             note: format!("Task: earlier {id}"),
             files: files.iter().map(|f| f.to_string()).collect(),
@@ -2998,5 +3099,19 @@ mod tests {
         let r = balanced("", REPO);
         assert!(r.candidate_paths.is_empty());
         assert_eq!(r.signals.blast_radius, 0);
+    }
+
+    #[test]
+    fn a_failing_check_hands_on_only_what_failed() {
+        let out = "> vue-tsc --noEmit
+src/api.ts(12,5): error TS2322: nope
+building 40 modules
+  FAIL  tests/a.test.ts > adds
+Done in 3s";
+        assert_eq!(failing_lines(out), "src/api.ts(12,5): error TS2322: nope
+  FAIL  tests/a.test.ts > adds");
+        assert_eq!(failing_lines("exit 1
+something odd"), "exit 1
+something odd", "unknown runners keep their output");
     }
 }

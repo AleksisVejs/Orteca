@@ -25,6 +25,51 @@ pub enum Intent {
     Hard,
 }
 
+/// What the task is, beside how hard (`Intent`). It picks the ruleset and the
+/// tools; the difficulty still picks the route and the tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    Chat,
+    Question,
+    #[default]
+    CodeChange,
+    Debug,
+    Plan,
+}
+
+impl TaskType {
+    pub const ALL: [TaskType; 5] = [Self::Chat, Self::Question, Self::CodeChange, Self::Debug, Self::Plan];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Question => "question",
+            Self::CodeChange => "code_change",
+            Self::Debug => "debug",
+            Self::Plan => "plan",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The route this type runs on: a plan is written like an answer, read-only.
+    pub fn intent(self, difficulty: Option<Intent>) -> Option<Intent> {
+        match self {
+            Self::Chat => Some(Intent::Chat),
+            Self::Question | Self::Plan => Some(Intent::Question),
+            Self::CodeChange | Self::Debug => difficulty,
+        }
+    }
+
+    /// Where a wrong guess at what was meant wastes a whole run.
+    pub fn may_clarify(self) -> bool {
+        matches!(self, Self::CodeChange | Self::Debug | Self::Plan)
+    }
+}
+
 /// What kind of work the small classifier read, and which repository-declared
 /// commands the user explicitly asked Orteca to run. `None` at the call site
 /// means classification failed and the deterministic fallback takes over.
@@ -38,15 +83,29 @@ pub struct Job {
     pub lint: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Reading {
     pub intent: Option<Intent>,
     pub title: String,
     pub job: Option<Job>,
+    pub task_type: Option<TaskType>,
+    /// How sure the classifier was of the type, 0 to 1.
+    pub confidence: Option<f64>,
+    /// One question to ask before a run a wrong guess would waste.
+    pub clarify: Option<String>,
+    /// Talk, already answered in the same call.
+    pub reply: Option<String>,
 }
 
+/// Below this the type falls back to the broader one: a question, not talk.
+const SURE: f64 = 0.6;
+
 // One line: it travels as an argument, and a Windows shim mangles newlines.
-const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: chat, question, easy, medium, or hard. chat means small talk or a personal message with nothing to look up in the repository; question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Input validation, pagination or page-size limits, rate limits, and other resource bounds are general unless the request is about an authentication or permission boundary. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. The request may be in any language.";
+const INSTRUCTION: &str = "You classify one request made to a coding agent working in a git repository. You run in an empty scratch folder, not in that repository, so its files are not here; the agent will have them. The request may be in any language. Fill every field. type: chat is small talk or a personal message with nothing to look up; question wants an answer and no file changes; plan wants a plan to approve before any change; debug wants something broken found and fixed; code_change is any other change. A request that asks a question and also asks for a change is not a question. difficulty: easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. confidence: from 0 to 1, how sure you are of the type. clarify: null, unless the type is code_change, debug or plan and the request itself leaves out what to change, holds conflicting requirements, or gives no way to tell when it is done, so that even an agent that reads the whole repository could not tell what the user wants; then one short question in the request's language about that missing part. The agent finds any file, page, project or existing code on its own, so never ask about those. title: at most six words in the request's language. job: security only for a security boundary or vulnerability; authentication for login, session or credential behavior; authorization for access or permission behavior; schema for a database or schema migration; otherwise general. Display text, translations, documentation or styling that merely mention these are general, and so are input validation, pagination, rate limits and other resource bounds unless the request is about an authentication or permission boundary. run: build, test or lint only when the user explicitly asks to run it. reply: for chat only, your answer in the request's language in at most three short sentences; otherwise null. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. When a previous type is given, keep it unless the reply asks for something different.";
+
+/// The reading's shape, enforced by `claude --json-schema` and
+/// `codex --output-schema`. Every field required, as Codex's strict mode wants.
+const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["type","difficulty","confidence","clarify","title","job","run","reply"],"properties":{"type":{"type":"string","enum":["chat","question","code_change","debug","plan"]},"difficulty":{"type":"string","enum":["easy","medium","hard"]},"confidence":{"type":"number"},"clarify":{"type":["string","null"]},"title":{"type":"string"},"job":{"type":"array","items":{"type":"string","enum":["general","security","authentication","authorization","schema"]}},"run":{"type":"array","items":{"type":"string","enum":["build","test","lint"]}},"reply":{"type":["string","null"]}}}"#;
 
 /// A classifier slower than this costs more waiting than it can save. The
 /// wait is the model, not the shim: the CLI itself starts in ~0.3s, and an
@@ -87,27 +146,28 @@ pub fn model(id: ProviderId) -> &'static str {
 /// supply their instruction explicitly through `args_with`.
 #[cfg(test)]
 fn args(id: ProviderId) -> Vec<String> {
-    args_with(id, INSTRUCTION)
+    args_with(id, INSTRUCTION, Some(SCHEMA))
 }
 
-/// Where a Codex call's instruction is kept, named by its content so a file
-/// once written is never rewritten under a call reading it.
-fn instruction_file(instruction: &str) -> std::path::PathBuf {
+/// Where a Codex call's instruction or schema is kept, named by its content
+/// so a file once written is never rewritten under a call reading it.
+fn temp_file(text: &str, ext: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    instruction.hash(&mut hash);
-    std::env::temp_dir().join(format!("orteca-instruction-{:016x}.txt", hash.finish()))
+    text.hash(&mut hash);
+    std::env::temp_dir().join(format!("orteca-instruction-{:016x}.{ext}", hash.finish()))
 }
 
-fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
+fn args_with(id: ProviderId, instruction: &str, schema: Option<&str>) -> Vec<String> {
     let model = model(id);
     // Codex's own system prompt is ~7k tokens of agent guidance a one-line
     // answer never uses; this replaces it. A TOML string, so `\` is escaped.
     let instructions = format!(
         "model_instructions_file=\"{}\"",
-        instruction_file(instruction).to_string_lossy().replace('\\', "\\\\")
+        temp_file(instruction, "txt").to_string_lossy().replace('\\', "\\\\")
     );
-    let fixed: Vec<&str> = match id {
+    let schema_file = schema.map(|s| temp_file(s, "json").to_string_lossy().into_owned());
+    let mut fixed: Vec<&str> = match id {
         // No tools and a replaced system prompt: the whole call is the
         // instruction and the request. The prompt arrives on stdin.
         ProviderId::Claude => vec![
@@ -126,6 +186,8 @@ fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
             instruction,
             "--model",
             model,
+            "--fallback-model",
+            "sonnet",
         ],
         ProviderId::Codex => [
             &["exec", "-", "--json"][..],
@@ -148,74 +210,69 @@ fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
         ]
         .concat(),
     };
+    match (id, schema, schema_file.as_deref()) {
+        (ProviderId::Claude, Some(schema), _) => fixed.extend(["--json-schema", schema]),
+        (ProviderId::Codex, _, Some(file)) => fixed.extend(["--output-schema", file]),
+        _ => {}
+    }
     fixed.into_iter().map(str::to_string).collect()
 }
 
 /// The longest title kept. The sidebar cuts it to fit with an ellipsis.
 pub const TITLE_CHARS: usize = 60;
 
-/// The first of the four words the reply contains, wherever it sits.
-pub fn parse(reply: &str) -> Option<Intent> {
-    reply
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .find_map(|word| match word {
-            "chat" => Some(Intent::Chat),
-            "question" => Some(Intent::Question),
-            "easy" => Some(Intent::Easy),
-            "medium" => Some(Intent::Medium),
-            "hard" => Some(Intent::Hard),
-            _ => None,
-        })
-}
-
-/// The reply's second line, stripped of markdown, quotes and a "Title:"
-/// label. Empty when the model gave none; the sidebar then shows the prompt.
-pub fn parse_title(reply: &str) -> String {
-    let line = reply.lines().map(str::trim).filter(|l| !l.is_empty()).nth(1).unwrap_or("");
-    let line = line.trim_start_matches(['#', '*', '-', '>', ' ']);
-    let line = line
-        .split_once(':')
-        .filter(|(label, _)| label.trim().eq_ignore_ascii_case("title"))
-        .map_or(line, |(_, rest)| rest);
-    let title = line.trim_matches(['*', '_', '`', '"', '\'', '“', '”', '.', ' ']);
-    title.chars().take(TITLE_CHARS).collect()
-}
-
-fn values(reply: &str, label: &str, allowed: &[&str]) -> Option<Vec<String>> {
-    let value = reply.lines().map(str::trim).find_map(|line| {
-        let (found, value) = line.split_once(':')?;
-        found.trim().eq_ignore_ascii_case(label).then_some(value)
-    })?;
-    let values: Vec<String> = value
-        .split(',')
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect();
-    (!values.is_empty()
-        && values
-            .iter()
-            .all(|value| value == "none" || allowed.contains(&value.as_str())))
-    .then_some(values)
-}
-
-pub fn parse_job(reply: &str) -> Option<Job> {
-    let kinds = values(
-        reply,
-        "job",
-        &["general", "security", "authentication", "authorization", "schema"],
-    )?;
-    let actions = values(reply, "run", &["build", "test", "lint"])?;
-    Some(Job {
-        security: kinds.iter().any(|value| value == "security"),
-        authz: kinds
-            .iter()
-            .any(|value| matches!(value.as_str(), "authentication" | "authorization")),
-        schema_change: kinds.iter().any(|value| value == "schema"),
-        build: actions.iter().any(|value| value == "build"),
-        test: actions.iter().any(|value| value == "test"),
-        lint: actions.iter().any(|value| value == "lint"),
+/// The classifier's JSON, or `None` when it is not the shape asked for. Low
+/// confidence in talk reads as a question, and only talk keeps a reply.
+pub fn parse_reading(reply: &str) -> Option<Reading> {
+    let v: serde_json::Value = serde_json::from_str(reply.trim()).ok()?;
+    let mut task_type = TaskType::from_name(v["type"].as_str()?)?;
+    let confidence = v["confidence"].as_f64();
+    if task_type == TaskType::Chat && confidence.is_some_and(|c| c < SURE) {
+        task_type = TaskType::Question;
+    }
+    let difficulty = match v["difficulty"].as_str() {
+        Some("easy") => Some(Intent::Easy),
+        Some("medium") => Some(Intent::Medium),
+        Some("hard") => Some(Intent::Hard),
+        _ => None,
+    };
+    let words = |key: &str| -> Vec<String> {
+        v[key].as_array().into_iter().flatten().filter_map(|w| w.as_str()).map(str::to_string).collect()
+    };
+    let (kinds, runs) = (words("job"), words("run"));
+    let has = |list: &[String], w: &str| list.iter().any(|x| x == w);
+    let text = |key: &str| v[key].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+    Some(Reading {
+        intent: task_type.intent(difficulty),
+        title: text("title").unwrap_or_default().trim_matches(['"', '.', ' ']).chars().take(TITLE_CHARS).collect(),
+        job: Some(Job {
+            security: has(&kinds, "security"),
+            authz: has(&kinds, "authentication") || has(&kinds, "authorization"),
+            schema_change: has(&kinds, "schema"),
+            build: has(&runs, "build"),
+            test: has(&runs, "test"),
+            lint: has(&runs, "lint"),
+        }),
+        task_type: Some(task_type),
+        confidence,
+        clarify: text("clarify").filter(|_| task_type.may_clarify()),
+        reply: text("reply").filter(|_| task_type == TaskType::Chat),
     })
+}
+
+/// A `/command` at the start picks the type and skips the classifier.
+pub fn command(text: &str) -> Option<(TaskType, String)> {
+    let text = text.trim_start();
+    let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let task_type = match word {
+        "/chat" => TaskType::Chat,
+        "/ask" | "/question" => TaskType::Question,
+        "/code" => TaskType::CodeChange,
+        "/debug" | "/fix" => TaskType::Debug,
+        "/plan" => TaskType::Plan,
+        _ => return None,
+    };
+    Some((task_type, rest.trim().to_string()))
 }
 
 const MEMORY_INSTRUCTION: &str = "You turn a personal instructions file for a coding agent into short standing rules. Reply with only a list, one rule per line, each line starting with `- `. Each rule is one plain sentence of at most 20 words that keeps the file's meaning. Keep only lasting rules about how the agent should behave or write code. Skip headings, examples, explanations, and anything that is not an instruction. Do not add rules the file does not state. At most 25 rules.";
@@ -247,7 +304,7 @@ const COMMIT_PATCH_CHARS: usize = 40_000;
 pub async fn commit_message(id: ProviderId, program: &str, patch: &str) -> String {
     let patch: String = patch.chars().take(COMMIT_PATCH_CHARS).collect();
     let mut events = Vec::new();
-    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, COMMIT_INSTRUCTION, &format!("Patch:\n{patch}"), &mut events))
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, COMMIT_INSTRUCTION, None, &format!("Patch:\n{patch}"), &mut events))
         .await
         .ok()
         .flatten()
@@ -262,7 +319,7 @@ fn parse_commit(reply: &str) -> String {
 
 async fn propose_rules(id: ProviderId, program: &str, instruction: &str, request: &str) -> Vec<String> {
     let mut events = Vec::new();
-    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, instruction, request, &mut events))
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, instruction, None, request, &mut events))
         .await
         .ok()
         .flatten()
@@ -280,53 +337,63 @@ fn parse_rules(reply: &str) -> Vec<String> {
         .collect()
 }
 
-/// Ask the provider what `prompt` wants and what to call it, in one call.
-/// `None` means "could not tell" and the keyword router decides; the events
-/// come back either way, so what the call cost is still counted.
-pub async fn read(
-    id: ProviderId,
-    program: &str,
-    prompt: &str,
-) -> (Reading, Vec<ProviderEvent>) {
+/// The smallest call there is, on the cheapest model: it starts the plan's
+/// rolling window when the user wants it started. Whether it answered, and
+/// what it cost.
+pub async fn ping(id: ProviderId, program: &str) -> (bool, Option<crate::providers::Usage>) {
     let mut events = Vec::new();
-    let reply = tokio::time::timeout(DEADLINE, ask(id, program, prompt, &mut events))
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, "Reply with the word ok.", None, "ok?", &mut events))
         .await
         .ok()
         .flatten()
         .unwrap_or_default();
-    (
-        Reading {
-            intent: parse(&reply),
-            title: parse_title(&reply),
-            job: parse_job(&reply),
-        },
-        events,
-    )
+    let usage = events.into_iter().find_map(|e| match e {
+        ProviderEvent::Usage(u) => Some(u),
+        _ => None,
+    });
+    (!reply.trim().is_empty(), usage)
 }
 
-async fn ask(
+/// Ask the provider what `prompt` wants and what to call it, in one call.
+/// `None` fields mean "could not tell" and the keyword router decides; the
+/// events come back either way, so what the call cost is still counted.
+/// `previous` is the type of the task a follow-up continues.
+pub async fn read(
     id: ProviderId,
     program: &str,
     prompt: &str,
-    events: &mut Vec<ProviderEvent>,
-) -> Option<String> {
-    ask_with(id, program, INSTRUCTION, &format!("Request:\n{prompt}"), events).await
+    previous: Option<TaskType>,
+) -> (Reading, Vec<ProviderEvent>) {
+    let mut events = Vec::new();
+    let request = match previous {
+        Some(t) => format!("Previous type: {}\nRequest:\n{prompt}", t.name()),
+        None => format!("Request:\n{prompt}"),
+    };
+    let reply = tokio::time::timeout(DEADLINE, ask_with(id, program, INSTRUCTION, Some(SCHEMA), &request, &mut events))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    (parse_reading(&reply).unwrap_or_default(), events)
 }
 
 async fn ask_with(
     id: ProviderId,
     program: &str,
     instruction: &str,
+    schema: Option<&str>,
     request: &str,
     events: &mut Vec<ProviderEvent>,
 ) -> Option<String> {
     if id == ProviderId::Codex {
-        let file = instruction_file(instruction);
-        if !file.exists() {
-            std::fs::write(&file, instruction).ok()?;
+        for (text, ext) in std::iter::once((instruction, "txt")).chain(schema.map(|s| (s, "json"))) {
+            let file = temp_file(text, ext);
+            if !file.exists() {
+                std::fs::write(&file, text).ok()?;
+            }
         }
     }
-    let argv = args_with(id, instruction);
+    let argv = args_with(id, instruction, schema);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Never in the user's project: nobody has consented to its settings for this.
     let mut run = proc::spawn_env(program, &borrowed, &std::env::temp_dir(), &env(id)).ok()?;
@@ -341,6 +408,8 @@ async fn ask_with(
                 for event in id.parse_line(&v) {
                     match &event {
                         ProviderEvent::Text(text) => reply = text.clone(),
+                        // A schema's answer arrives as data, not as words.
+                        ProviderEvent::Done { structured: Some(value), .. } => reply = value.to_string(),
                         ProviderEvent::Done { result, .. } if !result.is_empty() => {
                             reply = result.clone()
                         }
@@ -367,7 +436,7 @@ mod tests {
 * Be brief
 -
 not a rule"), ["Use tabs.", "Be brief"]);
-        assert!(args_with(ProviderId::Claude, MEMORY_INSTRUCTION).join(" ").contains("--tools  --system-prompt"));
+        assert!(args_with(ProviderId::Claude, MEMORY_INSTRUCTION, None).join(" ").contains("--tools  --system-prompt"));
     }
 
     #[test]
@@ -388,47 +457,54 @@ not a rule"), ["Use tabs.", "Be brief"]);
         assert!(!rules.is_empty());
     }
 
-    #[test]
-    fn reads_the_first_label_in_the_reply() {
-        assert_eq!(parse("question"), Some(Intent::Question));
-        assert_eq!(parse("Chat\nExpressing affection"), Some(Intent::Chat));
-        assert_eq!(parse("Hard."), Some(Intent::Hard));
-        assert_eq!(parse("**easy**\n"), Some(Intent::Easy));
-        assert_eq!(parse("It's medium, not hard"), Some(Intent::Medium));
-        assert_eq!(parse("I cannot tell"), None);
-        assert_eq!(parse("uneasy"), None);
+    /// Spends a few tiny calls: reads prompts with each CLI and prints what
+    /// came back and what it cost. LIVE_PROVIDER picks claude or codex.
+    /// `cargo test live_classify -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_classify() {
+        let id: ProviderId = serde_json::from_value(serde_json::Value::String(
+            std::env::var("LIVE_PROVIDER").unwrap_or_else(|_| "claude".into()),
+        ))
+        .unwrap();
+        let program = crate::providers::which(id.program()).unwrap();
+        for prompt in ["thanks, that was great!", "why does the login page redirect twice?", "fix it", "Pievieno tumšo režīmu iestatījumu lapai"] {
+            let started = std::time::Instant::now();
+            let (reading, events) = read(id, &program.to_string_lossy(), prompt, None).await;
+            let usage = events.iter().find_map(|e| match e {
+                ProviderEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            });
+            println!("{prompt:?} -> {:?} conf {:?} clarify {:?} reply {:?} title {:?} | {:?} in {:?}", reading.task_type, reading.confidence, reading.clarify, reading.reply, reading.title, usage.map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens, u.cost_usd)), started.elapsed());
+            assert!(reading.task_type.is_some(), "no reading for {prompt:?}");
+        }
     }
 
     #[test]
-    fn reads_the_title_from_the_second_line() {
-        assert_eq!(parse_title("easy\nFix login redirect"), "Fix login redirect");
-        assert_eq!(parse_title("**hard**\n\nTitle: \"Rework the router.\""), "Rework the router");
-        assert_eq!(parse_title("- medium\n# 2FA setup page"), "2FA setup page");
-        assert_eq!(parse_title("question"), "");
-        assert_eq!(parse_title(&format!("easy\n{}", "x".repeat(200))).len(), TITLE_CHARS);
+    fn reads_the_classifier_json() {
+        let json = |t: &str, c: f64, clarify: &str, reply: &str| format!(
+            r#"{{"type":"{t}","difficulty":"medium","confidence":{c},"clarify":{clarify},"title":"Protect delete.","job":["security","authorization"],"run":["test"],"reply":{reply}}}"#
+        );
+        let r = parse_reading(&json("debug", 0.9, r#""Which page?""#, r#""hi""#)).unwrap();
+        assert_eq!((r.task_type, r.intent), (Some(TaskType::Debug), Some(Intent::Medium)));
+        assert_eq!(r.title, "Protect delete");
+        assert_eq!(r.job, Some(Job { security: true, authz: true, test: true, ..Default::default() }));
+        assert_eq!((r.clarify.as_deref(), r.reply), (Some("Which page?"), None), "only talk keeps a reply");
+        let plan = parse_reading(&json("plan", 0.9, "null", "null")).unwrap();
+        assert_eq!(plan.intent, Some(Intent::Question), "a plan runs read-only");
+        let chat = parse_reading(&json("chat", 0.9, r#""x""#, r#""Thanks!""#)).unwrap();
+        assert_eq!((chat.reply.as_deref(), chat.clarify), (Some("Thanks!"), None));
+        let unsure = parse_reading(&json("chat", 0.3, "null", r#""Thanks!""#)).unwrap();
+        assert_eq!((unsure.task_type, unsure.reply), (Some(TaskType::Question), None), "unsure talk is a question");
+        assert_eq!(parse_reading("easy
+Fix it"), None);
     }
 
     #[test]
-    fn reads_job_risk_and_only_explicit_requested_actions() {
-        assert_eq!(
-            parse_job("easy\nFix login copy\njob: general\nrun: build"),
-            Some(Job {
-                build: true,
-                ..Default::default()
-            })
-        );
-        assert_eq!(
-            parse_job("medium\nProtect delete\njob: security, authorization\nrun: test, lint"),
-            Some(Job {
-                security: true,
-                authz: true,
-                test: true,
-                lint: true,
-                ..Default::default()
-            })
-        );
-        assert_eq!(parse_job("easy\nFix copy"), None);
-        assert_eq!(parse_job("easy\nFix copy\njob: mystery\nrun: none"), None);
+    fn a_command_picks_the_type() {
+        assert_eq!(command("/plan add dark mode"), Some((TaskType::Plan, "add dark mode".into())));
+        assert_eq!(command("/debug"), Some((TaskType::Debug, String::new())));
+        assert_eq!(command("/usr/bin is slow"), None);
     }
 
     #[test]
@@ -441,6 +517,7 @@ not a rule"), ["Use tabs.", "Be brief"]);
         assert!(!codex.contains("danger-full-access"));
         assert!(codex.contains("web_search=\"disabled\""));
         assert!(codex.contains(r"\\orteca-instruction-"), "the path is a TOML string: {codex}");
+        assert!(codex.contains("--output-schema") && claude.contains("--json-schema"));
     }
 
     /// Both providers bound the reasoning, by the means each one has. Without

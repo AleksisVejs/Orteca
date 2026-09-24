@@ -209,9 +209,15 @@ draggable divider, and `Ctrl+\`` shows and hides it.
   in as the orb grows into place; a new task's box glides from where it was
   typed down to the chat box (none under reduced motion).
 - The only looping animation in the app is the `Orb` (the dotted sphere in a
-  live run's status pill). Its mood follows the current activity: idle,
-  thinking, reading, editing, checking, failed, stopping. It stops under
-  `prefers-reduced-motion` and shows one still frame per mood.
+  live run's status pill). Its state follows the stage and the current
+  activity, each shown for at least 500 ms and blended into the next. Motion
+  has one meaning each: rotation thinks, directional flow reads, a local change
+  edits, and an outward wave (needs input, nothing else) asks for the user.
+  Its dots take the provider's tone (`--orb-claude` / `--orb-codex`, the one
+  place provider gets a colour); tier sets the dot density. Under
+  `prefers-reduced-motion` it keeps still and speaks in colour and opacity
+  only. It draws only while on screen. Dev builds preview every state with
+  Ctrl+Shift+O.
 - A delivered steering message flies from the input into the orb, which
   swells and flashes as it takes it. Only a delivered one; none under reduced
   motion.
@@ -260,6 +266,13 @@ the mock's chrome for features that are not wired up yet.
   opened fresh starts at the top of an answer too long to fit.
   A past task from the sidebar is the same chat. Details show recorded execution
   steps, labelled usage, and direct links to changes and activity.
+- A run that finished out of sight (another task, page or project on screen,
+  or the window hidden) opens its answer with a short "While you were away"
+  note: what was done, what failed, what needs a call. "Got it" clears it.
+- Once a task finished, the status bar says how it ran: type · agent · model ·
+  tier · effort, from the result, never guessed while it runs. A provider at
+  `warning` or `limited` gets a `--warn` dot beside its usage, and the next
+  window-anchor ping shows there when anchoring is on.
 - Live execution comes from runner-owned stage events, including parallel stages
   and added Fix steps. A stage that ran is labelled Ran, not Passed.
 - Completion shows changed-file count, the latest structured verification result,
@@ -269,7 +282,10 @@ the mock's chrome for features that are not wired up yet.
   reports the backend delivery receipt: queued, delivered, or restarted.
 - File review keeps file selection next to its recorded patch on wide panes and
   stacks it on narrow panes. Added/deleted/renamed labels come from the Git patch;
-  unknown and pre-existing changes stay explicit.
+  unknown and pre-existing changes stay explicit. The latest answer's files
+  each offer "Undo this file": a confirm naming it, then that file alone goes
+  back to the snapshot saved before the answer (`rewind_task`, which marks the
+  task rejected). Not for a rename, and not while a run is going.
 - Recent-task search and status filters apply to loaded recent history, grouped
   by UTC date. The search never claims to cover older, unloaded tasks.
 - The composer displays project, working branch/copy and helper before submission.

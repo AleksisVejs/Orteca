@@ -491,6 +491,8 @@ impl ProviderId {
         };
         let text = lines.join(" ");
         match self {
+            // `claude -p` bills a key in the environment ahead of the plan login.
+            Self::Claude if env::var_os("ANTHROPIC_API_KEY").is_some_and(|k| !k.is_empty()) => Auth::ApiKey,
             // `--json` is the documented default, but parse defensively: an
             // unreadable answer is Unknown, never an optimistic "signed in".
             Self::Claude => match serde_json::from_str::<Value>(&text) {

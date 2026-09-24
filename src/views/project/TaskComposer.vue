@@ -10,7 +10,7 @@ import type { CliChatSummary, MemoryState } from "../../types";
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
   task, picks, attachments, attachError, dragging, addAttachments, pasteImages, fileName,
-  schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation, autoWait, chooseAutoWait,
+  schedulePreview, canRun, run, optionsOpen, MODES, mode, ISOLATIONS, isolation, autoWait, chooseAutoWait, clarify, chooseClarify,
   installed, provider, providerPicked, previewing, preview, previewError,
   limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
   remembering, rememberText, rememberError, remember,
@@ -325,12 +325,25 @@ function formatDuration(milliseconds: number) {
             </button>
           </div>
         </div>
+        <div class="setting" role="group" :aria-labelledby="domId('clarify-label')">
+          <div class="setting-text">
+            <span :id="domId('clarify-label')" class="option-label">Unclear requests</span>
+            <span class="setting-hint">{{ clarify ? "Asks one question first when a wrong guess would waste the run" : "The agent guesses and says how it read the request" }}</span>
+          </div>
+          <div class="segments">
+            <button class="seg" :class="{ on: clarify }" :aria-pressed="clarify" title="Ask one short question before a change, fix or plan whose target is unclear" @click="chooseClarify(true)">Ask me</button>
+            <button class="seg" :class="{ on: !clarify }" :aria-pressed="!clarify" title="Never ask; the agent states its reading at the top of its reply" @click="chooseClarify(false)">Let it guess</button>
+          </div>
+        </div>
       </div>
 
       <div v-if="previewing" class="preview note" aria-live="polite">Figuring out the best way to do it…</div>
       <div v-else-if="preview" class="preview" aria-live="polite">
         <!-- Routed without the model reading of the prompt, which costs a call; the run may still adjust it. -->
         <span class="note">Likely steps: {{ preview.route.stages.map(stageLabel).join(" → ") }}. This can change once Orteca reads your request.</span>
+        <span v-if="preview.route.candidatePaths.length" class="note">
+          Likely files: <span class="mono">{{ preview.route.candidatePaths.slice(0, 4).map((p) => p.split(/[\\/]/).pop()).join(", ") }}</span><template v-if="preview.route.candidatePaths.length > 4"> and {{ preview.route.candidatePaths.length - 4 }} more</template>.
+        </span>
         <span v-if="isolation === 'worktree'" class="note">
           I’ll work in a separate copy on a new branch and leave this folder alone.
           <template v-if="preview.git.dirty">

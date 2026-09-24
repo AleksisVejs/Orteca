@@ -10,6 +10,7 @@ mod proc;
 mod project;
 mod providers;
 mod routing;
+mod rules;
 mod run;
 mod store;
 
@@ -211,6 +212,9 @@ async fn start_task(
     continue_task: Option<i64>,
     // Run a command the agent hands over without asking first.
     auto_wait: bool,
+    // The answer to the question a first try of this request asked, or an
+    // empty answer when the user skipped it.
+    clarified: Option<Clarified>,
     events: tauri::ipc::Channel<providers::ProviderEvent>,
     task: tauri::ipc::Channel<i64>,
     checking: tauri::ipc::Channel<run::TaskResult>,
@@ -231,6 +235,7 @@ async fn start_task(
         _ => None,
     };
     let attachments = existing(&attachments)?;
+    let (prompt, asked, picked) = strip_command(prompt, asked);
     // Beside the database, because a recording belongs to the run it came from.
     // Losing the directory costs a replay, never the run itself.
     let recordings = app
@@ -251,6 +256,8 @@ async fn start_task(
         isolation,
         model,
         continue_task,
+        picked,
+        clarified.as_ref(),
     )
     .await?;
     request.attachments = attachments;
@@ -329,6 +336,34 @@ fn answer_wait(task_id: i64, run: bool, live: State<run::Live>) -> Result<()> {
     live.send(task_id, run::Control::Wait { run })
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Clarified {
+    question: String,
+    answer: String,
+}
+
+/// A `/plan`, `/debug` and so on at the start of what the user just said:
+/// the type they picked, and their words without it.
+fn strip_command(prompt: String, asked: Option<String>) -> (String, Option<String>, Option<intent::TaskType>) {
+    let said = asked.as_deref().unwrap_or(&prompt);
+    let Some((picked, rest)) = intent::command(said) else {
+        return (prompt, asked, None);
+    };
+    match &asked {
+        Some(a) => {
+            let prompt = prompt.strip_suffix(a.as_str()).map_or_else(|| prompt.clone(), |head| format!("{head}{rest}"));
+            (prompt, Some(rest), Some(picked))
+        }
+        None => (rest, None, Some(picked)),
+    }
+}
+
+/// The reading a request that asked a question got, kept so its second try
+/// with the answer does not pay to be read again.
+// ponytail: one slot; two requests asking at once read the second again.
+static ASKED: std::sync::Mutex<Option<(String, ProviderId, intent::Reading, Vec<providers::ProviderEvent>)>> =
+    std::sync::Mutex::new(None);
+
 fn codex_acl_refusal() -> AppError {
     AppError::new(
         ErrorKind::Invalid,
@@ -352,11 +387,12 @@ struct Scanned {
 }
 
 impl Scanned {
-    fn route(self, intent: Option<intent::Intent>, job: Option<intent::Job>) -> PlannedRun {
+    fn route(self, intent: Option<intent::Intent>, job: Option<intent::Job>, task_type: Option<intent::TaskType>) -> PlannedRun {
         let signals = routing::RepoSignals {
             checks_locally: run::checks_locally(&self.dir, job),
             intent,
             job,
+            task_type,
             ..self.signals
         };
         let route = routing::route(&self.routed, self.mode, &signals);
@@ -458,6 +494,8 @@ fn scan_run(
         Err(_) => store.past_notes(project.id).unwrap_or_default(),
     };
     let tracked_paths = project::tracked_paths(&dir);
+    // Git history is read for a run, not for each preview while the user types.
+    let (commits, co_change) = if refresh_map { project::co_changes(&dir) } else { Default::default() };
     // A run rescans before it ranks; a map that fails to refresh only weakens
     // the file list, never the run. The preview reads what is already there.
     if refresh_map {
@@ -479,6 +517,8 @@ fn scan_run(
         // The frontend's reading, not a fresh one: the preview and the run
         // must be routed on the same number.
         headroom: headroom.filter(|room| room.is_finite()),
+        co_change,
+        co_change_weight: project::co_change_weight(commits),
         ..Default::default()
     };
     Ok(Scanned {
@@ -509,8 +549,19 @@ async fn begin(
     isolation: Isolation,
     model: Option<run::ModelOverride>,
     continue_task: Option<i64>,
+    picked: Option<intent::TaskType>,
+    clarified: Option<&Clarified>,
 ) -> Result<run::Request> {
     let started = std::time::Instant::now();
+    let words = routing_words(&prompt, asked.as_deref());
+    // The second try of a request that asked a question was already read.
+    let kept = clarified
+        .and_then(|_| ASKED.lock().ok()?.take())
+        .filter(|(text, id, ..)| Some(text) == words.as_ref() && *id == provider)
+        .map(|(_, _, reading, events)| (reading, events));
+    let previous = continue_task
+        .and_then(|id| store.task_type(id).ok().flatten())
+        .and_then(|name| intent::TaskType::from_name(&name));
     let ms = |since: std::time::Instant| since.elapsed().as_millis() as u64;
     // Read on the provider the run will spend. Unreadable means the keyword
     // router decides, never a failed run. The same call names the task, so a
@@ -518,13 +569,11 @@ async fn begin(
     //
     // A follow-up reads the last answer and what the user just said, not the
     // task at the top: see `routing_words`.
-    let reading = match (
-        routing_words(&prompt, asked.as_deref()),
-        providers::which(provider.program()),
-    ) {
+    let reading = match (words.clone(), providers::which(provider.program())) {
+        _ if picked.is_some() || kept.is_some() => None,
         (Some(text), Some(program)) if !routing::keywords_suffice(&text) => {
             Some(tokio::spawn(async move {
-                let read = intent::read(provider, &program.to_string_lossy(), &text).await;
+                let read = intent::read(provider, &program.to_string_lossy(), &text, previous).await;
                 (read, ms(started))
             }))
         }
@@ -535,7 +584,7 @@ async fn begin(
         scan_run(store, path, prompt, asked, provider, mode, headroom, isolation, true)
     });
     let scan_ms = ms(started);
-    let scanned = match scanned {
+    let mut scanned = match scanned {
         Ok(scanned) => scanned,
         Err(e) => {
             // Dropping the call's process closes its job, which kills it.
@@ -545,19 +594,58 @@ async fn begin(
             return Err(e);
         }
     };
-    let ((reading, classified), classify) = match reading {
-        Some(handle) => match handle.await {
+    let ((mut reading, classified), classify) = match (reading, kept) {
+        (Some(handle), _) => match handle.await {
             Ok((read, took)) => (read, run::Timing { label: "classify".into(), ms: took }),
             Err(_) => (Default::default(), run::Timing { label: "classify".into(), ms: ms(started) }),
         },
-        None => (Default::default(), run::Timing { label: "classify skipped".into(), ms: 0 }),
+        (None, Some(kept)) => (kept, run::Timing { label: "classify kept".into(), ms: 0 }),
+        (None, None) => (Default::default(), run::Timing { label: "classify skipped".into(), ms: 0 }),
     };
-    let planned = scanned.route(reading.intent, reading.job);
+    let source = if picked.is_some() {
+        "command"
+    } else if reading.task_type.is_some() {
+        "classifier"
+    } else {
+        "keywords"
+    };
+    if let Some(task_type) = picked {
+        reading.intent = task_type.intent(None);
+        reading.task_type = Some(task_type);
+        (reading.clarify, reading.reply) = (None, None);
+    }
+    // One question before a run a wrong guess would waste, unless the user
+    // turned it off. Nothing is recorded yet: the task starts with the answer.
+    let ask = clarified.is_none() && store.setting("clarify")?.as_deref() != Some("off");
+    if let Some(question) = reading.clarify.clone().filter(|_| ask) {
+        if let (Some(text), Ok(mut slot)) = (words, ASKED.lock()) {
+            *slot = Some((text, provider, reading, classified));
+        }
+        return Err(AppError::new(ErrorKind::Clarify, question));
+    }
+    if let Some(c) = clarified {
+        let answer = c.answer.trim();
+        scanned.prompt.push_str(&if answer.is_empty() {
+            "\n\nThis request can be read more than one way. Start your reply with one line on how you read it, then do it.".to_string()
+        } else {
+            format!("\n\nOrteca asked: {}\nThe user answered: {answer}", c.question.trim())
+        });
+    }
+    let planned = scanned.route(reading.intent, reading.job, reading.task_type);
     let routed = std::time::Instant::now();
     let mut request = tokio::task::block_in_place(|| {
         prepare_run(store, recordings, planned, provider, mode, isolation, model, &reading.title, continue_task)
     })?;
     request.classified = classified;
+    request.reply = reading.reply.clone().filter(|_| request.route.task_type == intent::TaskType::Chat);
+    // How the type was chosen, for counting misreadings and questions asked.
+    let note = serde_json::json!({ "kind": "classified", "data": {
+        "type": request.route.task_type,
+        "confidence": reading.confidence,
+        "source": source,
+        "clarify": clarified.map(|c| serde_json::json!({ "question": c.question, "answered": !c.answer.trim().is_empty() })),
+    }});
+    let _ = store.append_event(request.task_id, "classify", "classified", provider.program(), &note.to_string());
     request.timings = vec![
         classify,
         run::Timing { label: "scan".into(), ms: scan_ms },
@@ -586,7 +674,7 @@ async fn preview_task(
     // thread: git, PATH and ACL probes froze the window on every pause.
     let planned = tauri::async_runtime::spawn_blocking(move || {
         scan_run(&app.state::<Store>(), path, prompt, asked, provider, mode, headroom, isolation, false)
-            .map(|scanned| scanned.route(None, None))
+            .map(|scanned| scanned.route(None, None, None))
     })
     .await
     .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
@@ -655,6 +743,10 @@ fn prepare_run(
         route,
     } = planned;
 
+    let profile = store.profile(record.id)?.unwrap_or_else(|| project::profile(&dir));
+    let mut ruleset = rules::Ruleset::new(route.task_type, &profile);
+    let (dirs, files) = project::junk(&dir);
+    ruleset.skip = dirs.iter().map(|d| format!("{d}/")).chain(files.iter().map(|f| f.to_string())).collect();
     // A copy starts clean from HEAD: the user's uncommitted changes are not in it.
     let dirty_at_start = git.dirty && isolation == Isolation::CurrentTree;
     // The baseline is taken before the agent runs, so the diff afterwards has
@@ -729,6 +821,8 @@ fn prepare_run(
         timings: Vec::new(),
         checking: None,
         auto_wait: false,
+        ruleset,
+        reply: None,
     })
 }
 
@@ -883,13 +977,26 @@ async fn git_action(
     input: String,
     store: State<'_, Store>,
 ) -> Result<GitState> {
-    let (dir, _) = trusted_dir(&store, &path)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let (dir, record) = trusted_dir(&store, &path)?;
+    let committing = matches!(action, project::GitAction::Commit);
+    let merged = matches!(action, project::GitAction::Merge)
+        .then(|| input.strip_prefix("orteca/task-").and_then(|n| n.parse::<i64>().ok()))
+        .flatten();
+    let (state, head) = tauri::async_runtime::spawn_blocking(move || {
+        let head = committing.then(|| project::git_state(&dir).head).flatten();
         project::git_action(&dir, action, &input)?;
-        Ok(project::git_state(&dir))
+        Ok::<_, AppError>((project::git_state(&dir), head))
     })
     .await
-    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))?
+    .map_err(|e| AppError::new(ErrorKind::Io, e.to_string()))??;
+    // Committing work a run did on this commit is the user keeping it.
+    if let Some(head) = head {
+        let _ = store.accept_tasks(record.id, &head);
+    }
+    if let Some(task_id) = merged {
+        let _ = store.set_verdict(task_id, "accepted");
+    }
+    Ok(state)
 }
 
 /// A commit subject the cheapest model drafts from the uncommitted patch.
@@ -1268,10 +1375,82 @@ fn set_memory_limit(limit: u32, store: State<Store>) -> Result<()> {
 }
 
 /// Past runs in this project, newest first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoProfile {
+    /// What runs are sent: the user's own text, or the detected one.
+    text: String,
+    detected: String,
+    custom: bool,
+}
+
+/// The few lines on this repository every run's rules carry.
+#[tauri::command(async)]
+fn repo_profile(path: String, store: State<Store>) -> Result<RepoProfile> {
+    let (dir, record) = trusted_dir(&store, &path)?;
+    let detected = project::profile(&dir);
+    let custom = store.profile(record.id)?;
+    Ok(RepoProfile { text: custom.clone().unwrap_or_else(|| detected.clone()), detected, custom: custom.is_some() })
+}
+
+/// `None` goes back to the detected profile.
+#[tauri::command]
+fn set_repo_profile(path: String, text: Option<String>, store: State<Store>) -> Result<()> {
+    let (_, record) = trusted_dir(&store, &path)?;
+    store.set_profile(record.id, text.as_deref())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Ping {
+    ok: bool,
+    tokens: Option<u64>,
+}
+
+/// One tiny call on the cheapest model, to start the plan's window now. The
+/// schedule is the UI's (`anchor.ts`); this only sends and logs it.
+#[tauri::command]
+async fn anchor_ping(provider: ProviderId, store: State<'_, Store>) -> Result<Ping> {
+    let program = providers::which(provider.program())
+        .ok_or_else(|| AppError::new(ErrorKind::CliMissing, format!("{} is not installed.", provider.program())))?;
+    let (ok, usage) = intent::ping(provider, &program.to_string_lossy()).await;
+    store.record_ping(provider.program(), ok, usage.as_ref())?;
+    Ok(Ping { ok, tokens: usage.map(|u| u.input_tokens + u.cached_input_tokens + u.output_tokens) })
+}
+
+/// The settings the UI may read and change. Anything else is refused.
+const APP_SETTINGS: &[&str] = &["clarify", "anchor"];
+
+#[tauri::command]
+fn app_settings(store: State<Store>) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for key in APP_SETTINGS {
+        if let Some(value) = store.setting(key)? {
+            out.insert(key.to_string(), value);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn set_app_setting(key: String, value: String, store: State<Store>) -> Result<()> {
+    if !APP_SETTINGS.contains(&key.as_str()) {
+        return Err(AppError::new(ErrorKind::Invalid, "Unknown setting."));
+    }
+    store.set_setting(&key, &value)
+}
+
 #[tauri::command]
 fn recent_tasks(path: String, store: State<Store>) -> Result<Vec<store::TaskSummary>> {
     let dir = project::validate_dir(&path)?;
     store.recent_tasks(store.project(&dir.to_string_lossy())?.id, 20)
+}
+
+/// How this project's tasks ran and ended, newest first, for the Stats page.
+#[tauri::command]
+fn task_log(path: String, store: State<Store>) -> Result<Vec<store::TaskLogRow>> {
+    let dir = project::validate_dir(&path)?;
+    store.task_log(store.project(&dir.to_string_lossy())?.id, 1000)
 }
 
 /// Past runs across every remembered project, newest first.
@@ -1340,6 +1519,7 @@ fn rewind_task(
     }
     if let Some(saved) = saved {
         project::rewind_files(&dir, &saved, &files)?;
+        let _ = store.set_verdict(task_id, "rejected");
     }
     if keep > 0 {
         let mark = serde_json::json!({ "kind": "rewind", "data": { "keep": keep } });
@@ -1453,7 +1633,13 @@ fn main() {
             set_memory_limit,
             propose_memory_import,
             propose_memory_from_runs,
+            repo_profile,
+            set_repo_profile,
+            app_settings,
+            set_app_setting,
+            anchor_ping,
             recent_tasks,
+            task_log,
             global_tasks,
             rename_task,
             delete_task,
@@ -1618,6 +1804,7 @@ ELI5";
         let store = Store::in_memory().unwrap();
         let record = store.touch_project("nav", "nav").unwrap();
         let tracked = project::tracked_paths(&dir);
+        let (commits, co_change) = project::co_changes(&dir);
         store.scan_map(record.id, &dir, &tracked).unwrap();
         let signals = routing::RepoSignals {
             tracked_paths: tracked,
@@ -1627,6 +1814,12 @@ ELI5";
                 Ok(_) => Vec::new(),
                 Err(_) => store.code_map(record.id).unwrap(),
             },
+            // NAV_NOCO ranks without co-changes, for the before number.
+            co_change_weight: match std::env::var("NAV_NOCO") {
+                Ok(_) => 0.0,
+                Err(_) => project::co_change_weight(commits),
+            },
+            co_change,
             ..Default::default()
         };
         for prompt in prompts {
@@ -1670,6 +1863,8 @@ ELI5";
         fn json<T: serde::de::DeserializeOwned>(s: String) -> T {
             serde_json::from_value(serde_json::Value::String(s)).unwrap()
         }
+        // Nobody is there to answer a question before the run either.
+        store.set_setting("clarify", "off").unwrap();
         let mut request = begin(
             &store,
             None,
@@ -1680,6 +1875,8 @@ ELI5";
             json(var("BENCH_MODE")),
             None,
             Isolation::CurrentTree,
+            None,
+            None,
             None,
             None,
         )

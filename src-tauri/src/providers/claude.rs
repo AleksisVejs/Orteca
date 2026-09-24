@@ -37,6 +37,7 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
             .as_array()
             .map(|blocks| blocks.iter().filter_map(block).collect())
             .unwrap_or_default(),
+        "system" if v["subtype"] == "api_retry" => api_retry(v).into_iter().collect(),
         "result" => result(v),
         "user" => edit_result(v).into_iter().collect(),
         // Sent before the answer on every call; `allowed` and `allowed_warning`
@@ -59,6 +60,25 @@ pub fn parse_line(v: &Value) -> Vec<ProviderEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The CLI retries a failed API call by itself. A retry that cannot succeed -
+/// the account, not the request, is the problem - fails the run now instead
+/// of after every attempt. A short rate-limit or overload wait is left alone.
+/// Shape read from claude 2.1.280's bundle; not yet seen in a recording.
+fn api_retry(v: &Value) -> Option<ProviderEvent> {
+    let error = v["error"].as_str()?;
+    let (kind, message) = match error {
+        "billing_error" => (FailureKind::UsageLimit, "Claude reports a billing problem or a used-up plan."),
+        "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold" | "verification_required" => {
+            (FailureKind::AuthExpired, "Claude could not sign in to its account. Sign in again with `claude auth login`.")
+        }
+        "rate_limit" if v["retry_delay_ms"].as_u64().is_some_and(|ms| ms >= 60_000) => {
+            (FailureKind::RateLimit, "Claude is rate limited for more than a minute.")
+        }
+        _ => return None,
+    };
+    Some(ProviderEvent::Failed { kind, message: message.into() })
 }
 
 /// Claude returns a schema-constrained value in the final result event.
@@ -406,5 +426,16 @@ mod tests {
             classify_failure("You've hit your session limit · resets 4pm"),
             FailureKind::UsageLimit
         );
+    }
+
+    #[test]
+    fn an_api_retry_fails_only_when_retrying_cannot_help() {
+        let retry = |error: &str, ms: u64| parse_line(&serde_json::json!({"type": "system", "subtype": "api_retry",
+            "attempt": 1, "max_retries": 10, "retry_delay_ms": ms, "error_status": 429, "error": error}));
+        assert!(matches!(retry("billing_error", 500)[..], [ProviderEvent::Failed { kind: FailureKind::UsageLimit, .. }]));
+        assert!(matches!(retry("authentication_failed", 500)[..], [ProviderEvent::Failed { kind: FailureKind::AuthExpired, .. }]));
+        assert!(matches!(retry("rate_limit", 120_000)[..], [ProviderEvent::Failed { kind: FailureKind::RateLimit, .. }]));
+        assert!(retry("rate_limit", 2_000).is_empty());
+        assert!(retry("overloaded", 2_000).is_empty());
     }
 }

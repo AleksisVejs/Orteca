@@ -19,6 +19,9 @@ pub enum ErrorKind {
     CliMissing,
     /// The project has not been consented to. A run loads that repo's hooks.
     NotTrusted,
+    /// Not a failure: the request needs one answer before a run is worth it.
+    /// The message is the question.
+    Clarify,
     Invalid,
     Io,
     Db,

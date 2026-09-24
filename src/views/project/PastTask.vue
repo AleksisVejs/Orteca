@@ -99,6 +99,7 @@ const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current
   patchText: d.value?.patchText ?? null,
   // The task row keeps no saved state; only an exchange's own result does.
   savedState: null,
+  taskId: d.value?.id ?? null,
   verification: verificationSummary(savedArtifacts(current.value?.events ?? [])),
   route: route.value,
   routeSteps: routeSteps.value,

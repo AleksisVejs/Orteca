@@ -35,6 +35,8 @@ export type ErrorKind =
   | "notAGitRepo"
   | "cliMissing"
   | "notTrusted"
+  /** Not a failure: the message is one question to answer before the run. */
+  | "clarify"
   | "invalid"
   | "io"
   | "db";
@@ -156,10 +158,21 @@ export interface LimitWindow {
 }
 
 /** How much of a plan is used. No windows means no reading, and `unavailable` says why. */
+export interface RepoProfile {
+  /** What runs are sent: the user's own text, or the detected one. */
+  text: string;
+  detected: string;
+  custom: boolean;
+}
+
 export interface Limits {
   id: ProviderId;
   windows: LimitWindow[];
   unavailable: string | null;
+  /** `warning` at 80% of a window; `limited` when one is spent or a run hit the plan. */
+  status: "ok" | "warning" | "limited" | "unknown";
+  /** Unix seconds, when a limited provider can run again, if known. */
+  limitedUntil: number | null;
 }
 
 export type FailureKind =
@@ -202,6 +215,33 @@ export type RouteKind =
 /** Cheapest capable tier for this task class. It names a model and an effort
  *  on the provider's command line; see architecture §4.3.4. */
 export type Tier = "cheapest" | "standard" | "deep";
+
+export type TaskType = "chat" | "question" | "code_change" | "debug" | "plan";
+
+/** One task from the task log (migration 0013), for the Stats page. */
+export interface TaskLogRow {
+  id: number;
+  /** SQLite `datetime('now')`, UTC. */
+  startedAt: string;
+  status: TaskSummary["status"];
+  taskType: TaskType | null;
+  provider: ProviderId | null;
+  /** The model ID the CLI reported. */
+  model: string | null;
+  tier: Tier | null;
+  gate: "pass" | "fail" | "none" | null;
+  verdict: "accepted" | "rejected" | "retried" | null;
+  tokens: number | null;
+  costUsd: number | null;
+  costQuality: CostQuality | null;
+  toolsBeforeEdit: number | null;
+  /** From the `classified` event: `command` means the user picked the type. */
+  classifiedBy: "classifier" | "command" | "keywords" | null;
+  /** From the `classified` event: whether a question was asked, and answered or skipped. */
+  clarify: "none" | "answered" | "skipped" | null;
+  /** Of the files the run edited, the share the pre-run ranking named. Null when it edited none. */
+  fileRecall: number | null;
+}
 
 /** What a tier asks one provider for. */
 export interface ModelChoice {
@@ -257,6 +297,8 @@ export interface Route {
   candidateNotes?: string[];
   /** What each stage would have preferred to run on. Recorded, not acted on. */
   preferredProviders: ProviderId[];
+  /** Picks the ruleset and the tools. Missing on routes saved before task types. */
+  taskType?: TaskType;
 }
 
 /** One finished stage. `artifact` is null unless structured output came back
@@ -276,7 +318,8 @@ export interface StageNote {
 /** Why a run stopped short of its route. Neither a win nor a fault: the work,
  *  the diff and the usage are all kept, and going further is the user's call. */
 export interface BudgetStop {
-  limit: "calls" | "turns" | "tokens" | "review" | "verify";
+  /** `loop`: the agent repeated a failing command or an edit. */
+  limit: "calls" | "turns" | "tokens" | "review" | "verify" | "loop";
   allowed: number;
   observed: number;
   /** Stages the route still had. Nothing starts them automatically. */

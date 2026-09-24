@@ -89,6 +89,12 @@ async function projectView(api = {}) {
     forRouting: s => s,
     reference: () => ({ label: '', block: '' }),
     recentTasks: async () => [],
+    appSettings: async () => ({}),
+    setAppSetting: async () => {},
+    startAnchor: () => {},
+    work: { running: 0, lastEnd: 0 },
+    readAnchor: () => ({ mode: 'off', start: '09:00', end: '18:00', hours: 3, providers: ['claude'] }),
+    ANCHOR_OFF: { mode: 'off', start: '09:00', end: '18:00', hours: 3, providers: ['claude'] },
     gitStatus: async () => ({ ...gitState }),
     sendInstruction: async () => ({ disposition: 'live' }),
     isAppError: e => !!e?.message,
@@ -371,12 +377,12 @@ test('a reply goes on in the same task, unless that task ran in a copy', async (
     return { ...finished, taskId: 7, status: 'done', failure: null, summary: 'did it', worktree: calls.length === 2 ? {} : null };
   } });
   await state.run();
-  assert.equal(calls[0].at(-2), null, 'a first run opens its own task');
-  assert.equal(calls[0].at(-1), null, 'a first ask is routed on the whole prompt');
+  assert.equal(calls[0].at(-3), null, 'a first run opens its own task');
+  assert.equal(calls[0].at(-2), null, 'a first ask is routed on the whole prompt');
   state.reply.value = 'also this';
   await state.sendReply();
-  assert.equal(calls[1].at(-2), 7);
-  assert.equal(calls[1].at(-1), 'also this', 'the route reads the reply, not the exchange above it');
+  assert.equal(calls[1].at(-3), 7);
+  assert.equal(calls[1].at(-2), 'also this', 'the route reads the reply, not the exchange above it');
   assert.equal(calls[1][1], [
     'test',
     'Your answer:\ndid it',
@@ -384,7 +390,7 @@ test('a reply goes on in the same task, unless that task ran in a copy', async (
   ].join('\n\n'), 'the follow-up keeps user and assistant text under the correct labels');
   state.reply.value = 'and that';
   await state.sendReply();
-  assert.equal(calls[2].at(-2), null, 'a copy folder is not where the task is');
+  assert.equal(calls[2].at(-3), null, 'a copy folder is not where the task is');
 });
 
 test('a reply carries on in the run on screen, with its own attachments', async () => {
@@ -451,15 +457,15 @@ test('an old task from the sidebar can be replied to, and goes on in that task',
   await state.replyToPast();
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].at(-2), 42, 'it goes on in the task it was replying to');
-  assert.equal(calls[0].at(-1), 'now do the other half', 'the route reads the reply alone');
+  assert.equal(calls[0].at(-3), 42, 'it goes on in the task it was replying to');
+  assert.equal(calls[0].at(-2), 'now do the other half', 'the route reads the reply alone');
   assert.equal(calls[0][1], [
     'the original ask',
     'Your answer:' + String.fromCharCode(10) + 'what it did',
     'My reply:' + String.fromCharCode(10) + 'now do the other half',
     'Files changed so far: src/a.ts',
   ].join(String.fromCharCode(10, 10)), 'the recap carries the old exchange, since the session is cold');
-  assert.equal(calls[0].at(-3), null, 'a task this old has no session left to resume');
+  assert.equal(calls[0].at(-4), null, 'a task this old has no session left to resume');
 
   const row = state.runs.value[0];
   assert.equal(state.runs.value.length, 1, 'the reply opens one run for the task');
@@ -508,8 +514,8 @@ test('rewinding a task drops the later messages, puts their files back and sends
   const left = state.splitExchanges(past);
   assert.deepEqual([...left.map((p) => p.said)], ['first'], 'the chat ends before that message');
   assert.equal(calls.length, 1, 'the edited message is sent');
-  assert.equal(calls[0].at(-2), 42, 'in the same task');
-  assert.equal(calls[0].at(-1), 'second, but better');
+  assert.equal(calls[0].at(-3), 42, 'in the same task');
+  assert.equal(calls[0].at(-2), 'second, but better');
   assert.match(calls[0][1], /did first/, 'answering what came before it, not what was rewound');
   assert.doesNotMatch(calls[0][1], /did third/);
 
@@ -518,7 +524,7 @@ test('rewinding a task drops the later messages, puts their files back and sends
   assert.equal(rewinds.length, 1);
   assert.equal(calls.length, 2);
   assert.equal(calls[1][1], 'first, again');
-  assert.equal(calls[1].at(-2), null, 'a new task');
+  assert.equal(calls[1].at(-3), null, 'a new task');
 });
 
 test('activity is bounded even when a provider emits long messages', async () => {
@@ -1208,7 +1214,7 @@ test('a reply that hands off to the other CLI stays in its task', async () => {
     detectProviders: bothInstalled,
     providerLimits: reading(100, 30),
     startTask: async (...args) => {
-      sent.push({ provider: args[2], task: args.at(-2) });
+      sent.push({ provider: args[2], task: args.at(-3) });
       return outcomes.shift();
     },
   });

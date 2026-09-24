@@ -7,6 +7,7 @@ import SteerBox from "./SteerBox.vue";
 import ExchangeView from "./Exchange.vue";
 import Story from "./Story.vue";
 import { PROJECT, exchangeOf, rewindCode, storyOf } from "./state";
+import { unfinishedSummary } from "./taskPresentation";
 import { visiblePath } from "../../path";
 
 // The task on screen, as one chat from the first message to the reply after it.
@@ -17,7 +18,27 @@ const {
   removedCopies, confirmRemove, removeCopy, removeError, tokens,
   comparison, HISTORY_STATUS, formatTokens, sendReply, warmLeft,
   git, openGit, retryAt, waiting, waitForReset, cancelWait, formatWhen, lines, carryOn, rewindTo,
+  answerClarify,
 } = inject(PROJECT)!;
+// A run that finished out of sight: what was done, what failed, what waits on the user.
+const away = computed(() => {
+  const r = result.value;
+  if (!activeRun.value?.away || !r || running.value) return null;
+  const d = exchangeOf(r, lines.value);
+  const files = d.changed.byRun.length;
+  return {
+    title: unfinishedSummary(r.status),
+    lines: [
+      `${files} ${files === 1 ? "file" : "files"} changed · ${d.verification}`,
+      r.failure && `What failed: ${r.failure}`,
+      (r.status === "verifyFailed" || r.status === "reviewRejected") && "Needs your call: reply to fix it, or keep it as it is.",
+      d.changed.reverted.length && `${d.changed.reverted.length} of your own changes were undone. You can put them back below.`,
+      activeRun.value.handoff && `Needs your call: ${activeRun.value.handoff.to} can carry on on its own plan.`,
+    ].filter((l): l is string => typeof l === "string"),
+  };
+});
+const clarifyAnswer = ref("");
+watch(() => activeRun.value?.clarify, () => (clarifyAnswer.value = ""));
 
 // A copy's committed work is on its branch; a fresh run would start without it.
 // A failed or stopped run takes a reply like any other: "try again, but…".
@@ -178,6 +199,19 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
     <template v-if="running" #composer><SteerBox ref="steer" /></template>
 
     <template #notes>
+      <section v-if="away" class="away" role="status" aria-label="While you were away">
+        <p><strong>While you were away</strong> · {{ away.title }}</p>
+        <ul><li v-for="line in away.lines" :key="line" class="note">{{ line }}</li></ul>
+        <button class="link" @click="activeRun.away = false">Got it</button>
+      </section>
+      <form v-if="activeRun.clarify && !running" class="clarify" @submit.prevent="answerClarify(clarifyAnswer.trim())">
+        <p class="note">Before it starts: {{ activeRun.clarify.question }}</p>
+        <div class="clarify-row">
+          <input v-model="clarifyAnswer" aria-label="Your answer" placeholder="Your answer" />
+          <button class="btn" :disabled="!clarifyAnswer.trim()">Answer and run</button>
+          <button type="button" class="link" title="The agent says how it read the request, then does it" @click="answerClarify('')">Skip</button>
+        </div>
+      </form>
       <p v-if="waiting && waiting.prompt === activeRun.prompt" class="note" role="status">
         Carries on {{ formatWhen(waiting.at) }}, after {{ waiting.provider }}’s limit resets. Keep Orteca open.
         <button class="link" @click="cancelWait">Cancel</button>
@@ -197,7 +231,10 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
 
     <template v-if="result" #after>
       <!-- A budget stop hands the decision back rather than spending more. -->
-      <p v-if="result.budgetStop" class="note caveat">
+      <p v-if="result.budgetStop?.limit === 'loop'" class="note caveat">
+        {{ result.budgetStop.message }} What it changed is kept, and the stop counts toward moving this kind of task to a stronger model.
+      </p>
+      <p v-else-if="result.budgetStop" class="note caveat">
         Orteca stopped safely after using the planned limit.
         <template v-if="result.budgetStop.remaining.length">
           Still to do: {{ result.budgetStop.remaining.map(stageLabel).join(" → ") }}.
@@ -259,6 +296,37 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
 <style scoped src="./result.css"></style>
 <style scoped src="./chat.css"></style>
 <style scoped>
+.away {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+}
+.away p {
+  margin: 0;
+  color: var(--text);
+}
+.away ul {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+.clarify-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.clarify-row input {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 8px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font: inherit;
+}
 .early {
   padding: 16px 18px;
 }

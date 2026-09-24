@@ -770,6 +770,80 @@ Why a quick check, not the full suite, and not in parallel:
 **Not measured yet.** Whether the resumed Claude Fix is cheaper once its
 prompt cache has expired during a long Verify.
 
+### 4.3.11 Task types, rulesets and the task log — 2026-09-24
+
+Checked against claude 2.1.280 and codex-cli 0.155.1. `--system-prompt-file`,
+`--append-system-prompt-file` and `--max-turns` are hidden from `claude --help`
+but present; `developer_instructions`, `service_tier` and `rate_limits` are in
+the Codex binary; `codex exec resume` takes `--output-schema`.
+
+- **Task type beside difficulty.** `intent::TaskType` (chat, question,
+  code_change, debug, plan) picks the ruleset and tools; `Intent` still picks
+  route and tier. A plan runs as a read-only Answer. `/chat`, `/ask`, `/code`,
+  `/debug`, `/plan` pick it and skip the classifier.
+- **Classifier is JSON** (`--json-schema` / `--output-schema`): type,
+  difficulty, confidence, clarify, title, job, run, reply. Talk is answered in
+  that call and no agent starts. Unsure talk (< 0.6) is a question. A follow-up
+  is told the type it continues. Live, 2026-09-24: haiku ~2.2k in / 400-1500
+  out, $0.004-0.010, 8-22 s; Luna ~6.2k in / ~50 out, ~10 s. The instruction
+  says it runs outside the repository: told nothing, haiku saw its empty temp
+  folder and asked which project the request was about.
+- **Clarify.** A code_change, debug or plan the classifier cannot read asks one
+  question (`ErrorKind::Clarify`) before any task exists; the answer, or a
+  skip that has the agent state its reading, rides on the prompt. The reading
+  is kept, so the second try is not classified again. Setting `clarify=off`.
+- **Rulesets** are `src-tauri/rulesets/*.md`, base + type, with the repository
+  profile under them: Claude `--append-system-prompt-file` (chat:
+  `--system-prompt-file` and `--tools ""`), Codex `-c developer_instructions`
+  (never `model_instructions_file`, which the classifier alone keeps). Never
+  sent on a Codex resume; Claude's system-prompt snapshot ignores it on one.
+- **Repository profile** (`project::profile`, editable in Memory, stored in
+  `projects.profile`): commands, top folders, what not to read. Junk folders
+  also become Claude Read deny rules through `--settings`, a hint Grep and
+  Glob follow and a shell does not. No startup self-test: it would spend a call.
+- **Stripping still drops the user's own settings**: user deny rules, env and
+  model defaults (`--setting-sources project,local`), and all of Codex's
+  `config.toml`, profiles and sandbox defaults included (`--ignore-user-config`).
+- **Billing.** `ANTHROPIC_API_KEY` in the environment reads as `apiKey`.
+  `system/api_retry` with `billing_error` or an auth error fails the run at
+  once, `rate_limit` over a minute too. A spent plan marks the provider
+  `limited` until its window resets (`limits::block`); the next task's pick
+  skips it. `--fallback-model` is set per alias (`routing::claude_fallback`).
+- **Loops.** The same failing command three times with no edit between, or the
+  same edit three times, stops the stage as `budgetReached` (limit `loop`),
+  which counts toward `stalled_tiers`. No turn ceiling came back (§4.3.8).
+- **Gates.** Code changes and fixes that touch JS also run the repository's
+  lint, type-check and build scripts (on a PHP-only change `npm run build`
+  cost 26-75 s a Verify and could fail nothing); one counts only when its output names a file
+  the run changed, so a failure that was already there buys no Fix. A Fix is
+  handed only the lines that say what failed. Existing tests changed without
+  being asked for are flagged in the summary.
+- **Files.** Git co-changes rank siblings of the top matches, off under 150
+  commits: `navstats --recall` LiftMe (119 commits) 73% unchanged, RigInspect
+  61% -> 68%; on for LiftMe they cost 5 points. Files earlier tasks read or
+  changed, when their prompt shares this one's rarer words, rank too
+  (`task_files`); the offline recall has no history, so that part is unmeasured.
+- **Second opinion.** A Codex code change over 100 lines is reviewed by Claude
+  (opus medium, fresh session) when Claude is signed in to its plan. Advisory:
+  findings go in the summary, a `crossReview` event logs lines, findings and
+  cost. Claude's work is never sent to Codex.
+- **Checkpoints.** Every run in the current tree saves `refs/orteca/before/`,
+  a clean one too, so a moved branch cannot take the undo point with it.
+- **Window anchoring** (`views/project/anchor.ts`, Agents page, off by
+  default): one tiny cheapest-model call before work (start − (5 − N) h) or
+  right after each reset inside work hours; skipped while a task runs or ran in
+  the last 30 minutes, or more than 10 minutes late. `pings` logs each cost.
+- **Task log** (migration 0013): `task_type`, `ruleset` (`name@hash`), `turns`,
+  `tools_before_edit`, `gate`, `verdict` (commit on the run's base or a merge
+  = accepted, a rewind with files = rejected, the same prompt again = retried),
+  plus a `classified` event (type, confidence, source, clarify answered).
+
+Measured the same day, RigInspectBE `easy`, one run per arm, 0280b56 against
+this: Claude 3/3 both, $0.41 / 159 s -> $0.25 / 143 s; Codex 3/3 both,
+$0.17 / 336 s -> $0.01 / 268 s. Most of Codex's drop is the route: the JSON
+classifier read the task as easy, so it ran without the Sol Review the old
+run bought. One sample each; not yet a baseline.
+
 ### Parked: replace the CLI's own system prompt
 
 Most of each turn's ~21k is the CLI's built-in system prompt, not Orteca's

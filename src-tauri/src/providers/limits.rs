@@ -35,6 +35,71 @@ pub struct Limits {
     pub windows: Vec<Window>,
     /// Why there are no windows. An unread limit is never shown as an empty one.
     pub unavailable: Option<String>,
+    /// `ok`, `warning` (a window is 80% used), `limited`, or `unknown`.
+    pub status: &'static str,
+    /// When a limited provider can run again, in Unix seconds, if it said.
+    pub limited_until: Option<i64>,
+}
+
+/// A provider a run found out of plan, until it resets (Unix seconds,
+/// `i64::MAX` when it did not say). A reading with room left clears it.
+static BLOCKED: Mutex<[Option<i64>; 2]> = Mutex::new([None, None]);
+
+fn slot(id: ProviderId) -> usize {
+    match id {
+        ProviderId::Claude => 0,
+        ProviderId::Codex => 1,
+    }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A run stopped on this provider's plan: nothing more goes to it until the
+/// spent window resets.
+pub fn block(id: ProviderId) {
+    let until = streamed(id)
+        .unwrap_or_default()
+        .iter()
+        .filter(|w| w.used_percent >= 100.0)
+        .filter_map(|w| w.resets_at)
+        .max()
+        .unwrap_or(i64::MAX);
+    if let Ok(mut blocked) = BLOCKED.lock() {
+        blocked[slot(id)] = Some(until);
+    }
+}
+
+fn clear_if_room(id: ProviderId, windows: &[Window]) {
+    if !windows.is_empty() && windows.iter().all(|w| w.used_percent < 100.0) {
+        if let Ok(mut blocked) = BLOCKED.lock() {
+            blocked[slot(id)] = None;
+        }
+    }
+}
+
+fn reading(id: ProviderId, windows: Vec<Window>, unavailable: Option<String>) -> Limits {
+    let blocked = BLOCKED.lock().ok().and_then(|b| b[slot(id)]).filter(|until| *until > now());
+    let full = windows.iter().filter(|w| w.used_percent >= 100.0).filter_map(|w| w.resets_at).max();
+    let status = if blocked.is_some() || windows.iter().any(|w| w.used_percent >= 100.0) {
+        "limited"
+    } else if windows.iter().any(|w| w.used_percent >= 80.0) {
+        "warning"
+    } else if windows.is_empty() {
+        "unknown"
+    } else {
+        "ok"
+    };
+    Limits {
+        id,
+        windows,
+        unavailable,
+        status,
+        limited_until: full.or(blocked).filter(|at| *at != i64::MAX),
+    }
 }
 
 /// Starting a CLI is two seconds before it says anything; `/usage` also reads
@@ -82,6 +147,9 @@ pub fn remember(id: ProviderId, v: &Value) {
         return;
     }
     if let Some(windows) = parse_claude_event(v) {
+        if v["rate_limit_info"]["status"] != "rejected" {
+            clear_if_room(id, &windows);
+        }
         keep(windows);
     }
 }
@@ -126,18 +194,10 @@ fn streamed(id: ProviderId) -> Option<Vec<Window>> {
 /// Orteca's own Claude calls - runs, the classify call, commit drafts - were
 /// told on the way, and none at all until one has run.
 pub async fn read(id: ProviderId, fresh: bool) -> Limits {
-    let none = |why: String| Limits {
-        id,
-        windows: Vec::new(),
-        unavailable: Some(why),
-    };
+    let none = |why: String| reading(id, Vec::new(), Some(why));
     // A run just told us. Asking again would start a process to be told the same.
     if let Some(windows) = streamed(id).filter(|_| !fresh) {
-        return Limits {
-            id,
-            windows,
-            unavailable: None,
-        };
+        return reading(id, windows, None);
     }
     if id == ProviderId::Claude && !fresh {
         return none("not read since Orteca started. Claude reports it with every call, so the next run shows it; Refresh asks now with one small haiku call".into());
@@ -158,11 +218,8 @@ pub async fn read(id: ProviderId, fresh: bool) -> Limits {
             if id == ProviderId::Claude {
                 keep(windows.clone());
             }
-            Limits {
-                id,
-                windows,
-                unavailable: None,
-            }
+            clear_if_room(id, &windows);
+            reading(id, windows, None)
         }
         Ok(Err(why)) => none(why),
         Err(_) => none(format!(

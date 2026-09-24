@@ -26,7 +26,9 @@ use crate::project::{self, FileStat};
 use crate::providers::{
     claude, codex, CostQuality, FailureKind, ProviderEvent, ProviderId, Steering, Usage,
 };
+use crate::intent::TaskType;
 use crate::routing::{self, Route, Stage, StageNote};
+use crate::rules;
 use crate::store::{Baseline, Store};
 
 // Commands the agent may never run, in either shell. Deny beats allow, so these
@@ -391,6 +393,8 @@ pub struct StagePlan {
     /// no Bash or PowerShell, two fewer tool schemas on every turn. Codex's only
     /// tool is its shell, so it ignores this.
     pub shell: bool,
+    /// The task's rules and repository profile, the same for every stage.
+    pub ruleset: Option<rules::Ruleset>,
 }
 
 impl StagePlan {
@@ -489,9 +493,13 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             plan.schema.as_deref().map_or_else(Vec::new, |path| {
                 vec![arg("--output-schema"), path.display().to_string()]
             }),
+            // Added to Codex's own prompt, never replacing it.
+            plan.ruleset.as_ref().map_or_else(Vec::new, |rules| vec![arg("-c"), rules.codex_arg()]),
         ]
         .concat(),
         ProviderId::Claude => {
+            // Talk needs neither tools nor the agent prompt that explains them.
+            let chat = plan.ruleset.as_ref().is_some_and(|r| r.task_type == TaskType::Chat);
             let mut args = vec![
                 arg("-p"),
                 arg("--output-format"),
@@ -511,7 +519,9 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 // Without the user's settings every built-in tool schema loads
                 // in full. No stage uses the rest; the grants below narrow these.
                 arg("--tools"),
-                arg(if plan.shell {
+                arg(if chat {
+                    ""
+                } else if plan.shell {
                     "Bash,PowerShell,Read,Edit,Write,Glob,Grep"
                 } else if plan.stage == Stage::Answer {
                     // A question about the world outside the repo needs the web.
@@ -543,6 +553,13 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             args.extend(claude_deny(writes));
             args.extend(schema_arg(plan));
             args.extend(model_args(id, plan));
+            if let Some(settings) = plan.ruleset.as_ref().and_then(rules::Ruleset::claude_settings) {
+                args.extend([arg("--settings"), settings]);
+            }
+            if let Some(file) = plan.ruleset.as_ref().and_then(rules::Ruleset::file) {
+                let flag = if chat { "--system-prompt-file" } else { "--append-system-prompt-file" };
+                args.extend([arg(flag), file.display().to_string()]);
+            }
             args
         }
     }
@@ -554,12 +571,14 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
 fn model_args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
     let choice = plan.model(id);
     match id {
-        ProviderId::Claude => vec![
-            "--model".into(),
-            choice.model,
-            "--effort".into(),
-            choice.effort,
-        ],
+        ProviderId::Claude => {
+            let fallback = routing::claude_fallback(&choice.model);
+            let mut args = vec!["--model".into(), choice.model, "--effort".into(), choice.effort];
+            if let Some(fallback) = fallback {
+                args.extend(["--fallback-model".into(), fallback.into()]);
+            }
+            args
+        }
         ProviderId::Codex => vec![
             "--model".into(),
             choice.model,
@@ -805,6 +824,11 @@ pub struct Request {
     /// Run a command the agent hands over (`ORTECA-WAIT:`) without asking the
     /// user first. The blocked-command list applies either way.
     pub auto_wait: bool,
+    /// The task's rules and repository profile, sent with every stage.
+    pub ruleset: rules::Ruleset,
+    /// Talk the classify call already answered: the run records it and
+    /// starts no agent.
+    pub reply: Option<String>,
 }
 
 pub type OnChecking = Box<dyn Fn(&TaskResult) + Send + Sync>;
@@ -1013,6 +1037,59 @@ struct State {
     /// What the writing stages did with tools, for a run that changed
     /// nothing: whether any tool ran at all, and whether an edit was refused.
     work: WorkSeen,
+    /// Tool calls so far, how many came before the first edit, and the files
+    /// the agent read: the task log's record of how it went about the work.
+    tools_seen: u32,
+    first_edit: Option<u32>,
+    read: Vec<String>,
+    /// Watches the current stage for an agent going round in circles.
+    loops: Loops,
+}
+
+/// The same failing command three times with no edit between, or the same
+/// edit made three times: the agent is going round in circles. A command that
+/// fails again after an edit is ordinary work and starts the count over.
+#[derive(Default)]
+struct Loops {
+    last_shell: Option<String>,
+    failed: HashMap<String, u32>,
+    edits: HashMap<String, u32>,
+}
+
+const LOOP: u32 = 3;
+
+impl Loops {
+    fn saw(&mut self, event: &ProviderEvent) -> Option<String> {
+        let changes = match event {
+            ProviderEvent::ToolUse { name, summary, .. } if matches!(name.as_str(), "Bash" | "PowerShell") => {
+                self.last_shell = Some(summary.clone());
+                return None;
+            }
+            ProviderEvent::ToolResult { failed: true, changes, .. } if changes.is_empty() => {
+                let command = self.last_shell.take()?;
+                return self.failed(command);
+            }
+            ProviderEvent::ToolUse { changes, .. } | ProviderEvent::ToolResult { failed: false, changes, .. } => changes,
+            _ => return None,
+        };
+        let mut again = None;
+        for change in changes {
+            let Some(patch) = &change.patch else { continue };
+            self.failed.clear();
+            let n = self.edits.entry(format!("{}\n{patch}", change.path)).or_default();
+            *n += 1;
+            if *n >= LOOP {
+                again = Some(format!("made the same edit to {} {LOOP} times", change.path));
+            }
+        }
+        again
+    }
+
+    fn failed(&mut self, command: String) -> Option<String> {
+        let n = self.failed.entry(command.clone()).or_default();
+        *n += 1;
+        (*n >= LOOP).then(|| format!("ran `{command}` {LOOP} times and it failed each time, with no edit between"))
+    }
 }
 
 /// A writing stage that ends with the tree untouched is one of three things.
@@ -1077,6 +1154,22 @@ impl State {
             timings,
             flaky: Vec::new(),
             work: WorkSeen::default(),
+            tools_seen: 0,
+            first_edit: None,
+            read: Vec::new(),
+            loops: Loops::default(),
+        }
+    }
+
+    fn track(&mut self, event: &ProviderEvent) {
+        if let ProviderEvent::ToolUse { name, summary, changes, .. } = event {
+            if !changes.is_empty() || CLAUDE_EDIT_TOOLS.contains(&name.as_str()) {
+                self.first_edit.get_or_insert(self.tools_seen);
+            }
+            self.tools_seen += 1;
+            if name == "Read" && !summary.is_empty() {
+                self.read.push(summary.clone());
+            }
         }
     }
 
@@ -1139,6 +1232,8 @@ pub async fn stream(
         timings,
         checking,
         auto_wait,
+        ruleset,
+        reply,
     } = request;
     // Registered before the CLI is even spawned: a run is stoppable from the
     // moment the user can see it, including while a slow Node shim starts up.
@@ -1155,6 +1250,7 @@ pub async fn stream(
             model: model.as_ref().map(|choice| choice.model.clone()),
             effort: model.as_ref().map(|choice| choice.effort.clone()),
             shell: true,
+            ruleset: Some(ruleset.clone()),
         },
         final_stage: true,
         attachments,
@@ -1163,14 +1259,12 @@ pub async fn stream(
     };
     // The folder as it was, saved before any agent can touch it, so whatever
     // the run undoes can be put back and the task rewound to before it. A
-    // clean folder is its commit already.
-    let saved_state = before_run.as_ref().filter(|_| worktree.is_none()).and_then(|_| {
-        if dirty_at_start {
-            project::save_state(&ctx.dir, base_commit.as_deref(), task_id)
-        } else {
-            base_commit.clone()
-        }
-    });
+    // clean folder gets its hidden ref too, so a reset branch cannot take the
+    // undo point with it; its commit is the fallback.
+    let saved_state = before_run
+        .as_ref()
+        .filter(|_| worktree.is_none())
+        .and_then(|_| project::save_state(&ctx.dir, base_commit.as_deref(), task_id).or_else(|| base_commit.clone()));
     let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
     // Memory is standing instructions that outlive the run: global, then project.
     state.constraints = store.memory_for_task(task_id).unwrap_or_default();
@@ -1202,6 +1296,14 @@ pub async fn stream(
             let _ = record(store, task_id, "classify", id, event);
         }
         state.outcome.begin_process();
+    }
+
+    // Talk the classify call already answered: said, recorded, and no agent.
+    if let Some(reply) = &reply {
+        let event = ProviderEvent::Text(reply.clone());
+        let _ = record(store, task_id, "answer", id, &event).and_then(|()| emit(&event));
+        state.outcome.result = reply.clone();
+        state.outcome.finished = true;
     }
 
     // The change so far, shown while its full suite still runs. Never `done`:
@@ -1256,7 +1358,7 @@ pub async fn stream(
 
     // Mutable because a failed check is followed by a Fix and the same check.
     // An independent Review runs at most once; its fix is judged by Verify.
-    let mut stages = route.stages.clone();
+    let mut stages = if reply.is_some() { Vec::new() } else { route.stages.clone() };
     let mut index = 0;
     // The agent configuration each stage's CLI loads from the folder. A stage
     // that changes it (a hook in `.claude/settings.json`) must not have the
@@ -1277,7 +1379,7 @@ pub async fn stream(
             );
             break;
         }
-        ctx.plan = stage_plan(&route, model.as_ref(), id, task_id, &stages, index);
+        ctx.plan = stage_plan(&route, model.as_ref(), id, task_id, &stages, index, Some(&ruleset));
         ctx.final_stage = index + 1 == stages.len();
         let completed = state.notes.len();
         let current = if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
@@ -1292,6 +1394,7 @@ pub async fn stream(
             current,
         });
         state.outcome.begin_stage();
+        state.loops = Loops::default();
         let stage_started = now_ms();
         state.structured = None;
         state.session = None;
@@ -1306,7 +1409,7 @@ pub async fn stream(
         // Review runs while the suite does, and one Fix answers both.
         if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
             let review_ctx = Context {
-                plan: stage_plan(&route, model.as_ref(), id, task_id, &stages, index + 1),
+                plan: stage_plan(&route, model.as_ref(), id, task_id, &stages, index + 1, Some(&ruleset)),
                 final_stage: index + 2 == stages.len(),
                 ..ctx.clone()
             };
@@ -1328,6 +1431,7 @@ pub async fn stream(
                 before_run: before_run.as_ref(),
                 requested_build: route.signals.requested_build,
                 requested_lint: route.signals.requested_lint,
+                gates: matches!(route.task_type, TaskType::CodeChange | TaskType::Debug),
             };
             let mut side = state.beside(&ctx);
             let (to_review, mut review_control) = mpsc::unbounded_channel();
@@ -1404,6 +1508,7 @@ pub async fn stream(
                     before_run: before_run.as_ref(),
                     requested_build: route.signals.requested_build,
                     requested_lint: route.signals.requested_lint,
+                    gates: matches!(route.task_type, TaskType::CodeChange | TaskType::Debug),
                 },
                 &show_checking,
             )
@@ -1485,7 +1590,9 @@ pub async fn stream(
             if stage.writes() && state.session.is_some() {
                 state.work_session = state.session.clone();
             }
-            if let Some(session) = state.session.clone().filter(|_| stage.writes() || stage == Stage::Answer) {
+            // A chat session has no tools and no agent prompt; work cannot go on in it.
+            let resumable = stage.writes() || (stage == Stage::Answer && route.task_type != TaskType::Chat);
+            if let Some(session) = state.session.clone().filter(|_| resumable) {
                 state.resume_point = Some(Resume {
                     session,
                     model: ctx.plan.model(id).model,
@@ -1563,6 +1670,20 @@ pub async fn stream(
         }
         index += 1;
     }
+
+    // Codex wrote a large change: Claude reads it in a fresh session. Never
+    // the other way round, and advisory: nothing is fixed or failed on it.
+    let second_opinion = if id == ProviderId::Codex
+        && state.outcome.failure.is_none()
+        && !state.outcome.cancelled
+        && state.budget_stop.is_none()
+        && matches!(route.task_type, TaskType::CodeChange | TaskType::Debug)
+    {
+        let words = CrossReview { route: &route, prompt: &prompt, constraints: &state.constraints, ruleset: &ruleset };
+        cross_review(store, &ctx, &mut control, &emit, words, base_commit.as_deref(), before_run.as_ref(), recordings.as_deref()).await
+    } else {
+        None
+    };
 
     let dir = ctx.dir;
     let mut outcome = state.outcome;
@@ -1647,6 +1768,9 @@ pub async fn stream(
         });
     }
     let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if outcome.failure_kind() == Some(FailureKind::UsageLimit) {
+        crate::providers::limits::block(id);
+    }
     if let (Some(message), Some(kind)) = (&outcome.failure, outcome.failure_kind()) {
         let event = ProviderEvent::Failed {
             kind,
@@ -1674,6 +1798,29 @@ pub async fn stream(
             outcome.status()
         };
     let mut summary = final_words(&state.notes, status == "done").unwrap_or_else(|| outcome.summary());
+    // Existing tests the task never mentioned, changed: flagged, never undone.
+    let lower = prompt.to_lowercase();
+    let tests: Vec<String> = diff
+        .iter()
+        .filter(|f| f.origin != Some(project::Origin::BeforeRun) && routing::is_test(&f.path))
+        .filter(|f| !patch_text.as_deref().is_some_and(|p| p.contains(&format!("diff --git a/{0} b/{0}
+new file mode", f.path))))
+        .map(|f| format!("`{}`", f.path))
+        .collect();
+    if !tests.is_empty() && !lower.contains("test") && !lower.contains("spec") {
+        let flag = format!(
+            "
+
+It changed existing tests the task did not ask about: {}. Check that it did not weaken them.",
+            tests.join(", ")
+        );
+        let payload = serde_json::json!({ "kind": "flag", "data": { "tests": tests } }).to_string();
+        let _ = store.append_event(task_id, "run", "flag", id.program(), &payload);
+        summary.push_str(&flag);
+    }
+    if let Some(review) = &second_opinion {
+        summary.push_str(review);
+    }
     if status == "done" {
         summary.push_str(&open_findings(&state.notes));
         if !state.flaky.is_empty() {
@@ -1707,6 +1854,32 @@ These checks failed once and passed when run again, so they count as passed: {}.
         outcome.failure = Some(format!("could not finish task record: {}", e.message));
     }
 
+    let gate = state
+        .notes
+        .iter()
+        .rev()
+        .find(|n| matches!(n.stage, Stage::Verify | Stage::Fix))
+        .map_or("none", |n| {
+            if n.artifact.as_ref().is_some_and(|a| routing::stage_passed(n.stage, a)) { "pass" } else { "fail" }
+        });
+    let _ = store.log_task(
+        task_id,
+        &crate::store::TaskLog {
+            task_type: route.task_type.name(),
+            ruleset: &ruleset.label,
+            turns: state.turns_used,
+            tools_before_edit: state.first_edit,
+            gate,
+        },
+    );
+    let read: Vec<String> = state.read.iter().filter_map(|p| relative(&dir, p)).collect();
+    let edited: Vec<String> = diff
+        .iter()
+        .filter(|f| f.origin != Some(project::Origin::BeforeRun))
+        .map(|f| f.path.clone())
+        .collect();
+    let _ = store.record_files(task_id, &read, &edited);
+
     let result = TaskResult {
         task_id,
         status,
@@ -1739,6 +1912,108 @@ These checks failed once and passed when run again, so they count as passed: {}.
     result
 }
 
+/// A path an agent named, relative to the repository, `/`-separated. `None`
+/// for one outside it.
+fn relative(dir: &Path, path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let root = dir.to_string_lossy().replace('\\', "/");
+    let root = root.trim_start_matches("//?/").trim_end_matches('/');
+    if !Path::new(&path).is_absolute() {
+        return Some(path);
+    }
+    // The CLI may spell the drive letter in another case.
+    let head = path.get(..root.len())?;
+    head.eq_ignore_ascii_case(root)
+        .then(|| path[root.len()..].strip_prefix('/').map(str::to_string))
+        .flatten()
+}
+
+/// Changed lines above which a Codex change gets Claude's second opinion.
+const CROSS_REVIEW_LINES: u64 = 100;
+
+struct CrossReview<'a> {
+    route: &'a Route,
+    prompt: &'a str,
+    constraints: &'a [String],
+    ruleset: &'a rules::Ruleset,
+}
+
+/// Claude's review of a large Codex change, as words for the summary, when
+/// Claude is signed in to its plan. Its cost and findings are logged as a
+/// `crossReview` event, so whether it earns its keep can be counted.
+#[allow(clippy::too_many_arguments)]
+async fn cross_review(
+    store: &Store,
+    ctx: &Context,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    words: CrossReview<'_>,
+    base: Option<&str>,
+    before: Option<&project::Snapshot>,
+    recordings: Option<&Path>,
+) -> Option<String> {
+    let mut diff = project::diff_since(&ctx.dir, base).ok()?;
+    project::attribute(&ctx.dir, &mut diff, before);
+    let lines: u64 = diff
+        .iter()
+        .filter(|f| f.origin != Some(project::Origin::BeforeRun))
+        .map(|f| f.added.unwrap_or(0) + f.deleted.unwrap_or(0))
+        .sum();
+    if lines < CROSS_REVIEW_LINES {
+        return None;
+    }
+    let claude = ProviderId::Claude.detect_async().await;
+    let program = PathBuf::from(claude.path.filter(|_| claude.auth == crate::providers::Auth::Subscription)?);
+    let plan = StagePlan {
+        stage: Stage::Review,
+        schema: write_schema(ctx.task_id, Stage::Review),
+        tier: routing::Tier::Deep,
+        model: None,
+        effort: Some("medium".into()),
+        shell: true,
+        ruleset: Some(words.ruleset.clone()),
+    };
+    let review = Context { id: ProviderId::Claude, program, plan, final_stage: true, ..ctx.clone() };
+    let mut brief = routing::brief(words.route, Stage::Review, words.prompt, words.constraints, &[], false);
+    brief.push_str(&review_context(&ctx.dir, base, before));
+    let _ = note(store, &review, "stage", &stage_payload(Stage::Review, 0, 1, &review.plan, ProviderId::Claude));
+    let mut side = State::new(Recording::new(recordings, ctx.task_id, Stage::Review, ProviderId::Claude), Vec::new());
+    let launch = Launch::first(ProviderId::Claude, &brief, &review.plan);
+    call(store, &review, &mut side, control, emit, launch).await;
+    let artifact = side.structured.filter(|a| routing::artifact_is_valid(Stage::Review, a));
+    let findings: Vec<serde_json::Value> = artifact
+        .as_ref()
+        .and_then(|a| a["findings"].as_array().cloned())
+        .unwrap_or_default();
+    let logged = serde_json::json!({ "kind": "crossReview", "data": {
+        "lines": lines,
+        "findings": findings.len(),
+        "serious": findings.iter().filter(|f| f["severity"] != "low").count(),
+        "usage": side.outcome.usage,
+        "failure": side.outcome.failure,
+    }});
+    let _ = note(store, &review, "crossReview", &logged.to_string());
+    if findings.is_empty() {
+        return artifact.map(|_| "\n\nClaude also reviewed this change and raised nothing.".into());
+    }
+    let listed: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "- {} `{}:{}` {}",
+                f["severity"].as_str().unwrap_or("?"),
+                f["file"].as_str().unwrap_or("?"),
+                f["line"],
+                f["issue"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    Some(format!(
+        "\n\nClaude also reviewed this change. Its findings are advice; nothing was changed for them:\n{}",
+        listed.join("\n")
+    ))
+}
+
 /// What `stages[index]` asks of the CLI.
 fn stage_plan(
     route: &Route,
@@ -1747,6 +2022,7 @@ fn stage_plan(
     task_id: i64,
     stages: &[Stage],
     index: usize,
+    ruleset: Option<&rules::Ruleset>,
 ) -> StagePlan {
     let stage = stages[index];
     // A Fix stays on the tier that wrote the change: a resumed session on
@@ -1784,6 +2060,7 @@ fn stage_plan(
         // tool schemas cost more than that is worth on every question.
         // Implement keeps them so a resumed Fix sees the same tool list.
         shell: stage != Stage::Answer,
+        ruleset: ruleset.cloned(),
     }
 }
 
@@ -1909,6 +2186,8 @@ struct VerifyScope<'a> {
     before_run: Option<&'a project::Snapshot>,
     requested_build: bool,
     requested_lint: bool,
+    /// Also run the lint, type-check and build scripts: code changes and fixes.
+    gates: bool,
 }
 
 /// Returns `None` when Orteca cannot run the checks itself, otherwise whether
@@ -1937,7 +2216,18 @@ async fn verify_locally(
             command.install = None;
         }
     }
+    // Gates the user did not ask for count only against this run's own files.
+    let gates: Vec<project::Check> = if scope.gates { project::gate_commands(&ctx.dir, &changed_paths) } else { Vec::new() }
+        .into_iter()
+        .filter(|g| !requested.iter().chain(&candidates).any(|c| c.test == g.test && c.dir == g.dir))
+        .collect();
+    let is_gate = |check: &project::Check| gates.iter().any(|g| g.test == check.test && g.dir == check.dir);
     candidates.extend(requested);
+    candidates.extend(gates.iter().cloned().map(|mut g| {
+        // One install per folder is enough: the test suite's, or the first gate's.
+        g.install = None;
+        g
+    }));
     let (checks, missing): (Vec<_>, Vec<_>) = candidates.into_iter().partition(runnable);
     if checks.is_empty() {
         return None;
@@ -2040,6 +2330,17 @@ async fn verify_locally(
             Ran::NotStarted => {}
             // A failed install is reported under its suite, with what it printed.
             Ran::Finished { mut passed, output } => {
+                // A gate that fails only on files this run did not touch failed
+                // before it too; fixing those is not this task.
+                // ponytail: a change can break a file it never touched; that
+                // passes here. Compare with the base commit if it bites.
+                if !passed && is_gate(check) && !names_any(&output, &changed_paths) {
+                    passed = true;
+                    let event = ProviderEvent::Text(format!(
+                        "{shown} failed only on files this run did not change, so it counts as passed"
+                    ));
+                    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+                }
                 if !passed && php_warnings_only(&shown, &output, &changed_paths) {
                     passed = true;
                     let event = ProviderEvent::Text(format!(
@@ -2070,6 +2371,12 @@ async fn verify_locally(
         "verdict": if passed { "pass" } else { "fail" },
     }));
     Some(passed)
+}
+
+/// Whether a check's output names any of these files, by path or file name.
+fn names_any(output: &str, paths: &[String]) -> bool {
+    let output = output.replace('\\', "/");
+    paths.iter().any(|p| output.contains(p.as_str()) || p.rsplit('/').next().is_some_and(|name| output.contains(name)))
 }
 
 /// The failed checks that also fail at the base commit: the test files they
@@ -3891,6 +4198,15 @@ async fn attempt(
                     }
                 }
                 let mut events = ctx.id.parse_line(&value);
+                // Codex says a command failed only in the raw item.
+                let item = &value["item"];
+                let mut looped = (ctx.id == ProviderId::Codex
+                    && value["type"] == "item.completed"
+                    && item["type"] == "command_execution"
+                    && (item["status"] == "failed" || item["exit_code"].as_i64().is_some_and(|c| c != 0)))
+                .then(|| item["command"].as_str().map(|c| state.loops.failed(c.to_string())))
+                .flatten()
+                .flatten();
                 if let Some(snapshots) = &mut edit_snapshots {
                     snapshots.complete(&value, &mut events);
                 }
@@ -3956,6 +4272,8 @@ async fn attempt(
                     if ctx.plan.stage.writes() {
                         state.work.saw(&event);
                     }
+                    state.track(&event);
+                    looped = looped.or_else(|| state.loops.saw(&event));
                     if let ProviderEvent::Done {
                         structured, turns, ..
                     } = &event
@@ -3985,6 +4303,19 @@ async fn attempt(
                     }
                 }
                 if state.outcome.failure.is_some() {
+                    break;
+                }
+                // Stopped, not failed: the work so far stays, and the stall
+                // counts against this tier, so the next run of the route goes
+                // one up. Leaving the loop closes the process's job.
+                if let Some(why) = looped.filter(|_| ending.is_none()) {
+                    let message = format!("Orteca stopped {}: it {why}.", ctx.id.program());
+                    let stop = BudgetStop { limit: "loop", allowed: LOOP.into(), observed: LOOP.into(), remaining: Vec::new(), message: message.clone() };
+                    let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
+                    let event = ProviderEvent::Text(message);
+                    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+                    state.budget_stop = Some(stop);
+                    state.halt = true;
                     break;
                 }
                 if ending.is_none() && state.apply_now_pending {
@@ -4214,6 +4545,7 @@ mod tests {
             model: None,
             effort: None,
             shell: true,
+            ruleset: None,
         }
     }
 
@@ -4294,6 +4626,31 @@ mod tests {
         assert!(usage.reasoning_tokens <= usage.output_tokens);
     }
 
+    #[test]
+    fn a_loop_is_the_same_failure_with_no_edit_between() {
+        let mut loops = Loops::default();
+        let shell = ProviderEvent::ToolUse { name: "Bash".into(), summary: "npm test".into(), id: None, changes: vec![] };
+        let failed = ProviderEvent::ToolResult { id: "t".into(), changes: vec![], failed: true };
+        let edit = ProviderEvent::ToolResult {
+            id: "e".into(),
+            changes: vec![crate::providers::FileEdit { path: "a.rs".into(), patch: Some("+x".into()) }],
+            failed: false,
+        };
+        for _ in 0..2 {
+            loops.saw(&shell);
+            assert!(loops.saw(&failed).is_none());
+        }
+        assert!(loops.saw(&edit).is_none(), "an edit starts the count over");
+        for _ in 0..2 {
+            loops.saw(&shell);
+            assert!(loops.saw(&failed).is_none());
+        }
+        loops.saw(&shell);
+        assert!(loops.saw(&failed).is_some());
+        assert!(loops.saw(&edit).is_none());
+        assert!(loops.saw(&edit).is_some(), "the same edit a third time");
+    }
+
     fn task_request(store: &Store, label: &str) -> Request {
         let dir =
             std::env::temp_dir().join(format!("orteca-stream-{label}-{}", std::process::id()));
@@ -4329,6 +4686,8 @@ mod tests {
             timings: Vec::new(),
             checking: None,
             auto_wait: false,
+            ruleset: rules::Ruleset::new(TaskType::CodeChange, ""),
+            reply: None,
             id: ProviderId::Codex,
             program: dir.join("fake.cmd"),
             dir,
@@ -5468,8 +5827,12 @@ ping -n 60 127.0.0.1 >nul
             model: None,
             effort: None,
             shell: true,
+            ruleset: Some(rules::Ruleset::new(TaskType::Plan, "")),
         };
         let claude = args(ProviderId::Claude, &plan);
+        assert!(claude.contains(&"--append-system-prompt-file".to_string()));
+        assert!(claude.windows(2).any(|w| w == ["--fallback-model", "sonnet"]));
+        assert!(args(ProviderId::Codex, &plan).iter().any(|a| a.starts_with("developer_instructions=")));
         assert!(
             !claude.contains(&"--max-turns".to_string()),
             "a stage runs until it is done"

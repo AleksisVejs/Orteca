@@ -12,7 +12,7 @@ const props = defineProps<{ openError?: string | null; openProjects?: OpenProjec
 const emit = defineEmits<{ open: [path: string]; closeProject: [path: string] }>();
 
 const RECENT_SHOWN = 5;
-const AUTH: Record<string, string> = { subscription: "signed in", apiKey: "API key", signedOut: "signed out", unknown: "" };
+const AUTH: Record<string, string> = { subscription: "signed in", apiKey: "API key, billed per token", signedOut: "signed out", unknown: "" };
 
 const open = computed(() => props.openProjects ?? []);
 

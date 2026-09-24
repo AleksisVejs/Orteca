@@ -25,6 +25,27 @@ const lines = computed(() => allLines.value.filter((line) => filter.value === "a
   || (filter.value === "messages" && ["text", "thinking", "instruction", "failed"].includes(line.kind))
   || (filter.value === "edits" && (line.edits.length > 0 || line.failed))
   || (filter.value === "checks" && /test|check|lint|build|compil|verif|passed|failed/i.test(line.text))));
+// Three or more reads in a row fold into one "Read 12 files" line.
+type Line = (typeof lines.value)[number];
+const isRead = (l: Line) => l.kind === "toolUse" && !l.failed && !l.edits.length && l.text.startsWith("Reading");
+const rows = computed(() => {
+  const out: ({ group: Line[]; line?: never } | { line: Line; group?: never })[] = [];
+  let run: Line[] = [];
+  const flush = () => {
+    if (run.length >= 3) out.push({ group: run });
+    else out.push(...run.map((line) => ({ line })));
+    run = [];
+  };
+  for (const line of lines.value) {
+    if (isRead(line)) run.push(line);
+    else {
+      flush();
+      out.push({ line });
+    }
+  }
+  flush();
+  return out;
+});
 const log = ref<HTMLOListElement | null>(null);
 const following = ref(true);
 const unread = ref(false);
@@ -56,12 +77,19 @@ onMounted(() => { if (!finished.value) follow(); });
   </div>
   <p v-if="!lines.length" class="note">{{ allLines.length ? 'No activity matches this filter.' : 'Nothing to show yet.' }}</p>
   <ol v-else ref="log" class="card stream" @scroll="onScroll" role="log" aria-live="polite" aria-relevant="additions">
-    <li v-for="(line, i) in lines" :key="i" :class="[line.kind, { failed: line.failed }]">
-      <span v-if="line.kind === 'instruction'" class="said">you</span><span v-if="line.delivery" class="delivery">{{ line.delivery }}</span>
-      <template v-if="line.edits.length">
-        <details v-for="edit in line.edits" :key="edit.path" class="edit">
+    <template v-for="(entry, i) in rows" :key="i">
+    <li v-if="entry.group" class="toolUse group">
+      <details>
+        <summary>{{ entry.group.every((l) => l.file) ? `Read ${entry.group.length} files` : `Read and searched ${entry.group.length} times` }}</summary>
+        <ul><li v-for="(l, j) in entry.group" :key="j">{{ l.text }} <FileLink v-if="l.file" :file="l.file" /></li></ul>
+      </details>
+    </li>
+    <li v-else :class="[entry.line.kind, { failed: entry.line.failed }]">
+      <span v-if="entry.line.kind === 'instruction'" class="said">you</span><span v-if="entry.line.delivery" class="delivery">{{ entry.line.delivery }}</span>
+      <template v-if="entry.line.edits.length">
+        <details v-for="edit in entry.line.edits" :key="edit.path" class="edit">
           <summary :title="`Show changes in ${edit.path}`">
-            <span class="edit-label">{{ line.text }} <span class="edit-name">{{ edit.path.split(/[\\/]/).pop() }}</span></span>
+            <span class="edit-label">{{ entry.line.text }} <span class="edit-name">{{ edit.path.split(/[\\/]/).pop() }}</span></span>
             <span class="edit-counts" :aria-label="edit.file && !edit.file.binary ? `${edit.file.added} lines added, ${edit.file.removed} lines removed` : 'Show diff'">
               <template v-if="edit.file && !edit.file.binary"><span class="added">+{{ edit.file.added }}</span> <span class="removed">−{{ edit.file.removed }}</span></template>
               <template v-else>+ / −</template>
@@ -89,8 +117,9 @@ onMounted(() => { if (!finished.value) follow(); });
           </div>
         </details>
       </template>
-      <template v-else>{{ line.text }} <FileLink v-if="line.file" :file="line.file" /></template>
+      <template v-else>{{ entry.line.text }} <FileLink v-if="entry.line.file" :file="entry.line.file" /></template>
     </li>
+    </template>
   </ol>
 </template>
 
@@ -126,6 +155,23 @@ onMounted(() => { if (!finished.value) follow(); });
   color: var(--text-faint);
   white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stream li.group {
+  white-space: normal;
+}
+.stream li.group summary {
+  cursor: pointer;
+}
+.stream li.group ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+}
+.stream li.group li {
+  padding: 2px 0;
+  border: 0;
+  overflow: hidden;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 .stream li.failed {

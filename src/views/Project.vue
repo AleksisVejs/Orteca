@@ -4,6 +4,7 @@ import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import ProviderMark from "../components/ProviderMark.vue";
 import VeloMark from "../components/VeloMark.vue";
 import Agents from "./project/Agents.vue";
+import Stats from "./project/Stats.vue";
 import Dock from "./project/Dock.vue";
 import CurrentTask from "./project/CurrentTask.vue";
 import PastTask from "./project/PastTask.vue";
@@ -11,7 +12,8 @@ import TaskComposer from "./project/TaskComposer.vue";
 import { DOCK, useDock } from "./project/dock";
 import { PROJECT, useProject } from "./project/state";
 import { globalTasks, workingPatch } from "../api";
-import type { GitAction, GlobalTaskSummary, OpenedProject } from "../types";
+import type { GitAction, GlobalTaskSummary, OpenedProject, TaskType, Tier } from "../types";
+import { nextPing } from "./project/anchor";
 import { parseHistoryPatch } from "./project/historyPatch";
 
 // The shell: sidebar, top bar and whichever page the sidebar picked.
@@ -45,8 +47,31 @@ const {
   usageCounters, limitsLoading, limitsCheckedAt, loadLimits,
   git, gitOpen, gitAsk, gitBusy, gitLoading, gitRefreshError, gitError, gitNotice,
   commitMessage, drafting, draftCommit, targetBranch, newBranch, gitQuestion, gitDisabledReason, openGit, refreshGit, runGit, domId,
-  formatDuration,
+  formatDuration, anchor, limits, formatWhen,
 } = state;
+
+// The finished task on screen, as it actually ran: type, agent, model, tier, effort.
+const TYPE: Record<TaskType, string> = { chat: "Chat", question: "Question", code_change: "Code change", debug: "Debug", plan: "Plan" };
+const TIER: Record<Tier, string> = { cheapest: "cheap tier", standard: "mid tier", deep: "top tier" };
+const taskBadge = computed(() => {
+  const r = result.value;
+  if (!r || !activeRun.value) return null;
+  const main = r.stages.find((s) => s.stage === "implement" || s.stage === "answer") ?? r.stages.find((s) => s.model);
+  return [
+    r.route.taskType && TYPE[r.route.taskType],
+    activeRun.value.provider === "codex" ? "Codex" : "Claude",
+    r.usage?.model ?? main?.model,
+    TIER[r.route.budget.preferredTier],
+    main?.effort && `${main.effort} effort`,
+  ].filter(Boolean).join(" · ");
+});
+// The next window-anchor ping, when anchoring is on and one is scheduled.
+const nextAnchor = computed(() => {
+  const a = anchor.value;
+  if (a.mode === "off") return null;
+  const times = a.providers.map((id) => nextPing(a, Date.now(), limits.value.find((l) => l.id === id))).filter((t): t is number => t !== null);
+  return times.length ? formatWhen(Math.min(...times)) : null;
+});
 
 // The pane heading names the task on screen; its dot carries the outcome, the tooltip the rest.
 const heading = computed(() => {
@@ -324,6 +349,10 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             {{ agentsPending ? "…" : `${agentsReady}/${rows.length}` }}
           </span>
         </button>
+        <button :class="{ on: view === 'stats' }" :aria-current="view === 'stats' ? 'page' : undefined" @click="view = 'stats'">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 13.5h11M4.5 11V8m3.5 3V4.5m3.5 6.5V6.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
+          <span class="grow">Stats</span>
+        </button>
       </nav>
 
       <div class="task-inbox">
@@ -420,7 +449,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </h1>
         <h1 v-else class="workspace-tab">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          {{ view === 'agents' ? 'Agents' : view === 'history' ? 'Task history' : 'New task' }}
+          {{ view === 'agents' ? 'Agents' : view === 'stats' ? 'Stats' : view === 'history' ? 'Task history' : 'New task' }}
         </h1>
         <span class="project-name">{{ opened.project.name }}</span>
         <button
@@ -584,6 +613,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
             <TaskComposer v-else />
           </template>
           <PastTask v-else-if="view === 'history'" />
+          <Stats v-else-if="view === 'stats'" />
           <Agents v-else />
         </main>
         <template v-if="dockPrefs.open">
@@ -615,10 +645,14 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         Start screen
       </button>
       <span v-if="anyRunning" class="status-item"><span class="dot live" aria-hidden="true"></span>{{ runningCount === 1 ? "Task running" : `${runningCount} tasks running` }}</span>
+      <span v-if="taskBadge" class="status-item" title="How the task on screen ran">{{ taskBadge }}</span>
+      <span v-if="nextAnchor" class="status-item" title="The next call that starts a plan window on purpose. Set on the Agents page.">Window ping {{ nextAnchor }}</span>
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
         <template v-for="usage in usageCounters" :key="usage.id">
           <button class="usage-counter" :popovertarget="domId(`usage-${usage.id}`)" :title="`${usage.name} usage details and reset times`">
             <span class="usage-name"><ProviderMark :id="usage.id" :size="12" />{{ usage.name }}</span>
+            <span v-if="usage.level" class="dot warn" aria-hidden="true"></span>
+            <span v-if="usage.level" class="hidden-label">{{ usage.level === "limited" ? `limited${usage.until ? ` until ${usage.until}` : ""}` : "running low" }}</span>
             <span v-if="usage.status" class="usage-unavailable">- {{ usage.status }}</span>
             <template v-else>
               <span v-for="(w, i) in usage.windows.slice(0, 2)" :key="i" class="usage-window" :class="{ low: w.left !== null && w.left <= 20 }" :title="w.left === null ? `${w.label}: usage unavailable` : w.label">
@@ -640,6 +674,8 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
               </button>
             </header>
             <p class="note usage-description">Remaining allowance in each reported plan window.</p>
+            <p v-if="usage.level === 'limited'" class="note low" role="status">Limited{{ usage.until ? ` until ${usage.until}` : "" }}. New tasks go to the other agent until then.</p>
+            <p v-else-if="usage.level === 'warning'" class="note low" role="status">Over 80% of a window is used.</p>
             <template v-if="usage.status">
               <p class="usage-empty" role="status">{{ usage.status }}</p>
               <p v-if="usage.status === 'Unavailable'" class="note usage-reason">{{ usage.reason }}</p>

@@ -849,7 +849,19 @@ pub fn check_commands(root: &Path) -> Vec<Check> {
 /// changed path positively identifies an ecosystem.
 pub fn relevant_check_commands(root: &Path, changed_paths: &[String]) -> Vec<Check> {
     let checks = check_commands(root);
-    let kinds: std::collections::HashSet<&str> = changed_paths
+    let kinds = changed_kinds(changed_paths);
+    if kinds.is_empty() {
+        return checks;
+    }
+    checks
+        .into_iter()
+        .filter(|check| kinds.contains(check.kind))
+        .collect()
+}
+
+/// The ecosystems these changed paths belong to: `php`, `js`, `rust`, `go`, `python`.
+fn changed_kinds(changed_paths: &[String]) -> std::collections::HashSet<&'static str> {
+    changed_paths
         .iter()
         .filter_map(|path| {
             let path = path.to_ascii_lowercase();
@@ -885,13 +897,6 @@ pub fn relevant_check_commands(root: &Path, changed_paths: &[String]) -> Vec<Che
                 None
             }
         })
-        .collect();
-    if kinds.is_empty() {
-        return checks;
-    }
-    checks
-        .into_iter()
-        .filter(|check| kinds.contains(check.kind))
         .collect()
 }
 
@@ -899,7 +904,25 @@ pub fn relevant_check_commands(root: &Path, changed_paths: &[String]) -> Vec<Che
 /// the repository itself declares. They run as Orteca in a trusted project,
 /// never as an arbitrary command invented by a model.
 pub fn requested_check_commands(root: &Path, build: bool, lint: bool) -> Vec<Check> {
-    if !build && !lint {
+    let names: Vec<&'static str> = [(build, "build"), (lint, "lint")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect();
+    script_checks(root, &names)
+}
+
+/// What checks a code change or fix after its tests: the repository's own
+/// lint, type-check and build scripts, where it declares them.
+// ponytail: package.json scripts only; add phpstan or clippy when a project wants them.
+/// Only for a change that touches JS: `npm run build` on a PHP-only change
+/// cost 26-75 s a Verify on the RigInspect benchmark and could fail nothing.
+pub fn gate_commands(root: &Path, changed_paths: &[String]) -> Vec<Check> {
+    if !changed_kinds(changed_paths).contains("js") {
+        return Vec::new();
+    }
+    script_checks(root, &["lint", "typecheck", "type-check", "check-types", "build"])
+}
+
+/// A check per declared script in `names`, run the lockfile's way.
+fn script_checks(root: &Path, names: &[&'static str]) -> Vec<Check> {
+    if names.is_empty() {
         return Vec::new();
     }
     let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
@@ -928,8 +951,8 @@ pub fn requested_check_commands(root: &Path, build: bool, lint: bool) -> Vec<Che
             ("npm", vec!["npm", "install", "--no-package-lock"])
         };
     let mut commands = Vec::new();
-    for (asked, script) in [(build, "build"), (lint, "lint")] {
-        if asked && scripts.get(script).and_then(|value| value.as_str()).is_some() {
+    for script in names.iter().copied() {
+        if scripts.get(script).and_then(|value| value.as_str()).is_some() {
             commands.push(Check {
                 kind: "js",
                 dir: root.to_path_buf(),
@@ -939,6 +962,83 @@ pub fn requested_check_commands(root: &Path, build: bool, lint: bool) -> Vec<Che
         }
     }
     commands
+}
+
+/// Folders and files an agent has no reason to read: dependencies, build
+/// output, caches, lockfiles and minified bundles. `storage/framework/` and
+/// not `storage/`, because a debug task reads `storage/logs/`.
+pub const JUNK_DIRS: &[&str] = &[
+    "node_modules", "vendor", "storage/framework", "bootstrap/cache", "dist", "build", "target",
+    "public/build", ".next", "coverage",
+];
+pub const JUNK_FILES: &[&str] = &["*.lock", "package-lock.json", "*.min.js", "*.min.css", "*.map"];
+
+/// The junk folders this repository has, and the junk file patterns.
+pub fn junk(root: &Path) -> (Vec<&'static str>, &'static [&'static str]) {
+    (JUNK_DIRS.iter().copied().filter(|d| root.join(d).is_dir()).collect(), JUNK_FILES)
+}
+
+/// A few static lines on how this repository is built, tested and laid out,
+/// and what not to read. Sent with every run's rules unless the user wrote
+/// their own. Read from manifests only; nothing is run.
+pub fn profile(root: &Path) -> String {
+    let mut lines = Vec::new();
+    let has = |file: &str| root.join(file).is_file();
+    if has("artisan") {
+        lines.push("Laravel app: run it with `php artisan serve`.".to_string());
+    }
+    for check in check_commands(root) {
+        let at = check.dir.strip_prefix(root).ok().filter(|p| !p.as_os_str().is_empty());
+        let at = at.map_or(String::new(), |p| format!(" (in {}/)", p.to_string_lossy().replace('\\', "/")));
+        lines.push(format!("Test: `{}`{at}", check.test.join(" ")));
+    }
+    let scripts = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|m| m["scripts"].as_object().cloned())
+        .unwrap_or_default();
+    let run = js_runner(root);
+    for (label, names) in [
+        ("Build", &["build"][..]),
+        ("Lint", &["lint"]),
+        ("Type check", &["typecheck", "type-check", "check-types"]),
+        ("Dev server", &["dev", "start"]),
+    ] {
+        if let Some(name) = names.iter().find(|n| scripts.contains_key(**n)) {
+            lines.push(format!("{label}: `{run} run {name}`"));
+        }
+    }
+    if has("Cargo.toml") {
+        lines.push("Build: `cargo build`".into());
+    }
+    let mut folders: Vec<String> = tracked_paths(root)
+        .iter()
+        .filter_map(|p| p.split_once('/').map(|(dir, _)| dir.to_string()))
+        .filter(|d| !d.starts_with('.'))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    if !folders.is_empty() {
+        let shown: Vec<String> = folders.iter().take(12).map(|d| format!("{d}/")).collect();
+        lines.push(format!("Top folders: {}", shown.join(", ")));
+    }
+    let (dirs, files) = junk(root);
+    let skip: Vec<String> = dirs.iter().map(|d| format!("{d}/")).chain(files.iter().map(|f| f.to_string())).collect();
+    lines.push(format!("Do not read: {}", skip.join(", ")));
+    lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The package manager a JS repository's lockfile names.
+fn js_runner(root: &Path) -> &'static str {
+    if root.join("pnpm-lock.yaml").is_file() {
+        "pnpm"
+    } else if root.join("yarn.lock").is_file() {
+        "yarn"
+    } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+        "bun"
+    } else {
+        "npm"
+    }
 }
 
 fn checks_in(dir: &Path) -> Vec<(&'static str, Check)> {
@@ -1037,6 +1137,51 @@ pub fn tracked_paths(dir: &Path) -> Vec<String> {
         .take(CAP)
         .map(str::to_string)
         .collect()
+}
+
+/// Files changed together in the last 300 commits: for each file, the ones
+/// that shared at least two commits with it, most often first, and how many
+/// commits were read. A commit of more than 20 files says nothing about pairs.
+pub fn co_changes(dir: &Path) -> (usize, std::collections::HashMap<String, Vec<(String, u32)>>) {
+    use std::collections::HashMap;
+    let log = git_output(dir, &["-c", "core.quotepath=false", "log", "-n", "300", "--name-only", "--format=%x00"])
+        .unwrap_or_default();
+    let mut pairs: HashMap<(&str, &str), u32> = HashMap::new();
+    let mut commits = 0;
+    for commit in log.split('\0') {
+        let files: Vec<&str> = commit.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if files.is_empty() {
+            continue;
+        }
+        commits += 1;
+        if files.len() > 20 {
+            continue;
+        }
+        for (i, a) in files.iter().enumerate() {
+            for b in &files[i + 1..] {
+                *pairs.entry((a, b)).or_default() += 1;
+            }
+        }
+    }
+    let mut map: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+    for ((a, b), n) in pairs.into_iter().filter(|(_, n)| *n >= 2) {
+        map.entry(a.to_string()).or_default().push((b.to_string(), n));
+        map.entry(b.to_string()).or_default().push((a.to_string(), n));
+    }
+    for list in map.values_mut() {
+        list.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+        list.truncate(5);
+    }
+    (commits, map)
+}
+
+/// How far co-changes are trusted, from the commits `co_changes` read (at
+/// most 300): not at all under 150, fully at 300. Measured with `navstats
+/// --recall`: on 119 commits (LiftMe) they cost 73% -> 68%, on 300 of 695
+/// (RigInspect) they gave 61% -> 68%.
+// ponytail: two repositories set these bounds; move them when more runs say so.
+pub fn co_change_weight(commits: usize) -> f64 {
+    if commits < 150 { 0.0 } else { (commits as f64 / 300.0).min(1.0) }
 }
 
 /// Paths touched by the last 50 commits, as `git log` names them. A ranking

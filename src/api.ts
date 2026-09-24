@@ -16,6 +16,8 @@ import type {
   MemoryProposal,
   MemoryState,
   Mode,
+  RepoProfile,
+  TaskLogRow,
   ModelOverride,
   OpenedProject,
   Preflight,
@@ -95,9 +97,22 @@ export const proposeMemoryFromRuns = (path: string) =>
   invoke<MemoryProposal>("propose_memory_from_runs", { path });
 export const setMemoryLimit = (limit: number) => invoke<void>("set_memory_limit", { limit });
 
+/** The lines on this repository every run's rules carry. */
+export const repoProfile = (path: string) => invoke<RepoProfile>("repo_profile", { path });
+/** `null` goes back to the detected profile. */
+export const setRepoProfile = (path: string, text: string | null) => invoke<void>("set_repo_profile", { path, text });
+
+/** `clarify` ("on" | "off") and `anchor` (JSON), when set. */
+export const appSettings = () => invoke<Record<string, string>>("app_settings");
+export const setAppSetting = (key: "clarify" | "anchor", value: string) => invoke<void>("set_app_setting", { key, value });
+/** One tiny call on the cheapest model, to start the plan's window now. Logged with its cost. */
+export const anchorPing = (provider: ProviderId) => invoke<{ ok: boolean; tokens: number | null }>("anchor_ping", { provider });
+
 /** This project's past runs, newest first. */
 export const recentTasks = (path: string) =>
   invoke<TaskSummary[]>("recent_tasks", { path });
+/** How this project's tasks ran and ended, newest first, for the Stats page. */
+export const taskLog = (path: string) => invoke<TaskLogRow[]>("task_log", { path });
 /** Recent tasks across every remembered project, newest first. */
 export const globalTasks = () => invoke<GlobalTaskSummary[]>("global_tasks");
 export const getTaskDetail = (path: string, taskId: number) =>
@@ -185,6 +200,8 @@ export const startTask = (
   // before it. The route and the classifier read this, so a question asked
   // after a finished change is routed as a question and not as more of it.
   asked: string | null = null,
+  // The answer to the question a first try asked; an empty answer skipped it.
+  clarified: { question: string; answer: string } | null = null,
 ) => {
   const events = new Channel<ProviderEvent>();
   events.onmessage = onEvent;
@@ -194,7 +211,7 @@ export const startTask = (
   task.onmessage = onTask;
   const checking = new Channel<TaskResult>();
   checking.onmessage = onChecking;
-  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, autoWait, model, events, task, checking });
+  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, autoWait, model, clarified, events, task, checking });
 };
 
 /** Runs, or declines, the command a run's agent is waiting on. */

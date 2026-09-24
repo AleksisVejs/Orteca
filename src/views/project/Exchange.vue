@@ -25,7 +25,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{ editAgain: [text: string]; rewind: [text: string] }>();
 
-const { domId, describeVerdict, stageLabel, formatTokens, formatCost, formatDuration, HISTORY_STATUS, TONE, restored, restoreError, restore } = inject(PROJECT)!;
+const { domId, describeVerdict, stageLabel, formatTokens, formatCost, formatDuration, HISTORY_STATUS, TONE, restored, restoreError, restore, undoFile } = inject(PROJECT)!;
 
 const id = (name: string) => domId(`${props.idPrefix}-${name}`);
 const d = computed(() => props.data);
@@ -84,6 +84,24 @@ const selectedFile = ref<string | null>(null);
 const parsedPatch = computed(() => parseHistoryPatch(d.value.patchText ?? ""));
 const selectedPath = computed(() => d.value.changed.byRun.some((f) => f.path === selectedFile.value) ? selectedFile.value : d.value.changed.byRun[0]?.path);
 const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path === selectedPath.value));
+
+// Reject one file of the latest answer: back as it was before that answer, after
+// a confirm naming it. Not for a rename, whose old name the undo would not bring back.
+const undoAsk = ref<string | null>(null);
+const undone = (path: string) => restored.value.includes(`${d.value.savedState}:${path}`);
+const canUndo = (path: string | null | undefined): path is string =>
+  !!path && !props.earlier && !props.editDisabled && !!d.value.savedState && d.value.taskId !== null
+  && !!props.rewindFiles?.includes(path) && !undone(path)
+  && !["Renamed", "Copied"].includes(parsedPatch.value.files.find((f) => f.path === path)?.status ?? "");
+const undoCancel = ref<HTMLButtonElement | null>(null);
+function askUndo(path: string) {
+  undoAsk.value = path;
+  void nextTick(() => undoCancel.value?.focus());
+}
+function confirmUndo(path: string) {
+  undoAsk.value = null;
+  void undoFile(d.value.taskId!, d.value.savedState!, path);
+}
 </script>
 
 <template>
@@ -201,6 +219,19 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
             </ul>
             <section class="review-patch" aria-label="Selected file changes" tabindex="0">
               <h2 class="label mono">{{ selectedPath }}</h2>
+              <div v-if="canUndo(selectedPath)" class="undo-file">
+                <template v-if="undoAsk === selectedPath">
+                  <p class="note" role="alert">
+                    Put <span class="mono">{{ selectedPath }}</span> back as it was before this answer? Anything changed in it since, by the agent or by you, is lost.
+                    <template v-if="d.changed.byRun.find((f) => f.path === selectedPath)?.origin === 'run' && selectedPatch?.status === 'Added'">It was new, so it is deleted.</template>
+                  </p>
+                  <button ref="undoCancel" class="link" @click="undoAsk = null">Cancel</button>
+                  <button class="btn warn" @click="confirmUndo(selectedPath)">Undo this file</button>
+                </template>
+                <button v-else class="btn" title="Put only this file back as it was before this answer. The other files stay." @click="askUndo(selectedPath)">Undo this file</button>
+              </div>
+              <p v-else-if="selectedPath && undone(selectedPath)" class="note" role="status">Put back as it was before this answer.</p>
+              <p v-if="restoreError && undoAsk === null" class="missing">{{ restoreError }}</p>
               <p v-if="d.changed.byRun.find((f) => f.path === selectedPath)?.origin === 'both'" class="note">This patch includes changes already present before the task.</p>
               <template v-if="selectedPatch">
                 <p v-for="note in selectedPatch.notes" :key="note" class="note">{{ note }}</p>
@@ -284,6 +315,17 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
 <style scoped src="./result.css"></style>
 <style scoped src="./chat.css"></style>
 <style scoped>
+.undo-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.undo-file p {
+  flex-basis: 100%;
+  margin: 0;
+}
 .exchange {
   display: flex;
   flex-direction: column;

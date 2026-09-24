@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, ref } from "vue";
 import FileLink from "./FileLink.vue";
-import Orb from "../../components/Orb.vue";
+import Orb, { type OrbState } from "../../components/Orb.vue";
 import { PROJECT } from "./state";
 
 // The chat box while a run goes: what the agent is doing now, Stop, and steering,
@@ -22,19 +22,38 @@ const steps = computed(() => {
   const first = Math.min(...p.current);
   return p.stages.map((name, i) => ({ name: stageLabel(name), state: p.current.includes(i) ? "running" : i < first ? "ran" : "upcoming" }));
 });
-// What the orb acts out: the current activity's first word decides it.
-const mood = computed(() => {
-  const { text, failed } = currentActivity.value;
-  if (stopping.value) return "stop";
+// What the orb acts out: the stage first, then the current activity's first word.
+const orbState = computed<OrbState>(() => {
+  const run = activeRun.value;
+  const { text, failed, file } = currentActivity.value;
+  const now = run?.progress?.current.map((i) => run.progress!.stages[i] ?? "").join(" ") ?? "";
+  if (stopping.value) return "paused";
+  if (waitAsk.value) return "needs_input";
   if (failed || /^(Edit failed|Couldn)/.test(text)) return "error";
-  if (text.startsWith("Editing")) return "edit";
-  if (text.startsWith("Reading")) return "read";
-  if (/^(Testing|Checking)/.test(text)) return "check";
-  if (text.startsWith("Thinking")) return "think";
+  if (typing.value) return "user_typing";
+  if (text === "Getting ready" && !run?.progress) return run?.switchedFrom ? "handoff" : "classifying";
+  if (/review/i.test(now)) return "reviewing";
+  if (/plan/i.test(now)) return "planning";
+  if (/verify/i.test(now)) return "testing";
+  if (text.startsWith("Searched the web") || (text.startsWith("Reading") && !file && /\b(grep|rg|glob|find|search|select-string)\b/i.test(text))) return "searching";
+  if (text.startsWith("Editing")) return "editing";
+  if (text.startsWith("Reading")) return "reading";
+  if (/^(Testing|Checking)/.test(text)) return "testing";
+  if (/^(Running|Waiting on)/.test(text)) return "running";
+  if (text.startsWith("Thinking")) return "thinking";
   return "idle";
 });
 // A delivered steer is swallowed by the orb. Nothing happens if it wasn't delivered.
 const orb = ref<InstanceType<typeof Orb> | null>(null);
+// Typing leans the orb toward the box; each key sends a ripple.
+const typing = ref(false);
+let typingTimer = 0;
+function onType() {
+  typing.value = true;
+  orb.value?.ripple();
+  clearTimeout(typingTimer);
+  typingTimer = window.setTimeout(() => (typing.value = false), 1500);
+}
 async function send(now: boolean) {
   const text = instruction.value.trim();
   await instruct(now);
@@ -56,7 +75,7 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
   <p v-if="fileError" class="missing">{{ fileError }}</p>
   <div class="composer">
     <div class="now" role="status" aria-live="polite">
-      <Orb ref="orb" class="orb" :size="36" :mood="mood" />
+      <Orb ref="orb" class="orb" :size="42" :state="orbState" :provider="ranOn" />
       <div class="grow current">
         <strong>{{ ranOn === "codex" ? "Codex" : "Claude" }} · {{ stopping ? "Stopping" : stage ?? "Running" }}</strong>
         <p>
@@ -87,6 +106,7 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
       :placeholder="waiting ? 'Ask anything while it runs…' : 'Steer: add context or change direction…'"
       :disabled="sending"
       @paste="pasteImages"
+      @input="onType"
       @keydown.enter.exact="onEnter"
     ></textarea>
     <ul v-if="attachments.length" class="attachments" aria-label="Attached">

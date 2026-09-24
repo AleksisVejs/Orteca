@@ -4,9 +4,13 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import type { InjectionKey, Ref } from "vue";
 import { reference, tidy, forRouting, split } from "./picks";
 import { verificationSummary } from "./taskPresentation";
+import { ANCHOR_OFF, readAnchor, startAnchor, work } from "./anchor";
+import type { Anchor } from "./anchor";
 import type { Pick } from "./picks";
 import {
   addMemory,
+  appSettings,
+  setAppSetting,
   pickAttachments,
   savePastedImage,
   cancelProviderOperation,
@@ -83,6 +87,7 @@ export type Exchange = {
   patchText: string | null;
   /** The folder as it was before the run, for a `reverted` file or a rewind. */
   savedState: string | null;
+  taskId: number | null;
   verification: string;
   route: Route | null;
   routeSteps: Array<{ stage: string; ran: boolean; asked?: string | null }>;
@@ -200,6 +205,7 @@ export function exchangeOf(r: TaskResult, stream: ActivityLine[]): Exchange {
     changed: changedOf(r),
     patchText: r.patchText,
     savedState: r.savedState ?? null,
+    taskId: r.taskId,
     verification: verificationSummary(r.stages),
     route: r.route,
     routeSteps: routeStepsOf(r),
@@ -337,6 +343,24 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     try { localStorage.setItem(WAIT_KEY, on ? "1" : "0"); } catch { /* kept for this session */ }
   }
 
+  // An unclear request that edits: ask one question first, or let the agent
+  // guess and say how it read it. One setting for the whole app.
+  const clarify = ref(true);
+  // When to start a plan's 5-hour window on purpose; off unless the user sets it.
+  const anchor = ref<Anchor>(ANCHOR_OFF);
+  appSettings().then((s) => {
+    clarify.value = s.clarify !== "off";
+    anchor.value = readAnchor(s);
+  }, () => { /* asks, and anchors nothing: the defaults */ });
+  function chooseClarify(on: boolean) {
+    clarify.value = on;
+    void setAppSetting("clarify", on ? "on" : "off");
+  }
+  function saveAnchor(next: Anchor) {
+    anchor.value = next;
+    void setAppSetting("anchor", JSON.stringify(next));
+  }
+
   const installed = computed(() => providers.value.filter((p) => p.path));
   const missing = computed(() => providers.value.filter((p) => !p.path));
 
@@ -463,7 +487,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   /** The room left in this provider's tightest window, or null with no reading. */
   function headroom(id: ProviderId): number | null {
-    const windows = limits.value.find((l) => l.id === id)?.windows ?? [];
+    const reading = limits.value.find((l) => l.id === id);
+    if (reading?.status === "limited") return 0;
+    const windows = reading?.windows ?? [];
     return windows.length && windows.every((w) => Number.isFinite(w.usedPercent))
       ? Math.min(...windows.map((w) => Math.max(0, Math.min(100, 100 - w.usedPercent))))
       : null;
@@ -509,6 +535,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       : !p.path ? "Not installed"
       : p.auth === "signedOut" ? "Sign in required"
       : !reading && limitsLoading.value ? "Checking usage…"
+      : reading?.status === "limited" && !reading.windows.length
+        ? `Limited${reading.limitedUntil ? ` until ${formatWhen(reading.limitedUntil * 1000)}` : ""}`
       : !reading?.windows.length ? "Unavailable" : null;
     const windows = status ? [] : reading!.windows.map((w) => {
       const left = Number.isFinite(w.usedPercent) ? Math.max(0, Math.min(100, 100 - w.usedPercent)) : null;
@@ -525,6 +553,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       name: p.id === "codex" ? "Codex" : "Claude",
       status,
       windows,
+      /** Only `warning` and `limited` get a mark; the next task's pick reads the same. */
+      level: reading?.status === "warning" || reading?.status === "limited" ? reading.status : null,
+      until: reading?.status === "limited" && reading.limitedUntil ? formatWhen(reading.limitedUntil * 1000) : null,
       reason: limitsError.value ?? reading?.unavailable ?? "No plan usage reading is available yet.",
     };
   }));
@@ -750,6 +781,10 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     /** The other CLI this run can carry on with, once its plan ran out. The
      *  user says yes first: it spends a different subscription. */
     handoff?: { to: ProviderId; opts: RunOpts } | null;
+    /** It finished while nobody was looking at it: the page sums it up once. */
+    away?: boolean;
+    /** The one question the request needs answered before it runs. */
+    clarify?: { question: string; opts: RunOpts } | null;
   };
   // Newest first. Every run still going is kept; finished ones are capped,
   // since the database holds them and the sidebar lists them from there.
@@ -969,6 +1004,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     restoreError.value = null;
     try {
       await restoreFile(opened.project.path, saved, file);
+      restored.value = [...restored.value, `${saved}:${file}`];
+      void refreshGit();
+    } catch (e) {
+      restoreError.value = isAppError(e) ? e.message : String(e);
+    }
+  }
+
+  /** One file the latest answer changed, back as it was before that answer.
+   *  The page asked first; the task counts as rejected. */
+  async function undoFile(taskId: number, saved: string, file: string) {
+    restoreError.value = null;
+    try {
+      await rewindTask(opened.project.path, taskId, 0, saved, [file]);
       restored.value = [...restored.value, `${saved}:${file}`];
       void refreshGit();
     } catch (e) {
@@ -1212,6 +1260,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   }
 
   onMounted(async () => {
+    startAnchor();
     void loadHistory();
     void loadLimits(true);
     limitsTimer = setInterval(() => {
@@ -1279,6 +1328,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     /** The request itself, when it is not the composer's: a handoff or a run
      *  that waited for a reset. The composer is left as the user has it. */
     prompt?: string;
+    /** The answer to the question a first try asked; empty when skipped. */
+    clarified?: { question: string; answer: string } | null;
   };
 
   async function run(opts: RunOpts = {}) {
@@ -1290,6 +1341,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     // The composer empties on send, the way the chain of replies below it does.
     // A handoff re-sends what the first attempt was given rather than nothing.
     const attached = opts.attachments ?? attachments.value;
+    work.running++;
     if (!opts.attachments) attachments.value = [];
     const sent = opts.prompt ?? promptText();
     if (opts.prompt === undefined) picks.value = [];
@@ -1344,6 +1396,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         stopping: false,
         waitAsk: null,
         handoff: null,
+        clarify: null,
         queued: [],
       });
     } else {
@@ -1398,10 +1451,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         // read the blob, a classifier answers about the task at the top instead
         // of the reply at the bottom. An earlier task handed in goes as its title alone.
         opts.asked?.at(-1) ?? (forRouting(live.prompt) === live.prompt ? null : forRouting(live.prompt)),
+        opts.clarified ?? null,
       );
     } catch (e) {
-      live.error = isAppError(e) ? e.message : String(e);
+      // A question before the run is not a failure: the page asks it.
+      if (isAppError(e) && e.kind === "clarify") {
+        live.clarify = { question: e.message, opts: { ...opts, prompt: live.prompt, attachments: attached } };
+      } else {
+        live.error = isAppError(e) ? e.message : String(e);
+      }
     } finally {
+      work.running--;
+      work.lastEnd = Date.now();
+      live.away = !active.value || selectedRun.value !== live.key || view.value !== "task" || !!globalThis.document?.hidden;
       live.active = false;
       live.stopping = false;
       live.waitAsk = null;
@@ -1426,6 +1488,16 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     live.handoff = next
       ? { to: next.id, opts: { ...opts, prompt: live.prompt, attachments: attached, switchedFrom: live.provider } }
       : null;
+  }
+
+  /** The user answered the question the request asked, or skipped it with an
+   *  empty answer: the same request runs, carrying the answer. */
+  function answerClarify(answer: string) {
+    const live = activeRun.value;
+    const ask = live?.clarify;
+    if (!live || !ask) return;
+    live.clarify = null;
+    void run({ ...ask.opts, continueRun: live, clarified: { question: ask.question, answer } });
   }
 
   /** The user said yes: the same request goes on with the other CLI. What the
@@ -1720,13 +1792,13 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   const AUTH: Record<Auth, string> = {
     subscription: "saved login",
-    apiKey: "API key",
+    apiKey: "API key, billed per token",
     signedOut: "not signed in",
     unknown: "",
   };
 
   // The main pane shows one thing at a time; the sidebar picks which.
-  const view = ref<"task" | "history" | "agents">("task");
+  const view = ref<"task" | "history" | "agents" | "stats">("task");
   const optionsOpen = ref(false);
 
   /** Dot colour per status: green only for a finished run, blue only while one is going. */
@@ -1969,6 +2041,10 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     isolation,
     ISOLATIONS,
     autoWait,
+    clarify,
+    chooseClarify,
+    anchor,
+    saveAnchor,
     chooseAutoWait,
     installed,
     missing,
@@ -2010,6 +2086,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     alternative,
     fallback,
     carryOn,
+    answerClarify,
     switchedFrom,
     switchTo,
     canRun,
@@ -2058,6 +2135,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     restored,
     restoreError,
     restore,
+    undoFile,
     taskName,
     historyRow,
     taskMenu,

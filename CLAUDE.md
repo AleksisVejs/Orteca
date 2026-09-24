@@ -58,9 +58,14 @@ drop, Ctrl+`) check the `active` flag before answering.
   plus the Laravel strings that name a file. `store.rs` keeps a map per project,
   rescanned on open and before a run, reparsing only what moved; `routing` ranks
   with it. `NAV_NOMAP=1` withholds it from a run, for the benchmark's before arm.
-- `intent.rs` — before a run, asks the provider's smallest model (no tools, temp dir)
-  whether the prompt is chat, a question, or easy/medium/hard work. Feeds `routing` as
-  `RepoSignals::intent`; a failed read falls back to keywords.
+- `intent.rs` — before a run, asks the provider's smallest model (no tools, temp dir,
+  JSON schema) for the task type (chat/question/code_change/debug/plan), difficulty,
+  confidence and at most one clarifying question; talk is answered in that call.
+  Feeds `routing` as `RepoSignals::intent` and `task_type`; a failed read falls back
+  to keywords, a `/plan`-style command skips it.
+- `rules.rs` — the per-type ruleset (`src-tauri/rulesets/*.md`) plus the repository
+  profile, sent as Claude's appended system prompt and Codex's
+  `developer_instructions`, byte-identical on every call. Never switched mid-session.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
   fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A failed
   Verify gets one Fix (resuming the session that wrote the change) and runs

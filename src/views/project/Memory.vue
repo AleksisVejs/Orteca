@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { addMemory, deleteMemory, editMemory, isAppError, memory, proposeMemoryFromRuns, proposeMemoryImport, readText, setMemoryLimit } from "../../api";
-import type { ImportFile, MemoryProposal, MemoryState } from "../../types";
+import { addMemory, deleteMemory, editMemory, isAppError, memory, proposeMemoryFromRuns, proposeMemoryImport, readText, repoProfile, setMemoryLimit, setRepoProfile } from "../../api";
+import type { ImportFile, MemoryProposal, MemoryState, RepoProfile } from "../../types";
 
 // Short standing instructions the user writes; every run is told them. One
 // component for both screens: with a path it lists this project and all
@@ -40,8 +40,34 @@ async function loadRepoFiles() {
   repoFiles.value = found.filter((n) => n !== null);
 }
 
+// How to build and test this repository and what not to read, sent with
+// every run's rules. Detected until the user edits it.
+const profile = ref<RepoProfile | null>(null);
+const profileDraft = ref("");
+
+async function loadProfile() {
+  if (!props.path) return;
+  try {
+    profile.value = await repoProfile(props.path);
+    profileDraft.value = profile.value.text;
+  } catch (e) {
+    error.value = isAppError(e) ? e.message : String(e);
+  }
+}
+
+// Saving the detected text as-is keeps it detected, so it follows the repo.
+const saveProfile = (text: string | null) =>
+  change(() => setRepoProfile(props.path!, text === null || text.trim() === profile.value?.detected ? null : text));
+
+/** A rough size for a long file: long rules are paid for on every turn. */
+const longFile = computed(() => {
+  const chars = proposal.value?.original.length ?? 0;
+  return chars > 4000 && source.value !== "runs" ? Math.round(chars / 4) : 0;
+});
+
 async function load() {
   void loadRepoFiles();
+  void loadProfile();
   try {
     state.value = await memory(props.path);
   } catch (e) {
@@ -160,6 +186,7 @@ async function save(id: number) {
             <textarea v-model="b.text" rows="2" :aria-label="`Rule ${i + 1}`"></textarea>
           </li>
         </ul>
+        <p v-if="longFile" class="note">This file is long, about {{ longFile.toLocaleString() }} tokens, estimated. Long rules are paid for on every turn and can make runs worse, so keep only the few that matter.</p>
         <p class="note">Nothing is saved until you confirm.<template v-if="source !== 'runs'"> These become copies: changing the file later does not change them.</template></p>
         <div class="row">
           <button class="btn primary" :disabled="!picked.some((b) => b.keep)" @click="saveImport">Save {{ picked.filter((b) => b.keep).length }} to {{ scopeName }}</button>
@@ -194,6 +221,16 @@ async function save(id: number) {
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
           {{ reading && source === f ? "Reading…" : importLabel(f) }}
         </button>
+      </div>
+    </section>
+
+    <section v-if="path && profile" class="list" aria-label="Repository profile">
+      <h3>Repository profile <span class="count">{{ profile.custom ? "edited" : "detected" }}</span></h3>
+      <p class="note">Sent with every run's rules: how to build and test, the folders, and what not to read. Keep it to a few lines.</p>
+      <textarea v-model="profileDraft" rows="7" class="profile" aria-label="Repository profile"></textarea>
+      <div class="row">
+        <button class="btn" :disabled="profileDraft === profile.text" @click="saveProfile(profileDraft)">Save profile</button>
+        <button v-if="profile.custom" class="link" @click="saveProfile(null)">Use detected</button>
       </div>
     </section>
 
@@ -415,7 +452,12 @@ ul {
   gap: 10px;
   margin-bottom: 8px;
 }
-.review .keep {
+.review .profile {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+}
+.keep {
   margin-top: 8px;
 }
 .review .row {

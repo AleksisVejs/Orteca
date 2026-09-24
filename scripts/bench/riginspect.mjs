@@ -179,7 +179,7 @@ function runArm(arm, dir, prompt, extraEnv = {}) {
     return {
       status: j.subtype, calls: 1, turns: j.num_turns, model: Object.keys(j.modelUsage ?? {}).join(","),
       input: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), cached: u.cache_read_input_tokens, output: u.output_tokens,
-      cost: j.total_cost_usd, costQuality: "exact", ms: Date.now() - t0,
+      cost: j.total_cost_usd, costQuality: "estimated", ms: Date.now() - t0,
     };
   }
   const r = spawnSync("codex", CODEX_ARGS, { cwd: dir, input: prompt, encoding: "utf8", shell: true, env: ENV, timeout: ARM_TIMEOUT, maxBuffer: 64e6 });

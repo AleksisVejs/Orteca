@@ -1406,8 +1406,14 @@ pub async fn stream(
             .flatten();
 
         // The tests and a Review both only read, so on a guarded route the
-        // Review runs while the suite does, and one Fix answers both.
-        if stage == Stage::Verify && stages.get(index + 1) == Some(&Stage::Review) {
+        // Review runs while the suite does, and one Fix answers both. A Review
+        // a first-try pass may skip waits for the suite instead.
+        if stage == Stage::Verify
+            && stages.get(index + 1) == Some(&Stage::Review)
+            && !(checks_locally(&ctx.dir, None)
+                && !state.notes.iter().any(|n| n.stage == Stage::Fix)
+                && skippable_review(&route, &ctx.dir, base_commit.as_deref(), before_run.as_ref()))
+        {
             let review_ctx = Context {
                 plan: stage_plan(&route, model.as_ref(), id, task_id, &stages, index + 1, Some(&ruleset)),
                 final_stage: index + 2 == stages.len(),
@@ -1658,6 +1664,19 @@ pub async fn stream(
             remaining: &stages[index + 1..],
         };
         match after_stage(round) {
+            Then::Continue
+                if checked_locally
+                    && stage == Stage::Verify
+                    && stages.get(index + 1) == Some(&Stage::Review)
+                    && !state.notes.iter().any(|n| n.stage == Stage::Fix)
+                    && skippable_review(&route, &ctx.dir, base_commit.as_deref(), before_run.as_ref()) =>
+            {
+                stages.remove(index + 1);
+                let event = ProviderEvent::Text(
+                    "Review skipped: a small change whose tests passed on the first try".into(),
+                );
+                let _ = record(store, task_id, ctx.plan.stage.name(), id, &event).and_then(|()| emit(&event));
+            }
             Then::Continue => {}
             Then::Stop(stop) => {
                 let _ = note(store, &ctx, "budget", &budget_payload("stopped", &stop));
@@ -2256,8 +2275,13 @@ async fn verify_locally(
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     }
 
-    let mut results = Vec::new();
-    for (check, shown) in checks.iter().zip(shown) {
+    // First each check's install and focused tests, one at a time: they are
+    // short, and a change whose focused tests pass is worth reading now.
+    let mut results: Vec<Vec<serde_json::Value>> = vec![Vec::new(); checks.len()];
+    let mut rans: Vec<Option<Ran>> = (0..checks.len()).map(|_| None).collect();
+    let mut full = Vec::new();
+    let mut focused_passed = false;
+    for (i, check) in checks.iter().enumerate() {
         let mut ran = Ran::Finished {
             passed: true,
             output: String::new(),
@@ -2267,7 +2291,6 @@ async fn verify_locally(
             ran = run_check(store, ctx, state, control, emit, install, &check.dir, &named).await;
         }
         let mut covered = false;
-        let mut focused_passed = false;
         if matches!(ran, Ran::Finished { passed: true, .. }) {
             if let Some(focused) = focused_php_check(&ctx.dir, check, &changed_paths) {
                 let parallel = parallel_focused(check, &focused[3..]);
@@ -2291,7 +2314,7 @@ async fn verify_locally(
                     // so the whole argv would call any change covered.
                     covered = focused_covers(&changed_paths, &focused[3..]);
                     focused_passed = true;
-                    results.push(serde_json::json!({
+                    results[i].push(serde_json::json!({
                         "command": named,
                         "passed": true,
                         "output": output,
@@ -2300,31 +2323,97 @@ async fn verify_locally(
             }
         }
         if covered {
-            let event = ProviderEvent::Text(format!("{shown} skipped: the change is only the tests that just passed"));
+            let event = ProviderEvent::Text(format!("{} skipped: the change is only the tests that just passed", shown[i]));
             let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
             continue;
         }
-        if matches!(ran, Ran::Finished { passed: true, .. }) {
-            // Result first, proof after: the change is worth reading now, and
-            // the suite still decides whether it is done.
-            if focused_passed {
-                let event = ProviderEvent::Text(format!(
-                    "Its focused tests passed, so the change is shown now; {shown} is still running"
-                ));
-                let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
-                state.timings.push(Timing {
-                    label: "result shown".into(),
-                    ms: now_ms().saturating_sub(ctx.started),
-                });
-                show_checking(state);
-            }
-            ran = match shards(check) {
-                Some(groups) => {
-                    run_sharded(store, ctx, state, control, emit, &groups, &check.dir, &shown, &changed_paths).await
-                }
-                None => run_check_twice(store, ctx, state, control, emit, &check.test, &check.dir, &shown).await,
-            };
+        match ran {
+            Ran::Cancelled => return Some(false),
+            Ran::Finished { passed: true, .. } => full.push(i),
+            other => rans[i] = Some(other),
         }
+    }
+    // Result first, proof after: the change is worth reading now, and the
+    // suites still decide whether it is done.
+    if focused_passed && !full.is_empty() {
+        let still: Vec<&str> = full.iter().map(|&i| shown[i].as_str()).collect();
+        let event = ProviderEvent::Text(format!(
+            "Its focused tests passed, so the change is shown now; {} {} still running",
+            still.join(", "),
+            if still.len() == 1 { "is" } else { "are" }
+        ));
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+        state.timings.push(Timing {
+            label: "result shown".into(),
+            ms: now_ms().saturating_sub(ctx.started),
+        });
+        show_checking(state);
+    }
+
+    // Then every suite and gate at once, since none waits on another's
+    // output: one after another, the tough RigInspectBE task's four took
+    // 254 s of a 481 s run (2026-09-24).
+    let sharded: Vec<Option<Vec<Vec<String>>>> = full.iter().map(|&i| shards(&checks[i])).collect();
+    let scratch = std::env::temp_dir().join(format!("orteca-shards-{}", ctx.task_id));
+    let (mut argvs, mut envs, mut cwds, mut labels, mut owner) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (k, &i) in full.iter().enumerate() {
+        let check = &checks[i];
+        match &sharded[k] {
+            Some(groups) => {
+                let named = shards_shown(&shown[i], groups.len());
+                for (files, env) in groups.iter().zip(shard_envs(&scratch.join(k.to_string()), &check.dir, groups.len())) {
+                    argvs.push(phpunit(files));
+                    envs.push(env);
+                    cwds.push(check.dir.as_path());
+                    labels.push(named.clone());
+                    owner.push(k);
+                }
+            }
+            None => {
+                argvs.push(check.test.iter().map(|s| s.to_string()).collect());
+                envs.push(Vec::new());
+                cwds.push(check.dir.as_path());
+                labels.push(shown[i].clone());
+                owner.push(k);
+            }
+        }
+    }
+    let commands: Vec<Vec<&str>> = argvs.iter().map(|a| a.iter().map(String::as_str).collect()).collect();
+    let named: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let ran = if commands.is_empty() {
+        Ok(Vec::new())
+    } else {
+        run_all(store, ctx, state, control, emit, &commands, &envs, &cwds, &named).await
+    };
+    let _ = std::fs::remove_dir_all(&scratch);
+    match ran {
+        Err(Ran::Cancelled) => return Some(false),
+        // Nothing started, and a check that did not start is left out, as ever.
+        Err(_) => {}
+        Ok(ended) => {
+            for (k, &i) in full.iter().enumerate() {
+                let check = &checks[i];
+                let mine: Vec<(Option<i32>, String)> =
+                    (0..ended.len()).filter(|&c| owner[c] == k).map(|c| ended[c].clone()).collect();
+                let ran = match &sharded[k] {
+                    Some(groups) => {
+                        shards_verdict(store, ctx, state, control, emit, &mine, groups, &check.dir, &shown[i], &changed_paths).await
+                    }
+                    None => {
+                        let (code, output) = mine.into_iter().next().unwrap_or_default();
+                        said_whether(store, ctx, emit, &shown[i], code == Some(0));
+                        let first = Ran::Finished { passed: code == Some(0), output };
+                        run_again(store, ctx, state, control, emit, first, &check.test, &check.dir, &shown[i]).await
+                    }
+                };
+                rans[i] = Some(ran);
+            }
+        }
+    }
+
+    for (i, (check, ran)) in checks.iter().zip(rans).enumerate() {
+        let shown = &shown[i];
+        let Some(ran) = ran else { continue };
         match ran {
             Ran::Cancelled => return Some(false),
             Ran::NotStarted => {}
@@ -2356,12 +2445,13 @@ async fn verify_locally(
                         "{shown} could not run because a required program is missing. No automatic fix was started."
                     ));
                 }
-                results.push(
+                results[i].push(
                     serde_json::json!({ "command": shown, "passed": passed, "output": output }),
                 );
             }
         }
     }
+    let results: Vec<serde_json::Value> = results.into_iter().flatten().collect();
     if results.is_empty() {
         return None;
     }
@@ -2778,6 +2868,23 @@ async fn run_check_twice(
     shown: &str,
 ) -> Ran {
     let first = run_check(store, ctx, state, control, emit, command, cwd, shown).await;
+    run_again(store, ctx, state, control, emit, first, command, cwd, shown).await
+}
+
+/// A failed check once more, unchanged: a pass the second time is a flaky
+/// test. Anything but a failure comes back as it was.
+#[allow(clippy::too_many_arguments)]
+async fn run_again(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    first: Ran,
+    command: &[&str],
+    cwd: &Path,
+    shown: &str,
+) -> Ran {
     let Ran::Finished { passed: false, output } = &first else {
         return first;
     };
@@ -2828,7 +2935,7 @@ async fn run_check(
     cwd: &Path,
     shown: &str,
 ) -> Ran {
-    match run_all(store, ctx, state, control, emit, &[command.to_vec()], &[], cwd, shown).await {
+    match run_all(store, ctx, state, control, emit, &[command.to_vec()], &[], &[cwd], &[shown]).await {
         Ok(mut ended) => {
             let (code, output) = ended.remove(0);
             said_whether(store, ctx, emit, shown, code == Some(0));
@@ -2838,10 +2945,11 @@ async fn run_check(
     }
 }
 
-/// Commands with the same program, side by side, each in its own Job Object
-/// and with its own added environment, if `envs` has one for it. Each ends
-/// with its exit code (`None` when killed or timed out) and the end of its
-/// output. A Stop or the timeout stops them all.
+/// Commands side by side, each in its own Job Object, in its own folder and
+/// with its own added environment, if `envs` has one for it. `labels` names
+/// each command; commands that share a label (a suite's shards) are shown and
+/// timed as one. Each ends with its exit code (`None` when killed or timed
+/// out) and the end of its output. A Stop or the timeout stops them all.
 #[allow(clippy::too_many_arguments)]
 async fn run_all(
     store: &Store,
@@ -2851,34 +2959,42 @@ async fn run_all(
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     commands: &[Vec<&str>],
     envs: &[Vec<(&str, PathBuf)>],
-    cwd: &Path,
-    shown: &str,
+    cwds: &[&Path],
+    labels: &[&str],
 ) -> std::result::Result<Vec<(Option<i32>, String)>, Ran> {
     // ponytail: ten minutes per command is a guess at a slow suite; make it per project when one needs longer.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     let say = |event: ProviderEvent| {
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
-    let Some(program) = crate::providers::which(commands[0][0]) else {
-        return Err(Ran::NotStarted);
-    };
+    let mut shown: Vec<&str> = Vec::new();
+    for label in labels {
+        if !shown.contains(label) {
+            shown.push(label);
+        }
+    }
     let mut runs = Vec::new();
     for (i, command) in commands.iter().enumerate() {
         let env = envs.get(i).map_or(&[][..], Vec::as_slice);
         // Dropping the ones already started kills them.
-        let Ok(run) = proc::spawn_env(&program.to_string_lossy(), &command[1..], cwd, env) else {
-            say(ProviderEvent::Text(format!("{shown} did not start")));
+        let Some(Ok(run)) = crate::providers::which(command[0])
+            .map(|program| proc::spawn_env(&program.to_string_lossy(), &command[1..], cwds[i], env))
+        else {
+            say(ProviderEvent::Text(format!("{} did not start", labels[i])));
             return Err(Ran::NotStarted);
         };
         runs.push(run);
     }
-    say(ProviderEvent::ToolUse {
-        name: "orteca".into(),
-        summary: shown.to_string(),
-        id: None,
-        changes: Vec::new(),
-    });
+    for label in &shown {
+        say(ProviderEvent::ToolUse {
+            name: "orteca".into(),
+            summary: label.to_string(),
+            id: None,
+            changes: Vec::new(),
+        });
+    }
     let started = now_ms();
+    let mut ended_at = vec![None; runs.len()];
 
     // Every process's lines through one channel, tagged with whose they are.
     let (tx, mut lines) = mpsc::unbounded_channel();
@@ -2902,7 +3018,10 @@ async fn run_all(
     loop {
         tokio::select! {
             line = lines.recv() => match line {
-                Some((i, Line::Exit(exit))) => codes[i] = exit,
+                Some((i, Line::Exit(exit))) => {
+                    codes[i] = exit;
+                    ended_at[i] = Some(now_ms());
+                }
                 Some((i, Line::Text(text))) => tails[i].push_back(text),
                 Some((i, Line::Json(value))) => tails[i].push_back(value.to_string()),
                 // Every process has exited and said everything it had.
@@ -2935,10 +3054,18 @@ async fn run_all(
     if state.outcome.cancelled {
         return Err(Ran::Cancelled);
     }
-    state.timings.push(Timing {
-        label: shown.to_string(),
-        ms: now_ms().saturating_sub(started),
-    });
+    let now = now_ms();
+    for label in shown {
+        let last = (0..runs.len())
+            .filter(|&i| labels[i] == label)
+            .map(|i| ended_at[i].unwrap_or(now))
+            .max()
+            .unwrap_or(now);
+        state.timings.push(Timing {
+            label: label.to_string(),
+            ms: last.saturating_sub(started),
+        });
+    }
     let ended: Vec<(Option<i32>, String)> = codes
         .into_iter()
         .zip(tails)
@@ -3119,29 +3246,17 @@ fn collect_tests(root: &Path, folder: &str, files: &mut Vec<(u64, String)>) {
 /// only printed runner warnings counts as passed, the way a whole run does.
 /// When one fails, its tests run again in one process and that output, which
 /// names the failing tests, is the verdict.
-#[allow(clippy::too_many_arguments)]
-async fn run_sharded(
-    store: &Store,
-    ctx: &Context,
-    state: &mut State,
-    control: &mut mpsc::UnboundedReceiver<Control>,
-    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
-    shards: &[Vec<String>],
-    cwd: &Path,
-    shown: &str,
-    changed: &[String],
-) -> Ran {
-    let phpunit = |files: &[String]| -> Vec<String> {
-        ["php", "vendor/bin/phpunit"].into_iter().map(String::from).chain(files.iter().cloned()).collect()
-    };
-    let argvs: Vec<Vec<String>> = shards.iter().map(|files| phpunit(files)).collect();
-    let commands: Vec<Vec<&str>> = argvs.iter().map(|a| a.iter().map(String::as_str).collect()).collect();
-    // Laravel writes its manifests, compiled views, facade cache and fake
-    // disks by renaming or deleting files that another process may hold open,
-    // which Windows refuses. Each shard gets its own manifests and its own
-    // copy of the `storage/` folder tree.
-    let scratch = std::env::temp_dir().join(format!("orteca-shards-{}", ctx.task_id));
-    let envs: Vec<Vec<(&str, PathBuf)>> = (0..shards.len())
+fn phpunit(files: &[String]) -> Vec<String> {
+    ["php", "vendor/bin/phpunit"].into_iter().map(String::from).chain(files.iter().cloned()).collect()
+}
+
+/// Each shard's own environment. Laravel writes its manifests, compiled
+/// views, facade cache and fake disks by renaming or deleting files that
+/// another process may hold open, which Windows refuses. Each shard gets its
+/// own manifests and its own copy of the `storage/` folder tree, under
+/// `scratch`, which the caller removes once they have run.
+fn shard_envs(scratch: &Path, cwd: &Path, count: usize) -> Vec<Vec<(&'static str, PathBuf)>> {
+    (0..count)
         .map(|i| {
             let own = scratch.join(i.to_string());
             copy_folders(&cwd.join("storage"), &own.join("storage"));
@@ -3151,14 +3266,28 @@ async fn run_sharded(
                 ("LARAVEL_STORAGE_PATH", own.join("storage")),
             ]
         })
-        .collect();
-    let named = format!("{shown}, as {} parallel phpunit shards", shards.len());
-    let ran = run_all(store, ctx, state, control, emit, &commands, &envs, cwd, &named).await;
-    let _ = std::fs::remove_dir_all(&scratch);
-    let ended = match ran {
-        Ok(ended) => ended,
-        Err(ran) => return ran,
-    };
+        .collect()
+}
+
+fn shards_shown(shown: &str, count: usize) -> String {
+    format!("{shown}, as {count} parallel phpunit shards")
+}
+
+/// The verdict on shards that have run, as `ended`.
+#[allow(clippy::too_many_arguments)]
+async fn shards_verdict(
+    store: &Store,
+    ctx: &Context,
+    state: &mut State,
+    control: &mut mpsc::UnboundedReceiver<Control>,
+    emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
+    ended: &[(Option<i32>, String)],
+    shards: &[Vec<String>],
+    cwd: &Path,
+    shown: &str,
+    changed: &[String],
+) -> Ran {
+    let named = shards_shown(shown, shards.len());
     let failing: Vec<usize> = (0..ended.len())
         .filter(|&i| {
             let (code, output) = &ended[i];
@@ -3425,6 +3554,32 @@ fn failed_summary(artifact: Option<&serde_json::Value>) -> String {
 /// Every file in the diff was already changed before the run started.
 fn ran_nothing(diff: &[project::FileStat]) -> bool {
     diff.iter().all(|f| f.origin == Some(project::Origin::BeforeRun))
+}
+
+/// A Review that a first-try pass of the suite makes worth skipping: not a
+/// guarded route, and a small change. Across 84 benchmark runs such a Review
+/// found something in 1 of 16, never high (2026-09-24).
+fn skippable_review(route: &Route, dir: &Path, base: Option<&str>, before: Option<&project::Snapshot>) -> bool {
+    route.kind != routing::RouteKind::Guarded
+        && project::diff_since(dir, base).is_ok_and(|mut diff| {
+            project::attribute(dir, &mut diff, before);
+            small_change(dir, &diff)
+        })
+}
+
+/// At most one code file and 30 changed lines, tests aside. A new file git
+/// has no count for is counted on disk; a binary one is never small.
+fn small_change(dir: &Path, diff: &[FileStat]) -> bool {
+    let code: Vec<&FileStat> = diff
+        .iter()
+        .filter(|f| f.origin != Some(project::Origin::BeforeRun))
+        .filter(|f| !f.path.starts_with("tests/") && !f.path.starts_with("test/"))
+        .collect();
+    let lines = |f: &FileStat| match f.added.zip(f.deleted) {
+        Some((a, d)) => Some(a + d),
+        None => std::fs::read_to_string(dir.join(&f.path)).ok().map(|text| text.lines().count() as u64),
+    };
+    code.len() <= 1 && code.iter().all(|f| lines(f).is_some_and(|n| n <= 30))
 }
 
 /// The run has not changed the repository yet. A diff that cannot be read
@@ -6313,6 +6468,101 @@ ping -n 60 127.0.0.1 >nul
         assert!(ran.contains("test tests/Feature/") && !ran.contains("suite"), "shown after the focused tests, before the suite: {ran}");
         assert!(std::fs::read_to_string(dir.join("runs.log")).unwrap().contains("suite"), "the suite still ran");
         assert!(result.timings.iter().any(|t| t.label == "result shown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A PHP suite and a JS suite run at the same time, not one after another.
+    #[tokio::test]
+    async fn suites_of_different_kinds_run_side_by_side() {
+        let store = Store::in_memory().unwrap();
+        let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
+        let mut request = routed(&store, "side-by-side", route);
+        let dir = request.dir.clone();
+        if fake_laravel(&dir).is_none() || crate::providers::which("npm").is_none() {
+            eprintln!("skipped: php, composer or npm is not on PATH");
+            return;
+        }
+        // Each suite logs when it starts and ends. The JS one lasts longer,
+        // since Composer alone takes about two seconds to start.
+        std::fs::write(
+            dir.join("artisan"),
+            "<?php\nif (($argv[1] ?? '') === 'suite') { file_put_contents('times.log', 'php ' . round(microtime(true) * 1000) . \"\\n\", FILE_APPEND); usleep(1500000); file_put_contents('times.log', 'php ' . round(microtime(true) * 1000) . \"\\n\", FILE_APPEND); }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"node t.js"}}"#).unwrap();
+        std::fs::write(
+            dir.join("t.js"),
+            "const fs = require('fs'); const log = () => fs.appendFileSync('times.log', 'js ' + Date.now() + '\\n');\nlog(); setTimeout(log, 6000);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
+        std::fs::write(dir.join("header.js"), "export {};\n").unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        let times = std::fs::read_to_string(dir.join("times.log")).unwrap();
+        let span = |kind: &str| -> (u64, u64) {
+            let at: Vec<u64> = times.lines().filter_map(|l| l.strip_prefix(kind)?.trim().parse().ok()).collect();
+            (at[0], at[1])
+        };
+        let (php, js) = (span("php "), span("js "));
+        assert!(php.0 < js.1 && js.0 < php.1, "they overlap: {times}");
+        assert!(result.timings.iter().any(|t| t.label == "npm test") && result.timings.iter().any(|t| t.label == "composer test"), "{:?}", result.timings);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Only a change of at most one code file and 30 lines is small.
+    #[test]
+    fn a_small_change_is_one_code_file_of_thirty_lines() {
+        let file = |path: &str, added: Option<u64>, origin: Option<project::Origin>| FileStat {
+            path: path.into(),
+            added,
+            deleted: Some(0),
+            origin,
+        };
+        let dir = std::env::temp_dir().join(format!("orteca-small-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = |diff: &[FileStat]| small_change(&dir, diff);
+        assert!(small(&[file("app/A.php", Some(30), None), file("tests/Feature/ATest.php", Some(200), None)]));
+        assert!(!small(&[file("app/A.php", Some(31), None)]));
+        assert!(!small(&[file("app/A.php", Some(1), None), file("app/B.php", Some(1), None)]));
+        assert!(!small(&[file("public/logo.png", None, None)]), "no count and nothing to read");
+        assert!(small(&[file("app/A.php", Some(5), None), file("app/Old.php", Some(900), Some(project::Origin::BeforeRun))]));
+        // A new file git has no count for is counted on disk.
+        std::fs::write(dir.join("New.php"), "<?php\n".repeat(31)).unwrap();
+        assert!(!small(&[file("New.php", None, None)]));
+        std::fs::write(dir.join("New.php"), "<?php\n").unwrap();
+        assert!(small(&[file("New.php", None, None)]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A small change whose suite passed first time ends without its Review.
+    #[tokio::test]
+    async fn a_small_passing_change_skips_its_review() {
+        let store = Store::in_memory().unwrap();
+        let repo = RepoSignals { checks_locally: true, ..RepoSignals::default() };
+        let route = routing::route("make the header bold", Mode::Balanced, &repo);
+        assert_eq!(route.stages, [Stage::Implement, Stage::Verify, Stage::Review]);
+        assert_ne!(route.kind, routing::RouteKind::Guarded);
+        let mut request = routed(&store, "skip-review", route);
+        let dir = request.dir.clone();
+        if fake_laravel(&dir).is_none() {
+            eprintln!("skipped: php or composer is not on PATH");
+            return;
+        }
+        // The stand-in app is the project, not the change.
+        std::fs::write(dir.join(".git/info/exclude"), "briefs.log\nargv.log\ncomposer.json\nartisan\nruns.log\nfake.*\n").unwrap();
+        std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert!(result.stages.iter().all(|n| n.stage != Stage::Review), "{:?}", result.stages.iter().map(|n| n.stage).collect::<Vec<_>>());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

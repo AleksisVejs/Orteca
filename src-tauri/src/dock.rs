@@ -95,6 +95,7 @@ fn shell_cwd(target: &Path) -> PathBuf {
 
 /// Open a shell in `sub` and stream it to the window as `pty:<id>`.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn pty_open(
     app: AppHandle,
     path: String,
@@ -192,7 +193,9 @@ fn pump(app: AppHandle, id: u32, mut reader: Box<dyn Read + Send>) {
     let _ = app.emit(&format!("pty-exit:{id}"), ());
 }
 
-#[tauri::command]
+// Off the main thread: a shell that stops reading can block this write, and
+// the window must not freeze with it.
+#[tauri::command(async)]
 pub fn pty_write(id: u32, data: String, terminals: State<Terminals>) -> Result<()> {
     let mut live = terminals.live.lock().expect("terminals poisoned");
     let terminal = live
@@ -297,12 +300,21 @@ pub fn read_text(path: String, file: String, store: State<Store>) -> Result<Stri
         .map_err(|_| AppError::new(ErrorKind::Invalid, "That file is not text."))
 }
 
+/// `base` is the text the tab loaded. A file that no longer holds it was
+/// changed by something else - a run, a terminal, another editor - and saving
+/// over it would silently throw that change away.
 #[tauri::command(async)]
-pub fn write_text(path: String, file: String, text: String, store: State<Store>) -> Result<()> {
+pub fn write_text(path: String, file: String, text: String, base: String, store: State<Store>) -> Result<()> {
     // The file must already exist: the code tab edits, it does not create.
     let (_, target) = inside(&store, &path, &file)?;
     if !target.is_file() {
         return Err(AppError::new(ErrorKind::NotFound, "That file is not there anymore."));
+    }
+    if std::fs::read(&target)? != base.as_bytes() {
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            "This file changed on disk since you opened it. Reload to see the new version; your edits stay in the box until you do.",
+        ));
     }
     std::fs::write(&target, text)?;
     Ok(())

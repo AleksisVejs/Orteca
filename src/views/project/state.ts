@@ -2,7 +2,7 @@
 // render it, and share one instance through provide/inject.
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import type { InjectionKey, Ref } from "vue";
-import { reference, tidy, forRouting } from "./picks";
+import { reference, tidy, forRouting, split } from "./picks";
 import { verificationSummary } from "./taskPresentation";
 import type { Pick } from "./picks";
 import {
@@ -26,6 +26,8 @@ import {
   providerLimits,
   recentTasks,
   removeWorktree,
+  restoreFile,
+  rewindTask,
   renameTask,
   deleteTask,
   sendInstruction,
@@ -77,8 +79,10 @@ export type Exchange = {
   failure: string | null;
   summary: string | null;
   unknownEvents: number;
-  changed: { byRun: FileStat[]; beforeRun: FileStat[]; unknown: boolean };
+  changed: { byRun: FileStat[]; beforeRun: FileStat[]; reverted: FileStat[]; unknown: boolean };
   patchText: string | null;
+  /** The folder as it was before the run, for a `reverted` file or a rewind. */
+  savedState: string | null;
   verification: string;
   route: Route | null;
   routeSteps: Array<{ stage: string; ran: boolean; asked?: string | null }>;
@@ -142,8 +146,9 @@ function routeStepsOf(r: TaskResult | null) {
 function changedOf(r: TaskResult | null) {
   const diff = r?.diff ?? [];
   return {
-    byRun: diff.filter((f) => f.origin !== "beforeRun"),
+    byRun: diff.filter((f) => f.origin !== "beforeRun" && f.origin !== "reverted"),
     beforeRun: diff.filter((f) => f.origin === "beforeRun"),
+    reverted: diff.filter((f) => f.origin === "reverted"),
     unknown: !!r?.dirtyAtStart && diff.some((f) => f.origin === null),
   };
 }
@@ -164,9 +169,24 @@ export function splitExchanges(d: TaskDetail) {
       const said = data?.said ?? recap.match(/My reply:\n([\s\S]*?)(?:\n\nFiles changed so far: [^\n]*)?$/)?.[1] ?? recap;
       parts.push({ said: tidy(said), events: [], result: null });
     } else if (e.kind === "exchange") last.result = e.payload as TaskResult;
-    else last.events.push(e);
+    else if (e.kind === "rewind") {
+      // The user went back to before a message: it and everything after leave the chat.
+      const keep = (e.payload as { data?: { keep?: number } } | null)?.data?.keep ?? parts.length;
+      parts.length = Math.max(1, Math.min(keep, parts.length));
+    } else last.events.push(e);
   }
   return parts;
+}
+
+/** What rewinding a task to before exchange `at` puts back: the state saved
+ *  before it ran, and every file it or a later answer changed. null when that
+ *  is not known for sure: a result not kept, or work done in a copy. */
+export function rewindCode(results: Array<TaskResult | null | undefined>, at: number) {
+  const later = results.slice(at);
+  const saved = later[0]?.savedState;
+  if (!saved || later.some((r) => !r || r.worktree)) return null;
+  const files = later.flatMap((r) => r!.diff.filter((f) => f.origin !== "beforeRun").map((f) => f.path));
+  return { saved, files: [...new Set(files)] };
 }
 
 /** One live result, and the stream it came with, as the chat shows it. */
@@ -179,6 +199,7 @@ export function exchangeOf(r: TaskResult, stream: ActivityLine[]): Exchange {
     unknownEvents: r.unknownEvents,
     changed: changedOf(r),
     patchText: r.patchText,
+    savedState: r.savedState ?? null,
     verification: verificationSummary(r.stages),
     route: r.route,
     routeSteps: routeStepsOf(r),
@@ -262,14 +283,19 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const providerError = ref(false);
   const provider = ref<ProviderId>("codex");
 
+  // "auto" keeps Orteca's per-stage choice on the provider the user picked:
+  // a small model for a plan or a question, a stronger one where it pays.
+  const AUTO_MODEL = { id: "auto", label: "Orteca picks per step", efforts: [] as string[] };
   const MODELS: Record<ProviderId, Array<{ id: string; label: string; efforts: string[] }>> = {
     claude: [
+      AUTO_MODEL,
       { id: "sonnet", label: "Sonnet", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { id: "opus", label: "Opus", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { id: "fable", label: "Fable", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { id: "haiku", label: "Haiku", efforts: ["low", "medium", "high"] },
     ],
     codex: [
+      AUTO_MODEL,
       { id: "gpt-6-astra", label: "GPT-6 Astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { id: "gpt-6-sol", label: "GPT-6 Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
       { id: "gpt-6-luna", label: "GPT-6 Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -280,8 +306,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     ],
   };
   const modelChoices = ref<Record<ProviderId, ModelOverride>>({
-    claude: { model: "sonnet", effort: "high" },
-    codex: { model: "gpt-6-sol", effort: "medium" },
+    claude: { model: "auto", effort: "high" },
+    codex: { model: "auto", effort: "medium" },
   });
 
   // How readily the classifier takes the shorter route. Two modes, not three.
@@ -301,8 +327,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   ];
 
   // A slow command the agent hands over (`ORTECA-WAIT:`): run it at once, or
-  // ask first. Remembered, since it is a standing choice about trust.
-  const WAIT_KEY = "orteca.autoWait";
+  // ask first. Remembered per project, since it is a standing choice about
+  // trusting that project's agent with commands outside its sandbox.
+  const WAIT_KEY = `orteca.autoWait:${opened.project.path}`;
   const autoWait = ref(false);
   try { autoWait.value = localStorage.getItem(WAIT_KEY) === "1"; } catch { /* no storage: ask first */ }
   function chooseAutoWait(on: boolean) {
@@ -354,7 +381,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         const fresh = await installProvider(id);
         providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
         provider.value = id;
-        void loadLimits(true);
+        // Not fresh: that would pay a Claude model call nobody asked for.
+        void loadLimits();
       } catch (e) {
         installError.value = isAppError(e) ? e.message : String(e);
         break;
@@ -387,8 +415,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       const fresh = await signInProvider(id);
       providers.value = providers.value.map((p) => (p.id === id ? fresh : p));
       // A signed-out CLI reports no limits, so the reading taken at open is stale
-      // the moment a sign-in succeeds. Not awaited: it takes seconds.
-      void loadLimits(true);
+      // the moment a sign-in succeeds. Not fresh: only the Refresh button pays
+      // for a Claude reading. Not awaited: it takes seconds.
+      void loadLimits();
     } catch (e) {
       signInError.value = isAppError(e) ? e.message : String(e);
     } finally {
@@ -642,12 +671,15 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     const choice = modelChoices.value[provider.value];
     choice.model = model;
     const efforts = MODELS[provider.value].find((item) => item.id === model)?.efforts ?? [];
-    if (!efforts.includes(choice.effort)) choice.effort = efforts[0] ?? "medium";
+    if (efforts.length && !efforts.includes(choice.effort)) choice.effort = efforts[0]!;
     schedulePreview();
   }
 
+  // Picking a provider alone picks no model: every step keeps its own.
   const modelOverride = computed<ModelOverride | null>(() =>
-    providerPicked.value ? { ...modelChoices.value[provider.value] } : null,
+    providerPicked.value && modelChoices.value[provider.value].model !== "auto"
+      ? { ...modelChoices.value[provider.value] }
+      : null,
   );
 
   /// `signedOut` is a hard block, `unknown` is not: the CLI could not be asked,
@@ -711,8 +743,13 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     instruction: string;
     sending: boolean;
     instructionError: string | null;
+    /** Steers sent before the task id arrived, each with its line in `stream`. */
+    queued: { line: ActivityLine; applyNow: boolean; attached: string[] }[];
     /** The command the agent handed over, while it waits for the user's OK. */
     waitAsk?: string | null;
+    /** The other CLI this run can carry on with, once its plan ran out. The
+     *  user says yes first: it spends a different subscription. */
+    handoff?: { to: ProviderId; opts: RunOpts } | null;
   };
   // Newest first. Every run still going is kept; finished ones are capped,
   // since the database holds them and the sidebar lists them from there.
@@ -781,27 +818,42 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     () => providers.value.find((p) => p.id === (activeRun.value?.provider ?? provider.value))?.steering ?? "checkpoint",
   );
 
+  /** Where an instruction landed, or null when the run ended before it could take it. */
+  async function deliver(id: number, text: string, applyNow: boolean, attached: string[]) {
+    const receipt = await sendInstruction(id, text, applyNow, attached);
+    if (receipt.disposition === "tooLate") return null;
+    const delivery = receipt.disposition === "held" ? "Queued for next step"
+      : receipt.disposition === "resumed" ? "Applied · step restarted" : "Delivered to the running agent";
+    return delivery + (attached.length ? ` · ${attached.length} attached` : "");
+  }
+
   async function instruct(applyNow: boolean) {
     const text = instruction.value.trim();
-    if (!running.value || taskId.value === null || sending.value || !text) return;
+    if (!running.value || sending.value || !text) return;
     const live = activeRun.value!;
-    live.sending = true;
     live.instructionError = null;
+    // The steer box shares the reply box's attachments: only one of them is ever on screen.
+    // ponytail: shared across runs too, so an unsent one shows on another run's steer box; per-run if that confuses.
+    const attached = attachments.value;
+    // Still getting ready: there is no task to send it to yet, so it waits on
+    // the page and goes out the moment the id arrives (`flushQueued`).
+    if (live.id === null) {
+      live.stream.push({ kind: "instruction", text, file: null, delivery: "Sends once the run starts" });
+      live.queued.push({ line: live.stream.at(-1)!, applyNow, attached });
+      live.instruction = "";
+      attachments.value = attachments.value.filter((p) => !attached.includes(p));
+      return;
+    }
+    live.sending = true;
     try {
-      // The steer box shares the reply box's attachments: only one of them is ever on screen.
-      // ponytail: shared across runs too, so an unsent one shows on another run's steer box; per-run if that confuses.
-      const attached = attachments.value;
-      const receipt = await sendInstruction(taskId.value, text, applyNow, attached);
-      if (receipt.disposition === "tooLate") {
+      const delivery = await deliver(live.id, text, applyNow, attached);
+      if (delivery === null) {
         live.instructionError = "The run finished before it could take that instruction.";
         return;
       }
       // Shown as the user's own words. Never pushed through `describe`, which
       // would file them among the things the agent said.
-      const delivery = receipt.disposition === "held" ? "Queued for next step"
-        : receipt.disposition === "resumed" ? "Applied · step restarted" : "Delivered to the running agent";
-      const count = attached.length ? ` · ${attached.length} attached` : "";
-      live.stream.push({ kind: "instruction", text, file: null, delivery: delivery + count });
+      live.stream.push({ kind: "instruction", text, file: null, delivery });
       live.instruction = "";
       attachments.value = attachments.value.filter((p) => !attached.includes(p));
     } catch (e) {
@@ -811,15 +863,33 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     }
   }
 
+  // In the order they were typed; `sending` holds a new steer back until they are out.
+  async function flushQueued(live: LiveRun, id: number) {
+    if (!live.queued.length) return;
+    live.sending = true;
+    for (const q of live.queued.splice(0)) {
+      try {
+        q.line.delivery = (await deliver(id, q.line.text, q.applyNow, q.attached)) ?? "Not sent · the run had already finished";
+      } catch (e) {
+        q.line.delivery = "Not sent";
+        live.instructionError = isAppError(e) ? e.message : String(e);
+      }
+    }
+    live.sending = false;
+  }
+
   /** The command the run on screen is waiting on the user's OK for. */
   const waitAsk = computed(() => activeRun.value?.waitAsk ?? null);
   async function answerWaitFor(run: boolean) {
     const live = activeRun.value;
-    if (!live?.waitAsk || live.id === null) return;
+    const asked = live?.waitAsk;
+    if (!live || !asked || live.id === null) return;
     live.waitAsk = null;
     try {
       await answerWait(live.id, run);
     } catch (e) {
+      // The run is still waiting unless it ended; keep the question up.
+      if (live.active) live.waitAsk = asked;
       live.instructionError = isAppError(e) ? e.message : String(e);
     }
   }
@@ -890,6 +960,22 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     }
   }
 
+  // A change of the user's that a run undid, put back from the state saved
+  // before it. Keyed `saved:file`, so each exchange's button knows its own.
+  const restored = ref<string[]>([]);
+  const restoreError = ref<string | null>(null);
+
+  async function restore(saved: string, file: string) {
+    restoreError.value = null;
+    try {
+      await restoreFile(opened.project.path, saved, file);
+      restored.value = [...restored.value, `${saved}:${file}`];
+      void refreshGit();
+    } catch (e) {
+      restoreError.value = isAppError(e) ? e.message : String(e);
+    }
+  }
+
   // A task goes by its title, or its prompt cut to the title limit until it has one.
   const taskName = (t: TaskSummary) =>
     t.title || (t.prompt.length > 60 ? `${t.prompt.slice(0, 59).trimEnd()}…` : t.prompt);
@@ -899,6 +985,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   const taskMenu = ref<number | null>(null);
   const renameId = ref<number | null>(null);
   const renaming = ref("");
+  const renameFrom = ref("");
   const deleteAsk = ref<TaskSummary | null>(null);
   const taskError = ref<string | null>(null);
 
@@ -906,17 +993,20 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     taskMenu.value = null;
     renameId.value = t.id;
     renaming.value = t.title || t.prompt.slice(0, 60);
+    renameFrom.value = t.title ?? "";
     taskError.value = null;
   }
 
+  // The sidebar lists more tasks than `history` holds, so this goes by id alone,
+  // and a fresh array lets the sidebar's shallow watch reload its own list.
   async function saveRename() {
-    const row = history.value.find((t) => t.id === renameId.value);
+    const id = renameId.value;
     const title = renaming.value.trim();
     renameId.value = null;
-    if (!row || !title || title === row.title) return;
+    if (id === null || !title || title === renameFrom.value) return;
     try {
-      await renameTask(opened.project.path, row.id, title);
-      row.title = title;
+      await renameTask(opened.project.path, id, title);
+      history.value = history.value.map((t) => (t.id === id ? { ...t, title } : t));
     } catch (e) {
       taskError.value = isAppError(e) ? e.message : String(e);
     }
@@ -1123,11 +1213,12 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   onMounted(async () => {
     void loadHistory();
-    void loadLimits();
+    void loadLimits(true);
     limitsTimer = setInterval(() => {
-      // A reading costs a CLI start each. Only the project on screen asks.
-      if (!limitsLoading.value && active.value) void loadLimits();
-    }, 60_000);
+      // A fresh Claude reading is one haiku call, so only the project on screen
+      // asks, and not while a run is going: its stream already reports it.
+      if (!limitsLoading.value && active.value) void loadLimits(!anyRunning.value);
+    }, 120_000);
     try {
       providers.value = await detectProviders((one) => {
         providers.value = [...providers.value.filter((p) => p.id !== one.id), one];
@@ -1225,6 +1316,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       instruction: "",
       sending: false,
       instructionError: null,
+      queued: [],
     });
     if (carry) {
       // The exchange it answers stays on the page, above the new one.
@@ -1251,6 +1343,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         activity: { text: "Getting ready", file: null },
         stopping: false,
         waitAsk: null,
+        handoff: null,
+        queued: [],
       });
     } else {
       runs.value = [live, ...runs.value].filter((r, i) => r.active || i < KEPT_FINISHED);
@@ -1289,6 +1383,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         },
         (id) => {
           live.id = id;
+          void flushQueued(live, id);
           // The sidebar lists runs from the database, so the new row shows now, not at the end.
           void loadHistory();
         },
@@ -1312,6 +1407,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       live.waitAsk = null;
       live.checking = null;
       live.id = null;
+      for (const q of live.queued.splice(0)) q.line.delivery = "Not sent · the run ended before it started";
       if (selectedRun.value === live.key) {
         if (tick !== null) clearTimeout(tick);
         tickWhileWarm();
@@ -1324,16 +1420,25 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       // The run just spent some of a limit; the next pick should know.
       void loadLimits();
     }
-    // Out of plan usage: the other CLI carries on, once, so two spent plans cannot bounce.
+    // Out of plan usage: the other CLI can carry on, once, so two spent plans
+    // cannot bounce. Offered, not started: it is another plan's money.
     const next = opts.switchedFrom ? null : fallbackFor(live);
-    if (next) {
-      // The same request on the other CLI. What the stopped run changed is still on disk.
-      provider.value = next.id;
-      providerPicked.value = true;
-      pickedFor.value = null;
-      // The handoff is the same request carrying on: it keeps the reply's task.
-      await run({ ...opts, prompt: live.prompt, attachments: attached, switchedFrom: live.provider });
-    }
+    live.handoff = next
+      ? { to: next.id, opts: { ...opts, prompt: live.prompt, attachments: attached, switchedFrom: live.provider } }
+      : null;
+  }
+
+  /** The user said yes: the same request goes on with the other CLI. What the
+   *  stopped run changed is still on disk, and the reply's task is kept. */
+  async function carryOn() {
+    const live = activeRun.value;
+    const handoff = live?.handoff;
+    if (!live || !handoff) return;
+    live.handoff = null;
+    provider.value = handoff.to;
+    providerPicked.value = true;
+    pickedFor.value = null;
+    await run(handoff.opts);
   }
 
   /** Short, human words for the things a provider does behind the scenes. */
@@ -1546,6 +1651,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     budgetReached: "Stopped safely",
     reviewRejected: "Needs another look",
     verifyFailed: "Checks didn’t pass",
+    unchanged: "No changes made",
     checking: "Still checking",
   };
 
@@ -1650,10 +1756,40 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     focusTask();
   }
 
-  /** Back to the prompt with the same words, to tweak and run again. */
-  function editAgain() {
-    selectRun(null);
-    focusTask();
+  const rewindError = ref<string | null>(null);
+
+  /** Back to before message `at` of a task, counting from its first, and
+   *  `text` sent in its place. With `code`, the files the answers from there
+   *  on changed go back as they were first. The chat keeps what came before;
+   *  the first message goes again as a new task, keeping the picked elements
+   *  and tasks of `raw`, the prompt as it was sent. */
+  async function rewindTo(taskId: number, at: number, text: string, raw: string, code: { saved: string; files: string[] } | null) {
+    const live = runs.value.find((r) => (r.result?.taskId ?? r.id) === taskId);
+    if (live?.active) return;
+    rewindError.value = null;
+    try {
+      if (at > 0 || code) await rewindTask(opened.project.path, taskId, at, code?.saved ?? null, code?.files ?? []);
+    } catch (e) {
+      rewindError.value = isAppError(e) ? e.message : String(e);
+      return;
+    }
+    if (code) void refreshGit();
+    if (at === 0) {
+      // The bubble showed each pick as its one-line form; the pick itself goes back as a chip.
+      const again = split(raw).picks;
+      task.value = again.reduce((t, p) => t.replace(tidy(p.block), ""), text).trim();
+      picks.value = again;
+      if (canRun.value) return run();
+      selectRun(null);
+      focusTask();
+      return;
+    }
+    // The live run still shows the later exchanges; the saved task is the one that ends before it.
+    if (live) runs.value = runs.value.filter((r) => r !== live);
+    reply.value = text;
+    view.value = "history";
+    await openHistory({ id: taskId } as TaskSummary);
+    if (historyDetail.value?.id === taskId) await replyToPast();
   }
 
   // A follow-up. While the provider's prompt cache is warm it resumes the
@@ -1768,11 +1904,13 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
         stream: linesOf(p.events),
       };
     });
+    // The last exchange's own result, when kept: after a rewind the task row still holds a later one.
+    const last = parts.at(-1)?.result;
     await followUp({
       taskId: d.id,
       inCopy: !!d.worktreePath,
-      summary: d.summary ?? noAnswer(d.status),
-      files: changedOf({ diff: d.diff } as TaskResult).byRun.map((f) => f.path),
+      summary: last ? last.summary ?? noAnswer(last.status, last.failure) : d.summary ?? noAnswer(d.status),
+      files: changedOf(last ?? ({ diff: d.diff } as TaskResult)).byRun.map((f) => f.path),
       resume: null,
       asked: [d.prompt, ...parts.slice(1).map((p) => p.said)],
       carry: null,
@@ -1789,7 +1927,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       const d = await getTaskDetail(opened.project.path, t.id);
       const files = changedOf({ diff: d.diff } as TaskResult).byRun.map((f) => f.path);
       const said = splitExchanges(d).map((p) => p.said);
-      picks.value.push(reference(t.id, taskName(t), said, d.summary ?? noAnswer(d.status), files));
+      picks.value.push(reference(`task #${t.id}`, taskName(t), said, d.summary ?? noAnswer(d.status), files));
     } catch (e) {
       attachError.value = `Task #${t.id} could not be read: ${isAppError(e) ? e.message : String(e)}`;
     }
@@ -1871,6 +2009,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     otherThan,
     alternative,
     fallback,
+    carryOn,
     switchedFrom,
     switchTo,
     canRun,
@@ -1916,6 +2055,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     removedCopies,
     removeError,
     removeCopy,
+    restored,
+    restoreError,
+    restore,
     taskName,
     historyRow,
     taskMenu,
@@ -1983,7 +2125,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     agentsReady,
     focusTask,
     newTask,
-    editAgain,
+    rewindTo,
+    rewindError,
     reply,
     ranOn,
     sendReply,

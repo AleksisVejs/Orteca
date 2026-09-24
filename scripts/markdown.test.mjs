@@ -50,3 +50,40 @@ test('web addresses become links, other targets stay words', () => {
   ]);
   assert.equal(p.lines[0].map(s => s.text).join(''), 'Cursor: https://cursor.com/ and docs. See file, or https://aider.chat.');
 });
+
+test('a pipe table becomes a head and rows', () => {
+  const blocks = parseMarkdown([
+    'Intro.',
+    '',
+    '| | Orteca | Orca |',
+    '|---|---|---|',
+    '| Pros | **Windows** | `free` |',
+    '| Cons | few | many |',
+    'After.',
+  ].join('\n'));
+  assert.deepEqual(blocks.map(b => b.kind), ['p', 'table', 'p']);
+  assert.deepEqual(blocks[1].head.map(c => c[0]?.text), [undefined, 'Orteca', 'Orca']);
+  assert.equal(blocks[1].rows.length, 2);
+  assert.deepEqual(blocks[1].rows[0][1][0], { kind: 'bold', text: 'Windows' });
+  assert.equal(parseMarkdown('| not | a table |').at(0).kind, 'p');
+});
+
+test('italics, strikes, quotes and rules', () => {
+  const blocks = parseMarkdown([
+    'An *easy* and _quick_ ~~slow~~ fix, not snake_case_name or 2 * 3 * 4.',
+    '---',
+    '> quoted **line**',
+    '>',
+    '> still quoted',
+    '',
+    'After.',
+  ].join('\n'));
+  assert.deepEqual(blocks.map(b => b.kind), ['p', 'hr', 'quote', 'p']);
+  assert.deepEqual(blocks[0].lines[0].filter(s => s.kind !== 'text'), [
+    { kind: 'italic', text: 'easy' },
+    { kind: 'italic', text: 'quick' },
+    { kind: 'strike', text: 'slow' },
+  ]);
+  assert.equal(blocks[2].lines.length, 2);
+  assert.deepEqual(blocks[2].lines[0][1], { kind: 'bold', text: 'line' });
+});

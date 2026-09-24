@@ -190,7 +190,7 @@ mod tests {
             "the file change is missing"
         );
         // Only completed commands become events; `item.started` carries none,
-        // which is why run::stream keeps those lines under `kind = unknown`.
+        // and run::stream skips it as the announcement of what completes later.
         let shells = events
             .iter()
             .filter(|e| matches!(e, ProviderEvent::ToolUse { name, .. } if name == "Shell"))

@@ -3,8 +3,9 @@ import { computed, inject, onMounted, ref } from "vue";
 import Memory from "./Memory.vue";
 import ProviderMark from "../../components/ProviderMark.vue";
 import { PROJECT } from "./state";
-import { isAppError, memory } from "../../api";
-import type { MemoryState } from "../../types";
+import { cliChat, cliChats, isAppError, memory } from "../../api";
+import { reference } from "./picks";
+import type { CliChatSummary, MemoryState } from "../../types";
 
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
@@ -14,7 +15,7 @@ const {
   limitWarning, alternative, switchTo, waiting, waitForReset, cancelWait, formatWhen, runError, providerError, agentsPending, view,
   remembering, rememberText, rememberError, remember,
   MODELS, modelChoices, chooseProvider, chooseModel, domId, anyRunning, runningCount, opened, git, history,
-  taskName, referTask, TONE, HISTORY_STATUS,
+  taskName, referTask, TONE, HISTORY_STATUS, stageLabel,
 } = inject(PROJECT)!;
 
 // Any task that has ended; a failed one is often the context worth handing on.
@@ -29,6 +30,29 @@ function pickTask(t: (typeof pastTasks.value)[number]) {
   taskFilter.value = "";
   void referTask(t);
 }
+
+// Chats the user had with a CLI here before Orteca, handed on the same way.
+const chats = ref<CliChatSummary[]>([]);
+const shownChats = computed(() => {
+  const q = taskFilter.value.trim().toLowerCase();
+  return q ? chats.value.filter((c) => c.title.toLowerCase().includes(q)) : chats.value;
+});
+const cliName = (c: CliChatSummary) => (c.provider === "claude" ? "Claude" : "Codex");
+async function pickChat(c: CliChatSummary) {
+  document.getElementById(domId("task-refs"))?.hidePopover();
+  taskFilter.value = "";
+  attachError.value = null;
+  const what = `${cliName(c)} chat`;
+  try {
+    const d = await cliChat(opened.project.path, c.provider, c.id);
+    const pick = reference(what, d.title, d.said, d.answer || "(No answer was recorded.)", []);
+    if (!picks.value.some((p) => p.label === pick.label)) picks.value.push(pick);
+  } catch (e) {
+    attachError.value = `That ${what} could not be read: ${isAppError(e) ? e.message : String(e)}`;
+  }
+}
+// A folder with no transcripts is the common case, not an error worth a line.
+onMounted(() => cliChats(opened.project.path).then((found) => (chats.value = found), () => {}));
 
 // A run inherits only these explicit rules: global first, then this project.
 // Keep the receipt beside Run so the user can check the actual payload before
@@ -93,7 +117,7 @@ function formatDuration(milliseconds: number) {
 
       <ul v-if="picks.length" class="attachments" aria-label="Elements and tasks picked">
         <li v-for="(pick, i) in picks" :key="pick.block" class="chip">
-          <span class="mono" :title="pick.block">{{ pick.label.startsWith("#") ? "↩" : "⌖" }} {{ pick.label }}</span>
+          <span class="mono" :title="pick.block">{{ pick.block.startsWith("On ") ? "⌖" : "↩" }} {{ pick.label }}</span>
           <button class="unattach" :title="`Remove ${pick.label}`" :aria-label="`Remove ${pick.label}`" @click="picks.splice(i, 1)">×</button>
         </li>
       </ul>
@@ -129,7 +153,7 @@ function formatDuration(milliseconds: number) {
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
           Folder
         </button>
-        <button v-if="pastTasks.length" class="icon" :popovertarget="domId('task-refs')" title="Build on an earlier task: its chat and final answer go with this one">
+        <button v-if="pastTasks.length || chats.length" class="icon" :popovertarget="domId('task-refs')" title="Build on an earlier task: its chat and final answer go with this one">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M6 4 2.5 7.5 6 11M3 7.5h6.5a4 4 0 0 1 4 4v1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
           Task
         </button>
@@ -148,6 +172,16 @@ function formatDuration(milliseconds: number) {
               </button>
             </li>
             <li v-if="!shownTasks.length" class="note refs-empty">No task matches.</li>
+            <template v-if="shownChats.length">
+              <li class="refs-group" role="presentation">Chats here outside Orteca</li>
+              <li v-for="c in shownChats" :key="`${c.provider}:${c.id}`">
+                <button @click="pickChat(c)">
+                  <ProviderMark :id="c.provider" />
+                  <span class="refs-title">{{ c.title }}</span>
+                  <span class="refs-meta">{{ cliName(c) }} · {{ new Date(c.updatedMs).toLocaleDateString() }}</span>
+                </button>
+              </li>
+            </template>
           </ul>
         </section>
         <Memory :path="opened.project.path" :pop-id="domId('memory')" button-class="icon" @changed="loadMemory">
@@ -177,7 +211,7 @@ function formatDuration(milliseconds: number) {
         <div v-if="installed.length" class="setting" role="group" :aria-labelledby="domId('helper-label')">
           <div class="setting-text">
             <span :id="domId('helper-label')" class="option-label">AI helper</span>
-            <span class="setting-hint">{{ providerPicked ? "You pick the model and how hard it thinks" : "Orteca picks the helper, model and reasoning" }}</span>
+            <span class="setting-hint">{{ providerPicked ? "You pick the helper; Orteca still picks each step's model unless you choose one" : "Orteca picks the helper, model and reasoning" }}</span>
           </div>
           <div class="segments">
             <button
@@ -211,7 +245,7 @@ function formatDuration(milliseconds: number) {
               <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m5 6 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
             </span>
           </label>
-          <label class="setting sub">
+          <label v-if="modelChoices[provider].model !== 'auto'" class="setting sub">
             <span class="setting-text"><span class="option-label">Reasoning</span></span>
             <span class="select-field">
               <select v-model="modelChoices[provider].effort" @change="schedulePreview">
@@ -268,7 +302,7 @@ function formatDuration(milliseconds: number) {
         <div class="setting" role="group" :aria-labelledby="domId('wait-label')">
           <div class="setting-text">
             <span :id="domId('wait-label')" class="option-label">Slow commands</span>
-            <span class="setting-hint">{{ autoWait ? "Runs them at once. Blocked ones, like git push, are still refused" : "Asks before it runs a long command" }}</span>
+            <span class="setting-hint">{{ autoWait ? "Runs them at once, as you, outside the agent's sandbox. Only a short list, like git push, is refused" : "Asks before it runs a command the agent hands over" }}</span>
           </div>
           <div class="segments">
             <button
@@ -284,7 +318,7 @@ function formatDuration(milliseconds: number) {
               class="seg"
               :class="{ on: autoWait }"
               :aria-pressed="autoWait"
-              title="Run it at once. Blocked commands, like git push or rm, are still refused"
+              title="Run it at once, in this project only. It runs as you, with network access, outside the agent's sandbox; only a short list like git push or rm is refused"
               @click="chooseAutoWait(true)"
             >
               Run them
@@ -295,7 +329,8 @@ function formatDuration(milliseconds: number) {
 
       <div v-if="previewing" class="preview note" aria-live="polite">Figuring out the best way to do it…</div>
       <div v-else-if="preview" class="preview" aria-live="polite">
-        <span class="note">Questions get an answer. Code changes are planned, made, and checked.</span>
+        <!-- Routed without the model reading of the prompt, which costs a call; the run may still adjust it. -->
+        <span class="note">Likely steps: {{ preview.route.stages.map(stageLabel).join(" → ") }}. This can change once Orteca reads your request.</span>
         <span v-if="isolation === 'worktree'" class="note">
           I’ll work in a separate copy on a new branch and leave this folder alone.
           <template v-if="preview.git.dirty">
@@ -304,7 +339,7 @@ function formatDuration(milliseconds: number) {
           Files Git ignores, like node_modules, aren’t copied.
         </span>
         <span v-else-if="preview.git.dirty" class="note">
-          I’ll keep your {{ preview.git.dirtyCount }} existing change{{ preview.git.dirtyCount === 1 ? "" : "s" }} safe.
+          Your {{ preview.git.dirtyCount }} existing change{{ preview.git.dirtyCount === 1 ? " is" : "s are" }} saved first. If the run undoes any, you can put them back.
         </span>
         <!-- Only reported figures reach the words; the per-call threshold is a guess and is not shown as a number. -->
         <span v-if="limitWarning" class="missing" role="status">
@@ -583,6 +618,10 @@ textarea:focus {
 }
 .refs-empty {
   padding: 8px;
+}
+.refs-group {
+  padding: 12px 8px 4px;
+  color: var(--text-faint);
 }
 .count {
   min-width: 18px;

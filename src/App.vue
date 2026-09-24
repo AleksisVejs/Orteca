@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import Launch from "./views/Launch.vue";
 import ProjectView from "./views/Project.vue";
 import TrustPrompt from "./components/TrustPrompt.vue";
-import { isAppError, openProject, trustProject } from "./api";
+import { gitStatus, isAppError, openProject, trustProject } from "./api";
 import type { OpenedProject } from "./types";
 
 // Two screens plus one modal. A router would be more moving parts than routes.
@@ -149,6 +149,13 @@ async function confirmTrust() {
   }
   if (pendingTrust.value !== result) return;
   result.project.trusted = true;
+  // Before consent Orteca asked git only for the root; the full state is safe now.
+  try {
+    result.git = await gitStatus(result.project.path);
+  } catch {
+    // The project screen refreshes git on its own; a failure here is not a failed open.
+  }
+  if (pendingTrust.value !== result) return;
   pendingTrust.value = null;
   show(result);
 }

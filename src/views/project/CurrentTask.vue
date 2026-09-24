@@ -6,7 +6,7 @@ import TaskChat from "./TaskChat.vue";
 import SteerBox from "./SteerBox.vue";
 import ExchangeView from "./Exchange.vue";
 import Story from "./Story.vue";
-import { PROJECT, exchangeOf, storyOf } from "./state";
+import { PROJECT, exchangeOf, rewindCode, storyOf } from "./state";
 import { visiblePath } from "../../path";
 
 // The task on screen, as one chat from the first message to the reply after it.
@@ -15,8 +15,8 @@ import { visiblePath } from "../../path";
 const {
   activeRun, said, result, running, checking, ranOn, domId, switchedFrom, describeVerdict, stageLabel,
   removedCopies, confirmRemove, removeCopy, removeError, tokens,
-  comparison, HISTORY_STATUS, formatTokens, editAgain, sendReply, warmLeft,
-  git, openGit, retryAt, waiting, waitForReset, cancelWait, formatWhen, lines,
+  comparison, HISTORY_STATUS, formatTokens, sendReply, warmLeft,
+  git, openGit, retryAt, waiting, waitForReset, cancelWait, formatWhen, lines, carryOn, rewindTo,
 } = inject(PROJECT)!;
 
 // A copy's committed work is on its branch; a fresh run would start without it.
@@ -30,6 +30,18 @@ const replyHint = computed(() => warmLeft.value > 0
   : "A reply now starts over and reads the files again, so it costs more than one sent within 5 minutes of the run.");
 // Each earlier answer keeps its own proof; one read back from history has only its words.
 const earlier = computed(() => (activeRun.value?.turns ?? []).map((t) => ({ ...t, data: t.result ? exchangeOf(t.result, t.stream ?? []) : null })));
+
+// Back to before message `i`, sending `text` in its place; with `code` its files go back as
+// they were. The first request keeps its picked files, so it goes back raw too. Work in a copy is not in this
+// folder, so any of its messages goes to the composer as a new task.
+const results = computed(() => [...(activeRun.value?.turns ?? []).map((t) => t.result), result.value]);
+const inTree = computed(() => !!result.value && !result.value.worktree);
+function rewind(i: number, text: string, code: boolean) {
+  const live = activeRun.value;
+  if (!live || !result.value) return;
+  const raw = i === 0 ? live.asked[0] ?? live.prompt : "";
+  void rewindTo(result.value.taskId, inTree.value ? i : 0, text, raw, code && inTree.value ? rewindCode(results.value, i) : null);
+}
 // While it runs, everything in order: what the agent says, thinks and does, and every steer.
 const messages = computed(() => storyOf(lines.value));
 
@@ -99,13 +111,27 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
     :reply-note="replyNote"
     :reply-hint="replyHint"
     :follow="running"
+    :edit-disabled="running"
+    :rewind-files="inTree ? rewindCode(results, earlier.length)?.files : null"
     @send="sendReply"
-    @edit-again="editAgain"
+    @edit-again="(text: string) => rewind(earlier.length, text, false)"
+    @rewind="(text: string) => rewind(earlier.length, text, true)"
   >
     <!-- Everything already said in this task, so a follow-up reads as one conversation. -->
     <template #earlier>
       <template v-for="(t, i) in earlier" :key="i">
-        <ExchangeView v-if="t.data" :id-prefix="`turn-${i}`" :prompt="t.said" :data="t.data" earlier>
+        <ExchangeView
+          v-if="t.data"
+          :id-prefix="`turn-${i}`"
+          :prompt="t.said"
+          :data="t.data"
+          earlier
+          :editable="!!result"
+          :edit-disabled="running"
+          :rewind-files="inTree ? rewindCode(results, i)?.files : null"
+          @edit-again="(text: string) => rewind(i, text, false)"
+          @rewind="(text: string) => rewind(i, text, true)"
+        >
           <template #activity>
             <ActivityLog :items="t.stream ?? []" :patch-text="t.result?.patchText" :root="t.result?.worktree?.path" :finished="true" :dirty-at-start="t.result?.dirtyAtStart" />
           </template>
@@ -159,6 +185,10 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
       <p v-else-if="retryAt" class="note">
         {{ activeRun.provider }}’s limit resets {{ formatWhen(retryAt) }}.
         <button class="link" @click="waitForReset(retryAt, activeRun)">Carry on then</button>
+      </p>
+      <p v-if="activeRun.handoff && !running" class="note" role="status">
+        {{ activeRun.provider }} ran out of plan usage. {{ activeRun.handoff.to }} can carry on with the same request, on its own plan.
+        <button class="link" @click="carryOn">Carry on with {{ activeRun.handoff.to }}</button>
       </p>
       <p v-if="switchedFrom" class="note switched" role="status">
         {{ switchedFrom }} ran out of plan usage, so {{ ranOn }} carried on with the same request.

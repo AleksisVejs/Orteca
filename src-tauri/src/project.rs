@@ -168,6 +168,52 @@ pub fn trust_scan(root: &Path) -> Vec<TrustFinding> {
     findings
 }
 
+/// What a run could execute from the project's agent configuration, as one
+/// stable hash: every path the trust scan found, and the bytes of every file
+/// under the ones that can run something (settings and hooks, MCP servers,
+/// Codex config). Instruction files (`*.md`) are left out: they change with
+/// ordinary work and run nothing. A different hash means the user trusted
+/// something other than what is there now.
+pub fn trust_fingerprint(root: &Path, findings: &[TrustFinding]) -> String {
+    // FNV-1a: stable across builds, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    // ponytail: first 2000 files under the config paths; a `.claude` bigger than that is not config.
+    let mut files = 0;
+    for f in findings.iter().filter(|f| !f.path.to_ascii_lowercase().ends_with(".md")) {
+        feed(f.path.as_bytes());
+        feed(f.reason.as_bytes());
+        // An ancestor's (absolute) path counts by name only: the home folder's
+        // own `~/.claude` sits above most projects, is written by every CLI
+        // session, and runs load no user settings anyway. Only config paths
+        // are read: a skipped `target/` or `node_modules` is a finding too,
+        // and walking one took seconds on every open.
+        if Path::new(&f.path).is_absolute() || !TRUST_TARGETS.iter().any(|(_, r)| *r == f.reason) {
+            continue;
+        }
+        let mut stack = vec![root.join(&f.path)];
+        while let Some(path) = stack.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.is_dir() {
+                let mut children: Vec<PathBuf> = std::fs::read_dir(&path)
+                    .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                children.sort();
+                stack.extend(children.into_iter().rev());
+            } else if files < 2000 {
+                files += 1;
+                feed(path.strip_prefix(root).unwrap_or(&path).to_string_lossy().as_bytes());
+                feed(&std::fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    format!("{hash:016x}")
+}
+
 fn scan_targets(root: &Path, dir: &Path, findings: &mut Vec<TrustFinding>) {
     for (rel, reason) in TRUST_TARGETS {
         let path = dir.join(rel);
@@ -192,6 +238,16 @@ fn finding(root: &Path, path: &Path, reason: &'static str) -> TrustFinding {
             path.to_string_lossy().replace('\\', "/")
         },
         reason,
+    }
+}
+
+/// Only whether `dir` is in a repository, and its root. For a project nobody
+/// has trusted yet: `git status` can run a clean filter the repository's own
+/// config names, and `rev-parse` runs nothing.
+pub fn git_root(dir: &Path) -> GitState {
+    match git(dir, &["rev-parse", "--show-toplevel"]) {
+        Some(root) => GitState { is_repo: true, root: Some(root), ..Default::default() },
+        None => GitState::default(),
     }
 }
 
@@ -314,6 +370,9 @@ pub enum Origin {
     /// Already changed when the run started, and different again after. The
     /// line counts are measured against the commit, so they include both.
     Both,
+    /// Already changed when the run started, and back to the commit after:
+    /// the run undid the user's change. The diff alone would drop it silently.
+    Reverted,
 }
 
 /// Every file that was already changed when a run started, with a fingerprint
@@ -338,16 +397,132 @@ pub fn snapshot(dir: &Path, base: Option<&str>) -> Option<Snapshot> {
 }
 
 /// Label each entry of a finished run's diff against the snapshot taken
-/// before it. A file the run restored to the commit is no longer in the diff
-/// at all, and so is not labelled.
-pub fn attribute(dir: &Path, diff: &mut [FileStat], before: Option<&Snapshot>) {
+/// before it. A file that was dirty before and is no longer in the diff was
+/// put back to the commit by the run, and is added as `Reverted`.
+pub fn attribute(dir: &Path, diff: &mut Vec<FileStat>, before: Option<&Snapshot>) {
     let Some(before) = before else { return };
-    for file in diff {
+    for file in diff.iter_mut() {
         file.origin = Some(match before.0.iter().find(|(path, _)| *path == file.path) {
             None => Origin::Run,
             Some((_, print)) if *print == fingerprint(&dir.join(&file.path)) => Origin::BeforeRun,
             Some(_) => Origin::Both,
         });
+    }
+    let reverted: Vec<FileStat> = before
+        .0
+        .iter()
+        .filter(|(path, _)| !diff.iter().any(|f| f.path == *path))
+        .map(|(path, _)| FileStat { path: path.clone(), added: None, deleted: None, origin: Some(Origin::Reverted) })
+        .collect();
+    diff.extend(reverted);
+}
+
+/// Everything uncommitted, tracked and untracked, as a commit no branch holds,
+/// kept by `refs/orteca/before/<task>/<ms>`. Built in a throwaway index, so the
+/// working tree and the user's own index are not touched. What a run undoes
+/// can be put back from it. `None` when git cannot make it.
+pub fn save_state(dir: &Path, head: Option<&str>, task_id: i64) -> Option<String> {
+    let index = std::env::temp_dir().join(format!("orteca-index-{task_id}-{}", std::process::id()));
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // A machine with no git identity still gets its work saved.
+            .env("GIT_AUTHOR_NAME", "Orteca")
+            .env("GIT_AUTHOR_EMAIL", "orteca@localhost")
+            .env("GIT_COMMITTER_NAME", "Orteca")
+            .env("GIT_COMMITTER_EMAIL", "orteca@localhost")
+            .creation_flags(CREATE_NO_WINDOW)
+            .current_dir(dir)
+            .output()
+            .ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let saved = (|| {
+        match head {
+            Some(head) => run(&["read-tree", head])?,
+            None => run(&["read-tree", "--empty"])?,
+        };
+        run(&["add", "-A"])?;
+        let tree = run(&["write-tree"])?;
+        let message = format!("Orteca: uncommitted work before task {task_id}");
+        let mut args = vec!["commit-tree", "--no-gpg-sign", tree.as_str(), "-m", message.as_str()];
+        if let Some(head) = head {
+            args.extend(["-p", head]);
+        }
+        let commit = run(&args)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        run(&["update-ref", &format!("refs/orteca/before/{task_id}/{stamp}"), &commit])?;
+        Some(commit)
+    })();
+    let _ = std::fs::remove_file(&index);
+    saved
+}
+
+/// Put one file back as it was before a run, from the commit `save_state`
+/// made. Only a file that is now exactly as committed, so nothing is lost.
+pub fn restore_saved(dir: &Path, saved: &str, file: &str) -> Result<()> {
+    if !(saved.len() >= 40 && saved.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(AppError::new(ErrorKind::Invalid, "That is not a saved state Orteca made."));
+    }
+    if file.starts_with('-') || git(dir, &["status", "--porcelain", "--", file]).is_some() {
+        return Err(AppError::new(
+            ErrorKind::Invalid,
+            format!("{file} has changed since, so Orteca will not overwrite it."),
+        ));
+    }
+    if git(dir, &["cat-file", "-t", &format!("{saved}:{file}")]).is_none() {
+        // The user had deleted it and the run brought it back. It is tracked
+        // and as committed, so removing it again loses nothing.
+        if git(dir, &["ls-files", "--", file]).as_deref() != Some(file) {
+            return Err(AppError::new(ErrorKind::NotFound, format!("{file} was not saved.")));
+        }
+        return std::fs::remove_file(dir.join(file)).map_err(Into::into);
+    }
+    git_run(dir, &["restore", &format!("--source={saved}"), "--worktree", "--", file], "Git could not restore the file")
+        .map(drop)
+}
+
+/// Put files back as they were in `saved`, the state kept before one exchange
+/// of a task: a file it holds is restored, one it does not is removed, since
+/// it did not exist then. Whatever changed them since is lost, so the caller
+/// has asked the user first.
+pub fn rewind_files(dir: &Path, saved: &str, files: &[String]) -> Result<()> {
+    if !(saved.len() >= 40 && saved.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(AppError::new(ErrorKind::Invalid, "That is not a saved state Orteca made."));
+    }
+    let outside = |f: &str| {
+        f.starts_with('-') || Path::new(f).components().any(|c| !matches!(c, std::path::Component::Normal(_)))
+    };
+    if let Some(f) = files.iter().find(|f| outside(f)) {
+        return Err(AppError::new(ErrorKind::Invalid, format!("{f} is not a file in this project.")));
+    }
+    let (kept, gone): (Vec<&String>, Vec<&String>) =
+        files.iter().partition(|f| git(dir, &["cat-file", "-t", &format!("{saved}:{f}")]).is_some());
+    if !kept.is_empty() {
+        let source = format!("--source={saved}");
+        let mut args = vec!["restore", source.as_str(), "--worktree", "--"];
+        args.extend(kept.iter().map(|f| f.as_str()));
+        git_run(dir, &args, "Git could not put the files back")?;
+    }
+    for f in gone {
+        match std::fs::remove_file(dir.join(f)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Forget the saved states of one task.
+pub fn drop_saved(dir: &Path, task_id: i64) {
+    let refs = git(dir, &["for-each-ref", "--format=%(refname)", &format!("refs/orteca/before/{task_id}/")]).unwrap_or_default();
+    for name in refs.lines() {
+        let _ = git_run(dir, &["update-ref", "-d", name], "");
     }
 }
 
@@ -1050,6 +1225,13 @@ pub fn base_copy(repo: &Path, base: &str, copy: &Path, setup: &[&str]) -> Result
     Ok(())
 }
 
+/// A file's committed text at `commit`, `None` when it was not there. `path`
+/// is relative to the repository root.
+pub fn file_at(repo: &Path, commit: &str, path: &Path) -> Option<String> {
+    let spec = format!("{commit}:{}", path.to_string_lossy().replace('\\', "/"));
+    git_output(repo, &["cat-file", "blob", &spec]).ok()
+}
+
 /// `path` without the `\\?\` prefix `canonicalize` gives on Windows.
 pub fn plain(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
@@ -1061,6 +1243,22 @@ pub fn plain(path: &Path) -> PathBuf {
 pub fn drop_base_copy(repo: &Path, copy: &Path) {
     let _ = std::fs::remove_dir_all(copy);
     let _ = git_run(repo, &["worktree", "prune"], "");
+}
+
+/// What a run leaves in the temp folder when Orteca dies mid-way: a base copy
+/// (with the project's `.env` in it) and `save_state`'s throwaway index.
+/// Swept at start-up, when no run can still be using them. The repository's
+/// note of the copy goes at its next `worktree prune`.
+pub fn sweep_temp() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("orteca-base-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else if name.starts_with("orteca-index-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Runs as the user, with their identity and their hooks: this is their
@@ -1193,7 +1391,7 @@ fn rank_hits(output: &str, needles: &[&str]) -> Vec<String> {
         .filter(|l| l.len() < 400)
         .map(|l| (needles.iter().filter(|n| l.contains(**n)).count(), l))
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0)); // stable: ties keep git's file order
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.0)); // stable: ties keep git's file order
     hits.into_iter()
         .take(5)
         .map(|(_, l)| clip(l))
@@ -1693,6 +1891,47 @@ mod tests {
 
     /// The sandbox case that prompted this: `stray.txt` was untracked before
     /// the run and must not be reported as the agent's work.
+    /// Rewinding puts the named files back as the saved state had them: the
+    /// user's uncommitted edit comes back, a file made since goes, and a
+    /// file not named is left alone.
+    #[test]
+    fn rewinding_puts_named_files_back_as_saved() {
+        let dir = temp_dir("rewind");
+        let command = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        command(&["init", "-q"]);
+        command(&["config", "user.name", "test"]);
+        command(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "old\n").unwrap();
+        command(&["add", "."]);
+        command(&["commit", "-qm", "initial"]);
+        let base = git_state(&dir).head.unwrap();
+        std::fs::write(dir.join("a.txt"), "old\nmine\n").unwrap();
+        let saved = save_state(&dir, Some(&base), 9).expect("saved state");
+
+        // Two answers later.
+        std::fs::write(dir.join("a.txt"), "agent\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "agent\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "user, later\n").unwrap();
+
+        let files = ["a.txt".to_string(), "new.txt".to_string()];
+        rewind_files(&dir, &saved, &files).unwrap();
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap().replace('\r', "");
+        assert_eq!(read("a.txt"), "old\nmine\n");
+        assert!(!dir.join("new.txt").exists(), "a file made after was kept");
+        assert_eq!(read("b.txt"), "user, later\n", "a file not named was touched");
+        // A clean tree's saved state is its commit.
+        rewind_files(&dir, &base, &files).unwrap();
+        assert_eq!(read("a.txt"), "old\n");
+        assert!(rewind_files(&dir, &saved, &["../x".to_string()]).is_err());
+        assert!(rewind_files(&dir, "HEAD", &files).is_err());
+        drop_saved(&dir, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_diff_tells_the_users_changes_from_the_runs() {
         let dir = temp_dir("diff-origin");
@@ -1711,7 +1950,7 @@ mod tests {
         command(&["init", "-q"]);
         command(&["config", "user.name", "test"]);
         command(&["config", "user.email", "test@example.com"]);
-        for name in ["clean.txt", "edited.txt", "gone.txt"] {
+        for name in ["clean.txt", "edited.txt", "gone.txt", "undone.txt"] {
             std::fs::write(dir.join(name), "old\n").unwrap();
         }
         command(&["add", "."]);
@@ -1722,12 +1961,17 @@ mod tests {
         std::fs::write(dir.join("stray.txt"), "untracked\n").unwrap();
         std::fs::write(dir.join("edited.txt"), "old\nmine\n").unwrap();
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        std::fs::write(dir.join("undone.txt"), "old\nmine too\n").unwrap();
         let before = snapshot(&dir, Some(&base)).expect("snapshot");
+        let saved = save_state(&dir, Some(&base), 7).expect("saved state");
+        assert!(git_state(&dir).dirty, "saving touched the working tree");
 
         // The run: touches a clean file and one the user had already edited.
         std::fs::write(dir.join("clean.txt"), "old\nagent\n").unwrap();
         std::fs::write(dir.join("edited.txt"), "old\nmine\nagent\n").unwrap();
         std::fs::write(dir.join("created.txt"), "agent\n").unwrap();
+        // ...and undoes one of the user's.
+        std::fs::write(dir.join("undone.txt"), "old\n").unwrap();
 
         let mut diff = diff_since(&dir, Some(&base)).unwrap();
         attribute(&dir, &mut diff, Some(&before));
@@ -1750,6 +1994,16 @@ mod tests {
         assert_eq!(origin("edited.txt"), Some(Origin::Both));
         assert_eq!(origin("clean.txt"), Some(Origin::Run));
         assert_eq!(origin("created.txt"), Some(Origin::Run));
+        assert_eq!(origin("undone.txt"), Some(Origin::Reverted), "an undone change went unreported");
+        // What the run undid comes back from the saved state; nothing else moves.
+        restore_saved(&dir, &saved, "undone.txt").unwrap();
+        // Line endings follow the repo's checkout settings, as `git stash` would.
+        assert_eq!(std::fs::read_to_string(dir.join("undone.txt")).unwrap().replace('\r', ""), "old\nmine too\n");
+        assert!(restore_saved(&dir, &saved, "clean.txt").is_err(), "a changed file was overwritten");
+        drop_saved(&dir, 7);
+        assert!(git(&dir, &["for-each-ref", "refs/orteca/"]).is_none());
+        std::fs::write(dir.join("undone.txt"), "old\n").unwrap();
+        diff.retain(|f| f.path != "undone.txt");
 
         // No snapshot means no claim either way.
         let mut unknown = diff_since(&dir, Some(&base)).unwrap();
@@ -1776,6 +2030,23 @@ mod tests {
         // No path is no patch, and no filter is every path.
         assert_eq!(patch_of(&dir, Some(&base), Some(&[])).unwrap(), "");
         assert!(patch_since(&dir, Some(&base)).unwrap().contains("stray.txt"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Trust follows what can run: a hook edit asks again, an instructions edit does not.
+    #[test]
+    fn the_trust_fingerprint_moves_with_runnable_config_only() {
+        let dir = temp_dir("trust-print");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "be brief").unwrap();
+        let print = || trust_fingerprint(&dir, &trust_scan(&dir));
+        let first = print();
+        assert_eq!(print(), first, "the same folder hashed differently");
+        std::fs::write(dir.join("AGENTS.md"), "be very brief").unwrap();
+        assert_eq!(print(), first, "an instructions edit asked for trust again");
+        std::fs::write(dir.join(".claude/settings.json"), r#"{"hooks":{}}"#).unwrap();
+        assert_ne!(print(), first, "a hook edit went unnoticed");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2154,3 +2425,4 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+

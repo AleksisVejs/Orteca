@@ -45,7 +45,7 @@ async function send(now: boolean) {
 function onEnter(e: KeyboardEvent) {
   if (e.isComposing) return;
   e.preventDefault();
-  if (taskId.value !== null && !sending.value && instruction.value.trim()) void send(false);
+  if (!sending.value && instruction.value.trim()) void send(false);
 }
 
 // Where the orb stands, for the page to land it in the heading's dot when the run ends.
@@ -75,7 +75,7 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
     </div>
     <!-- Running it is consent, so neither button is the primary one. -->
     <div v-if="waitAsk" class="composer-row steer-row" role="group" aria-label="Command the agent asks Orteca to run">
-      <span class="grow">Run this for the agent? <span class="mono">{{ waitAsk }}</span></span>
+      <span class="grow">Run this for the agent? <span class="mono">{{ waitAsk }}</span> <span class="note">It runs as you, outside the agent's sandbox.</span></span>
       <button class="btn" @click="answerWaitFor(false)">Don’t run</button>
       <button class="btn" @click="answerWaitFor(true)">Run it</button>
     </div>
@@ -85,7 +85,7 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
       aria-label="Additional instructions for this task"
       spellcheck="false"
       :placeholder="waiting ? 'Ask anything while it runs…' : 'Steer: add context or change direction…'"
-      :disabled="taskId === null || sending"
+      :disabled="sending"
       @paste="pasteImages"
       @keydown.enter.exact="onEnter"
     ></textarea>
@@ -111,7 +111,8 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
         <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
       </button>
       <span class="note grow">
-        <template v-if="waiting">The agent answers now and changes nothing while the command runs.</template>
+        <template v-if="taskId === null">Sends once the run starts.</template>
+        <template v-else-if="waiting">The agent answers now and changes nothing while the command runs.</template>
         <template v-else-if="steering === 'live' && attachments.length">Anything outside this project restarts the step so Claude can open it.</template>
         <template v-else-if="steering === 'live'">Delivered to the running agent.</template>
         <template v-else>Used on the next step. “Apply now” restarts that step and keeps anything already changed.</template>
@@ -119,12 +120,12 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
       <button
         v-if="steering === 'checkpoint' && !waiting"
         class="btn"
-        :disabled="taskId === null || sending || !instruction.trim()"
+        :disabled="sending || !instruction.trim()"
         @click="send(true)"
       >
         Apply now
       </button>
-      <button class="btn primary" :disabled="taskId === null || sending || !instruction.trim()" @click="send(false)">
+      <button class="btn primary" :disabled="sending || !instruction.trim()" @click="send(false)">
         {{ waiting ? "Ask" : steering === "live" ? "Send to agent" : "Send for next step" }}
       </button>
     </div>

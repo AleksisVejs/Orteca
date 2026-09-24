@@ -100,6 +100,22 @@ export interface Preflight {
 
 export type ProviderId = "claude" | "codex";
 
+/** A chat the user had with a CLI outside Orteca, read from its own transcript. */
+export interface CliChatSummary {
+  provider: ProviderId;
+  id: string;
+  title: string;
+  /** How many times the user spoke. */
+  turns: number;
+  updatedMs: number;
+}
+
+export interface CliChat {
+  title: string;
+  said: string[];
+  answer: string;
+}
+
 /** How the CLI authenticates, as reported by the CLI itself. Orteca never reads
  *  a credential and never renders a login form. */
 export type Auth = "subscription" | "apiKey" | "signedOut" | "unknown";
@@ -214,7 +230,7 @@ export interface Signals {
   frontend: boolean;
   blastRadius: number;
   priorFailures: number;
-  intent?: "question" | "easy" | "medium" | "hard" | null;
+  intent?: "chat" | "question" | "easy" | "medium" | "hard" | null;
 }
 
 /** The tiers a route runs on. There is no call, turn or token ceiling: a
@@ -300,8 +316,9 @@ export type ProviderEvent =
   | { kind: "wait"; data: { command: string; asking: boolean } };
 
 /** `run`: clean before the run. `beforeRun`: already changed, untouched by
- *  the run. `both`: already changed, and changed again. */
-export type Origin = "run" | "beforeRun" | "both";
+ *  the run. `both`: already changed, and changed again. `reverted`: already
+ *  changed, and put back to the commit by the run - the user's change undone. */
+export type Origin = "run" | "beforeRun" | "both" | "reverted";
 
 /** `added`/`deleted` are null for a binary or untracked file, never zero. */
 export interface FileStat {
@@ -333,9 +350,10 @@ export interface TaskResult {
   /** `cancelled` is the user stopping the run, `budgetReached` a ceiling the
    *  route declared, `reviewRejected` an explicit review stop and
    *  `verifyFailed` checks that did not report a pass: none is a win, and none
-   *  is a provider fault. `checking` is only the early result a run sends
-   *  while its full suite still runs; no run ends on it. */
-  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed" | "checking";
+   *  is a provider fault. `unchanged` is the agent looking and deciding
+   *  nothing needed changing: not a win and not a failure. `checking` is only
+   *  the early result a run sends while its full suite still runs; no run ends on it. */
+  status: "done" | "cancelled" | "failed" | "budgetReached" | "reviewRejected" | "verifyFailed" | "unchanged" | "checking";
   summary: string;
   failure: string | null;
   /** Why it failed, when it did. `usageLimit` is what offers the other CLI. */
@@ -365,6 +383,9 @@ export interface TaskResult {
   resume: Resume | null;
   /** Steps outside the agent (classify, each check command), in order. */
   timings: { label: string; ms: number }[];
+  /** The commit holding the user's uncommitted work from before the run; a
+   *  `reverted` file is restored from it. Absent on older results. */
+  savedState?: string | null;
 }
 export interface TaskEvent {
   id: number;

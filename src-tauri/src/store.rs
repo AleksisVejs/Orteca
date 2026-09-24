@@ -6,7 +6,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::codemap;
@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_drop_check_passes.sql"),
     include_str!("../migrations/0010_code_map.sql"),
     include_str!("../migrations/0011_memory.sql"),
+    include_str!("../migrations/0012_trust_fingerprint.sql"),
 ];
 
 /// Files past this are minified or generated, not something a task edits.
@@ -584,15 +585,27 @@ impl Store {
             .collect())
     }
 
-    pub fn set_trusted(&self, path: &str, trusted: bool) -> Result<()> {
+    /// `fingerprint` is what the user saw when they decided; `None` keeps
+    /// the one already stored.
+    pub fn set_trusted(&self, path: &str, trusted: bool, fingerprint: Option<&str>) -> Result<()> {
         let conn = self.0.lock().expect("store poisoned");
         conn.execute(
             "UPDATE projects
-                SET trusted = ?2, trust_scanned_at = datetime('now')
+                SET trusted = ?2, trust_scanned_at = datetime('now'),
+                    trust_fingerprint = COALESCE(?3, trust_fingerprint)
               WHERE path = ?1",
-            params![path, trusted],
+            params![path, trusted, fingerprint],
         )?;
         Ok(())
+    }
+
+    /// The agent configuration a project had when it was trusted.
+    pub fn trust_fingerprint(&self, path: &str) -> Result<Option<String>> {
+        let conn = self.0.lock().expect("store poisoned");
+        Ok(conn
+            .query_row("SELECT trust_fingerprint FROM projects WHERE path = ?1", [path], |r| r.get(0))
+            .optional()?
+            .flatten())
     }
 
     pub fn recent_projects(&self, limit: u32) -> Result<Vec<Project>> {
@@ -880,7 +893,7 @@ impl Store {
                     (t.patch_text IS NOT NULL AND length(t.patch_text) > 0), p.path, p.name
                FROM tasks t JOIN projects p ON p.id = t.project_id
                LEFT JOIN usage u ON u.task_id = t.id
-              ORDER BY t.id DESC LIMIT ?1",
+              ORDER BY t.ended_at IS NULL DESC, t.ended_at DESC, t.id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |r| {
             Ok(GlobalTaskSummary {
@@ -1282,6 +1295,10 @@ mod tests {
         assert_eq!((&rows[0].project_path, &rows[0].project_name), (&"C:/second".to_string(), &"Second".to_string()));
         assert_eq!(rows[1].task.id, first_task);
         assert_eq!((&rows[1].project_path, &rows[1].project_name), (&"C:/first".to_string(), &"First".to_string()));
+
+        // A reply reopens the older task, which moves it back to the top.
+        store.reopen_task(first.id, first_task, None).unwrap();
+        assert_eq!(store.global_tasks(20).unwrap()[0].task.id, first_task);
     }
 
     #[test]
@@ -1847,7 +1864,7 @@ mod tests {
         let p = store.touch_project("C:/a", "a").unwrap();
         assert!(!p.trusted, "a new project starts untrusted");
 
-        store.set_trusted("C:/a", true).unwrap();
+        store.set_trusted("C:/a", true, None).unwrap();
         assert!(store.recent_projects(1).unwrap()[0].trusted);
     }
 

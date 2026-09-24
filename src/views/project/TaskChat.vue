@@ -18,13 +18,15 @@ const props = defineProps<{
   replyNote: string;
   replyHint: string;
   editDisabled?: boolean;
+  /** What "Rewind" on the current message puts back; null when it cannot. */
+  rewindFiles?: string[] | null;
   /** Start at the bottom, where a running task's newest message is. */
   follow?: boolean;
 }>();
-const emit = defineEmits<{ send: []; editAgain: [] }>();
+const emit = defineEmits<{ send: []; editAgain: [text: string]; rewind: [text: string] }>();
 
 const {
-  domId, newTask, reply, running, attachments, attachError, addAttachments, pasteImages, fileName,
+  domId, newTask, reply, running, rewindError, attachments, attachError, addAttachments, pasteImages, fileName,
 } = inject(PROJECT)!;
 
 const id = (name: string) => domId(`${props.idPrefix}-${name}`);
@@ -87,7 +89,9 @@ function onEnter(e: KeyboardEvent) {
           :data="data"
           editable
           :edit-disabled="editDisabled"
-          @edit-again="emit('editAgain')"
+          :rewind-files="rewindFiles"
+          @edit-again="(text: string) => emit('editAgain', text)"
+          @rewind="(text: string) => emit('rewind', text)"
         >
           <template #notes><slot name="notes" /></template>
           <template #after><slot name="after" /></template>
@@ -96,6 +100,7 @@ function onEnter(e: KeyboardEvent) {
           <template #activity><slot name="activity" /></template>
         </ExchangeView>
       </slot>
+      <p v-if="rewindError" class="missing" role="alert">{{ rewindError }}</p>
     </div>
 
     <!-- The same box the run was steered from, now taking a reply. -->

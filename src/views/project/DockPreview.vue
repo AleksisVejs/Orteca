@@ -48,7 +48,8 @@ function pick(on = !picking.value) {
 
 function heard(e: MessageEvent) {
   if (e.source !== frame.value?.contentWindow) return;
-  if (e.data?.orteca === "picked") {
+  // Only an answer to the user's own pick: the page itself cannot push text into a task.
+  if (e.data?.orteca === "picked" && picking.value) {
     picking.value = false;
     picked.value = e.data;
     change.value = "";

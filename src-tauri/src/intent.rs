@@ -15,6 +15,9 @@ use crate::providers::{ProviderEvent, ProviderId, CODEX_ISOLATION};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Intent {
+    /// Talk, not a question about the code: "i love Leina" once sent the
+    /// Answer stage searching the repo for her name.
+    Chat,
     /// Wants an answer, not a change.
     Question,
     Easy,
@@ -43,7 +46,7 @@ pub struct Reading {
 }
 
 // One line: it travels as an argument, and a Windows shim mangles newlines.
-const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: question, easy, medium, or hard. question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Input validation, pagination or page-size limits, rate limits, and other resource bounds are general unless the request is about an authentication or permission boundary. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. The request may be in any language.";
+const INSTRUCTION: &str = "You classify requests made to a coding agent working in a git repository. Reply with exactly four lines and nothing else. Line 1 is one label: chat, question, easy, medium, or hard. chat means small talk or a personal message with nothing to look up in the repository; question means no file changes; easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. Line 2 is a title of at most six words in the request's language, no quotes. Line 3 starts `job:` followed by a comma-separated subset of general, security, authentication, authorization, schema. Use security only for a security boundary or vulnerability; authentication for login/session/credential behavior; authorization for access or permission behavior; schema for a database/schema migration. Display text, translations, documentation, or styling that merely mentions auth, login, roles, permissions, or database is general. Input validation, pagination or page-size limits, rate limits, and other resource bounds are general unless the request is about an authentication or permission boundary. Line 4 starts `run:` followed by a comma-separated subset of build, test, lint, or none. Include an action only when the user explicitly asks to run it. A request that asks a question and also asks for a change is not a question. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. The request may be in any language.";
 
 /// A classifier slower than this costs more waiting than it can save. The
 /// wait is the model, not the shim: the CLI itself starts in ~0.3s, and an
@@ -87,8 +90,23 @@ fn args(id: ProviderId) -> Vec<String> {
     args_with(id, INSTRUCTION)
 }
 
+/// Where a Codex call's instruction is kept, named by its content so a file
+/// once written is never rewritten under a call reading it.
+fn instruction_file(instruction: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    instruction.hash(&mut hash);
+    std::env::temp_dir().join(format!("orteca-instruction-{:016x}.txt", hash.finish()))
+}
+
 fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
     let model = model(id);
+    // Codex's own system prompt is ~7k tokens of agent guidance a one-line
+    // answer never uses; this replaces it. A TOML string, so `\` is escaped.
+    let instructions = format!(
+        "model_instructions_file=\"{}\"",
+        instruction_file(instruction).to_string_lossy().replace('\\', "\\\\")
+    );
     let fixed: Vec<&str> = match id {
         // No tools and a replaced system prompt: the whole call is the
         // instruction and the request. The prompt arrives on stdin.
@@ -117,6 +135,11 @@ fn args_with(id: ProviderId, instruction: &str) -> Vec<String> {
                 model,
                 "-c",
                 "model_reasoning_effort=\"low\"",
+                // A classifier once searched the web before answering.
+                "-c",
+                "web_search=\"disabled\"",
+                "-c",
+                &instructions,
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
@@ -137,6 +160,7 @@ pub fn parse(reply: &str) -> Option<Intent> {
         .to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphabetic())
         .find_map(|word| match word {
+            "chat" => Some(Intent::Chat),
             "question" => Some(Intent::Question),
             "easy" => Some(Intent::Easy),
             "medium" => Some(Intent::Medium),
@@ -296,20 +320,24 @@ async fn ask_with(
     request: &str,
     events: &mut Vec<ProviderEvent>,
 ) -> Option<String> {
+    if id == ProviderId::Codex {
+        let file = instruction_file(instruction);
+        if !file.exists() {
+            std::fs::write(&file, instruction).ok()?;
+        }
+    }
     let argv = args_with(id, instruction);
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
     // Never in the user's project: nobody has consented to its settings for this.
     let mut run = proc::spawn_env(program, &borrowed, &std::env::temp_dir(), &env(id)).ok()?;
-    let request = match id {
-        ProviderId::Claude => request.to_string(),
-        ProviderId::Codex => format!("{instruction}\n\n{request}"),
-    };
-    run.send_line(&request).await.ok()?;
+    run.send_line(request).await.ok()?;
     run.close_stdin();
     let mut reply = String::new();
     while let Some(line) = run.lines.recv().await {
         match line {
             Line::Json(v) => {
+                // Every call carries the plan's usage: keep it, for free.
+                crate::providers::limits::remember(id, &v);
                 for event in id.parse_line(&v) {
                     match &event {
                         ProviderEvent::Text(text) => reply = text.clone(),
@@ -363,6 +391,7 @@ not a rule"), ["Use tabs.", "Be brief"]);
     #[test]
     fn reads_the_first_label_in_the_reply() {
         assert_eq!(parse("question"), Some(Intent::Question));
+        assert_eq!(parse("Chat\nExpressing affection"), Some(Intent::Chat));
         assert_eq!(parse("Hard."), Some(Intent::Hard));
         assert_eq!(parse("**easy**\n"), Some(Intent::Easy));
         assert_eq!(parse("It's medium, not hard"), Some(Intent::Medium));
@@ -410,6 +439,8 @@ not a rule"), ["Use tabs.", "Be brief"]);
         let codex = args(ProviderId::Codex).join(" ");
         assert!(codex.contains("--sandbox read-only"));
         assert!(!codex.contains("danger-full-access"));
+        assert!(codex.contains("web_search=\"disabled\""));
+        assert!(codex.contains(r"\\orteca-instruction-"), "the path is a TOML string: {codex}");
     }
 
     /// Both providers bound the reasoning, by the means each one has. Without

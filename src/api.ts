@@ -4,6 +4,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
+  CliChat,
+  CliChatSummary,
   Commit,
   Detected,
   DirEntry,
@@ -100,6 +102,10 @@ export const recentTasks = (path: string) =>
 export const globalTasks = () => invoke<GlobalTaskSummary[]>("global_tasks");
 export const getTaskDetail = (path: string, taskId: number) =>
   invoke<TaskDetail>("task_detail", { path, taskId });
+/** Chats the user had with either CLI in this folder, outside Orteca, newest first. */
+export const cliChats = (path: string) => invoke<CliChatSummary[]>("cli_chats", { path });
+export const cliChat = (path: string, provider: ProviderId, id: string) =>
+  invoke<CliChat>("cli_chat", { path, provider, id });
 /** `headroom` is the room left in the provider's tightest plan window, or null
  *  when unread. The router may run a checked route a tier down when it is low.
  *  `asked` is only what the user just said, when `prompt` also carries the
@@ -121,6 +127,14 @@ export const renameTask =(path: string, taskId: number, title: string) =>
 
 export const deleteTask = (path: string, taskId: number) =>
   invoke<void>("delete_task", { path, taskId });
+
+/** Puts back one file a run undid, from the state saved before it started. */
+export const restoreFile = (path: string, saved: string, file: string) =>
+  invoke<void>("restore_file", { path, saved, file });
+
+/** Back to before one exchange of a task; with `saved`, its files go back too. */
+export const rewindTask = (path: string, taskId: number, keep: number, saved: string | null, files: string[]) =>
+  invoke<void>("rewind_task", { path, taskId, keep, saved, files });
 
 export const removeWorktree =(path: string, taskId: number) =>
   invoke<void>("remove_worktree", { path, taskId });
@@ -253,8 +267,9 @@ export const listDir = (path: string, sub: string) =>
 export const readText = (path: string, file: string) =>
   invoke<string>("read_text", { path, file });
 
-export const writeText = (path: string, file: string, text: string) =>
-  invoke<void>("write_text", { path, file, text });
+/** `base` is the text the tab loaded; the save is refused if the file no longer holds it. */
+export const writeText = (path: string, file: string, text: string, base: string) =>
+  invoke<void>("write_text", { path, file, text, base });
 
 /** The repository's own commits, newest first, from `skip` back. */
 export const findLines = (path: string, needles: string[]) =>

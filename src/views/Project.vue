@@ -139,6 +139,13 @@ watch(runningCount, (count) => emit("busy", count), { immediate: true });
 watch(runningCount, (count, before) => {
   if (count < before && !document.hasFocus()) void getCurrentWindow().requestUserAttention(UserAttentionType.Informational);
 });
+// A run waiting on the user's OK goes nowhere until they give it, so it asks
+// loudly wherever they are: another app, another project, another task.
+watch(() => state.runs.value.filter((r) => r.waitAsk).length, (asking, before) => {
+  if (asking > before && (!document.hasFocus() || !props.active || !activeRun.value?.waitAsk)) {
+    void getCurrentWindow().requestUserAttention(UserAttentionType.Critical);
+  }
+});
 // A new task starting: the box it was typed in glides down to where it steers,
 // rather than the page swapping under it. Runs before the swap, while that box is there.
 watch(() => view.value === "task" && !!(running.value || result.value), (chat, was) => {

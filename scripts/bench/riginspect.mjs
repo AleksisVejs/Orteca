@@ -7,10 +7,12 @@
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
 //   NOEDITLOCK=1                      Claude may still edit through a shell, for the before arm
+//   PARALLEL=1                        arms side by side, one child each (log: <results>-<arm>.log)
+// Reviews: node scripts/bench/reviews.mjs tallies what every saved run's Review found.
 // Free modes: SUITE=1 (composer test on HEAD), SUITE=shards (sharded vs serial), DRY=1|<task>, REGRADE, DIAG.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { weeklyHeadroomStop } from "./weekly-limit.mjs";
 
@@ -81,6 +83,7 @@ function makeWorktree(dir) {
   if (copy.status === null || copy.status >= 8) throw Error(`robocopy vendor failed: ${copy.status}`);
   for (const j of junctions(dir)) execFileSync("cmd", ["/c", "mklink", "/J", j, j.replace(dir, RIG)], { stdio: "ignore" });
   copyFileSync(join(RIG, ".env"), join(dir, ".env"));
+  ownTestDatabase(dir);
   // Guard against grading the real repo's code again.
   const loaded = execFileSync("php", ["-r", "require 'vendor/autoload.php'; echo (new ReflectionClass('App\\Http\\Controllers\\Controller'))->getFileName();"], { cwd: dir, encoding: "utf8" });
   if (!loaded.toLowerCase().startsWith(dir.toLowerCase())) throw Error(`app classes load from ${loaded}, not ${dir}`);
@@ -91,6 +94,23 @@ function makeWorktree(dir) {
     .filter((f) => /function test|#\[Test\]|@test/.test(readFileSync(f, "utf8")))
     .sort((a, b) => statSync(a).size - statSync(b).size)[0];
   if (warm) spawnSync("php", ["artisan", "test", warm.slice(dir.length + 1)], { cwd: dir, env: ENV, stdio: "ignore", timeout: 5 * 60_000 });
+}
+
+// phpunit.xml forces one MySQL test database, so two worktrees testing at once
+// wiped each other's tables. Each gets its own, committed in the worktree so the
+// agent's patch and Orteca's base copy both start from it.
+function ownTestDatabase(dir) {
+  const file = join(dir, "phpunit.xml");
+  const xml = existsSync(file) ? readFileSync(file, "utf8") : "";
+  const m = xml.match(/name="DB_DATABASE" value="([^"]+)"/);
+  if (!m || !xml.includes('name="DB_CONNECTION" value="mysql"')) return;
+  const name = `${m[1]}_${dir.split(/[\\/]/).pop()}`.replace(/\W/g, "_").toLowerCase();
+  writeFileSync(file, xml.replace(m[0], `name="DB_DATABASE" value="${name}"`));
+  git("-C", dir, "-c", "user.name=bench", "-c", "user.email=bench@localhost", "commit", "-qm", "Use a separate test database", "phpunit.xml");
+  const db = Object.fromEntries(readFileSync(join(dir, ".env"), "utf8").split(/\r?\n/)
+    .map((l) => l.match(/^(DB_\w+)=(.*)$/)).filter(Boolean).map(([, k, v]) => [k, v.replace(/^"|"$/g, "")]));
+  execFileSync("mysql", ["-h", db.DB_HOST ?? "127.0.0.1", "-P", db.DB_PORT ?? "3306", "-u", db.DB_USERNAME ?? "root", "-e", `CREATE DATABASE IF NOT EXISTS \`${name}\``],
+    { env: { ...ENV, MYSQL_PWD: db.DB_PASSWORD ?? "" }, stdio: ["ignore", "ignore", "pipe"] });
 }
 
 function dropWorktree(dir) {
@@ -128,7 +148,11 @@ function ortecaRow(x) {
   return {
     status: x.status, route: x.route?.kind, stages: x.stages?.map((s) => s.stage).join(">"), calls: x.callsUsed, turns: x.turnsUsed,
     notes: x.route?.priorNotesWhy ?? [], noteChars: (x.route?.priorNotes ?? []).join("").length,
-    budgetStop: x.budgetStop?.message, model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
+    budgetStop: x.budgetStop?.message,
+    // Beside the grade, so a Review's findings can be held against the hidden tests (reviews.mjs).
+    firstVerify: x.stages?.find((s) => s.stage === "verify")?.artifact?.verdict,
+    review: x.stages?.filter((s) => s.stage === "review").map((s) => s.artifact ? `${s.artifact.verdict} ${s.artifact.findings.map((f) => f.severity).join(",")}`.trim() : "none").join(" | "),
+    model: u.model, input: u.inputTokens, cached: u.cachedInputTokens, output: u.outputTokens,
     cost: u.costUsd, costQuality: u.costQuality, ms: x.durationMs,
     stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
     // From the prompt, classify included: when the change was shown, and when the suite said done.
@@ -382,6 +406,29 @@ const start = limits();
 console.log("limits at start", start);
 const initialStop = limitStop(start);
 if (initialStop) { console.log(initialStop); process.exit(2); }
+// PARALLEL=1: one child per arm, each with its own results file and log, merged
+// at the end. A child can only stop itself between its own arms, so the start
+// reserves an arm's share for every arm on the same provider.
+if (process.env.PARALLEL && ARMS.length > 1) {
+  const most = Math.max(...[...usedProviders()].map((p) => ARMS.filter((a) => a.replace("orteca-", "") === p).length));
+  const stop = weeklyHeadroomStop(start, usedProviders(), WEEKLY_FLOOR, WEEKLY_ARM_RESERVE * most);
+  if (stop) { console.log(stop); process.exit(2); }
+  const part = (arm) => RESULTS.replace(/\.json$/, `-${arm}`);
+  await Promise.all(ARMS.map((arm) => new Promise((done) => {
+    const log = openSync(`${part(arm)}.log`, "w");
+    console.log(`running ${arm} -> ${part(arm)}.log`);
+    spawn(process.execPath, process.argv.slice(1), { env: { ...process.env, PARALLEL: "", ARMS: arm, RESULTS: basename(`${part(arm)}.json`) }, stdio: ["ignore", log, log] })
+      .on("exit", (code) => { console.log(`${arm} exited ${code}`); done(); });
+  })));
+  for (const arm of ARMS) {
+    if (!existsSync(`${part(arm)}.json`)) continue;
+    for (const row of JSON.parse(readFileSync(`${part(arm)}.json`, "utf8")))
+      if (!results.some((r) => r.task === row.task && r.arm === row.arm)) results.push(row);
+  }
+  writeFileSync(RESULTS, JSON.stringify(results, null, 2));
+  console.log("done");
+  process.exit(0);
+}
 for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS).filter((n) => !TASKS[n].trap)) {
   for (const arm of ARMS) {
     if (results.some((r) => r.task === name && r.arm === arm)) continue;

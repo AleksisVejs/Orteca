@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref } from "vue";
+import { computed, inject, nextTick, ref } from "vue";
 import { parseHistoryPatch } from "./historyPatch";
 import { unfinishedSummary } from "./taskPresentation";
 import Markdown from "../../components/Markdown.vue";
@@ -16,16 +16,43 @@ const props = defineProps<{
   data: Exchange;
   /** An exchange above the current one: its outcome is in its footer, not the heading. */
   earlier?: boolean;
-  /** Offer "Edit" under the user's words; only the current exchange does. */
+  /** Offer "Edit" and "Rewind" under the user's words. */
   editable?: boolean;
   editDisabled?: boolean;
+  /** The files "Rewind" puts back as they were before this message; null
+   *  when that is not known, so only the words can go back. */
+  rewindFiles?: string[] | null;
 }>();
-const emit = defineEmits<{ editAgain: [] }>();
+const emit = defineEmits<{ editAgain: [text: string]; rewind: [text: string] }>();
 
-const { domId, describeVerdict, stageLabel, formatTokens, formatCost, formatDuration, HISTORY_STATUS, TONE } = inject(PROJECT)!;
+const { domId, describeVerdict, stageLabel, formatTokens, formatCost, formatDuration, HISTORY_STATUS, TONE, restored, restoreError, restore } = inject(PROJECT)!;
 
 const id = (name: string) => domId(`${props.idPrefix}-${name}`);
 const d = computed(() => props.data);
+
+// Edit and Rewind turn the bubble into a box with its words. Nothing happens
+// until the change is sent; a rewind names the files it will put back first.
+const editing = ref<"edit" | "rewind" | null>(null);
+const draft = ref("");
+const box = ref<HTMLTextAreaElement | null>(null);
+function startEdit(mode: "edit" | "rewind") {
+  editing.value = mode;
+  draft.value = props.prompt;
+  void nextTick(() => box.value?.focus());
+}
+function accept() {
+  const text = draft.value.trim();
+  if (!text || !editing.value || props.editDisabled) return;
+  if (editing.value === "edit") emit("editAgain", text);
+  else emit("rewind", text);
+  editing.value = null;
+}
+// Enter sends, Shift+Enter breaks the line, Escape leaves it as it was: the same as the reply box.
+function onEnter(e: KeyboardEvent) {
+  if (e.isComposing) return;
+  e.preventDefault();
+  accept();
+}
 
 const PROOF = [
   { id: "files", label: "Files" },
@@ -62,8 +89,44 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
 <template>
   <section class="exchange" :class="{ earlier }">
     <div class="mine">
-      <component :is="earlier ? 'p' : 'h1'" class="bubble" :class="{ long: prompt.length > 600 }">{{ prompt }}</component>
-      <button v-if="editable" class="link edit" :disabled="editDisabled" title="Back to the composer with these words, to change them and run again" @click="emit('editAgain')">Edit</button>
+      <template v-if="editing">
+        <label class="hidden-label" :for="id('edit')">Edit this message</label>
+        <textarea
+          :id="id('edit')"
+          ref="box"
+          v-model="draft"
+          class="bubble edit-box"
+          rows="3"
+          spellcheck="false"
+          @keydown.enter.exact="onEnter"
+          @keydown.esc="editing = null"
+        ></textarea>
+        <div v-if="editing === 'rewind' && rewindFiles?.length" class="rewind-ask" role="alert">
+          <p class="note">Sending puts {{ rewindFiles.length }} {{ rewindFiles.length === 1 ? "file" : "files" }} back as {{ rewindFiles.length === 1 ? "it was" : "they were" }} before this message. Anything changed in them since is lost.</p>
+          <ul><li v-for="f in rewindFiles" :key="f" class="mono note">{{ f }}</li></ul>
+        </div>
+        <p v-else class="note">Everything after this message leaves the chat.<template v-if="editing === 'edit'"> Files stay as they are.</template></p>
+        <div class="edit-row">
+          <button class="link" @click="editing = null">Cancel</button>
+          <button class="btn" :class="{ warn: editing === 'rewind' }" :disabled="editDisabled || !draft.trim()" @click="accept">
+            {{ editing === "rewind" ? "Rewind and send" : "Send" }}
+          </button>
+        </div>
+      </template>
+      <template v-else>
+        <component :is="earlier ? 'p' : 'h1'" class="bubble" :class="{ long: prompt.length > 600 }">{{ prompt }}</component>
+        <div v-if="editable" class="edits">
+          <button class="link edit" :disabled="editDisabled" title="Change this message and send it again. Files stay as they are." @click="startEdit('edit')">Edit</button>
+          <button
+            class="link edit"
+            :disabled="editDisabled || !rewindFiles"
+            :title="rewindFiles ? 'Change this message and send it again, with the files the answers from here on changed put back as they were' : 'Orteca kept no copy of the files from before this message'"
+            @click="startEdit('rewind')"
+          >
+            Rewind
+          </button>
+        </div>
+      </template>
     </div>
 
     <!-- The way there, as it streamed; folded so the answer reads first. -->
@@ -81,6 +144,20 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
       <p v-if="d.status === 'cancelled'" class="note caveat">
         Stopped part-way. Anything the agent had already written is still on disk - Orteca reverts nothing.
       </p>
+      <!-- The user's own change, undone by the run. Loud, because the diff alone would never show it. -->
+      <div v-if="d.changed.reverted.length" class="missing" role="status">
+        <p>This run undid changes you had made before it started:</p>
+        <ul>
+          <li v-for="f in d.changed.reverted" :key="f.path">
+            <span class="mono">{{ f.path }}</span>
+            <template v-if="d.savedState">
+              <span v-if="restored.includes(`${d.savedState}:${f.path}`)" class="note"> · put back</span>
+              <button v-else class="link" @click="restore(d.savedState, f.path)">Put my version back</button>
+            </template>
+          </li>
+        </ul>
+        <p v-if="restoreError" class="note">{{ restoreError }}</p>
+      </div>
       <slot name="after" />
       <p v-if="d.unknownEvents" class="note caveat" role="status">
         {{ d.unknownEvents }} provider event{{ d.unknownEvents === 1 ? "" : "s" }} were not recognized and remain in the saved task log.
@@ -226,6 +303,18 @@ const selectedPatch = computed(() => parsedPatch.value.files.find((f) => f.path 
 .story > summary:hover { color: var(--text-dim); }
 .story-body { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
 
+.edits { display: flex; gap: 12px; }
+.edit-box {
+  width: min(80%, 64ch);
+  min-height: 5em;
+  font: inherit;
+  border: 1px solid var(--border-strong);
+  resize: vertical;
+}
+.rewind-ask { display: flex; flex-direction: column; gap: 4px; max-width: min(80%, 64ch); }
+.rewind-ask ul { margin: 0; padding-left: 16px; }
+.edit-row { display: flex; gap: 12px; align-items: center; }
+.btn.warn { color: var(--warn); }
 .mine .edit {
   font-size: 11px;
   color: var(--text-faint);

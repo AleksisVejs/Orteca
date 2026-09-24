@@ -27,6 +27,7 @@ export function unfinishedSummary(status: string) {
     case "verifyFailed": return "Checks need attention";
     case "reviewRejected": return "Review needs attention";
     case "failed": return "Task failed · review the details";
+    case "unchanged": return "Nothing needed changing · see why";
     default: return "Work is still in progress";
   }
 }

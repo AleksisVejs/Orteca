@@ -5,9 +5,8 @@ import ActivityLog from "./ActivityLog.vue";
 import TaskChat from "./TaskChat.vue";
 import ExchangeView from "./Exchange.vue";
 import Markdown from "../../components/Markdown.vue";
-import { PROJECT, exchangeOf, splitExchanges, storyOf } from "./state";
+import { PROJECT, exchangeOf, rewindCode, splitExchanges, storyOf } from "./state";
 import type { Exchange } from "./state";
-import { split } from "./picks";
 import type { Route } from "../../types";
 import { visiblePath } from "../../path";
 
@@ -15,8 +14,8 @@ import { visiblePath } from "../../path";
 const {
   historyDetail, historyDetailLoading, historyDetailError,
   cacheHit, formatPayload, removedCopies, confirmRemove, removeCopy,
-  removeError, linesOf, task, picks, selectRun, anyRunning, focusTask, domId,
-  replyToPast, git, openGit, describeVerdict,
+  removeError, linesOf, anyRunning, domId,
+  replyToPast, git, openGit, describeVerdict, rewindTo,
 } = inject(PROJECT)!;
 
 const d = computed(() => historyDetail.value);
@@ -34,8 +33,9 @@ const canReply = computed(() => !!d.value && !d.value.worktreePath && d.value.st
 const changed = computed(() => {
   const diff = d.value?.diff ?? [];
   return {
-    byRun: diff.filter((f) => f.origin !== "beforeRun"),
+    byRun: diff.filter((f) => f.origin !== "beforeRun" && f.origin !== "reverted"),
     beforeRun: diff.filter((f) => f.origin === "beforeRun"),
+    reverted: diff.filter((f) => f.origin === "reverted"),
     unknown: !!d.value?.dirtyAtStart && diff.some((f) => f.origin === null),
   };
 });
@@ -80,14 +80,14 @@ const metrics = computed(() => {
 // The same plain-English lines the live log showed, rebuilt from the saved events.
 const lines = computed(() => linesOf(current.value?.events ?? []));
 
-function editAgain() {
+// Back to before message `i`, sending `text` in its place; with `code` its files go back as
+// they were. The first request keeps its picked files, so it goes back raw too. A task that
+// takes no reply here sends any message as a new task.
+const results = computed(() => parts.value.map((p) => p.result));
+function rewind(i: number, text: string, code: boolean) {
   if (!d.value) return;
-  // A reply is edited as what was typed; the first request keeps its picked files.
-  const { picks: again, rest } = split(parts.value.length > 1 ? current.value!.said : d.value.prompt);
-  task.value = rest;
-  picks.value = again;
-  selectRun(null);
-  focusTask();
+  const raw = i && canReply.value ? "" : d.value.prompt;
+  void rewindTo(d.value.id, canReply.value ? i : 0, text, raw, code && canReply.value ? rewindCode(results.value, i) : null);
 }
 // A task logged before each reply kept its result falls back to the task row.
 const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current.value.result, lines.value) : ({
@@ -97,6 +97,8 @@ const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current
   unknownEvents: d.value?.unknownEvents ?? 0,
   changed: changed.value,
   patchText: d.value?.patchText ?? null,
+  // The task row keeps no saved state; only an exchange's own result does.
+  savedState: null,
   verification: verificationSummary(savedArtifacts(current.value?.events ?? [])),
   route: route.value,
   routeSteps: routeSteps.value,
@@ -120,12 +122,25 @@ const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current
     reply-note="Rereads the files"
     reply-hint="This task is over, so a reply reads the files again rather than picking up where it left off. It goes on in this same task."
     :edit-disabled="anyRunning"
+    :rewind-files="canReply ? rewindCode(results, parts.length - 1)?.files : null"
     @send="replyToPast"
-    @edit-again="editAgain"
+    @edit-again="(text: string) => rewind(parts.length - 1, text, false)"
+    @rewind="(text: string) => rewind(parts.length - 1, text, true)"
   >
     <template #earlier>
       <template v-for="(t, i) in earlier" :key="i">
-        <ExchangeView v-if="t.data" :id-prefix="`past-turn-${i}`" :prompt="t.said" :data="t.data" earlier>
+        <ExchangeView
+          v-if="t.data"
+          :id-prefix="`past-turn-${i}`"
+          :prompt="t.said"
+          :data="t.data"
+          earlier
+          :editable="canReply"
+          :edit-disabled="anyRunning"
+          :rewind-files="rewindCode(results, i)?.files ?? null"
+          @edit-again="(text: string) => rewind(i, text, false)"
+          @rewind="(text: string) => rewind(i, text, true)"
+        >
           <template #activity>
             <ActivityLog :items="t.lines" :patch-text="t.result?.patchText" :root="d.worktreePath ?? undefined" :finished="true" :dirty-at-start="t.result?.dirtyAtStart" />
           </template>

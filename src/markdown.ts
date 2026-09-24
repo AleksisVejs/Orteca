@@ -1,14 +1,18 @@
 // The little markdown agents answer in: paragraphs, headings, bullet and
-// numbered lists, fenced code, **bold**, `code` and web links. Parsed to plain data so
-// the page builds elements from it; agent text never becomes HTML.
-// ponytail: no tables, italics or block quotes; add them when an agent's reply needs them.
+// numbered lists, fenced code, pipe tables, > quotes, --- rules, **bold**, *italic*,
+// ~~struck~~, `code` and web links. Parsed to plain data so the page builds elements
+// from it; agent text never becomes HTML.
+// ponytail: no nested quotes or column alignment; add them when a reply needs them.
 
-export type Span = { kind: "text" | "bold" | "code"; text: string } | { kind: "link"; text: string; href: string };
+export type Span = { kind: "text" | "bold" | "italic" | "strike" | "code"; text: string } | { kind: "link"; text: string; href: string };
 export type ListItem = { depth: number; marker: string; spans: Span[] };
 export type Block =
   | { kind: "p"; lines: Span[][] }
   | { kind: "h"; spans: Span[] }
+  | { kind: "quote"; lines: Span[][] }
+  | { kind: "hr" }
   | { kind: "list"; items: ListItem[] }
+  | { kind: "table"; head: Span[][]; rows: Span[][][] }
   | { kind: "code"; text: string };
 
 export function inline(text: string): Span[] {
@@ -16,10 +20,12 @@ export function inline(text: string): Span[] {
   let last = 0;
   // A web address, bare or behind [words](...), becomes a link; any other
   // [words](target) keeps its words only. Trailing punctuation stays text.
-  for (const m of text.matchAll(/\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]*)\)|(https?:\/\/[^\s<>"]*[^\s<>".,;:!?')\]])/g)) {
+  for (const m of text.matchAll(/\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]*)\)|(https?:\/\/[^\s<>"]*[^\s<>".,;:!?')\]])|~~(.+?)~~|\*(?![\s*])([^*]*?[^\s*])\*|(?<!\w)_(?![\s_])([^_]*?[^\s_])_(?!\w)/g)) {
     if (m.index > last) spans.push({ kind: "text", text: text.slice(last, m.index) });
     if (m[1] !== undefined) spans.push({ kind: "bold", text: m[1] });
     else if (m[2] !== undefined) spans.push({ kind: "code", text: m[2] });
+    else if (m[6] !== undefined) spans.push({ kind: "strike", text: m[6] });
+    else if ((m[7] ?? m[8]) !== undefined) spans.push({ kind: "italic", text: m[7] ?? m[8] ?? "" });
     else if (m[5] !== undefined) spans.push({ kind: "link", text: m[5], href: m[5] });
     else if (/^https?:\/\//.test(m[4] ?? "")) spans.push({ kind: "link", text: m[3] ?? "", href: m[4] ?? "" });
     else spans.push({ kind: "text", text: m[3] ?? "" });
@@ -46,6 +52,27 @@ export function parseMarkdown(source: string): Block[] {
       blocks.push({ kind: "h", spans: inline(heading[1] ?? "") });
       continue;
     }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      blocks.push({ kind: "hr" });
+      continue;
+    }
+    const quote = line.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      const last = blocks[blocks.length - 1];
+      if (!quote[1]?.trim()) continue;
+      if (last?.kind === "quote" && /^\s*>/.test(lines[i - 1] ?? "")) last.lines.push(inline(quote[1]));
+      else blocks.push({ kind: "quote", lines: [inline(quote[1])] });
+      continue;
+    }
+    // A pipe row with a |---| line under it starts a table; it runs while rows start with |.
+    if (/^\s*\|/.test(line) && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[i + 1] ?? "")) {
+      const head = cells(line);
+      const rows: Span[][][] = [];
+      for (i += 2; i < lines.length && /^\s*\|/.test(lines[i] ?? ""); i++) rows.push(cells(lines[i] ?? ""));
+      i--;
+      blocks.push({ kind: "table", head, rows });
+      continue;
+    }
     const prev = blocks[blocks.length - 1];
     const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
     if (item) {
@@ -67,6 +94,10 @@ export function parseMarkdown(source: string): Block[] {
     else blocks.push({ kind: "p", lines: [inline(line)] });
   }
   return blocks;
+}
+
+function cells(row: string): Span[][] {
+  return row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => inline(c.trim()));
 }
 
 /** Whether a blank line separates line `i` from the block above. A list item

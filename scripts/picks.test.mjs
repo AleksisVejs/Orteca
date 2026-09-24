@@ -30,7 +30,7 @@ test('a picked element shows as one line and comes back apart for editing', () =
 });
 
 test('an earlier task goes in whole, shows as one line, and routes on its title alone', () => {
-  const ref = reference(12, 'Add pagination', ['add pagination to quotes', 'make it 20 a page'], 'Done.\nQuotes page at 20.', ['app/Quote.php']);
+  const ref = reference('task #12', 'Add pagination', ['add pagination to quotes', 'make it 20 a page'], 'Done.\nQuotes page at 20.', ['app/Quote.php']);
   assert.equal(ref.label, '#12 Add pagination');
   assert.match(ref.block, /Asked: add pagination to quotes\nThen: make it 20 a page\nFinal answer:\nDone\.\nQuotes page at 20\.\nFiles it changed: app\/Quote\.php/);
   const prompt = `${ref.block}\n\n${block}\n\nnow sort them by date`;
@@ -46,4 +46,13 @@ test('a task saved with the older heading still shows as one line', () => {
   const old = 'Earlier task #45 in this project, for context: Sentence builder issue\nAsked: why?\nFinal answer:\nBecause.\nEnd of the earlier task.\n\nsummarize it';
   assert.equal(tidy(old), 'Building on task #45: Sentence builder issue\n\nsummarize it');
   assert.equal(split(old).rest, 'summarize it');
+});
+
+test('a chat from outside Orteca goes in the same way, named by its CLI', () => {
+  const ref = reference('Codex chat', 'Footer', ['fix the footer'], 'Footer fixed.', []);
+  assert.equal(ref.label, 'Codex chat: Footer');
+  const prompt = `${ref.block}\n\nnow the header`;
+  assert.equal(tidy(prompt), 'Building on Codex chat: Footer\n\nnow the header');
+  assert.equal(forRouting(prompt), 'Attached earlier Codex chat: Footer\n\nnow the header');
+  assert.equal(split(prompt).picks.map((p) => p.label).join(' | '), 'Codex chat: Footer');
 });

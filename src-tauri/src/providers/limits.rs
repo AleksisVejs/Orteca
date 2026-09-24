@@ -8,7 +8,7 @@
 //! Neither answer is a credential read: Orteca asks the CLI, as it does for auth.
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -64,7 +64,7 @@ const CLAUDE_ARGS: &[&str] = &[
     "haiku",
 ];
 
-/// The last reading a Claude run's own stream carried, and when it arrived.
+/// The last reading a Claude run's own stream carried.
 ///
 /// Every model call sends a `rate_limit_event` before its answer, so a run that
 /// has just finished has already been told what `/usage` would cost another
@@ -73,12 +73,7 @@ const CLAUDE_ARGS: &[&str] = &[
 /// answered it for free. A reading Orteca had to ask for is kept here too:
 /// the timer asking once a minute was sixty haiku calls an hour against the
 /// very allowance it reports.
-static STREAMED: Mutex<Option<(Instant, Vec<Window>)>> = Mutex::new(None);
-
-/// How long a kept reading stands in for a fresh one. The windows it
-/// describes roll over five hours and seven days; minutes do not move them,
-/// and a run in between refreshes it for free.
-const STREAMED_FOR: Duration = Duration::from_secs(15 * 60);
+static STREAMED: Mutex<Option<Vec<Window>>> = Mutex::new(None);
 
 /// Keep a reading a run's stream carried. Called with every raw
 /// `rate_limit_event`, whatever its status.
@@ -93,21 +88,43 @@ pub fn remember(id: ProviderId, v: &Value) {
 
 fn keep(windows: Vec<Window>) {
     if let Ok(mut latest) = STREAMED.lock() {
-        *latest = Some((Instant::now(), windows));
+        *latest = Some(windows);
     }
 }
 
-/// A streamed reading still inside `STREAMED_FOR`, if there is one.
+/// The last kept reading, however old: nothing asks Claude on a timer any
+/// more, so dropping it only turned a known figure into none. A window whose
+/// reset has passed is back to zero.
 fn streamed(id: ProviderId) -> Option<Vec<Window>> {
     if id != ProviderId::Claude {
         return None;
     }
     let latest = STREAMED.lock().ok()?;
-    let (at, windows) = latest.as_ref()?;
-    (at.elapsed() < STREAMED_FOR).then(|| windows.clone())
+    let windows = latest.as_ref()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    Some(
+        windows
+            .iter()
+            .cloned()
+            .map(|mut w| {
+                if w.resets_at.is_some_and(|at| at <= now) {
+                    w.used_percent = 0.0;
+                }
+                w
+            })
+            .collect(),
+    )
 }
 
-/// `fresh` is the user asking: it skips the kept reading and pays for a new one.
+/// `fresh` skips the kept reading and pays for a new one: the user's Refresh,
+/// or the UI's two-minute timer while no run is going.
+///
+/// Claude has no free way to ask: since 2.1.273 `/usage` is a model call.
+/// Otherwise the reading is what
+/// Orteca's own Claude calls - runs, the classify call, commit drafts - were
+/// told on the way, and none at all until one has run.
 pub async fn read(id: ProviderId, fresh: bool) -> Limits {
     let none = |why: String| Limits {
         id,
@@ -121,6 +138,9 @@ pub async fn read(id: ProviderId, fresh: bool) -> Limits {
             windows,
             unavailable: None,
         };
+    }
+    if id == ProviderId::Claude && !fresh {
+        return none("not read since Orteca started. Claude reports it with every call, so the next run shows it; Refresh asks now with one small haiku call".into());
     }
     let Some(path) = which(id.program()) else {
         return none("not installed".into());
@@ -290,6 +310,22 @@ fn window_label(minutes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// A kept reading never expires, but a window that has since reset reads zero.
+    #[test]
+    fn a_kept_reading_stays_and_a_reset_window_reads_zero() {
+        let window = |label: &str, resets_at| Window {
+            label: label.into(),
+            used_percent: 80.0,
+            resets_at: Some(resets_at),
+            resets_text: None,
+        };
+        keep(vec![window("session", 1), window("week", i64::MAX)]);
+        let kept = streamed(ProviderId::Claude).unwrap();
+        assert_eq!(kept[0].used_percent, 0.0);
+        assert_eq!(kept[1].used_percent, 80.0);
+    }
 
     /// Recorded from claude 2.1.269 on a subscription, 2026-09-13.
     const CLAUDE_USAGE: &str =
@@ -298,6 +334,17 @@ mod tests {
         Current week (all models): 69% used · resets Sep 17, 11am (Europe/Kyiv)\n\n\
         What's contributing to your limits usage?\n\
         Last 24h · 965 requests · 51 sessions\n  60% of your usage was at >150k context\n";
+
+    /// A Claude reading costs a model call, so only the user's Refresh pays
+    /// for one: an ordinary read is a kept reading or a reason, never a CLI start.
+    #[tokio::test]
+    async fn claude_is_not_asked_unless_the_user_refreshes() {
+        let started = Instant::now();
+        let read = read(ProviderId::Claude, false).await;
+        let kept = !read.windows.is_empty();
+        assert!(kept || read.unavailable.as_deref().is_some_and(|w| w.contains("Refresh")), "{read:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "a CLI was started");
+    }
 
     #[test]
     fn claude_usage_text_becomes_windows() {

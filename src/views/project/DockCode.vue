@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import hljs from "highlight.js/lib/common";
 import { isAppError, readText, writeText } from "../../api";
 import { DOCK } from "./dock";
@@ -14,6 +14,8 @@ const dock = inject(DOCK)!;
 const text = ref("");
 const saved = ref("");
 const error = ref<string | null>(null);
+/** A save that did not land. Shown over the editor, which keeps the edits. */
+const saveError = ref<string | null>(null);
 const loading = ref(true);
 const area = ref<HTMLTextAreaElement | null>(null);
 const code = ref<HTMLPreElement | null>(null);
@@ -54,21 +56,35 @@ async function load() {
     saved.value = await readText(dock.path, props.tab.file!);
     text.value = saved.value;
     error.value = null;
+    saveError.value = null;
   } catch (e) {
     error.value = isAppError(e) ? e.message : String(e);
   }
   loading.value = false;
 }
 
+/** A tab with no edits of its own follows the disk: a run may have just
+ *  changed the file. One with edits is left alone; its save says if it clashes. */
+async function refresh() {
+  if (dirty.value || loading.value) return;
+  try {
+    const now = await readText(dock.path, props.tab.file!);
+    if (!dirty.value && now !== saved.value) saved.value = text.value = now;
+  } catch {
+    // Gone or unreadable: the next save or load says so.
+  }
+}
+
 async function save() {
   if (!dirty.value) return;
   const wrote = text.value;
   try {
-    await writeText(dock.path, props.tab.file!, wrote);
+    // The disk must still hold what this tab loaded, or someone else's change is lost.
+    await writeText(dock.path, props.tab.file!, wrote, saved.value);
     saved.value = wrote;
-    error.value = null;
+    saveError.value = null;
   } catch (e) {
-    error.value = isAppError(e) ? e.message : String(e);
+    saveError.value = isAppError(e) ? e.message : String(e);
   }
 }
 
@@ -93,6 +109,9 @@ async function indent(e: KeyboardEvent) {
 
 onMounted(load);
 watch(() => props.tab.file, load);
+// Coming back to the window is when a run's edits are most likely to have landed.
+onMounted(() => window.addEventListener("focus", refresh));
+onBeforeUnmount(() => window.removeEventListener("focus", refresh));
 </script>
 
 <template>
@@ -102,6 +121,10 @@ watch(() => props.tab.file, load);
       <span v-if="dirty" class="note">Unsaved</span>
       <button class="btn" :disabled="!dirty" @click="save">Save</button>
     </header>
+    <p v-if="saveError" class="note code-error" role="alert">
+      {{ saveError }}
+      <button class="link" @click="load">Reload from disk</button>
+    </p>
     <p v-if="error" class="note code-error" role="alert">{{ error }}</p>
     <p v-else-if="loading" class="note code-error">Opening…</p>
     <div v-else class="editor" :style="{ fontSize: `${dock.prefs.fontSize}px`, fontFamily: dock.prefs.fontFamily }">

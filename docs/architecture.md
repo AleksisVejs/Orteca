@@ -28,7 +28,7 @@ What exists and works:
   one until asked to apply it and then resumes its own session with it
 - Installing a missing CLI from the project screen, via the user's own npm
 - Routing with one small model call: the provider's smallest model reads the
-  prompt as a question or easy/medium/hard work (`intent.rs`, any language),
+  prompt as chat, a question, or easy/medium/hard work (`intent.rs`, any language),
   and the keyword classifier picks one of six routes,
   each with its stages and tiers declared before a provider starts; a trivial
   task is one Implement call, which verifies itself unless Orteca can run the
@@ -55,9 +55,11 @@ What exists and works:
 - CI on `windows-latest`: `npm test`, `npm run build`, `cargo test`
 - A route's tier picks a real model and effort on both CLIs, and moves up a tier
   when that tier has stalled in the project's own history (§4.3.4)
-- Each plan's rolling limits are read from its CLI (Codex free; Claude since
-  2.1.273 one haiku call, so a reading is kept 15 minutes and a run's own
-  stream refreshes it); the
+- Each plan's rolling limits are read from its CLI. Codex answers for free.
+  Claude since 2.1.273 answers `/usage` only with a model call, so Orteca
+  pays for one (haiku) only when the user presses Refresh; otherwise the
+  reading is the `rate_limit_event` its own Claude calls (runs, classify,
+  commit drafts) carry, kept 15 minutes; the
   provider with the most left is picked until the user picks one, and the
   preview warns when a route may not fit in what is left (§4.3.5)
 - A run can work in a separate copy: a git worktree beside the repository on
@@ -1253,18 +1255,21 @@ reimplement them.
 - Claude: `--permission-mode acceptEdits` plus explicit `--allowedTools` prefix rules.
 - Codex: `--sandbox workspace-write`. **Never** `danger-full-access`.
 
-Orteca adds one layer on top: a denylist checked against every command event.
-Hard-blocked regardless of the "Automatic" setting:
+Orteca adds one layer on top: Claude's `--disallowedTools` denylist
+(`run::CLAUDE_DENY_COMMANDS`: git push/reset/clean/rebase/restore, rm/del,
+publishing, curl/wget/ssh, registry and scheduled-task edits). It matches
+command spelling, so it is a guardrail against an agent going wrong, not a
+sandbox against a hostile one. A denied command is refused inside the CLI
+(`--permission-prompts none`) and the agent carries on; nothing pauses or asks.
 
-```
-git push --force | git reset --hard | git clean -fd | rm -rf /
-DROP DATABASE | TRUNCATE | deploy | publish | npm publish
-credential/keychain writes | shutdown
-```
-
-Hitting one pauses the task and asks. The setting
-`Risky command confirmation: Automatic | Ask me` controls the CAUTION tier only
-(installs, migrations, deletes).
+**As built - what runs outside the provider's sandbox.** Three things run as
+the user, with network, whatever the provider: the repository's own test
+suites in a local Verify (the agent may have edited them), a command the agent
+hands over with `ORTECA-WAIT:` (asked first unless the user picked "Run them"
+for that project; `run::refusal` blocks shells, inline code such as `node -e`,
+and the denylist), and the repo's Git hooks on a git-bar commit. Trust consent
+covers all three, and is asked again when the agent configuration it covered
+changes (`project::trust_fingerprint`).
 
 Process: one Job Object per task. Cancel = close handle = whole tree dies. Then record
 `cancelled`, keep the diff, show it.

@@ -153,6 +153,9 @@ fn claude_allowed(plan: &StagePlan) -> Vec<String> {
             .map(str::to_string),
         );
     }
+    if stage == Stage::Answer {
+        tools.extend(["WebSearch".to_string(), "WebFetch".to_string()]);
+    }
     tools
 }
 
@@ -322,8 +325,9 @@ fn now_ms() -> u64 {
 #[serde(rename_all = "camelCase")]
 pub struct TaskResult {
     pub task_id: i64,
-    /// `done`, `cancelled`, `failed`, `budgetReached`, `reviewRejected` or
-    /// `verifyFailed`. `checking` only on the early result a run sends while
+    /// `done`, `cancelled`, `failed`, `budgetReached`, `reviewRejected`,
+    /// `verifyFailed` or `unchanged` (the agent looked and changed nothing,
+    /// on purpose). `checking` only on the early result a run sends while
     /// its full suite is still running; a run never ends on it.
     pub status: &'static str,
     /// The provider's final answer, or its last message if it reports no final
@@ -364,6 +368,9 @@ pub struct TaskResult {
     pub resume: Option<Resume>,
     /// Steps outside the agent, in the order they ran.
     pub timings: Vec<Timing>,
+    /// The commit holding the user's uncommitted work from before the run,
+    /// which a `reverted` file is restored from. `None` for a clean folder.
+    pub saved_state: Option<String>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -506,6 +513,9 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 arg("--tools"),
                 arg(if plan.shell {
                     "Bash,PowerShell,Read,Edit,Write,Glob,Grep"
+                } else if plan.stage == Stage::Answer {
+                    // A question about the world outside the repo needs the web.
+                    "Read,Edit,Write,Glob,Grep,WebSearch,WebFetch"
                 } else {
                     "Read,Edit,Write,Glob,Grep"
                 }),
@@ -589,6 +599,9 @@ struct Outcome {
     /// Codex reports no final-answer field, so its last message is the answer.
     last_text: String,
     result: String,
+    /// What earlier turns of this stage answered. A later turn answers a
+    /// message the user sent meanwhile, so it adds to the answer, not replaces it.
+    earlier: Vec<String>,
     /// Summed across turns. A steered run reports usage once per turn, so
     /// keeping only the last would count one turn and throw the rest away.
     /// `Usage::absorb` knows which fields add and which replace.
@@ -619,8 +632,36 @@ impl Outcome {
     fn begin_stage(&mut self) {
         self.last_text.clear();
         self.result.clear();
+        self.earlier.clear();
         self.done = false;
         self.finished = false;
+    }
+
+    /// Keep one turn's answer before the next turn starts. A checker's JSON
+    /// is a verdict, not words for the user, and only the last one counts.
+    fn keep(&mut self, said: String) {
+        if !said.trim().is_empty() && !checker_json(&said) {
+            self.earlier.push(said);
+        }
+    }
+
+    /// A process restarted with the user's messages: a turn that finished
+    /// keeps its answer, one cut off part-way had none to keep.
+    fn next_turn(&mut self) {
+        if self.done {
+            let said = self.turn().to_string();
+            self.keep(said);
+        }
+        self.result.clear();
+        self.last_text.clear();
+    }
+
+    fn turn(&self) -> &str {
+        if self.result.is_empty() {
+            &self.last_text
+        } else {
+            &self.result
+        }
     }
 
     /// Claude's `total_cost_usd` is a running total for one process, so within
@@ -664,6 +705,11 @@ impl Outcome {
                 None => self.usage = Some(usage.clone()),
             },
             ProviderEvent::Done { result, .. } => {
+                // A live provider's second result answers a message sent mid-run.
+                if self.done {
+                    let said = std::mem::take(&mut self.result);
+                    self.keep(said);
+                }
                 self.done = true;
                 self.result = result.clone();
             }
@@ -698,11 +744,10 @@ impl Outcome {
     }
 
     fn summary(&self) -> String {
-        if self.result.is_empty() {
-            self.last_text.clone()
-        } else {
-            self.result.clone()
-        }
+        let mut said = self.earlier.clone();
+        said.push(self.turn().to_string());
+        said.retain(|s| !s.trim().is_empty());
+        said.join("\n\n")
     }
 }
 
@@ -961,6 +1006,50 @@ struct State {
     /// The last writing or answering session, for a follow-up.
     resume_point: Option<Resume>,
     timings: Vec<Timing>,
+    /// Checks that failed and then passed unchanged. Counted as passes, so
+    /// the run stays fast, but the answer says so: a test that only passes on
+    /// its own can be one the change broke in suite order.
+    flaky: Vec<String>,
+    /// What the writing stages did with tools, for a run that changed
+    /// nothing: whether any tool ran at all, and whether an edit was refused.
+    work: WorkSeen,
+}
+
+/// A writing stage that ends with the tree untouched is one of three things.
+/// No tool at all: a question back, or Codex's sandbox silently turned
+/// read-only (its rejected commands never reach `--json`) - not finished.
+/// An edit tried and refused: not finished either. Tools that ran and no
+/// edit tried: the agent looked and found nothing to change.
+#[derive(Default)]
+struct WorkSeen {
+    tools: u32,
+    edit_ids: Vec<String>,
+    edit_failed: bool,
+}
+
+impl WorkSeen {
+    fn saw(&mut self, event: &ProviderEvent) {
+        match event {
+            ProviderEvent::ToolUse { name, id, .. } => {
+                self.tools += 1;
+                if name == "Edit failed" {
+                    self.edit_failed = true;
+                }
+                if let Some(id) = id.as_ref().filter(|_| CLAUDE_EDIT_TOOLS.contains(&name.as_str())) {
+                    self.edit_ids.push(id.clone());
+                }
+            }
+            ProviderEvent::ToolResult { id, failed: true, .. } if self.edit_ids.contains(id) => {
+                self.edit_failed = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Nothing changed, and that is the agent's answer rather than a fault.
+    fn found_nothing_to_change(&self) -> bool {
+        self.tools > 0 && !self.edit_failed
+    }
 }
 
 impl State {
@@ -986,6 +1075,8 @@ impl State {
             attachments: Vec::new(),
             resume_point: None,
             timings,
+            flaky: Vec::new(),
+            work: WorkSeen::default(),
         }
     }
 
@@ -1001,6 +1092,7 @@ impl State {
     /// Take back what a check beside the model call learned or was told.
     fn absorb(&mut self, side: State) {
         self.timings.extend(side.timings);
+        self.flaky.extend(side.flaky);
         self.constraints.extend(side.constraints);
         self.attachments.extend(side.attachments);
         self.outcome.cancelled |= side.outcome.cancelled;
@@ -1069,6 +1161,16 @@ pub async fn stream(
         started: now_ms(),
         auto_wait,
     };
+    // The folder as it was, saved before any agent can touch it, so whatever
+    // the run undoes can be put back and the task rewound to before it. A
+    // clean folder is its commit already.
+    let saved_state = before_run.as_ref().filter(|_| worktree.is_none()).and_then(|_| {
+        if dirty_at_start {
+            project::save_state(&ctx.dir, base_commit.as_deref(), task_id)
+        } else {
+            base_commit.clone()
+        }
+    });
     let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
     // Memory is standing instructions that outlive the run: global, then project.
     state.constraints = store.memory_for_task(task_id).unwrap_or_default();
@@ -1140,6 +1242,7 @@ pub async fn stream(
             worktree: worktree.clone(),
             resume: None,
             timings: state.timings.clone(),
+            saved_state: saved_state.clone(),
         });
     };
 
@@ -1155,6 +1258,10 @@ pub async fn stream(
     // An independent Review runs at most once; its fix is judged by Verify.
     let mut stages = route.stages.clone();
     let mut index = 0;
+    // The agent configuration each stage's CLI loads from the folder. A stage
+    // that changes it (a hook in `.claude/settings.json`) must not have the
+    // next one run it: the user never trusted that.
+    let config = project::trust_fingerprint(&ctx.dir, &project::trust_scan(&ctx.dir));
     while index < stages.len() {
         let stage = stages[index];
         if state.outcome.failure.is_some()
@@ -1162,6 +1269,12 @@ pub async fn stream(
             || state.halt
             || state.budget_stop.is_some()
         {
+            break;
+        }
+        if index > 0 && project::trust_fingerprint(&ctx.dir, &project::trust_scan(&ctx.dir)) != config {
+            state.outcome.failure = Some(
+                "The run changed this project's agent settings (such as .claude or .codex), so Orteca stopped before another step could load them. The change is kept; review it, then open the project again to trust it.".into(),
+            );
             break;
         }
         ctx.plan = stage_plan(&route, model.as_ref(), id, task_id, &stages, index);
@@ -1512,7 +1625,17 @@ pub async fn stream(
     // no change of its own did not do what `done` would claim. Prose is not read.
     // Claude gets the same check: it can answer an implement brief with a
     // question and change nothing, and that is not a finished task either.
+    let mut unchanged = false;
     if outcome.failure.is_none()
+        && !outcome.cancelled
+        && state.budget_stop.is_none()
+        && state.notes.iter().any(|n| n.stage.writes())
+        && ran_nothing(&diff)
+    {
+        unchanged = state.work.found_nothing_to_change();
+    }
+    if !unchanged
+        && outcome.failure.is_none()
         && !outcome.cancelled
         && state.budget_stop.is_none()
         && state.notes.iter().any(|n| n.stage.writes())
@@ -1543,12 +1666,24 @@ pub async fn stream(
                 Some("verify") => "verifyFailed",
                 _ => "budgetReached",
             }
+        } else if unchanged && outcome.status() == "done" {
+            // Not done - nothing was changed - and not failed: the agent looked
+            // and says nothing needed to. Its reply says why.
+            "unchanged"
         } else {
             outcome.status()
         };
     let mut summary = final_words(&state.notes, status == "done").unwrap_or_else(|| outcome.summary());
     if status == "done" {
         summary.push_str(&open_findings(&state.notes));
+        if !state.flaky.is_empty() {
+            summary.push_str(&format!(
+                "
+
+These checks failed once and passed when run again, so they count as passed: {}. If they fail again, the change may be what breaks them when the whole suite runs.",
+                state.flaky.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     // Read before this task closes, so it is never its own comparison. A
     // baseline that cannot be read is no baseline, not a failed run.
@@ -1593,6 +1728,7 @@ pub async fn stream(
         resume: state.resume_point.filter(|_| worktree.is_none()),
         worktree,
         timings: state.timings,
+        saved_state,
     };
     // The task row keeps only the latest answer. Each exchange's own result goes
     // in the log too, so a task replied to later still shows what every answer
@@ -1978,6 +2114,26 @@ async fn failed_before(
         let event = ProviderEvent::Text(text);
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
+    // A test the run added has nothing to say about the base: a new file, or a
+    // file whose failing tests are all new. The run that added a test to
+    // SoftDeleteAuditTest spent 46s asking the base about it (2026-09-23).
+    // Read from git, so such a run makes no copy either (7s on RigInspectBE).
+    let cases = failing_cases(&text);
+    let at_base: Vec<&str> = files
+        .iter()
+        .filter(|f| {
+            let Some(old) = project::file_at(&ctx.dir, base, &sub.join(f)) else {
+                return false;
+            };
+            let names: Vec<&String> = cases.iter().filter(|(file, _)| file == *f).map(|(_, name)| name).collect();
+            let old = squash(&old);
+            names.is_empty() || names.iter().any(|name| old.contains(name.as_str()))
+        })
+        .map(String::as_str)
+        .collect();
+    if at_base.is_empty() {
+        return Vec::new();
+    }
     say("Checking whether these tests already failed before the run".into());
     let started = now_ms();
     let setup: Vec<String> = ["vendor", ".env", ".env.testing"]
@@ -1991,25 +2147,9 @@ async fn failed_before(
         ms: now_ms().saturating_sub(started),
     });
     let mut before = Vec::new();
-    // A test the run added has nothing to say about the base: a new file, or a
-    // file whose failing tests are all new. The run that added a test to
-    // SoftDeleteAuditTest spent 46s asking the base about it (2026-09-23).
-    let cases = failing_cases(&text);
-    let at_base: Vec<&str> = files
-        .iter()
-        .filter(|f| {
-            let Ok(old) = std::fs::read_to_string(copy.join(&sub).join(f)) else {
-                return false;
-            };
-            let names: Vec<&String> = cases.iter().filter(|(file, _)| file == *f).map(|(_, name)| name).collect();
-            let old = squash(&old);
-            names.is_empty() || names.iter().any(|name| old.contains(name.as_str()))
-        })
-        .map(String::as_str)
-        .collect();
     match made {
         Err(e) => say(format!("Could not ask the base commit: {}", e.message)),
-        Ok(()) if !at_base.is_empty() => {
+        Ok(()) => {
             let mut args = vec!["php", "artisan", "test"];
             args.extend(at_base);
             let shown = format!("before the change: {}", args.join(" "));
@@ -2021,7 +2161,6 @@ async fn failed_before(
                 }
             }
         }
-        Ok(()) => {}
     }
     project::drop_base_copy(&ctx.dir, &copy);
     before
@@ -2361,6 +2500,7 @@ async fn run_check_twice(
     };
     let again = run_check(store, ctx, state, control, emit, &rerun, cwd, &again_shown).await;
     if matches!(again, Ran::Finished { passed: true, .. }) {
+        state.flaky.push(shown.to_string());
         let event = ProviderEvent::Text(format!(
             "{shown} failed, then passed unchanged: a flaky test, so it counts as passed and buys no Fix"
         ));
@@ -2894,10 +3034,14 @@ fn failed_before_run(remaining: Vec<Stage>) -> BudgetStop {
 /// then cured is history, not the answer: the writer's words are.
 fn final_words(notes: &[StageNote], done: bool) -> Option<String> {
     notes.iter().rev().map(|n| (n.stage, &n.summary)).find_map(|(stage, s)| {
-        let checker = stage == Stage::Verify
-            || serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object());
+        let checker = stage == Stage::Verify || checker_json(s);
         (!s.trim().is_empty() && !(done && checker)).then(|| s.clone())
     })
+}
+
+/// A Review's or Verify's verdict, as opposed to words for the user.
+fn checker_json(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object())
 }
 
 /// What the last Review said, for a finished run. A pass leaves its notes to
@@ -2912,8 +3056,13 @@ fn open_findings(notes: &[StageNote]) -> String {
     else {
         return String::new();
     };
+    // A Fix that nothing ran after was never checked, and "done" must say so.
+    let unchecked = notes.last().is_some_and(|n| n.stage == Stage::Fix);
     let heading = match review["verdict"].as_str() {
         Some("pass") => "The Review passed it but noted, and nothing fixed:",
+        Some("changes_requested") if unchecked => {
+            "The Review asked for this, and a Fix changed it. Nothing checked that fix - no test or second review ran after it:"
+        }
         Some("changes_requested") => "The Review asked for this, and a Fix changed it:",
         _ => return String::new(),
     };
@@ -3270,11 +3419,47 @@ fn refusal(command: &str, words: &[String]) -> Option<&'static str> {
     let program = Path::new(first)
         .file_stem()
         .map_or_else(String::new, |stem| stem.to_string_lossy().to_lowercase());
-    if ["cmd", "powershell", "pwsh", "bash", "sh", "wsl"].contains(&program.as_str()) {
+    // Shells, and the Windows programs that run whatever they are handed.
+    const RUNS_ANYTHING: &[&str] = &[
+        "cmd", "powershell", "pwsh", "bash", "sh", "wsl", "mshta", "rundll32", "regsvr32",
+        "cscript", "wscript", "certutil", "bitsadmin", "msiexec",
+    ];
+    if RUNS_ANYTHING.contains(&program.as_str()) {
         return Some("a shell would run anything at all. Hand over the program itself.");
     }
+    // Code on the command line is a script nobody can read as a file first.
+    const INLINE: &[(&str, &[&str])] = &[
+        ("node", &["-e", "--eval", "-p", "--print"]),
+        ("bun", &["-e", "--eval"]),
+        ("deno", &["eval"]),
+        ("python", &["-c"]),
+        ("python3", &["-c"]),
+        ("py", &["-c"]),
+        ("php", &["-r"]),
+        ("ruby", &["-e"]),
+        ("perl", &["-e", "-E"]),
+    ];
+    let args: Vec<String> = words[1..].iter().map(|w| w.to_lowercase()).collect();
+    if INLINE
+        .iter()
+        .any(|(p, flags)| *p == program && args.iter().any(|a| flags.contains(&a.as_str())))
+    {
+        return Some("it runs code written on the command line. Put it in a file in the repository and hand that over.");
+    }
+    // `git -C dir push` is still a push: global options come off first.
+    let mut rest = args.as_slice();
+    if program == "git" {
+        while let Some((first, tail)) = rest.split_first() {
+            if !first.starts_with('-') {
+                break;
+            }
+            // `-c key=value` and `-C dir` (both `-c` once lowercased) take the
+            // next word; `--git-dir=x` does not.
+            rest = if first == "-c" { tail.get(1..).unwrap_or_default() } else { tail };
+        }
+    }
     let line = std::iter::once(program)
-        .chain(words[1..].iter().map(|w| w.to_lowercase()))
+        .chain(rest.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ");
     CLAUDE_DENY_COMMANDS
@@ -3662,9 +3847,27 @@ async fn attempt(
     // Set once this process is known to be ending, so whatever it has already
     // written is still drained before the decision is acted on.
     let mut ending: Option<Next> = None;
+    // No ceiling stops a stage, so a CLI that hangs would hang the run with no
+    // word. Silence this long is said out loud; stopping stays the user's call.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(600);
+    let quiet = tokio::time::sleep(QUIET);
+    tokio::pin!(quiet);
     loop {
         let next = tokio::select! {
-            line = run.lines.recv() => line,
+            line = run.lines.recv() => {
+                quiet.as_mut().reset(tokio::time::Instant::now() + QUIET);
+                line
+            }
+            () = &mut quiet, if ending.is_none() => {
+                let event = ProviderEvent::Text(format!(
+                    "No word from {} for {} minutes. It may be stuck; stop it if nothing changes.",
+                    ctx.id.program(),
+                    QUIET.as_secs() / 60
+                ));
+                let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+                quiet.as_mut().reset(tokio::time::Instant::now() + QUIET);
+                continue;
+            }
             // Retired once this process is ending - a second stop has nothing
             // left to kill - and again if the sender is dropped, so a closed
             // control channel cannot spin this loop.
@@ -3705,6 +3908,10 @@ async fn attempt(
                 // Claude's running thinking-token count says nothing the usage
                 // event does not; logging it buried real unknowns 3 to 1.
                 let tick = value["type"] == "system" && value["subtype"] == "thinking_tokens";
+                // Codex announces each turn and item before it runs; the
+                // `.completed` line after it carries everything the start did.
+                let start = ctx.id == ProviderId::Codex
+                    && matches!(value["type"].as_str(), Some("turn.started" | "item.started"));
                 // The reading `provider_limits` otherwise starts a whole call to
                 // ask for. It arrives before every answer, so a run keeps the
                 // limits panel current for free. Only `rejected` becomes an
@@ -3713,7 +3920,7 @@ async fn attempt(
                 if limits {
                     crate::providers::limits::remember(ctx.id, &value);
                 }
-                if events.is_empty() && !tick && !limits {
+                if events.is_empty() && !tick && !limits && !start {
                     state.unknown_events = state.unknown_events.saturating_add(1);
                     // Enough to say what the line was, not enough to store a
                     // file in it. An unrecognised line can carry a whole Read
@@ -3745,6 +3952,9 @@ async fn attempt(
                     }
                     if let ProviderEvent::Started { session_id } = &event {
                         state.session = Some(session_id.clone());
+                    }
+                    if ctx.plan.stage.writes() {
+                        state.work.saw(&event);
                     }
                     if let ProviderEvent::Done {
                         structured, turns, ..
@@ -3927,6 +4137,7 @@ fn restart_held(ctx: &Context, state: &mut State, run: &proc::Run) -> Option<Nex
     let launch = Launch::fix(ctx.id, session, &state.held.join("\n"), &ctx.plan);
     state.held.clear();
     state.apply_now_pending = false;
+    state.outcome.next_turn();
     // The next attempt must prove its own completion. Keeping this true from
     // the previous turn would let a failed resume exit zero and look done.
     state.outcome.done = false;
@@ -4027,6 +4238,12 @@ mod tests {
             "{claude}"
         );
         assert!(claude.contains("Bash(git push:*)"));
+
+        // An Answer may search the web, still with no shell and no edits.
+        let answer = args(ProviderId::Claude, &StagePlan { shell: false, ..plan_for(Stage::Answer) }).join(" ");
+        assert!(answer.contains("--tools Read,Edit,Write,Glob,Grep,WebSearch,WebFetch "), "{answer}");
+        assert!(answer.contains(" WebSearch WebFetch --disallowedTools"), "{answer}");
+        assert!(!answer.contains("--tools Bash"), "{answer}");
     }
 
     #[test]
@@ -4228,6 +4445,8 @@ process.stdin.on('end', () => {
         std::fs::write(
             &request.program,
             "@echo off
+             echo {\"type\":\"turn.started\"}
+             echo {\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\"}}
              echo {\"type\":\"item.completed\",\"item\":{\"type\":\"unified_exec\",\"error\":\"sandbox setup failed\"}}
              echo {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}
              exit /b 0
@@ -4242,10 +4461,8 @@ process.stdin.on('end', () => {
         })
         .await;
 
-        assert!(
-            store.event_kinds(task).contains(&"unknown".to_string()),
-            "unparsed line was dropped"
-        );
+        let unknown = store.event_kinds(task).iter().filter(|k| *k == "unknown").count();
+        assert_eq!(unknown, 1, "the unparsed line was dropped, or a start was counted");
         let raw = store
             .event_payloads(task)
             .into_iter()
@@ -4360,6 +4577,45 @@ process.stdin.on('end', () => {
         assert_eq!(result.status, "failed");
         assert!(result.failure.unwrap().contains("without changing any file"));
         assert!(result.summary.contains("git fetch"));
+        std::fs::remove_dir_all(shim).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An agent that looked and found nothing to change is neither done nor a
+    /// failure: "make the footer say 2026" when it already does. A failure
+    /// would also raise the next try a tier, paying more for the same answer.
+    #[tokio::test]
+    async fn an_implement_stage_that_looked_and_changed_nothing_is_unchanged() {
+        let store = Store::in_memory().unwrap();
+        let mut request = task_request(&store, "claude-looked");
+        request.id = ProviderId::Claude;
+        let dir = request.dir.clone();
+        let shim = std::env::temp_dir().join(format!("orteca-claude-looked-{}", std::process::id()));
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::write(shim.join("fake.cmd"), "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        std::fs::write(
+            shim.join("fake.js"),
+            concat!(
+                "process.stdin.resume();",
+                "console.log(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'t1',name:'Read',input:{file_path:'footer.html'}}]}}));",
+                "console.log(JSON.stringify({type:'result',subtype:'success',",
+                "result:'The footer already says 2026, so nothing needed changing.',",
+                "usage:{input_tokens:1,output_tokens:1},total_cost_usd:0.01}));",
+                "process.stdin.on('end',()=>process.exit(0));",
+            ),
+        )
+        .unwrap();
+        request.program = shim.join("fake.cmd");
+        request.route.stages = vec![Stage::Implement, Stage::Verify];
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "unchanged", "{:?}", result.failure);
+        assert!(result.failure.is_none());
+        assert!(result.summary.contains("already says 2026"));
+        // Not a failure, so the same ask later is not escalated.
+        let project = store.project(&dir.to_string_lossy()).unwrap().id;
+        assert_eq!(store.prior_failures(project, "test").unwrap(), 0);
         std::fs::remove_dir_all(shim).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4894,7 +5150,7 @@ ping -n 60 127.0.0.1 >nul
         );
 
         assert_eq!(result.status, "done", "{:?}", result.failure);
-        assert_eq!(result.summary, "boundary use tabs");
+        assert_eq!(result.summary, "working\n\nboundary use tabs", "the first answer stays");
         let payload = store
             .event_payloads(task)
             .into_iter()
@@ -5446,6 +5702,8 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(result.status, "done", "{:?}", result.budget_stop);
         assert_eq!(result.calls_used, 1, "a flaky test bought a Fix");
         assert!(said.iter().any(|t| t.contains("a flaky test")), "{said:?}");
+        // Counted as a pass, and the answer says so rather than only the log.
+        assert!(result.summary.contains("failed once and passed when run again"), "{}", result.summary);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5734,13 +5992,13 @@ ping -n 60 127.0.0.1 >nul
     /// A test that already fails at the base commit stops the Fix started
     /// beside that question and is not checked again; one the run broke gets
     /// its Fix and its check. The base is asked in a throwaway copy that is
-    /// gone afterwards.
+    /// gone afterwards, and one is not even made for a test the run added.
     #[tokio::test]
     async fn checks_that_failed_before_the_run_buy_no_fix() {
-        for broken_at_base in [true, false] {
+        for (broken_at_base, test_at_base) in [(true, true), (false, true), (false, false)] {
             let store = Store::in_memory().unwrap();
             let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
-            let mut request = routed(&store, &format!("failed-before-{broken_at_base}"), route);
+            let mut request = routed(&store, &format!("failed-before-{broken_at_base}-{test_at_base}"), route);
             let dir = request.dir.clone();
             if fake_laravel(&dir).is_none() {
                 eprintln!("skipped: php or composer is not on PATH");
@@ -5748,6 +6006,11 @@ ping -n 60 127.0.0.1 >nul
             }
             if broken_at_base {
                 std::fs::write(dir.join("broken"), "").unwrap();
+            }
+            let small = dir.join("tests/Feature/SmallTest.php");
+            let small_text = std::fs::read_to_string(&small).unwrap();
+            if !test_at_base {
+                std::fs::remove_file(&small).unwrap();
             }
             let git = |args: &[&str]| {
                 let out = std::process::Command::new("git")
@@ -5764,6 +6027,7 @@ ping -n 60 127.0.0.1 >nul
             // The run's work, and a suite that now fails either way.
             std::fs::write(dir.join("Header.php"), "<?php\n").unwrap();
             std::fs::write(dir.join("broken"), "").unwrap();
+            std::fs::write(&small, &small_text).unwrap();
             let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
             claude_shim(&mut request, &passing);
             let copy = std::env::temp_dir().join(format!("orteca-base-{}", request.task_id));
@@ -5775,17 +6039,22 @@ ping -n 60 127.0.0.1 >nul
             // The Fix starts beside the base check either way, and counts.
             assert_eq!(result.calls_used, 2, "the failure got no Fix");
             let log = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
-            // Each failing suite run is run once more before it counts.
-            let suites = log.lines().filter(|l| l.contains("suite")).count();
+            // Each failing check is run once more before it counts. A test file
+            // the run added is its focused check, so it runs by name instead.
+            let checks = log.lines().filter(|l| l.contains(if test_at_base { "suite" } else { "SmallTest" })).count();
             if broken_at_base {
                 assert!(stop.message.contains("already failed"), "{}", stop.message);
-                assert_eq!(suites, 2, "a failure the run did not cause was checked again: {log}");
+                assert_eq!(checks, 2, "a failure the run did not cause was checked again: {log}");
             } else {
                 assert!(!stop.message.contains("already failed"), "{}", stop.message);
-                assert_eq!(suites, 4, "the Fix was not checked: {log}");
+                assert_eq!(checks, 4, "the Fix was not checked: {log}");
             }
-            assert!(!log.contains("test tests/Feature/SmallTest.php"), "the base ran in the user's tree: {log}");
+            if test_at_base {
+                assert!(!log.contains("test tests/Feature/SmallTest.php"), "the base ran in the user's tree: {log}");
+            }
             assert!(!copy.exists(), "the base copy was left behind");
+            let copied = result.timings.iter().any(|t| t.label == "copy at the base commit");
+            assert_eq!(copied, test_at_base, "a base copy for a test the base did not have, or none for one it did");
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -6769,7 +7038,16 @@ ping -n 60 127.0.0.1 >nul
         assert!(refused("npm test && git push"));
         assert!(refused("powershell -Command npm test"));
         assert!(refused("git.exe push origin main"));
+        assert!(refused("git -C . push origin main"));
+        assert!(refused("git -c core.sshCommand=x push"));
+        assert!(!refused("git -C . status"));
         assert!(refused("Remove-Item build"));
+        // Inline code and the programs that run anything they are handed.
+        assert!(refused("node -e \"require('child_process').exec('x')\""));
+        assert!(refused("python -c \"import os\""));
+        assert!(refused("rundll32 url.dll,FileProtocolHandler x"));
+        assert!(!refused("node bench.mjs --eval-set hard"));
+        assert!(!refused("python -m pytest"));
         // Leading assignments are the environment; the program comes after.
         let all = words("ARMS=orteca-codex _X=\"a b\" node bench.mjs K=v");
         let (env, rest) = env_prefix(&all);
@@ -6818,11 +7096,13 @@ ping -n 60 127.0.0.1 >nul
                  const say=t=>console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:t}}}}));\
                  if(a.includes('resume'))say('Got it: '+i);\
                  else{{console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
-                 say('Starting the benchmark.\\nORTECA-WAIT: ANSWER=42 node -e \"console.log(process.env.ANSWER)\"');}}\
+                 say('Starting the benchmark.\\nORTECA-WAIT: ANSWER=42 node answer.js');}}\
                  console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));}});"
             ),
         )
         .unwrap();
+        // A file, not `node -e`: inline code is refused.
+        std::fs::write(dir.join("answer.js"), "console.log(process.env.ANSWER)").unwrap();
 
         let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
 
@@ -7016,7 +7296,7 @@ ping -n 60 127.0.0.1 >nul
         }
 
         assert_eq!(results, 2, "a steered run reports one result per turn");
-        assert_eq!(outcome.summary(), "SECOND", "the last turn is the answer");
+        assert_eq!(outcome.summary(), "OK\n\nSECOND", "each turn answered something the user asked");
         let usage = outcome.usage.expect("usage");
         // 4 + 6 output, and the cache-creation tokens fold into input as
         // claude.rs already does: (2 + 5321) + (2 + 58).
@@ -7025,6 +7305,18 @@ ping -n 60 127.0.0.1 >nul
         assert_eq!(usage.cached_input_tokens, 44451 + 49772);
         // The CLI's own running total, not 0.0302182 + 0.0404686.
         assert_eq!(usage.cost_usd, Some(0.0404686));
+    }
+
+    #[test]
+    fn a_held_message_adds_its_answer_to_the_first() {
+        let mut outcome = Outcome::default();
+        outcome.absorb(&ProviderEvent::Text("Yes, Leina is a diva!".into()));
+        outcome.done = true;
+        outcome.next_turn();
+        outcome.absorb(&ProviderEvent::Text("A very big diva!".into()));
+        assert_eq!(outcome.summary(), "Yes, Leina is a diva!\n\nA very big diva!");
+        outcome.begin_stage();
+        assert_eq!(outcome.summary(), "", "a new stage starts its own answer");
     }
 
     #[test]

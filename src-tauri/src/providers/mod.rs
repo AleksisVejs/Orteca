@@ -5,6 +5,7 @@
 //! raw shape. `mock` replays recorded JSONL through these same parsers, so a
 //! test exercises the real normalisation without spending a subscription.
 
+pub mod chats;
 pub mod claude;
 pub mod codex;
 pub mod codex_edits;

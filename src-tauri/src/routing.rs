@@ -1227,10 +1227,19 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             vec![Stage::Answer],
             "a question: one call answers it and changes no file",
         )
+    } else if intent == Some(Intent::Chat) {
+        (RouteKind::Answer, vec![Stage::Answer], "talk: one call replies and reads no file")
     } else if signals.prior_failures >= 2 {
+        // The prompt that keeps failing is the one that most needs its tests.
+        // Orteca running them costs no call, and they go before the Review so
+        // a Fix either answers is judged by them.
+        let mut stages = vec![Stage::Plan, Stage::Implement, Stage::Review];
+        if repo.checks_locally {
+            stages.insert(2, Stage::Verify);
+        }
         (
             RouteKind::Escalated,
-            vec![Stage::Plan, Stage::Implement, Stage::Review],
+            stages,
             "this prompt has already failed twice, so it is planned and reviewed",
         )
     } else if signals.security || signals.authz {
@@ -1380,11 +1389,12 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         .collect();
 
     // A brief names a handful of paths, not a directory listing. A question
-    // is about the code, so the tests paired beside it are only cost.
+    // is about the code, so the tests paired beside it are only cost. Talk is
+    // about none of it: a listed file is an invitation to go read it.
     let candidate_paths: Vec<String> = candidate_paths
         .into_iter()
         .filter(|p| kind != RouteKind::Answer || !is_test(p))
-        .take(LISTED)
+        .take(if intent == Some(Intent::Chat) { 0 } else { LISTED })
         .collect();
     let map: HashMap<&str, &FileFacts> = repo.code_map.iter().map(|(p, f)| (p.as_str(), f)).collect();
     let ours: HashSet<&str> = repo
@@ -1661,13 +1671,26 @@ pub fn brief(
              printed. `pass` means at least one check ran and every check passed. The check \
              that failed runs again after this call.\n\n",
         ),
+        // "About this project" turned "I LOOOOOOVE HER" into a code search
+        // for an older message's word, answered instead of the new one.
+        Stage::Answer if route.signals.intent == Some(Intent::Chat) => out.push_str(
+            "Reply to the message below. It is conversation, not a question about this \
+             project: read no file and run no command. When it holds an earlier exchange, \
+             reply only to the part after the last `My reply:`; the rest is what was said \
+             before. Reply in the language it was written in, briefly, in plain text.\n\n",
+        ),
         Stage::Answer => out.push_str(
-            "Answer the question below about this project. Read what you need, change no \
-             file, and reply in the language it was asked in. Stop reading as soon as you \
-             can answer; do not search again to double-check. A cause or a claim about \
-             what code does must come from the code or output you read: when the question \
-             is why something happened, read the part that decided it before answering, and \
-             never state a cause you only guessed. Explain it like to a \
+            "Answer the question below. Read what you need, change no file, and reply in \
+             the language it was asked in. When the answer is in this project, stop reading \
+             as soon as you can answer; do not search again to double-check. A cause or a \
+             claim about what code does must come from the code or output you read: when \
+             the question is why something happened, read the part that decided it before \
+             answering, and never state a cause you only guessed. When the answer needs \
+             facts from outside this project, such as other tools, the market or a \
+             library's current state, search the web before answering: compare the main \
+             options you find, then give a clear verdict and the reason for it, not \"I \
+             can't tell\". Name a source only by the exact address of a page you opened; \
+             never invent one. Explain it like to a \
              five-year-old: small words, short sentences, only what matters, a few short \
              paragraphs at most. Lead with the answer. Plain text only: no markdown, no \
              headings, no bold, no [[links]]; name a file only when the reader needs it.\n\n",
@@ -2410,6 +2433,12 @@ mod tests {
             escalated.stages,
             [Stage::Plan, Stage::Implement, Stage::Review]
         );
+        // With tests Orteca can run, they run: free, and before the Review.
+        signals.checks_locally = true;
+        assert_eq!(
+            route("fix the typo", Mode::Balanced, &signals).stages,
+            [Stage::Plan, Stage::Implement, Stage::Verify, Stage::Review]
+        );
     }
 
     /// No reading (the preview, a failed call): a plain question is still
@@ -2440,6 +2469,23 @@ mod tests {
         assert_eq!(question.kind, RouteKind::Answer);
         assert_eq!(question.stages, [Stage::Answer]);
         assert!(!Stage::Answer.writes());
+
+        // Talk is answered too, but with no files to open and no project framing.
+        let said = "hello\n\nYour answer:\nHi!\n\nMy reply:\nI LOOOOOOVE winback";
+        let talk = |intent| RepoSignals {
+            intent: Some(intent),
+            tracked_paths: vec!["app/Winback.php".into()],
+            ..repo(REPO)
+        };
+        assert!(!route(said, Mode::Balanced, &talk(Intent::Question)).candidate_paths.is_empty());
+        let chat = route(said, Mode::Balanced, &talk(Intent::Chat));
+        assert_eq!(chat.stages, [Stage::Answer]);
+        assert!(chat.candidate_paths.is_empty());
+        let text = brief(&chat, Stage::Answer, said, &[], &[], false);
+        assert!(text.contains("read no file") && !text.contains("search the web"));
+        // A question may reach past the repo, and must not invent a source.
+        let text = brief(&question, Stage::Answer, "is this the best app?", &[], &[], false);
+        assert!(text.contains("search the web") && text.contains("never invent one"));
 
         // A question lists no tests and a failed one is not retried a tier up.
         let asked = RepoSignals {
@@ -2615,7 +2661,7 @@ mod tests {
                 "verdict": "fail"
             })),
         };
-        let fix = brief(&r, Stage::Fix, "task", &[], &[failed.clone()], false);
+        let fix = brief(&r, Stage::Fix, "task", &[], std::slice::from_ref(&failed), false);
         // The command a passing check ran still says what must not break.
         assert!(fix.contains("cargo test") && !fix.contains("passing-suite-noise"));
         // Both ends of the failure survive; the middle does not.

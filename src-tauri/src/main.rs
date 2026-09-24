@@ -107,7 +107,8 @@ impl ProviderOperations {
 #[tauri::command(async)]
 fn open_project(app: AppHandle, path: String, store: State<Store>) -> Result<OpenedProject> {
     let dir = project::validate_dir(&path)?;
-    let git = project::git_state(&dir);
+    // Only the root until the project is trusted: nothing of its own runs yet.
+    let mut git = project::git_root(&dir);
 
     if !git.is_repo {
         if !project::git_installed() {
@@ -126,14 +127,29 @@ fn open_project(app: AppHandle, path: String, store: State<Store>) -> Result<Ope
     let root_path = project::validate_dir(git.root.as_deref().unwrap_or(&path))?;
     let root = root_path.to_string_lossy().into_owned();
 
-    let record = store.touch_project(&root, &project::display_name(&root_path))?;
-    // A first scan of a large repository takes seconds; the screen must not wait.
-    let (id, dir) = (record.id, root_path.clone());
-    std::thread::spawn(move || {
-        let _ = app.state::<Store>().scan_map(id, &dir, &project::tracked_paths(&dir));
-    });
+    let mut record = store.touch_project(&root, &project::display_name(&root_path))?;
+    let trust_findings = project::trust_scan(&root_path);
+    // Trust covers the agent configuration the user was shown. Anything that
+    // could run and has changed since - a pull, a run, a hand edit - is asked
+    // about again. A project trusted before this was kept is taken as it is.
+    if record.trusted {
+        let now = project::trust_fingerprint(&root_path, &trust_findings);
+        match store.trust_fingerprint(&root)? {
+            None => store.set_trusted(&root, true, Some(&now))?,
+            Some(then) if then != now => {
+                store.set_trusted(&root, false, None)?;
+                record.trusted = false;
+            }
+            Some(_) => {}
+        }
+    }
+    // The rest waits for consent: `trust_project` starts it then.
+    if record.trusted {
+        git = project::git_state(&root_path);
+        scan_in_background(&app, record.id, root_path.clone());
+    }
     Ok(OpenedProject {
-        trust_findings: project::trust_scan(&root_path),
+        trust_findings,
         git,
         project: record,
     })
@@ -400,6 +416,19 @@ fn scan_run(
     };
     let routed = routing_words(&prompt, asked.as_deref()).unwrap_or_else(|| prompt.clone());
     let (dir, project) = trusted_dir(store, &path)?;
+    // A run loads the repository's agent configuration. If that changed since
+    // the user trusted it, they have not agreed to what would run now.
+    if refresh_map {
+        let now = project::trust_fingerprint(&dir, &project::trust_scan(&dir));
+        let key = dir.to_string_lossy();
+        if store.trust_fingerprint(&key)?.is_some_and(|then| then != now) {
+            store.set_trusted(&key, false, None)?;
+            return Err(AppError::new(
+                ErrorKind::NotTrusted,
+                "This project's agent settings (such as .claude or .codex) changed since you trusted it. Close it and open it again to review them.",
+            ));
+        }
+    }
     let git = project::git_state(&dir);
 
     // A copy's folder does not exist yet; it is checked once it does.
@@ -882,6 +911,20 @@ async fn draft_commit_message(path: String, store: State<'_, Store>) -> Result<S
     Ok(message)
 }
 
+/// Chats the user had with either CLI in this folder, outside Orteca.
+#[tauri::command(async)]
+fn cli_chats(path: String, store: State<Store>) -> Result<Vec<providers::chats::ChatSummary>> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    Ok(providers::chats::list(&dir, &providers::chats::Homes::of_user()))
+}
+
+#[tauri::command(async)]
+fn cli_chat(path: String, provider: ProviderId, id: String, store: State<Store>) -> Result<providers::chats::Chat> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    providers::chats::read(&dir, &providers::chats::Homes::of_user(), provider, &id)
+        .ok_or_else(|| AppError::new(ErrorKind::NotFound, "That chat is gone or no longer belongs to this folder."))
+}
+
 pub(crate) fn trusted_dir(store: &Store, path: &str) -> Result<(std::path::PathBuf, Project)> {
     let dir = project::validate_dir(path)?;
     let record = store.project(&dir.to_string_lossy())?;
@@ -1107,9 +1150,24 @@ fn recent_projects(store: State<Store>) -> Result<Vec<Project>> {
     store.recent_projects(8)
 }
 
+/// Trusting records what was there to trust, so a later change asks again.
 #[tauri::command]
-fn trust_project(path: String, trusted: bool, store: State<Store>) -> Result<()> {
-    store.set_trusted(&path, trusted)
+fn trust_project(app: AppHandle, path: String, trusted: bool, store: State<Store>) -> Result<()> {
+    let dir = project::validate_dir(&path)?;
+    let print = project::trust_fingerprint(&dir, &project::trust_scan(&dir));
+    store.set_trusted(&path, trusted, Some(&print))?;
+    if trusted {
+        scan_in_background(&app, store.project(&path)?.id, dir);
+    }
+    Ok(())
+}
+
+/// A first scan of a large repository takes seconds; the screen must not wait.
+fn scan_in_background(app: &AppHandle, project_id: i64, dir: std::path::PathBuf) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _ = app.state::<Store>().scan_map(project_id, &dir, &project::tracked_paths(&dir));
+    });
 }
 
 #[tauri::command]
@@ -1233,10 +1291,61 @@ fn rename_task(path: String, task_id: i64, title: String, store: State<Store>) -
     store.rename_task(store.project(&dir.to_string_lossy())?.id, task_id, title.trim_end())
 }
 
+/// Deleting a task deletes everything Orteca kept of it: the rows, the raw
+/// recordings (which hold whatever the agent read), the handed-over commands'
+/// logs and the saved state of the user's work.
 #[tauri::command]
-fn delete_task(path: String, task_id: i64, store: State<Store>) -> Result<()> {
+fn delete_task(app: AppHandle, path: String, task_id: i64, store: State<Store>) -> Result<()> {
     let dir = project::validate_dir(&path)?;
-    store.delete_task(store.project(&dir.to_string_lossy())?.id, task_id)
+    store.delete_task(store.project(&dir.to_string_lossy())?.id, task_id)?;
+    let prefixed = |folder: Option<std::path::PathBuf>, prefix: String| {
+        let Some(entries) = folder.and_then(|f| std::fs::read_dir(f).ok()) else { return };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    };
+    prefixed(app.path().app_data_dir().ok().map(|d| d.join("recordings")), format!("task-{task_id}-"));
+    prefixed(project::orteca_dir(&dir), format!("wait-{task_id}-"));
+    project::drop_saved(&dir, task_id);
+    Ok(())
+}
+
+/// Put back one file of the user's that a run undid, from the state saved
+/// before it started. Refused when the file has changed since.
+#[tauri::command(async)]
+fn restore_file(path: String, saved: String, file: String, store: State<Store>) -> Result<()> {
+    let (dir, _) = trusted_dir(&store, &path)?;
+    project::restore_saved(&dir, &saved, &file)
+}
+
+/// Go back to before one message of a task. Its exchanges from `keep` on drop
+/// out of the chat (the log keeps them, and what they cost), and with `saved`
+/// the files they changed go back to how they were before it. Nothing is
+/// marked for the first message: the task stays as it was, and the words go
+/// back to the composer as a new one.
+#[tauri::command(async)]
+fn rewind_task(
+    path: String,
+    task_id: i64,
+    keep: u32,
+    saved: Option<String>,
+    files: Vec<String>,
+    store: State<Store>,
+) -> Result<()> {
+    let (dir, record) = trusted_dir(&store, &path)?;
+    if store.worktree_path(record.id, task_id)?.is_some() {
+        return Err(AppError::new(ErrorKind::Invalid, "This task worked in its own copy."));
+    }
+    if let Some(saved) = saved {
+        project::rewind_files(&dir, &saved, &files)?;
+    }
+    if keep > 0 {
+        let mark = serde_json::json!({ "kind": "rewind", "data": { "keep": keep } });
+        store.append_event(task_id, "run", "rewind", "", &mark.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1313,6 +1422,8 @@ fn main() {
                 .initialization_script_for_all_frames(include_str!("picker.js"))
                 .build()?;
             allow_preview_frames(&main);
+            // A run that died with the last session left copies in %TEMP%.
+            tauri::async_runtime::spawn_blocking(project::sweep_temp);
             // Codex runs are priced from this list. Offline keeps the last one.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -1346,8 +1457,12 @@ fn main() {
             global_tasks,
             rename_task,
             delete_task,
+            restore_file,
+            rewind_task,
             task_detail,
             preview_task,
+            cli_chats,
+            cli_chat,
             provider_limits,
             remove_worktree,
             open_file,
@@ -1475,7 +1590,7 @@ ELI5";
         let key = canonical.to_str().unwrap();
         store.touch_project(key, "test").unwrap();
         assert!(trusted_dir(&store, key).is_err());
-        store.set_trusted(key, true).unwrap();
+        store.set_trusted(key, true, None).unwrap();
         for path in [
             root.clone(),
             root.join("."),
@@ -1538,7 +1653,7 @@ ELI5";
             Err(_) => Store::in_memory().unwrap(),
         };
         let project = store.touch_project(&key, "bench").unwrap();
-        store.set_trusted(&key, true).unwrap();
+        store.set_trusted(&key, true, None).unwrap();
         // The app maps a project when it is opened, so a run only rescans what
         // moved. Mapped here, off the clock, or every arm times a cold parse
         // (22-33s on RigInspectBE) no user waits for.

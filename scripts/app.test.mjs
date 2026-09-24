@@ -56,7 +56,7 @@ test('task titles can be renamed and deletion takes confirmation', async () => {
   state.renaming.value = '  Better title  ';
   await state.saveRename();
   assert.deepEqual(renamed, { id: 1, title: 'Better title' });
-  assert.equal(past.title, 'Better title');
+  assert.equal(state.history.value[0].title, 'Better title');
 
   await state.removeTask();
   assert.equal(deleted, 0, 'nothing is deleted before the user asks');
@@ -74,7 +74,7 @@ async function projectView(api = {}) {
     .replace(/^export /gm, '');
   let mounted;
   const listeners = {};
-  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return useProject(opened); })()`, {
+  const state = vm.runInNewContext(`(() => { ${ts.transpile(source, { target: ts.ScriptTarget.ES2022 })}; return Object.assign(useProject(opened), { splitExchanges, rewindCode }); })()`, {
     ref, computed, reactive, nextTick: async () => {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
     opened: project,
     onMounted: fn => { mounted = fn; }, onUnmounted: () => {},
@@ -468,6 +468,57 @@ test('an old task from the sidebar can be replied to, and goes on in that task',
   assert.equal(row.turns[0].said, 'the original ask');
   assert.equal(row.turns[0].summary, 'what it did');
   assert.equal(state.view.value, 'task', 'and the page moves from history to the run');
+});
+
+test('rewinding a task drops the later messages, puts their files back and sends the new words', async () => {
+  const result = (said, saved, path) => ({ ...finished, taskId: 42, status: 'done', failure: null, summary: `did ${said}`, worktree: null, savedState: saved, diff: [{ path, origin: 'run' }, { path: 'mine.txt', origin: 'beforeRun' }] });
+  const turn = (said) => ({ kind: 'turn', payload: { kind: 'turn', data: { said } } });
+  const exchange = (r) => ({ kind: 'exchange', payload: r });
+  const events = [
+    exchange(result('first', 'a'.repeat(40), 'one.ts')),
+    turn('second'), exchange(result('second', 'b'.repeat(40), 'two.ts')),
+    turn('third'), exchange(result('third', 'c'.repeat(40), 'three.ts')),
+  ];
+  const past = { id: 42, prompt: 'first', status: 'done', summary: 'did third', diff: [], events, worktreePath: null };
+  const rewinds = [];
+  const calls = [];
+  const { state } = await projectView({
+    recentTasks: async () => [past],
+    getTaskDetail: async () => past,
+    startTask: async (...args) => {
+      calls.push(args);
+      return { ...finished, taskId: 42, status: 'done', failure: null, summary: 'ok', worktree: null };
+    },
+    split: (s) => ({ picks: [], rest: s }),
+    rewindTask: async (path, taskId, keep, saved, files) => {
+      rewinds.push({ taskId, keep, saved, files });
+      events.push({ kind: 'rewind', payload: { kind: 'rewind', data: { keep } } });
+    },
+  });
+  await state.openHistory(past);
+  assert.equal(state.splitExchanges(past).length, 3);
+
+  const results = state.splitExchanges(past).map((p) => p.result);
+  const code = state.rewindCode(results, 1);
+  assert.deepEqual({ ...code, files: [...code.files] }, { saved: 'b'.repeat(40), files: ['two.ts', 'three.ts'] }, 'the answers from there on, not what was already the user’s');
+  assert.equal(state.rewindCode([null, ...results.slice(1)], 0), null, 'a missing result means it cannot know');
+
+  await state.rewindTo(42, 1, 'second, but better', '', code);
+  assert.deepEqual(rewinds.map((r) => [r.taskId, r.keep, r.saved]), [[42, 1, 'b'.repeat(40)]]);
+  const left = state.splitExchanges(past);
+  assert.deepEqual([...left.map((p) => p.said)], ['first'], 'the chat ends before that message');
+  assert.equal(calls.length, 1, 'the edited message is sent');
+  assert.equal(calls[0].at(-2), 42, 'in the same task');
+  assert.equal(calls[0].at(-1), 'second, but better');
+  assert.match(calls[0][1], /did first/, 'answering what came before it, not what was rewound');
+  assert.doesNotMatch(calls[0][1], /did third/);
+
+  // Edit only the text of the first message: a new task with the new words, no files, no mark.
+  await state.rewindTo(42, 0, 'first, again', 'first', null);
+  assert.equal(rewinds.length, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1][1], 'first, again');
+  assert.equal(calls[1].at(-2), null, 'a new task');
 });
 
 test('activity is bounded even when a provider emits long messages', async () => {
@@ -979,7 +1030,9 @@ test('auto routes the model while a provider choice sends its model and reasonin
   await settle();
   assert.equal(state.modelOverride.value, null);
 
+  // Picking the helper alone leaves each step's model to Orteca.
   state.chooseProvider('claude');
+  assert.equal(state.modelOverride.value, null);
   state.chooseModel('opus');
   state.modelChoices.value.claude.effort = 'max';
   await state.run();
@@ -1080,7 +1133,7 @@ test('a route that may not fit in the fullest window warns before it starts', as
   assert.equal(state.providerPicked.value, true, 'switching is the user choosing');
 });
 
-test('a run that ran out of plan usage carries on with the other CLI by itself, once', async () => {
+test('a run that ran out of plan usage offers the other CLI, and carries on only when asked, once', async () => {
   const sent = [];
   const spent = { ...finished, status: 'failed', failure: 'usage limit is used up.', failureKind: 'usageLimit' };
   let outcomes = [spent, { ...finished, status: 'done', failure: null, failureKind: null }];
@@ -1096,6 +1149,9 @@ test('a run that ran out of plan usage carries on with the other CLI by itself, 
   state.providerPicked.value = true;
   state.provider.value = 'claude';
   await state.run();
+  assert.deepEqual(sent, [{ provider: 'claude', headroom: 0 }], 'another plan was spent without asking');
+  assert.equal(state.activeRun.value.handoff.to, 'codex');
+  await state.carryOn();
   assert.deepEqual(sent, [{ provider: 'claude', headroom: 0 }, { provider: 'codex', headroom: 70 }]);
   assert.equal(state.switchedFrom.value, 'claude');
   assert.equal(state.result.value.status, 'done');
@@ -1162,6 +1218,9 @@ test('a reply that hands off to the other CLI stays in its task', async () => {
   await state.run();
   state.reply.value = 'also this';
   await state.sendReply();
+  // The other plan is spent only once the user says so.
+  assert.deepEqual(sent.slice(1), [{ provider: 'claude', task: 7 }]);
+  await state.carryOn();
   assert.deepEqual(sent.slice(1), [
     { provider: 'claude', task: 7 },
     { provider: 'codex', task: 7 },

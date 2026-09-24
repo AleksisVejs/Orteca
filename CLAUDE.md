@@ -59,7 +59,7 @@ drop, Ctrl+`) check the `active` flag before answering.
   rescanned on open and before a run, reparsing only what moved; `routing` ranks
   with it. `NAV_NOMAP=1` withholds it from a run, for the benchmark's before arm.
 - `intent.rs` — before a run, asks the provider's smallest model (no tools, temp dir)
-  whether the prompt is a question or easy/medium/hard work. Feeds `routing` as
+  whether the prompt is chat, a question, or easy/medium/hard work. Feeds `routing` as
   `RepoSignals::intent`; a failed read falls back to keywords.
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
   fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A failed
@@ -86,6 +86,9 @@ drop, Ctrl+`) check the `active` flag before answering.
   auth mode) and `parse_line()`, which normalises each CLI's JSONL into
   `ProviderEvent`. `mock.rs` replays `src-tauri/fixtures/*.jsonl` through those
   same parsers. No trait yet — one enum, two parsers, nothing to dispatch on.
+  `chats.rs` reads the user's own chats with either CLI in this folder from
+  `~/.claude/projects` and `~/.codex/sessions` (headless ones skipped - those are
+  Orteca's), so the composer's Task menu can attach one like an earlier task.
 - `error.rs` — `AppError { kind, message }`, the only error shape the frontend sees;
   `src/api.ts` mirrors it with `isAppError`.
 - `dock.rs` — the workspace's other half, outside the run path: real ConPTY
@@ -116,7 +119,14 @@ never the store. Colors and spacing come from `src/styles/tokens.css`, and
   Orteca changes the user's repo only when the user asks and confirms: the git bar's
   fetch, `pull --ff-only`, commit, plain push, `switch` / `switch -c` (git refuses
   to overwrite work) and a clean-tree merge that aborts on a clash
-  (`project::git_action`). Nothing there may force, reset or discard work.
+  (`project::git_action`). Nothing there may force or reset. The actions
+  that discard work are Discard (`git restore` / `git clean -f` on paths git
+  lists as changed) and a chat's Rewind (`project::rewind_files`: the files
+  later answers changed, back to the state saved before that message), each
+  only after its own confirmation naming the files. Before a run in a
+  dirty folder, `project::save_state` keeps the uncommitted work under
+  `refs/orteca/before/<task>/`; a file the run undoes shows as `reverted` and
+  can be put back.
 - **Every metric carries a `cost_quality`** of `exact` | `estimated` | `unavailable`.
   Nothing reaches the UI unlabelled, and there is no savings percentage until a project
   has a real baseline. Codex reports tokens but no cost — Orteca prices them from

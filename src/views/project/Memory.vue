@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { addMemory, deleteMemory, editMemory, isAppError, memory, proposeMemoryFromRuns, proposeMemoryImport, readText, repoProfile, setMemoryLimit, setRepoProfile } from "../../api";
 import type { ImportFile, MemoryProposal, MemoryState, RepoProfile } from "../../types";
 
 // Short standing instructions the user writes; every run is told them. One
 // component for both screens: with a path it lists this project and all
-// projects, without one (the Launch screen) only all projects.
-const props = defineProps<{ path?: string; popId: string; buttonClass?: string }>();
+// projects, without one (the Launch screen) only all projects. With a
+// `popId` it is a button and popover (Launch); without, a workspace page.
+const props = defineProps<{ path?: string; popId?: string; buttonClass?: string }>();
 const emit = defineEmits<{ changed: [] }>();
 
 const LIMITS = [500, 1000, 2000, 0];
@@ -76,6 +77,8 @@ async function load() {
 }
 
 /** Run a change, then reload; a refusal (the limit) shows as the error. */
+onMounted(() => props.popId || load());
+
 async function change(work: () => Promise<void>) {
   error.value = "";
   try {
@@ -147,34 +150,47 @@ async function save(id: number) {
 </script>
 
 <template>
-  <button :class="buttonClass ?? 'btn'" :popovertarget="popId" title="Standing instructions every run receives"><slot>Memory</slot></button>
-  <section :id="popId" class="memory" popover role="dialog" :aria-labelledby="`${popId}-title`" @toggle="(e) => (e as ToggleEvent).newState === 'open' && load()">
+  <button v-if="popId" :class="buttonClass ?? 'btn'" :popovertarget="popId" title="Standing instructions every run receives"><slot>Memory</slot></button>
+  <div
+    :id="popId"
+    class="memory"
+    :popover="popId ? '' : undefined"
+    :role="popId ? 'dialog' : undefined"
+    :aria-labelledby="popId && `${popId}-title`"
+    @toggle="(e) => (e as ToggleEvent).newState === 'open' && load()"
+  >
     <header class="head">
       <div>
-        <h2 :id="`${popId}-title`">Memory</h2>
-        <p class="note">Short rules sent with every task, to Claude and Codex alike.</p>
+        <h2 :id="popId && `${popId}-title`" class="title">Memory</h2>
+        <p class="lede">Short rules sent with every task, to Claude and Codex alike.</p>
       </div>
-      <button class="close" :popovertarget="popId" popovertargetaction="hide" title="Close" aria-label="Close memory">
+      <button v-if="popId" class="close" :popovertarget="popId" popovertargetaction="hide" title="Close" aria-label="Close memory">
         <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
       </button>
     </header>
 
-    <form class="add" @submit.prevent="add">
+    <!-- Adding a rule is the common job, so it comes first. -->
+    <form class="card add" @submit.prevent="add">
       <input v-model="text" placeholder="Add a rule, like “Use pnpm, never npm”" aria-label="New rule" />
-      <div class="add-row">
-        <div v-if="path" class="segments" role="group" aria-label="Save the rule for">
-          <button type="button" class="seg" :class="{ on: target === 'project' }" :aria-pressed="target === 'project'" @click="target = 'project'">This project</button>
-          <button type="button" class="seg" :class="{ on: target === 'global' }" :aria-pressed="target === 'global'" @click="target = 'global'">All projects</button>
-        </div>
-        <button class="btn" :disabled="!text.trim()">Add rule</button>
+      <div v-if="path" class="segments" role="group" aria-label="Save the rule for">
+        <button type="button" class="seg" :class="{ on: target === 'project' }" :aria-pressed="target === 'project'" @click="target = 'project'">This project</button>
+        <button type="button" class="seg" :class="{ on: target === 'global' }" :aria-pressed="target === 'global'" @click="target = 'global'">All projects</button>
       </div>
+      <button class="btn primary" :disabled="!text.trim()">Add rule</button>
     </form>
     <p v-if="error" class="err" role="alert">{{ error }}</p>
 
-    <section v-for="list in lists" :key="list.name" class="list" :aria-label="list.name">
-      <h3>{{ list.name }} <span class="count">{{ list.items.length }}</span></h3>
+    <section v-for="list in lists" :key="list.name" :aria-label="list.name">
+      <div class="section-head">
+        <h3 class="label">{{ list.name }} <span class="count">{{ list.items.length }}</span></h3>
+        <span v-if="!reviewing(list.global)" class="imports">
+          <button v-for="f in importFiles(list.global)" :key="f" class="link" :disabled="reading" @click="proposeImport(f)">
+            {{ reading && source === f ? "Reading…" : importLabel(f) }}
+          </button>
+        </span>
+      </div>
 
-      <div v-if="reviewing(list.global) && proposal" class="review">
+      <div v-if="reviewing(list.global) && proposal" class="card review">
         <p class="review-title">Rules proposed from <strong>{{ sourceName }}</strong></p>
         <details>
           <summary>{{ source === "runs" ? "Show the runs it read" : "Show the original file" }}</summary>
@@ -188,14 +204,13 @@ async function save(id: number) {
         </ul>
         <p v-if="longFile" class="note">This file is long, about {{ longFile.toLocaleString() }} tokens, estimated. Long rules are paid for on every turn and can make runs worse, so keep only the few that matter.</p>
         <p class="note">Nothing is saved until you confirm.<template v-if="source !== 'runs'"> These become copies: changing the file later does not change them.</template></p>
-        <div class="row">
-          <button class="btn primary" :disabled="!picked.some((b) => b.keep)" @click="saveImport">Save {{ picked.filter((b) => b.keep).length }} to {{ scopeName }}</button>
+        <div class="actions-row">
+          <button class="btn" :disabled="!picked.some((b) => b.keep)" @click="saveImport">Save {{ picked.filter((b) => b.keep).length }} to {{ scopeName }}</button>
           <button class="link" @click="proposal = null">Cancel</button>
         </div>
       </div>
 
-      <p v-if="!list.items.length && !reviewing(list.global)" class="note empty">No rules yet.</p>
-      <ul v-else-if="list.items.length" class="items">
+      <ul v-if="list.items.length" class="card items">
         <li v-for="item in list.items" :key="item.id">
           <template v-if="editing === item.id">
             <input v-model="draft" :aria-label="`Edit: ${item.text}`" @keydown.enter="save(item.id)" @keydown.esc.stop="editing = null" />
@@ -215,67 +230,117 @@ async function save(id: number) {
           </template>
         </li>
       </ul>
-
-      <div v-if="!reviewing(list.global)" class="imports">
-        <button v-for="f in importFiles(list.global)" :key="f" class="import" :disabled="reading" @click="proposeImport(f)">
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
-          {{ reading && source === f ? "Reading…" : importLabel(f) }}
-        </button>
-      </div>
+      <p v-else-if="!reviewing(list.global)" class="card empty note">No rules yet.</p>
     </section>
 
-    <section v-if="path && profile" class="list" aria-label="Repository profile">
-      <h3>Repository profile <span class="count">{{ profile.custom ? "edited" : "detected" }}</span></h3>
-      <p class="note">Sent with every run's rules: how to build and test, the folders, and what not to read. Keep it to a few lines.</p>
-      <textarea v-model="profileDraft" rows="7" class="profile" aria-label="Repository profile"></textarea>
-      <div class="row">
-        <button class="btn" :disabled="profileDraft === profile.text" @click="saveProfile(profileDraft)">Save profile</button>
+    <section v-if="path && profile" aria-label="Repository profile">
+      <div class="section-head">
+        <h3 class="label">Repository profile <span class="count">{{ profile.custom ? "edited" : "detected" }}</span></h3>
         <button v-if="profile.custom" class="link" @click="saveProfile(null)">Use detected</button>
       </div>
+      <div class="card profile">
+        <p class="note">Sent with every run's rules: how to build and test, the folders, and what not to read. Keep it to a few lines.</p>
+        <textarea v-model="profileDraft" rows="7" aria-label="Repository profile"></textarea>
+        <div class="actions-row">
+          <button class="btn" :disabled="profileDraft === profile.text" @click="saveProfile(profileDraft)">Save profile</button>
+        </div>
+      </div>
     </section>
 
-    <p class="note hint">Instruction files like <code>CLAUDE.md</code> and <code>AGENTS.md</code> are not sent on their own. Import the rules you want, and you review them before anything is saved.</p>
-
-    <footer>
-      <span class="note" role="status">{{ meter }}</span>
-      <label class="note">Limit
+    <section aria-label="Size">
+      <h3 class="label">Size</h3>
+      <label class="card limit">
+        <span class="text">
+          <span class="name">Limit</span>
+          <span class="note" role="status">{{ meter }}</span>
+        </span>
         <select :value="state.limit" @change="change(() => setMemoryLimit(Number(($event.target as HTMLSelectElement).value)))">
-          <option v-for="n in LIMITS" :key="n" :value="n">{{ n ? n.toLocaleString() : "No limit" }}</option>
+          <option v-for="n in LIMITS" :key="n" :value="n">{{ n ? `${n.toLocaleString()} tokens` : "No limit" }}</option>
         </select>
       </label>
-    </footer>
-  </section>
+      <p class="note hint">Instruction files like <code>CLAUDE.md</code> and <code>AGENTS.md</code> are not sent on their own. Import the rules you want, and you review them before anything is saved.</p>
+    </section>
+  </div>
 </template>
 
 <style scoped>
+/* A workspace page by default, laid out like Settings; on Launch the same
+   content sits in a popover, one step smaller. */
 .memory {
+  color: var(--text);
+  font-size: 14px;
+}
+.memory[popover] {
   width: min(560px, calc(100vw - 24px));
+  max-width: none;
   max-height: calc(100dvh - 60px);
   overflow-y: auto;
   padding: 20px;
   background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--r);
-  color: var(--text);
   font-size: 12px;
 }
-.memory::backdrop {
+.memory[popover]::backdrop {
   background: var(--overlay);
 }
+.memory[popover] .title {
+  font-size: 14px;
+}
+.memory[popover] .card {
+  background: var(--bg);
+}
+.memory[popover] section {
+  margin-top: 20px;
+}
+
 .head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
 }
-.head h2 {
-  margin: 0 0 4px;
-  font-size: 14px;
-  font-weight: 600;
-}
-.head .note {
+.title {
   margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
+.lede {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+}
+section {
+  margin-top: 32px;
+}
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.count {
+  margin-left: 4px;
+  color: var(--text-faint);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.imports {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-bottom: 10px;
+}
+.link:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
 .close,
 .act {
   display: inline-flex;
@@ -300,28 +365,22 @@ async function save(id: number) {
   background: var(--surface-2);
   color: var(--text);
 }
-code {
-  font-family: var(--mono);
-  font-size: 11px;
+
+.add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+  padding: 12px;
+}
+.add input {
+  flex: 1 1 240px;
 }
 
-/* Adding a rule is the common job, so it comes first. */
-.add {
-  display: grid;
-  gap: 8px;
-  margin-top: 16px;
-}
-.add-row {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-.add-row .segments {
-  margin-right: auto;
-}
 .segments {
-  display: flex;
+  display: inline-flex;
+  flex: none;
   gap: 2px;
   padding: 2px;
   background: var(--bg);
@@ -333,6 +392,7 @@ code {
   padding: 2px 10px;
   border-radius: var(--r-sm);
   color: var(--text-faint);
+  font-size: 12px;
   transition: color 120ms ease, background 120ms ease;
 }
 .seg:hover {
@@ -343,42 +403,25 @@ code {
   color: var(--text);
 }
 
-.list {
-  margin-top: 18px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-h3 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-dim);
-}
-.count {
-  margin-left: 4px;
-  color: var(--text-faint);
-  font-weight: 400;
-  font-variant-numeric: tabular-nums;
-}
-.empty {
-  margin: 8px 0 0;
-}
 ul {
   margin: 0;
   padding: 0;
   list-style: none;
 }
 .items {
-  margin-top: 8px;
+  padding: 4px 8px;
 }
 .items li {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
-  padding: 4px 4px 4px 10px;
+  min-height: 44px;
+  padding: 6px 4px 6px 10px;
   border-radius: var(--r-sm);
   transition: background 120ms ease;
+}
+.items li + li {
+  border-top: 1px solid var(--border);
 }
 .items li:hover,
 .items li:focus-within {
@@ -386,6 +429,7 @@ ul {
 }
 .text {
   flex: 1;
+  min-width: 0;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -400,41 +444,17 @@ ul {
 .items li:focus-within .actions {
   opacity: 1;
 }
-.imports {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
+.empty {
+  margin: 0;
+  padding: 16px 18px;
 }
-.import {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  padding: 2px 10px 2px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  color: var(--text-dim);
-  transition: background 120ms ease, color 120ms ease;
+
+.review,
+.profile {
+  padding: 16px 18px;
 }
-.import:hover:not(:disabled) {
-  background: var(--surface-2);
-  color: var(--text);
-}
-.import:disabled {
-  color: var(--text-faint);
-  cursor: default;
-}
-.hint {
-  margin: 18px 0 0;
-  line-height: 1.5;
-}
-.review {
+.review + .items {
   margin-top: 12px;
-  padding: 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
 }
 .review-title {
   margin: 0 0 8px;
@@ -452,45 +472,62 @@ ul {
   gap: 10px;
   margin-bottom: 8px;
 }
-.review .profile {
-  display: block;
-  width: 100%;
-  margin: 8px 0;
+.review .note,
+.profile .note {
+  margin: 0 0 10px;
 }
 .keep {
+  flex: none;
+  width: 16px;
+  height: 16px;
   margin-top: 8px;
-}
-.review .row {
-  margin-top: 10px;
+  accent-color: var(--button);
 }
 pre {
   margin: 6px 0 0;
   max-height: 200px;
   overflow: auto;
   padding: 8px;
-  background: var(--surface);
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   white-space: pre-wrap;
   font: 11px var(--mono);
 }
-.row,
-footer {
+/* The profile is commands and paths, so it reads as mono. */
+.profile textarea {
+  display: block;
+  width: 100%;
+  font-family: var(--mono);
+}
+.actions-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
+  margin-top: 12px;
 }
-footer {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
+
+.limit {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 16px;
+  padding: 12px 18px;
 }
-footer label {
+.limit .text {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 2px;
 }
+.limit select {
+  flex: none;
+  width: 160px;
+}
+.hint {
+  margin: 12px 0 0;
+  line-height: 1.5;
+}
+
 input:not([type="checkbox"]),
 textarea,
 select {
@@ -501,9 +538,10 @@ select {
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   font: inherit;
+  font-size: 12px;
 }
-input:not([type="checkbox"]),
-textarea {
+.items input,
+.review textarea {
   flex: 1;
   min-width: 0;
 }
@@ -517,14 +555,11 @@ select:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 1px;
 }
-.keep {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  accent-color: var(--button);
-}
 .err {
   margin: 8px 0 0;
   color: var(--err);
+}
+@media (max-width: 600px) {
+  .limit { flex-wrap: wrap; }
 }
 </style>

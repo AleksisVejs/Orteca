@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { computed, inject, onMounted, ref } from "vue";
-import Memory from "./Memory.vue";
 import ProviderMark from "../../components/ProviderMark.vue";
 import { PROJECT } from "./state";
-import { cliChat, cliChats, isAppError, memory } from "../../api";
+import { cliChat, cliChats, isAppError } from "../../api";
 import { reference } from "./picks";
-import type { CliChatSummary, MemoryState } from "../../types";
+import type { CliChatSummary } from "../../types";
 
 // The idle page: one prompt, one clear action. Options stay one click away.
 const {
@@ -53,21 +52,6 @@ async function pickChat(c: CliChatSummary) {
 }
 // A folder with no transcripts is the common case, not an error worth a line.
 onMounted(() => cliChats(opened.project.path).then((found) => (chats.value = found), () => {}));
-
-// A run inherits only these explicit rules: global first, then this project.
-// Keep the receipt beside Run so the user can check the actual payload before
-// spending an agent call.
-const memories = ref<MemoryState>({ items: [], limit: 1000, tokens: 0 });
-const memoryError = ref("");
-async function loadMemory() {
-  try {
-    memories.value = await memory(opened.project.path);
-    memoryError.value = "";
-  } catch (err) {
-    memoryError.value = isAppError(err) ? err.message : String(err);
-  }
-}
-onMounted(loadMemory);
 
 // A compact local receipt, not a benchmark claim: it groups only by route and
 // provider, while task difficulty and mode can still vary within a row.
@@ -135,7 +119,6 @@ function formatDuration(milliseconds: number) {
         </li>
       </ul>
       <p v-if="attachError" class="attach-error">{{ attachError }}</p>
-      <p v-if="memoryError" class="attach-error" role="status">Memory could not be read: {{ memoryError }}</p>
       <div v-if="rememberText !== null" class="remember" role="group" aria-label="Save to memory">
         <span>Save “{{ rememberText }}” to memory for:</span>
         <button class="btn" @click="remember(false)">This project</button>
@@ -184,11 +167,6 @@ function formatDuration(milliseconds: number) {
             </template>
           </ul>
         </section>
-        <Memory :path="opened.project.path" :pop-id="domId('memory')" button-class="icon" @changed="loadMemory">
-          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 2.5h8v11L8 10.8 4 13.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          Memory
-          <span v-if="memories.items.length" class="count" :title="`${memories.items.length} rule${memories.items.length === 1 ? '' : 's'} · ~${memories.tokens.toLocaleString()} tokens, sent with every stage`">{{ memories.items.length }}</span>
-        </Memory>
         <span class="shortcut note">Ctrl + Enter</span>
         <button class="btn primary run" :disabled="!canRun" title="Run task (Ctrl+Enter)" @click="run()">
           {{ remembering ? "Remember" : "Run task" }}
@@ -635,17 +613,6 @@ textarea:focus {
 .refs-group {
   padding: 12px 8px 4px;
   color: var(--text-faint);
-}
-.count {
-  min-width: 18px;
-  padding: 0 5px;
-  background: var(--surface-2);
-  border-radius: var(--r-sm);
-  color: var(--text-dim);
-  font-size: 11px;
-  line-height: 18px;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
 }
 .controls :deep(.icon:hover),
 .options:hover,

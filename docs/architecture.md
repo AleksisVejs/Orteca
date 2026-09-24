@@ -829,7 +829,7 @@ the Codex binary; `codex exec resume` takes `--output-schema`.
   cost. Claude's work is never sent to Codex.
 - **Checkpoints.** Every run in the current tree saves `refs/orteca/before/`,
   a clean one too, so a moved branch cannot take the undo point with it.
-- **Window anchoring** (`views/project/anchor.ts`, Agents page, off by
+- **Window anchoring** (`views/project/anchor.ts`, Settings page, off by
   default): one tiny cheapest-model call before work (start − (5 − N) h) or
   right after each reset inside work hours; skipped while a task runs or ran in
   the last 30 minutes, or more than 10 minutes late. `pings` logs each cost.

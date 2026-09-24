@@ -1798,7 +1798,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
   };
 
   // The main pane shows one thing at a time; the sidebar picks which.
-  const view = ref<"task" | "history" | "agents" | "stats">("task");
+  const view = ref<"task" | "history" | "agents" | "stats" | "memory" | "settings">("task");
   const optionsOpen = ref(false);
 
   /** Dot colour per status: green only for a finished run, blue only while one is going. */

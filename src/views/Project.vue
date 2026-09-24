@@ -5,6 +5,8 @@ import ProviderMark from "../components/ProviderMark.vue";
 import VeloMark from "../components/VeloMark.vue";
 import Agents from "./project/Agents.vue";
 import Stats from "./project/Stats.vue";
+import Settings from "./project/Settings.vue";
+import Memory from "./project/Memory.vue";
 import Dock from "./project/Dock.vue";
 import CurrentTask from "./project/CurrentTask.vue";
 import PastTask from "./project/PastTask.vue";
@@ -353,6 +355,14 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 13.5h11M4.5 11V8m3.5 3V4.5m3.5 6.5V6.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
           <span class="grow">Stats</span>
         </button>
+        <button :class="{ on: view === 'memory' }" :aria-current="view === 'memory' ? 'page' : undefined" @click="view = 'memory'">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2.5h8v11L8 10.8 4 13.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
+          <span class="grow">Memory</span>
+        </button>
+        <button :class="{ on: view === 'settings' }" :aria-current="view === 'settings' ? 'page' : undefined" @click="view = 'settings'">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 1.6v1.6M8 12.8v1.6M14.4 8h-1.6M3.2 8H1.6m10.9-4.5-1.1 1.1M4.6 11.4l-1.1 1.1m9 0-1.1-1.1M4.6 4.6 3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+          <span class="grow">Settings</span>
+        </button>
       </nav>
 
       <div class="task-inbox">
@@ -449,7 +459,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
         </h1>
         <h1 v-else class="workspace-tab">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2h5l3 3v9H4V2Zm5 0v3h3M6 8h4M6 11h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-          {{ view === 'agents' ? 'Agents' : view === 'stats' ? 'Stats' : view === 'history' ? 'Task history' : 'New task' }}
+          {{ view === 'agents' ? 'Agents' : view === 'stats' ? 'Stats' : view === 'memory' ? 'Memory' : view === 'settings' ? 'Settings' : view === 'history' ? 'Task history' : 'New task' }}
         </h1>
         <span class="project-name">{{ opened.project.name }}</span>
         <button
@@ -607,13 +617,15 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       </section>
 
       <div ref="split" class="split" :class="[dockPrefs.side, { dragging }]">
-        <main class="content" :class="{ composing: view === 'task' && !running && !result, chatting: (view === 'task' && (running || !!result)) || view === 'history' }">
+        <main class="content" :class="{ page: ['stats', 'memory', 'settings', 'agents'].includes(view), composing: view === 'task' && !running && !result, chatting: (view === 'task' && (running || !!result)) || view === 'history' }">
           <template v-if="view === 'task'">
             <CurrentTask v-if="running || result" />
             <TaskComposer v-else />
           </template>
           <PastTask v-else-if="view === 'history'" />
           <Stats v-else-if="view === 'stats'" />
+          <Memory v-else-if="view === 'memory'" :path="opened.project.path" />
+          <Settings v-else-if="view === 'settings'" />
           <Agents v-else />
         </main>
         <template v-if="dockPrefs.open">
@@ -646,7 +658,7 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       </button>
       <span v-if="anyRunning" class="status-item"><span class="dot live" aria-hidden="true"></span>{{ runningCount === 1 ? "Task running" : `${runningCount} tasks running` }}</span>
       <span v-if="taskBadge" class="status-item" title="How the task on screen ran">{{ taskBadge }}</span>
-      <span v-if="nextAnchor" class="status-item" title="The next call that starts a plan window on purpose. Set on the Agents page.">Window ping {{ nextAnchor }}</span>
+      <span v-if="nextAnchor" class="status-item" title="The next call that starts a plan window on purpose. Set in Settings.">Window ping {{ nextAnchor }}</span>
       <div class="usage-counters" role="group" aria-label="Plan usage remaining">
         <template v-for="usage in usageCounters" :key="usage.id">
           <button class="usage-counter" :popovertarget="domId(`usage-${usage.id}`)" :title="`${usage.name} usage details and reset times`">
@@ -1564,6 +1576,11 @@ h1 {
 }
 .content.composing {
   display: flex;
+}
+/* Stats, Memory, Settings and Agents render loose blocks; centre each in the chat's column. */
+.content.page > :deep(*) {
+  max-width: 820px;
+  margin-inline: auto;
 }
 /* A live run, its result and a past task are a chat: the box sits on the pane's bottom edge, so no bottom padding. */
 .content.chatting {

@@ -54,8 +54,9 @@ is the only place colour, radius and spacing are defined.
 - `--r` (8px) for cards and panels. `--r-sm` (5px) for
   buttons, chips and inner groups. `999px` for status pills. Nothing else.
 - Borders are 1px hairlines. Never 2px, never doubled.
-- Launch is capped at 560px and the task composer at 680px. Working views use
-  the available pane width; summary prose is capped at 75ch for readability.
+- Launch is capped at 560px and the task composer at 680px. Stats, Memory,
+  Settings and Agents sit in a centred column capped at 820px, like the chat;
+  summary prose is capped at 75ch for readability.
 - Vertical rhythm: 32px between sections, 16–18px inside a card.
 
 ## Type
@@ -88,10 +89,10 @@ is the only place colour, radius and spacing are defined.
 - Icons are inline SVG in the file that needs them. No icon package.
 - The Project screen is a shell (`views/Project.vue`: sidebar, top bar) around
   one page at a time from `views/project/`: composer, live run, result, past
-  task, Agents. All state lives in `views/project/state.ts` and the pages
+  task, Agents, Stats, Memory, Settings. All state lives in `views/project/state.ts` and the pages
   `inject` it. A page renders; it does not own logic.
 - The sidebar holds only destinations that exist: New task, one row per live or
-  just-finished run, Agents, recent tasks, switch project. No entry for a
+  just-finished run, Agents, Stats, Memory, Settings, recent tasks, switch project. No entry for a
   feature that is not wired up. Runs are concurrent, so a row per run is the
   only honest listing; each carries its own dot, its own label taken from what
   was asked, and opens its own stream or result.
@@ -162,6 +163,9 @@ draggable divider, and `Ctrl+\`` shows and hides it.
   keeps its unsaved text, and a scrolled-back terminal keeps its place.
 - A tab carries one mark at most: `•` in `--warn` for unsaved text, `□` for a
   shell that exited. Neither is an error colour, because neither is a failure.
+- Settings is the one page for standing choices: unclear requests, slow
+  commands (per project), the window anchor and every dock preference. The
+  dock's gear opens it. It edits state that lives elsewhere; it owns none.
 - The dock's position (beside or below), its share of the pane, the shell, the
   mono face, type size, cursor and scrollback are the user's, saved across
   projects. Open tabs are saved per project. A blocked or full store loses the

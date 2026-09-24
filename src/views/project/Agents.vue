@@ -1,33 +1,13 @@
 <script setup lang="ts">
-import { computed, inject } from "vue";
+import { inject } from "vue";
 import ProviderMark from "../../components/ProviderMark.vue";
 import { PROJECT } from "./state";
-import { nextPing, sessionReset } from "./anchor";
-import type { Anchor } from "./anchor";
-import type { ProviderId } from "../../types";
 
 // The coding CLIs Orteca drives: installed, signed in, and how much plan is left.
 const {
   rows, missing, providerError, signingIn, signInLine, signInError, signIn, installing,
   installLine, installError, install, cancelProvider, usageCounters, limitsLoading, limitsCheckedAt, loadLimits, anyRunning, AUTH, newTask,
-  anchor, saveAnchor, limits, formatWhen,
 } = inject(PROJECT)!;
-
-const set = (change: Partial<Anchor>) => saveAnchor({ ...anchor.value, ...change });
-function toggle(id: ProviderId, on: boolean) {
-  set({ providers: on ? [...new Set([...anchor.value.providers, id])] : anchor.value.providers.filter((p) => p !== id) });
-}
-// What the schedule will do next, per chosen provider. Only as good as the last reading.
-const plan = computed(() => anchor.value.mode === "off" ? [] : anchor.value.providers.map((id) => {
-  const reading = limits.value.find((l) => l.id === id);
-  const ping = nextPing(anchor.value, Date.now(), reading);
-  const reset = sessionReset(reading);
-  return {
-    id,
-    ping: ping === null ? "after the next reset it knows of" : formatWhen(ping),
-    reset: reset === null ? "not read yet" : formatWhen(reset),
-  };
-}));
 </script>
 
 <template>
@@ -90,27 +70,6 @@ const plan = computed(() => anchor.value.mode === "off" ? [] : anchor.value.prov
   <p v-if="signInError" class="missing">{{ signInError }}</p>
   <p v-if="signingIn" class="note">Approve the sign-in in your browser. Orteca never sees your password.</p>
 
-  <section class="anchor" aria-labelledby="anchor-title">
-    <h3 id="anchor-title" class="label">Start the 5-hour window on purpose</h3>
-    <p class="note">One tiny call on the cheapest model starts a plan's 5-hour window, so it resets when you need it. It is skipped while a task runs or just ran, and when this computer was asleep at the time. Keep Orteca open.</p>
-    <div class="segments" role="group" aria-label="Window start">
-      <button v-for="m in (['off', 'morning', 'continuous'] as const)" :key="m" class="seg" :class="{ on: anchor.mode === m }" :aria-pressed="anchor.mode === m" @click="set({ mode: m })">
-        {{ m === "off" ? "Off" : m === "morning" ? "Before work" : "After each reset" }}
-      </button>
-    </div>
-    <div v-if="anchor.mode !== 'off'" class="anchor-fields">
-      <label class="note">Work starts <input type="time" :value="anchor.start" @change="set({ start: ($event.target as HTMLInputElement).value })" /></label>
-      <label v-if="anchor.mode === 'morning'" class="note">Limit usually hit after
-        <input type="number" min="0" max="5" step="0.5" :value="anchor.hours" @change="set({ hours: Number(($event.target as HTMLInputElement).value) })" /> hours</label>
-      <label v-else class="note">Work ends <input type="time" :value="anchor.end" @change="set({ end: ($event.target as HTMLInputElement).value })" /></label>
-      <label v-for="p in rows.filter((r) => r.path)" :key="p.id" class="note">
-        <input type="checkbox" :checked="anchor.providers.includes(p.id)" @change="toggle(p.id, ($event.target as HTMLInputElement).checked)" /> {{ p.program }}
-      </label>
-    </div>
-    <ul v-if="plan.length" class="anchor-plan">
-      <li v-for="row in plan" :key="row.id" class="note"><span class="mono">{{ row.id }}</span> next ping {{ row.ping }} · window resets {{ row.reset }}</li>
-    </ul>
-  </section>
 </template>
 
 <style scoped>
@@ -162,60 +121,6 @@ const plan = computed(() => anchor.value.mode === "off" ? [] : anchor.value.prov
   align-items: center;
   gap: 10px;
   margin: 12px 0 0;
-}
-.anchor {
-  margin-top: 32px;
-}
-.anchor .note {
-  margin: 4px 0 12px;
-}
-.segments {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-}
-.seg {
-  min-height: 26px;
-  padding: 2px 10px;
-  border-radius: var(--r-sm);
-  color: var(--text-faint);
-  font-size: 12px;
-  transition: color 120ms ease, background 120ms ease;
-}
-.seg:hover {
-  color: var(--text);
-}
-.seg.on {
-  background: var(--surface-2);
-  color: var(--text);
-}
-.anchor-fields {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-  margin-top: 12px;
-}
-.anchor-fields input[type="time"],
-.anchor-fields input[type="number"] {
-  padding: 3px 6px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font: inherit;
-  font-variant-numeric: tabular-nums;
-}
-.anchor-fields input[type="number"] {
-  width: 56px;
-}
-.anchor-plan {
-  margin: 12px 0 0;
-  padding: 0;
-  list-style: none;
 }
 .agents-refresh { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .facts { flex-direction: column; gap: 8px; }

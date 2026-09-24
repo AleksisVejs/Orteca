@@ -5,14 +5,14 @@ import DockFiles from "./DockFiles.vue";
 import DockHistory from "./DockHistory.vue";
 import DockPreview from "./DockPreview.vue";
 import DockTerminal from "./DockTerminal.vue";
-import { DOCK, FONTS, SHELLS } from "./dock";
+import { DOCK } from "./dock";
 import { PROJECT } from "./state";
 
-// The dock's own chrome: the tab strip, the settings and whichever tab is on
+// The dock's own chrome: the tab strip and whichever tab is on
 // top. Every tab stays mounted underneath, so a build keeps running while you
 // read a file.
 const dock = inject(DOCK)!;
-const { domId } = inject(PROJECT)!;
+const { view } = inject(PROJECT)!;
 const { prefs, tabs, active } = dock;
 
 const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", preview: "Preview", history: "Commit history" } as const;
@@ -56,7 +56,7 @@ const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", pre
       <button class="strip-button" title="Dev server preview" aria-label="Dev server preview" @click="dock.openPreview()">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M2 6h12" stroke="currentColor" stroke-width="1.3" /></svg>
       </button>
-      <button class="strip-button" :popovertarget="domId('dock-settings')" title="Dock settings" aria-label="Dock settings">
+      <button class="strip-button" title="Dock settings" aria-label="Dock settings" @click="view = 'settings'">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M8 1.6v1.6M8 12.8v1.6M14.4 8h-1.6M3.2 8H1.6m10.9-4.5-1.1 1.1M4.6 11.4l-1.1 1.1m9 0-1.1-1.1M4.6 4.6 3.5 3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
       </button>
       <button
@@ -70,64 +70,6 @@ const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", pre
       <button class="strip-button" title="Hide the dock (Ctrl+`)" aria-label="Hide the dock" @click="prefs.open = false">
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
       </button>
-
-      <section :id="domId('dock-settings')" class="settings" popover role="dialog" aria-labelledby="dock-settings-title">
-        <header class="settings-head">
-          <h2 id="dock-settings-title">Dock settings</h2>
-          <button class="link" @click="dock.resetPrefs()">Reset</button>
-        </header>
-
-        <h3 class="label">Terminal</h3>
-        <label class="field">
-          <span>Shell</span>
-          <select v-model="prefs.shell">
-            <option v-for="s in SHELLS" :key="s.label" :value="s.value">{{ s.label }}</option>
-            <option v-if="!SHELLS.some(s => s.value === prefs.shell)" :value="prefs.shell">Custom</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Or a command</span>
-          <input v-model="prefs.shell" class="mono" placeholder="Leave blank for PowerShell" />
-        </label>
-        <p class="note">New terminals use this. Open ones keep the shell they started with.</p>
-        <label class="field">
-          <span>Scrollback</span>
-          <input v-model.number="prefs.scrollback" type="number" min="200" max="200000" step="500" />
-        </label>
-        <label class="check"><input v-model="prefs.copyOnSelect" type="checkbox" /> Copy as soon as text is selected</label>
-        <label class="check"><input v-model="prefs.smartCopy" type="checkbox" /> Ctrl+C copies a selection, otherwise interrupts</label>
-
-        <h3 class="label">Type</h3>
-        <label class="field">
-          <span>Font</span>
-          <select v-model="prefs.fontFamily">
-            <option v-for="f in FONTS" :key="f.label" :value="f.value">{{ f.label }}</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Size</span>
-          <input v-model.number="prefs.fontSize" type="number" min="8" max="28" />
-        </label>
-        <label class="field">
-          <span>Cursor</span>
-          <select v-model="prefs.cursorStyle">
-            <option value="bar">Bar</option>
-            <option value="block">Block</option>
-            <option value="underline">Underline</option>
-          </select>
-        </label>
-        <label class="check"><input v-model="prefs.cursorBlink" type="checkbox" /> Blink the cursor</label>
-
-        <h3 class="label">Layout</h3>
-        <label class="field">
-          <span>Position</span>
-          <select v-model="prefs.side">
-            <option value="right">Beside the workspace</option>
-            <option value="bottom">Below the workspace</option>
-          </select>
-        </label>
-        <label class="check"><input v-model="prefs.followDevServer" type="checkbox" /> Point the preview at the last address a terminal printed</label>
-      </section>
     </header>
 
     <div class="bodies">
@@ -234,72 +176,6 @@ const KIND_LABEL = { terminal: "Terminal", files: "File tree", code: "File", pre
 .strip-button:hover {
   background: var(--surface-2);
   color: var(--text);
-}
-
-.settings {
-  inset: auto;
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  translate: -50% -50%;
-  width: min(420px, calc(100vw - 32px));
-  max-height: calc(100dvh - 80px);
-  overflow-y: auto;
-  margin: 0;
-  padding: 18px;
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r);
-  font-size: 12px;
-}
-.settings::backdrop {
-  background: var(--overlay);
-}
-.settings-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--gap);
-  margin-bottom: 4px;
-}
-.settings-head h2 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-}
-.settings .label {
-  margin: 20px 0 8px;
-  color: var(--text-faint);
-}
-.field {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--gap);
-  margin-bottom: 8px;
-  color: var(--text-dim);
-}
-.field input,
-.field select {
-  width: 220px;
-  max-width: 55%;
-  padding: 5px 8px;
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font: inherit;
-}
-.check {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  color: var(--text-dim);
-}
-.settings .note {
-  margin: 0 0 12px;
 }
 
 .bodies {

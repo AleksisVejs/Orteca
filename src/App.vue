@@ -105,6 +105,7 @@ async function open(path: string) {
 
 async function openTask(path: string, id: number) {
   taskFocus.value = { path, id };
+  if (projects.value.some((p) => p.project.path === path)) taskFocus.value = null;
   await open(path);
 }
 

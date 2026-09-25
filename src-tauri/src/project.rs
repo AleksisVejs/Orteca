@@ -69,6 +69,8 @@ pub struct TrustFinding {
 /// entries, enough to spend the scan's whole budget before it reaches the
 /// repository's own source. Their top level is still scanned.
 const GENERATED_DIRS: &[&str] = &["node_modules", "vendor", "target", "dist", "build"];
+const GENERATED: &str = "generated directory: only its top level was scanned, \
+                         and configuration nested deeper was not checked";
 
 const TRUST_TARGETS: &[(&str, &str)] = &[
     (
@@ -153,12 +155,7 @@ pub fn trust_scan(root: &Path) -> Vec<TrustFinding> {
                     // while configuration nested inside went unlooked-at. The
                     // budget used to announce itself when it ran out; this is
                     // that announcement, made where the decision is taken.
-                    findings.push(finding(
-                        root,
-                        &path,
-                        "generated directory: only its top level was scanned, \
-                         and configuration nested deeper was not checked",
-                    ));
+                    findings.push(finding(root, &path, GENERATED));
                 } else {
                     pending.push(path);
                 }
@@ -184,7 +181,13 @@ pub fn trust_fingerprint(root: &Path, findings: &[TrustFinding]) -> String {
     };
     // ponytail: first 2000 files under the config paths; a `.claude` bigger than that is not config.
     let mut files = 0;
-    for f in findings.iter().filter(|f| !f.path.to_ascii_lowercase().ends_with(".md")) {
+    // A build folder a check just created is not new configuration: its top
+    // level is still scanned, so a `.claude` put there is its own finding. It
+    // once stopped a run between Verify and the Fix over a fresh `dist/`.
+    for f in findings
+        .iter()
+        .filter(|f| !f.path.to_ascii_lowercase().ends_with(".md") && f.reason != GENERATED)
+    {
         feed(f.path.as_bytes());
         feed(f.reason.as_bytes());
         // An ancestor's (absolute) path counts by name only: the home folder's
@@ -2190,6 +2193,11 @@ mod tests {
         assert_eq!(print(), first, "the same folder hashed differently");
         std::fs::write(dir.join("AGENTS.md"), "be very brief").unwrap();
         assert_eq!(print(), first, "an instructions edit asked for trust again");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        assert_eq!(print(), first, "a build folder a check created asked for trust again");
+        std::fs::create_dir_all(dir.join("dist/.claude")).unwrap();
+        assert_ne!(print(), first, "config inside a build folder went unnoticed");
+        std::fs::remove_dir_all(dir.join("dist")).unwrap();
         std::fs::write(dir.join(".claude/settings.json"), r#"{"hooks":{}}"#).unwrap();
         assert_ne!(print(), first, "a hook edit went unnoticed");
         std::fs::remove_dir_all(dir).unwrap();

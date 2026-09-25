@@ -1004,9 +1004,6 @@ struct State {
     /// Fix changed nothing, so another round has nothing new to try. What
     /// happens next is the user's call.
     halt: bool,
-    /// The session that wrote the change. A Fix resumes it, so the task
-    /// and the files it already read stay in its cached context.
-    work_session: Option<String>,
     /// Whether the last Fix changed the tree, until a check passes. A check
     /// that still fails after a Fix that changed nothing ends the run.
     fix_changed: Option<bool>,
@@ -1141,7 +1138,6 @@ impl State {
             structured: None,
             budget_stop: None,
             halt: false,
-            work_session: None,
             fix_changed: None,
             thread_totals: HashMap::new(),
             noise: Vec::new(),
@@ -1420,9 +1416,9 @@ pub async fn stream(
                 ..ctx.clone()
             };
             let mut brief =
-                routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes, false);
+                routing::brief(&route, Stage::Review, &prompt, &state.constraints, &state.notes);
             brief.push_str(&attached_note(&ctx.attachments));
-            brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref()));
+            brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref(), true));
             let payload = stage_payload(Stage::Review, index + 1, stages.len(), &review_ctx.plan, id);
             if let Err(e) = note(store, &review_ctx, "stage", &payload) {
                 state.outcome.failure = Some(format!("could not record the stage: {}", e.message));
@@ -1527,10 +1523,11 @@ pub async fn stream(
                 .take()
                 .filter(|r| r.model == ctx.plan.model(id).model);
             let words = resuming.as_ref().map_or(prompt.as_str(), |r| r.reply.as_str());
-            // A Fix resumes the writing session unless a follow-up's does.
-            let resumes_work = resuming.is_none() && stage == Stage::Fix && state.work_session.is_some();
-            let mut brief =
-                routing::brief(&route, stage, words, &state.constraints, &state.notes, resumes_work);
+            // A Fix starts fresh rather than resuming the writing session:
+            // resumed, every one of its steps re-sent Implement's whole
+            // history, pasted files included - 5.4M tokens for one Fix of ~70
+            // steps on a real run. It gets the task, the patch and what failed.
+            let mut brief = routing::brief(&route, stage, words, &state.constraints, &state.notes);
             // The resumed session may be a question's, told to change no file.
             // Left unsaid, the model keeps to that and the reply edits nothing.
             if resuming.is_some() && stage.writes() {
@@ -1540,8 +1537,10 @@ pub async fn stream(
                 brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
             }
             brief.push_str(&attached_note(&ctx.attachments));
-            if stage == Stage::Review {
-                brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref()));
+            if stage == Stage::Review || (stage == Stage::Fix && resuming.is_none()) {
+                // A Fix edits, so Claude's Edit wants its own Read: no pasted files.
+                let files = stage == Stage::Review;
+                brief.push_str(&review_context(&ctx.dir, base_commit.as_deref(), before_run.as_ref(), files));
             }
             if let Err(e) = note(
                 store,
@@ -1556,12 +1555,9 @@ pub async fn stream(
             // Usually one pass. A checkpoint provider told to apply an instruction
             // now ends its process and comes back through here resuming its own
             // session.
-            let launch = match (&resuming, state.work_session.as_deref()) {
-                (Some(r), _) => Launch::fix(id, &r.session, &brief, &ctx.plan),
-                (None, Some(session)) if stage == Stage::Fix => {
-                    Launch::fix(id, session, &brief, &ctx.plan)
-                }
-                _ => Launch::first(id, &brief, &ctx.plan),
+            let launch = match &resuming {
+                Some(r) => Launch::fix(id, &r.session, &brief, &ctx.plan),
+                None => Launch::first(id, &brief, &ctx.plan),
             };
             match ask_base.take().filter(|_| stage == Stage::Fix) {
                 None => call(store, &ctx, &mut state, &mut control, &emit, launch).await,
@@ -1592,9 +1588,6 @@ pub async fn stream(
                     }
                     failing_before = before;
                 }
-            }
-            if stage.writes() && state.session.is_some() {
-                state.work_session = state.session.clone();
             }
             // A chat session has no tools and no agent prompt; work cannot go on in it.
             let resumable = stage.writes() || (stage == Stage::Answer && route.task_type != TaskType::Chat);
@@ -1993,8 +1986,8 @@ async fn cross_review(
         ruleset: Some(words.ruleset.clone()),
     };
     let review = Context { id: ProviderId::Claude, program, plan, final_stage: true, ..ctx.clone() };
-    let mut brief = routing::brief(words.route, Stage::Review, words.prompt, words.constraints, &[], false);
-    brief.push_str(&review_context(&ctx.dir, base, before));
+    let mut brief = routing::brief(words.route, Stage::Review, words.prompt, words.constraints, &[]);
+    brief.push_str(&review_context(&ctx.dir, base, before, true));
     let _ = note(store, &review, "stage", &stage_payload(Stage::Review, 0, 1, &review.plan, ProviderId::Claude));
     let mut side = State::new(Recording::new(recordings, ctx.task_id, Stage::Review, ProviderId::Claude), Vec::new());
     let launch = Launch::first(ProviderId::Claude, &brief, &review.plan);
@@ -2044,8 +2037,7 @@ fn stage_plan(
     ruleset: Option<&rules::Ruleset>,
 ) -> StagePlan {
     let stage = stages[index];
-    // A Fix stays on the tier that wrote the change: a resumed session on
-    // another model would re-read its whole history uncached.
+    // A Fix stays on the tier that wrote the change.
     let tier = match (stage, route.budget.review_tier) {
         (Stage::Review, Some(review)) => review,
         _ => route.budget.preferred_tier,
@@ -2056,15 +2048,7 @@ fn stage_plan(
         Stage::Implement | Stage::Fix => route.work_model(id),
         _ => None,
     };
-    // A Claude Fix resumes the Implement session, and any change to the tool
-    // list re-bills that whole history uncached (~74k tokens on a real run).
-    // `--json-schema` adds a StructuredOutput tool Implement never had, so a
-    // Fix the next Verify judges goes without it.
-    let schema = write_schema(task_id, stage).filter(|_| {
-        !(id == ProviderId::Claude
-            && stage == Stage::Fix
-            && stages.get(index + 1) == Some(&Stage::Verify))
-    });
+    let schema = write_schema(task_id, stage);
     StagePlan {
         stage,
         schema,
@@ -2077,7 +2061,6 @@ fn stage_plan(
             .or_else(|| choice.map(|choice| choice.effort.into())),
         // A question may only run `git diff`/`status` anyway; the two shell
         // tool schemas cost more than that is worth on every question.
-        // Implement keeps them so a resumed Fix sees the same tool list.
         shell: stage != Stage::Answer,
         ruleset: ruleset.cloned(),
     }
@@ -2119,7 +2102,7 @@ fn runnable(check: &project::Check) -> bool {
 /// anyway, a round-trip of uncached context each. A Review never edits, so
 /// unlike a writing stage it owes Claude's Edit tool no prior Read and the
 /// bytes are paid for once.
-fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snapshot>) -> String {
+fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snapshot>, files: bool) -> String {
     const MAX_BYTES: usize = 48 * 1024;
     // A diff that cannot be read narrows nothing: the whole patch is still the
     // truth, and blanking the review over a failed `git diff` would not be.
@@ -2143,7 +2126,7 @@ fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snaps
         // files it touches are not pasted either - that is the same bytes twice.
         _ => return String::new(),
     };
-    let Some(changed) = only else {
+    let Some(changed) = only.filter(|_| files) else {
         return patch;
     };
     format!("{patch}{}", pasted_files(dir, &changed))
@@ -7577,17 +7560,17 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A Codex Fix resumes the session that wrote the change, on the same
-    /// model, instead of a fresh process that reads everything again.
+    /// A Codex Fix starts a fresh session on the model that wrote the change:
+    /// resumed, each of its steps re-sent the whole Implement history.
     #[tokio::test]
-    async fn a_codex_fix_resumes_the_session_that_wrote_the_change() {
+    async fn a_codex_fix_starts_fresh_on_the_model_that_wrote_the_change() {
         let store = Store::in_memory().unwrap();
         let route = unreviewed(
             "make the header bold",
             Mode::Balanced,
             &RepoSignals::default(),
         );
-        let request = routed(&store, "fix-resumes", route);
+        let request = routed(&store, "fix-fresh", route);
         let dir = request.dir.clone();
         std::fs::write(dir.join("package.json"), FAILS_TWICE).unwrap();
         std::fs::write(
@@ -7602,10 +7585,10 @@ ping -n 60 127.0.0.1 >nul
                 "const fs=require('fs');const a=process.argv.slice(2);let i='';\
                  process.stdin.setEncoding('utf8');process.stdin.on('data',d=>i+=d);\
                  process.stdin.on('end',()=>{{fs.appendFileSync('{log}',a.join(' ')+'\\n');\
-                 if(a.includes('resume')){{console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',\
-                 text:JSON.stringify({{checks:[{{command:'npm test',passed:true,output:'ok'}}],verdict:'pass'}})}}}}));}}\
-                 else{{console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
-                 console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',text:'edited'}}}}));}}\
+                 fs.appendFileSync('{log}.briefs',i+'\\n<<end>>\\n');\
+                 console.log(JSON.stringify({{type:'thread.started',thread_id:'sess-1'}}));\
+                 console.log(JSON.stringify({{type:'item.completed',item:{{type:'agent_message',\
+                 text:JSON.stringify({{checks:[{{command:'npm test',passed:true,output:'ok'}}],verdict:'pass'}})}}}}));\
                  console.log(JSON.stringify({{type:'turn.completed',usage:{{input_tokens:1,output_tokens:1}}}}));}});"
             ),
         )
@@ -7628,8 +7611,14 @@ ping -n 60 127.0.0.1 >nul
             .map(str::to_string)
             .collect();
         assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(!calls[0].contains("resume"), "{}", calls[0]);
-        assert!(calls[1].starts_with("exec resume sess-1"), "{}", calls[1]);
+        assert!(calls.iter().all(|c| !c.contains("resume")), "{calls:?}");
+        // Fresh, so it is told the task, what failed and the patch so far.
+        let briefs = std::fs::read_to_string(dir.join("argv.log.briefs")).unwrap();
+        let fix = briefs.split("<<end>>").nth(1).unwrap();
+        assert!(
+            fix.contains("\nTask:\n") && fix.contains("header is not bold") && fix.contains("```diff"),
+            "{fix}"
+        );
         assert!(
             calls[1].contains("gpt-6-sol"),
             "the fix left the model that wrote the change: {}",
@@ -7729,9 +7718,9 @@ ping -n 60 127.0.0.1 >nul
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Claude's Fix continues the session that wrote the change.
+    /// Claude's Fix starts a fresh session too.
     #[tokio::test]
-    async fn a_claude_fix_resumes_the_session_that_wrote_the_change() {
+    async fn a_claude_fix_starts_fresh() {
         let store = Store::in_memory().unwrap();
         let route = unreviewed(
             "make the header bold",
@@ -7779,9 +7768,7 @@ ping -n 60 127.0.0.1 >nul
             .map(str::to_string)
             .collect();
         assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(!calls[0].contains("--resume"), "{}", calls[0]);
-        assert!(calls[1].starts_with("-p "), "{}", calls[1]);
-        assert!(calls[1].ends_with("--resume claude-1"), "{}", calls[1]);
+        assert!(calls.iter().all(|c| c.starts_with("-p ") && !c.contains("--resume")), "{calls:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

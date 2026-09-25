@@ -228,12 +228,30 @@ export function exchangeOf(r: TaskResult, stream: ActivityLine[]): Exchange {
 export const storyOf = (lines: ActivityLine[]) => lines.filter((l) => ["text", "instruction", "thinking", "toolUse"].includes(l.kind));
 
 /** A live update; `file` is the full path it is about, shown by name and openable. */
-export type Activity = { text: string; file: string | null; id?: string; changes?: FileEdit[]; failed?: boolean };
+export type Activity = { text: string; file: string | null; lines?: string; id?: string; changes?: FileEdit[]; failed?: boolean };
 export type ActivityLine = Omit<Activity, "file"> & { kind: string; file?: string | null; delivery?: string };
 
 const EDIT_RE = /edit|write|patch|create|delete|move|rename|file_change|set-content|out-file|new-item|remove-item/;
-const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect/;
+const READ_RE = /read|get-content|cat|head|tail|grep|glob|rg|find|list|search|inspect|sed -n/;
 const WEB_RE = /^web(search|fetch)$/i;
+// Claude's partial Read (`path:120-199`, from the backend), PowerShell's
+// Select-Object / Get-Content counts and `$c[a..b]` indexes, sed, head and tail.
+const RANGE_RE = /-Skip\s+(\d+)\s+-First\s+(\d+)|(?:-First|-TotalCount|-Head|\bhead\s+-n?)\s*(\d+)|\[(\d+)\.\.(\d+)\]|\bsed\s+-n\s+["']?(\d+),(\d+)p|(?:-Tail|\btail\s+-n?)\s*(\d+)|:(\d+)-(\d*)$/gi;
+
+/** Which lines a read covers, e.g. "lines 121–300, 576–646"; null for a whole file. */
+export function readRange(summary: string): string | null {
+  const parts = [...summary.matchAll(RANGE_RE)].map((m) => {
+    // Each alternative fills its own groups, so the first group present says which one matched.
+    const n = (i: number) => Number(m[i]);
+    if (m[1]) return `${n(1) + 1}–${n(1) + n(2)}`;
+    if (m[3]) return `1–${m[3]}`;
+    if (m[4]) return `${n(4) + 1}–${n(5) + 1}`;
+    if (m[6]) return `${m[6]}–${m[7]}`;
+    if (m[8]) return `last ${m[8]} lines`;
+    return `${m[9]}–${m[10] || "end"}`;
+  });
+  return parts.length ? `${/^\d/.test(parts[0]!) ? "lines " : ""}${parts.join(", ")}` : null;
+}
 
 // Several projects are open at once, each with its own copy of the workspace in
 // the document. Element ids have to be unique per project: a popover is targeted
@@ -1456,7 +1474,9 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     } catch (e) {
       // A question before the run is not a failure: the page asks it.
       if (isAppError(e) && e.kind === "clarify") {
+        live.id = e.taskId ?? null;
         live.clarify = { question: e.message, opts: { ...opts, prompt: live.prompt, attachments: attached } };
+        void loadHistory();
       } else {
         live.error = isAppError(e) ? e.message : String(e);
       }
@@ -1468,7 +1488,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       live.stopping = false;
       live.waitAsk = null;
       live.checking = null;
-      live.id = null;
+      if (!live.clarify) live.id = null;
       for (const q of live.queued.splice(0)) q.line.delivery = "Not sent · the run ended before it started";
       if (selectedRun.value === live.key) {
         if (tick !== null) clearTimeout(tick);
@@ -1497,7 +1517,15 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     const ask = live?.clarify;
     if (!live || !ask) return;
     live.clarify = null;
-    void run({ ...ask.opts, continueRun: live, clarified: { question: ask.question, answer } });
+    void run({ ...ask.opts, continueRun: live, continueTask: live.id, clarified: { question: ask.question, answer } });
+  }
+
+  /** A pending question opened from history after the window was closed. */
+  function answerPastClarify(answer: string) {
+    const pending = historyDetail.value;
+    if (!pending || pending.status !== "clarifying" || !pending.summary) return;
+    const prompt = (pending.route as { pendingPrompt?: string } | null)?.pendingPrompt ?? pending.prompt;
+    void run({ prompt, continueTask: pending.id, clarified: { question: pending.summary, answer } });
   }
 
   /** The user said yes: the same request goes on with the other CLI. What the
@@ -1531,19 +1559,24 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     // A Read/Edit tool's summary is the path itself, spaces and all.
     const whole = summary.trim();
     if (!/^(shell|bash|powershell)$/i.test(name) && /^[^*?<>|,]*[\w-]\.[A-Za-z0-9]{1,8}$/.test(whole)) return whole;
-    const tokens = summary.split(/[\s,]+/).map((t) => t.replace(/^["']|["']$/g, ""));
+    // `;` and `=` split too: Codex writes `$f='a.vue'; $c=Get-Content $f`.
+    const tokens = summary.split(/[\s,;=]+/).map((t) => t.replace(/^["']+|["']+$/g, ""));
     return tokens.reverse().find((t) => /^[^*?<>|]*[\w-]\.[A-Za-z0-9]{1,8}$/.test(t) && !/^-/.test(t)) ?? null;
   }
 
   /** What the live line and the log show: words, plus the file they are about when there is one. */
   function toolActivity(name: string, rawSummary: string): Activity {
     if (WEB_RE.test(name)) return { text: friendlyToolUse(name, rawSummary), file: null };
+    const shell = /^(shell|bash|powershell)$/i.test(name);
     const summary = unwrapShell(rawSummary);
     const head = `${name} ${summary.trim().split(/\s+/)[0] ?? ""}`.toLowerCase();
     const kind = `${name} ${summary}`.toLowerCase();
     const verb = EDIT_RE.test(head) ? "Editing" : READ_RE.test(kind) ? "Reading" : null;
-    const file = verb ? fileIn(name, summary) : null;
-    if (verb && file) return { text: verb, file };
+    const file = verb ? fileIn(name, shell ? summary : summary.replace(/:\d+-\d*$/, "")) : null;
+    // A command that reads several files gives no way to tell whose lines are whose.
+    const files = new Set(summary.match(/[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,7}\b/g)?.map((f) => f.replace(/\\/g, "/").toLowerCase()));
+    const lines = verb === "Reading" && (!shell || files.size === 1) ? readRange(shell ? summary : summary.match(/:\d+-\d*$/)?.[0] ?? "") : null;
+    if (verb && file) return { text: verb, file, ...(lines ? { lines } : {}) };
     return { text: friendlyToolUse(name, rawSummary), file: null };
   }
 
@@ -1767,7 +1800,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   const changed = computed(() => changedOf(result.value));
 
-  const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, running: "Running" };
+  const HISTORY_STATUS: Record<TaskSummary["status"], string> = { ...OUTCOME, running: "Running", clarifying: "Needs your answer" };
 
   /** A past run's metrics, each labelled, unknown spelled out rather than zeroed. */
   function historyLine(t: TaskSummary): string {
@@ -1808,6 +1841,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     verifyFailed: "warn",
     reviewRejected: "warn",
     running: "live",
+    clarifying: "warn",
     checking: "live",
   };
 
@@ -2087,6 +2121,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     fallback,
     carryOn,
     answerClarify,
+    answerPastClarify,
     switchedFrom,
     switchTo,
     canRun,

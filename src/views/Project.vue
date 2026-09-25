@@ -124,7 +124,7 @@ const historyStatus = computed({ get: () => props.sidebarStatus ?? "all", set: (
 const filteredHistory = computed(() => allTasks.value.filter((task) => {
   const query = historySearch.value.trim().toLocaleLowerCase();
   return (!query || [task.title, task.prompt, task.summary, task.provider, task.projectName].some((text) => text?.toLocaleLowerCase().includes(query)))
-    && (historyStatus.value === "all" || (historyStatus.value === "attention" ? ["failed", "verifyFailed", "reviewRejected", "budgetReached"].includes(task.status) : task.status === historyStatus.value));
+    && (historyStatus.value === "all" || (historyStatus.value === "attention" ? ["failed", "verifyFailed", "reviewRejected", "budgetReached", "clarifying"].includes(task.status) : task.status === historyStatus.value));
 }));
 const expandedProjects = computed(() => props.expandedTaskProjects ?? new Set<string>());
 const closedProjects = computed(() => props.closedTaskProjects ?? new Set<string>());
@@ -617,9 +617,9 @@ watch(deleteAsk, (t) => (t ? deleteDialog.value?.showModal() : deleteDialog.valu
       </section>
 
       <div ref="split" class="split" :class="[dockPrefs.side, { dragging }]">
-        <main class="content" :class="{ page: ['stats', 'memory', 'settings', 'agents'].includes(view), composing: view === 'task' && !running && !result, chatting: (view === 'task' && (running || !!result)) || view === 'history' }">
+        <main class="content" :class="{ page: ['stats', 'memory', 'settings', 'agents'].includes(view), composing: view === 'task' && !running && !result && !activeRun?.clarify, chatting: (view === 'task' && (running || !!result || !!activeRun?.clarify)) || view === 'history' }">
           <template v-if="view === 'task'">
-            <CurrentTask v-if="running || result" />
+            <CurrentTask v-if="running || result || activeRun?.clarify" />
             <TaskComposer v-else />
           </template>
           <PastTask v-else-if="view === 'history'" />

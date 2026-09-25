@@ -100,7 +100,7 @@ fn block(b: &Value) -> Option<ProviderEvent> {
             let editing = matches!(name, "Edit" | "Write" | "MultiEdit");
             Some(ProviderEvent::ToolUse {
                 name: name.to_string(),
-                summary: summarize(&b["input"]),
+                summary: summarize(&b["input"]) + &read_range(name, &b["input"]),
                 id: if editing {
                     b["id"].as_str().map(str::to_string)
                 } else {
@@ -200,6 +200,18 @@ fn summarize(input: &Value) -> String {
         .chars()
         .take(120)
         .collect()
+}
+
+/// A partial Read as `:start-end` after its path (`:start-` when unbounded),
+/// so the activity line can say which lines it read. A whole-file read adds nothing.
+fn read_range(name: &str, input: &Value) -> String {
+    let (offset, limit) = (input["offset"].as_u64(), input["limit"].as_u64());
+    if name != "Read" || (offset.is_none() && limit.is_none()) {
+        return String::new();
+    }
+    let start = offset.unwrap_or(1).max(1);
+    let end = limit.filter(|&n| n > 0).map(|n| (start + n - 1).to_string()).unwrap_or_default();
+    format!(":{start}-{end}")
 }
 
 /// Only the final `result` carries trustworthy numbers. Per-message `usage`
@@ -375,6 +387,16 @@ mod tests {
             "something"
         );
         assert_eq!(summary(serde_json::json!({"count": 3})), "");
+    }
+
+    #[test]
+    fn a_partial_read_names_its_lines() {
+        let read = |input| read_range("Read", &input);
+        assert_eq!(read(serde_json::json!({"file_path": "a.rs", "offset": 120, "limit": 80})), ":120-199");
+        assert_eq!(read(serde_json::json!({"file_path": "a.rs", "offset": 500})), ":500-");
+        assert_eq!(read(serde_json::json!({"file_path": "a.rs", "limit": 40})), ":1-40");
+        assert_eq!(read(serde_json::json!({"file_path": "a.rs"})), "");
+        assert_eq!(read_range("Grep", &serde_json::json!({"offset": 3})), "");
     }
 
     /// Cut by characters, never by bytes: a multi-byte path would panic.

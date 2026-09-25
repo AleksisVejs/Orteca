@@ -708,6 +708,9 @@ pub struct RepoSignals {
     /// is trusted (0 with too few commits, up to 1).
     pub co_change: HashMap<String, Vec<(String, u32)>>,
     pub co_change_weight: f64,
+    /// A question that needs a cause traced, or a follow-up in a task that
+    /// was already a question (the first answer did not settle it).
+    pub digs: bool,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1416,6 +1419,16 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             tier_reason = "this prompt did not finish before, so it runs one tier up";
         }
     }
+    // Why something broke, or asked again: the cheapest tier answered "No" to
+    // a traceable cause 3 times in 3, and a second cheap answer repeats "I
+    // can't tell" and pushes the user towards a change route.
+    if kind == RouteKind::Answer && repo.digs && repo.task_type == Some(TaskType::Question) {
+        if let Some(up) = budget.preferred_tier.up() {
+            budget.preferred_tier = up;
+            raised = true;
+            tier_reason = "a cause to trace, or asked again, so it runs one tier up";
+        }
+    }
     // Evidence only, never exploration: a tier that stalled here is stepped
     // over, and a cheaper one is never tried on Orteca's own initiative. The
     // evidence ages out with the project's last 50 runs, which is what lets a
@@ -1655,10 +1668,19 @@ pub fn clip_event(line: &str) -> String {
 /// must not break - and not its output, and a failing one is cut to
 /// `CHECK_OUTPUT`. The whole log is in the event log either way.
 fn forwarded(stage: Stage, artifact: &serde_json::Value) -> String {
+    let mut artifact = artifact.clone();
+    // A low finding does not hold the work up; handed to a Fix, it gets done
+    // anyway. Out-of-task asks are low (see the Review brief): one rated
+    // medium, "also save it in history", bought ~150 lines on a real run.
+    if stage == Stage::Review {
+        if let Some(findings) = artifact.get_mut("findings").and_then(serde_json::Value::as_array_mut) {
+            findings.retain(|f| f["severity"] != "low");
+        }
+        return artifact.to_string();
+    }
     if !matches!(stage, Stage::Verify | Stage::Fix) {
         return artifact.to_string();
     }
-    let mut artifact = artifact.clone();
     if let Some(checks) = artifact.get_mut("checks").and_then(serde_json::Value::as_array_mut) {
         for check in checks {
             let passed = check["passed"] == true;
@@ -1704,9 +1726,6 @@ pub fn brief(
     prompt: &str,
     constraints: &[String],
     carried: &[StageNote],
-    // The Fix resumes the session that wrote the change, which already holds
-    // the task and the paths; sending them again is paying for them twice.
-    resumed: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -1719,7 +1738,10 @@ pub fn brief(
                  Do not edit any file. Return only the structured review. Check it against \
                  every rule the task states: a rule that is missing or only partly met is a \
                  finding. Ask for changes only for a high or medium finding; report low ones, \
-                 which do not hold the work up. Say what each finding requires and what it \
+                 which do not hold the work up. A finding is high or medium only when the \
+                 change is wrong or misses something the task asked for; anything beyond \
+                 the task - a new feature, extra storage, wider coverage, a nicer design - \
+                 is low, however useful. Say what each finding requires and what it \
                  must not break; do not write the patch or dictate an implementation.",
             );
             // The latest check, not any: a pass before a later fix says nothing
@@ -1781,10 +1803,15 @@ pub fn brief(
         Stage::Answer => out.push_str(
             "Answer the question below. Read what you need, change no file, and reply in \
              the language it was asked in. When the answer is in this project, stop reading \
-             as soon as you can answer; do not search again to double-check. A cause or a \
-             claim about what code does must come from the code or output you read: when \
-             the question is why something happened, read the part that decided it before \
-             answering, and never state a cause you only guessed. When the answer needs \
+             as soon as you can answer every part of it; do not search again to \
+             double-check. A cause or a claim about what code does must come from the code \
+             or output you read, and never state a cause you only guessed. When the \
+             question is why something happened or what caused it, follow the code from \
+             what the user did to each thing they say went wrong, step by step, until every \
+             one of them is explained by code you read. You can only read here: never build, \
+             launch or install anything. When you cannot run it, trace it in the code and say \
+             it was traced, not run; \"I can't confirm without running it\" is not an \
+             answer when the code shows the cause. When the answer needs \
              facts from outside this project, such as other tools, the market or a \
              library's current state, search the web before answering: compare the main \
              options you find, then give a clear verdict and the reason for it, not \"I \
@@ -1812,13 +1839,11 @@ pub fn brief(
         );
     }
 
-    if !resumed {
-        out.push_str("Task:\n");
-        out.push_str(prompt.trim());
-        out.push('\n');
-    }
+    out.push_str("Task:\n");
+    out.push_str(prompt.trim());
+    out.push('\n');
 
-    if !resumed && !route.candidate_paths.is_empty() {
+    if !route.candidate_paths.is_empty() {
         out.push_str(if stage == Stage::Answer {
             // Naming the files as the user's makes the model review them
             // ("this file is about...") instead of answering. Saying what not to
@@ -1946,9 +1971,11 @@ pub fn brief(
                 "Make the change described above and nothing beyond it. If it changes \
                  behaviour, add or update tests that pin every rule the task states, \
                  edge values included: the later checks only catch what a test covers. \
-                 A later stage runs the repository's checks and any build or lint action \
-                 the user requested, directly through Orteca. Do not run those commands \
-                 yourself; stop when the change is complete.\n",
+                 Run only the test files you added or changed, once, and make them pass: \
+                 a test nobody ran buys a whole Fix round when it fails. A later stage \
+                 runs the repository's full checks and any build or lint action the user \
+                 requested, directly through Orteca. Do not run those yourself; stop when \
+                 the change is complete.\n",
             );
         } else {
             out.push_str(
@@ -2120,7 +2147,7 @@ mod tests {
             ..Default::default()
         };
         let r = route("fix the quote controller", Mode::Balanced, &signals);
-        let text = brief(&r, r.stages[0], "fix the quote controller", &[], &[], false);
+        let text = brief(&r, r.stages[0], "fix the quote controller", &[], &[]);
         assert!(
             text.contains("- app/Http/Controllers/QuoteController.php: class QuoteController (index, show); enum Status; functions helper\n"),
             "{text}"
@@ -2176,7 +2203,6 @@ mod tests {
             "make the header bold",
             &[],
             &[],
-            false,
         );
         assert!(brief.contains("do not write the patch"), "{brief}");
     }
@@ -2286,7 +2312,6 @@ mod tests {
             "Fix the typo in the README heading",
             &[],
             &[],
-            false,
         );
         assert!(
             brief.contains("one focused check"),
@@ -2324,10 +2349,10 @@ mod tests {
             "Fix the typo in the README heading",
             &[],
             &[],
-            false,
         );
         assert!(
-            text.contains("Do not run those commands")
+            text.contains("Do not run those yourself")
+                && text.contains("Run only the test files you added or changed")
                 && text.contains("pin every rule")
                 && !text.contains("one focused check"),
             "{text}"
@@ -2465,7 +2490,7 @@ mod tests {
                 .map(|choice| (choice.model, choice.effort)),
             Some(("gpt-6-sol", "medium"))
         );
-        assert!(brief(&balanced_route, Stage::Implement, prompt, &[], &[], false)
+        assert!(brief(&balanced_route, Stage::Implement, prompt, &[], &[])
             .contains("migration/schema agreement"));
 
         let local = RepoSignals {
@@ -2552,6 +2577,22 @@ mod tests {
         assert_ne!(kind("rename the button"), RouteKind::Answer);
     }
 
+    /// A question with a cause to trace answers one tier up; any other
+    /// question, and talk, stay on the cheapest.
+    #[test]
+    fn a_question_about_a_cause_answers_one_tier_up() {
+        let tier = |task_type, intent, digs| {
+            let signals = RepoSignals { intent: Some(intent), task_type: Some(task_type), digs, ..repo(REPO) };
+            let r = route("why does the login page redirect twice?", Mode::Balanced, &signals);
+            assert_eq!(r.kind, RouteKind::Answer);
+            r.budget.preferred_tier
+        };
+        assert_eq!(tier(TaskType::Question, Intent::Question, true), Tier::Standard);
+        assert_eq!(tier(TaskType::Question, Intent::Question, false), Tier::Cheapest);
+        assert_eq!(tier(TaskType::Chat, Intent::Chat, true), Tier::Cheapest);
+        assert_eq!(tier(TaskType::Plan, Intent::Question, true), Tier::Cheapest);
+    }
+
     /// The small model's reading picks the route in any language, and the
     /// keyword gates still escalate what it calls easy or medium.
     #[test]
@@ -2580,10 +2621,10 @@ mod tests {
         let chat = route(said, Mode::Balanced, &talk(Intent::Chat));
         assert_eq!(chat.stages, [Stage::Answer]);
         assert!(chat.candidate_paths.is_empty());
-        let text = brief(&chat, Stage::Answer, said, &[], &[], false);
+        let text = brief(&chat, Stage::Answer, said, &[], &[]);
         assert!(text.contains("read no file") && !text.contains("search the web"));
         // A question may reach past the repo, and must not invent a source.
-        let text = brief(&question, Stage::Answer, "is this the best app?", &[], &[], false);
+        let text = brief(&question, Stage::Answer, "is this the best app?", &[], &[]);
         assert!(text.contains("search the web") && text.contains("never invent one"));
 
         // A question lists no tests and a failed one is not retried a tier up.
@@ -2663,7 +2704,7 @@ mod tests {
         );
         let standard = balanced("make the header bold", REPO);
         assert_eq!(standard.budget.preferred_tier, Tier::Standard);
-        let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[], false);
+        let fix = brief(&standard, Stage::Fix, "make the header bold", &[], &[]);
         assert!(fix.contains("did not pass") && fix.contains("runs again after this call"));
         assert!(
             !fix.contains("agent call"),
@@ -2760,18 +2801,14 @@ mod tests {
                 "verdict": "fail"
             })),
         };
-        let fix = brief(&r, Stage::Fix, "task", &[], std::slice::from_ref(&failed), false);
+        let fix = brief(&r, Stage::Fix, "task", &["keep it small".into()], &[failed]);
         // The command a passing check ran still says what must not break.
         assert!(fix.contains("cargo test") && !fix.contains("passing-suite-noise"));
         // The lines that say what failed survive; the rest does not.
         assert!(fix.contains("first-error") && fix.contains("last-error"));
         assert!(!fix.contains(&noise));
-
-        // A Fix resuming the writing session is told the failure and what the
-        // user said, not the task and paths that session already holds.
-        let resumed = brief(&r, Stage::Fix, "the whole long task", &["keep it small".into()], &[failed], true);
-        assert!(!resumed.contains("the whole long task") && !resumed.contains("Start here"));
-        assert!(resumed.contains("first-error") && resumed.contains("keep it small"));
+        // A Fix starts a fresh session, so it carries the task and what the user said.
+        assert!(fix.contains("Task:\ntask") && fix.contains("keep it small"));
     }
 
     #[test]
@@ -2821,9 +2858,9 @@ mod tests {
         let r = route("fix the quote controller", Mode::Balanced, &signals);
         assert_eq!(r.prior_notes, ["Task: earlier 1"]);
         assert!(r.prior_notes_why[0].contains("task #1") && r.prior_notes_why[0].contains("QuoteController"));
-        let text = brief(&r, Stage::Implement, "fix the quote controller", &[], &[], false);
+        let text = brief(&r, Stage::Implement, "fix the quote controller", &[], &[]);
         assert!(text.contains("Task: earlier 1") && !text.contains("earlier 2"));
-        assert!(!brief(&r, Stage::Verify, "fix the quote controller", &[], &[], false).contains("earlier 1"));
+        assert!(!brief(&r, Stage::Verify, "fix the quote controller", &[], &[]).contains("earlier 1"));
 
         let r = route("rename the login page label", Mode::Balanced, &signals);
         assert!(r.prior_notes.is_empty(), "no shared file, no history");
@@ -2834,7 +2871,7 @@ mod tests {
     #[test]
     fn a_brief_names_paths_and_pastes_no_contents() {
         let r = balanced("fix the run.rs typo", REPO);
-        let text = brief(&r, Stage::Implement, "fix the run.rs typo", &[], &[], false);
+        let text = brief(&r, Stage::Implement, "fix the run.rs typo", &[], &[]);
         assert!(
             text.contains("src/run.rs"),
             "the candidate path was not named: {text}"
@@ -2861,7 +2898,6 @@ mod tests {
                 "redesign the storage subsystem",
                 &constraints,
                 &[],
-                false,
             );
             for c in &constraints {
                 assert!(text.contains(c.as_str()), "{} lost `{c}`", stage.name());
@@ -2886,7 +2922,6 @@ mod tests {
             "redesign the storage subsystem",
             &[],
             &[note],
-            false,
         );
         assert!(
             text.contains("no structured artifact"),
@@ -2935,7 +2970,6 @@ mod tests {
             "task",
             &[],
             std::slice::from_ref(&plan),
-            false,
         );
         assert!(implement.contains("private-plan-marker"));
         let fix = brief(
@@ -2944,7 +2978,6 @@ mod tests {
             "task",
             &[],
             &[plan.clone(), implementation.clone(), failed.clone()],
-            false,
         );
         assert!(
             fix.contains("boom")
@@ -2957,7 +2990,6 @@ mod tests {
             "task",
             &[],
             &[plan, implementation, failed],
-            false,
         );
         assert!(
             !review.contains("private-plan-marker")

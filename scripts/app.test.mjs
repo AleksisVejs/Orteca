@@ -21,6 +21,64 @@ function app(api = {}) {
 const gitState = { isRepo: true, root: 'C:/repo', branch: 'main', head: 'abc123', dirty: false, dirtyCount: 0, upstream: 'origin/main', ahead: 0, behind: 0, branches: ['feature'] };
 const project = { project: { path: 'C:/repo', trusted: false }, git: gitState, trustFindings: [{}] };
 
+for (const answer of ['Fix the broken task flow', '']) {
+  test(`an unclear request stays visible and runs after ${answer ? 'an answer' : 'skip'}`, async () => {
+    const question = 'What should be changed?';
+    const calls = [];
+    const { state } = await projectView({
+      recentTasks: async () => calls.length === 0 ? [] : [{ id: 7, prompt: 'fix this and that', status: calls.length === 1 ? 'clarifying' : 'done', summary: calls.length === 1 ? question : 'done' }],
+      startTask: async (...args) => {
+        calls.push(args);
+        if (calls.length === 1) throw { kind: 'clarify', message: question, taskId: 7 };
+        args[9](7);
+        return { ...finished, taskId: 7, status: 'done' };
+      },
+    });
+    state.task.value = 'fix this and that';
+    await state.run();
+
+    const view = readFileSync(new URL('../src/views/Project.vue', import.meta.url), 'utf8');
+    const current = readFileSync(new URL('../src/views/project/CurrentTask.vue', import.meta.url), 'utf8');
+    assert.match(current, /<template v-else-if="activeRun\.clarify" #current>[\s\S]*?<form class="clarify"/, 'the question form renders before a result exists');
+    const condition = view.match(/<CurrentTask v-if="([^"]+)"/)[1];
+    const visible = () => vm.runInNewContext(condition, {
+      running: state.running.value,
+      result: state.result.value,
+      activeRun: state.activeRun.value,
+    });
+    assert.equal(state.activeRun.value.clarify.question, question);
+    assert.equal(state.activeRun.value.id, 7);
+    assert.equal(state.history.value[0].status, 'clarifying');
+    assert.equal(Boolean(visible()), true, 'the question must keep the task view open');
+
+    state.answerClarify(answer);
+    await new Promise(resolve => setTimeout(resolve));
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].at(-3), 7, 'the answer resumes the pending task');
+    assert.equal(calls[1].at(-1).answer, answer);
+    assert.equal(state.result.value.status, 'done');
+    assert.equal(state.history.value.length, 1, 'the answer keeps one history row');
+    assert.equal(Boolean(visible()), true);
+  });
+}
+
+test('a clarification reopened from history resumes the saved request', async () => {
+  const calls = [];
+  const { state } = await projectView({
+    startTask: async (...args) => { calls.push(args); args[9](7); return { ...finished, taskId: 7, status: 'done' }; },
+  });
+  state.historyDetail.value = {
+    id: 7, status: 'clarifying', prompt: 'original task', summary: 'Which part?',
+    route: { pendingPrompt: 'fix this and that' },
+  };
+  state.answerPastClarify('The task flow');
+  await new Promise(resolve => setTimeout(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 'fix this and that');
+  assert.equal(calls[0].at(-3), 7);
+  assert.equal(calls[0].at(-1).answer, 'The task flow');
+});
+
 test('run history loads on open, refreshes after a run, and never shows a zero for unknown tokens', async () => {
   const past = { id: 1, prompt: 'old', status: 'failed', startedAt: '2026-09-12 10:00:00', summary: null, routeKind: 'implementOnce', callsUsed: 1, provider: 'codex', tokens: null, cachedTokens: null, costUsd: null, costQuality: 'unavailable' };
   let asked = 0;
@@ -557,6 +615,22 @@ test('provider actions become plain-English live updates', async () => {
   assert.deepEqual({ ...state.toolActivity('Shell', 'Get-Content -Raw "app/User.php"') }, { text: 'Reading', file: 'app/User.php' });
   assert.deepEqual({ ...state.toolActivity('Shell', ps) }, { text: 'Reading rg -n Write-Output app', file: null });
   assert.deepEqual({ ...state.toolActivity('Shell', 'npm test') }, { text: 'Testing: npm test', file: null });
+});
+
+test('a read names the lines it covered, and only when one file was read', async () => {
+  const { state } = await projectView();
+  const lines = (name, summary) => state.toolActivity(name, summary).lines;
+  const ps = (cmd) => `"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '${cmd}'`;
+  assert.equal(lines('Read', 'src/a.ts:120-199'), 'lines 120–199');
+  assert.equal(state.toolActivity('Read', 'src/a.ts:500-').file, 'src/a.ts');
+  assert.equal(lines('Read', 'src/a.ts:500-'), 'lines 500–end');
+  assert.equal(lines('Read', 'src/a.ts'), undefined);
+  assert.equal(lines('Shell', ps('Get-Content src/state.ts | Select-Object -Skip 810 -First 180; Get-Content src/state.ts | Select-Object -First 20')), 'lines 811–990, 1–20');
+  assert.equal(lines('Shell', ps("$c=Get-Content src/Page.vue; $c[50..165]; $c[575..645]")), 'lines 51–166, 576–646');
+  assert.equal(lines('Shell', ps('Get-Content -LiteralPath tests/a.spec.js -TotalCount 260')), 'lines 1–260');
+  assert.equal(lines('Shell', "sed -n '40,80p' src/lib.rs"), 'lines 40–80');
+  assert.equal(lines('Shell', 'tail -n 30 log.txt'), 'last 30 lines');
+  assert.equal(lines('Shell', ps('Get-Content a.php | Select-Object -First 9; Get-Content b.php')), undefined);
 });
 
 test('edit results update their own activity entry and replay without replacing another edit', async () => {

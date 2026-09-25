@@ -196,7 +196,19 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
         </div>
       </section>
     </template>
+    <template v-else-if="activeRun.clarify" #current>
+      <div class="mine"><h1 class="bubble">{{ said }}</h1></div>
+      <form class="clarify" @submit.prevent="answerClarify(clarifyAnswer.trim())">
+        <p class="note">Before it starts: {{ activeRun.clarify?.question }}</p>
+        <div class="clarify-row">
+          <input v-model="clarifyAnswer" aria-label="Your answer" placeholder="Your answer" />
+          <button class="btn" :disabled="!clarifyAnswer.trim()">Answer and run</button>
+          <button type="button" class="link" title="The agent says how it read the request, then does it" @click="answerClarify('')">Skip</button>
+        </div>
+      </form>
+    </template>
     <template v-if="running" #composer><SteerBox ref="steer" /></template>
+    <template v-else-if="activeRun.clarify" #composer><div class="composer-bar" /></template>
 
     <template #notes>
       <section v-if="away" class="away" role="status" aria-label="While you were away">
@@ -204,14 +216,6 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
         <ul><li v-for="line in away.lines" :key="line" class="note">{{ line }}</li></ul>
         <button class="link" @click="activeRun.away = false">Got it</button>
       </section>
-      <form v-if="activeRun.clarify && !running" class="clarify" @submit.prevent="answerClarify(clarifyAnswer.trim())">
-        <p class="note">Before it starts: {{ activeRun.clarify.question }}</p>
-        <div class="clarify-row">
-          <input v-model="clarifyAnswer" aria-label="Your answer" placeholder="Your answer" />
-          <button class="btn" :disabled="!clarifyAnswer.trim()">Answer and run</button>
-          <button type="button" class="link" title="The agent says how it read the request, then does it" @click="answerClarify('')">Skip</button>
-        </div>
-      </form>
       <p v-if="waiting && waiting.prompt === activeRun.prompt" class="note" role="status">
         Carries on {{ formatWhen(waiting.at) }}, after {{ waiting.provider }}’s limit resets. Keep Orteca open.
         <button class="link" @click="cancelWait">Cancel</button>

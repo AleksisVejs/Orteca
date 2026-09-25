@@ -214,6 +214,30 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Keep a request that needs an answer in history before any agent runs.
+    pub fn ask_clarification(&self, project_id: i64, prompt: &str, title: &str, mode: &str, question: &str, continue_task: Option<i64>) -> Result<i64> {
+        let conn = self.0.lock().expect("store poisoned");
+        let pending = serde_json::json!({ "pendingPrompt": prompt }).to_string();
+        if let Some(id) = continue_task {
+            let changed = conn.execute(
+                "UPDATE tasks SET status = 'clarifying', summary = ?3, route_json = ?4, ended_at = NULL WHERE id = ?1 AND project_id = ?2 AND status != 'running' AND worktree_path IS NULL",
+                params![id, project_id, question, pending],
+            )?;
+            if changed != 0 { return Ok(id); }
+            return Err(AppError::new(ErrorKind::Invalid, "That task cannot ask a follow-up question."));
+        }
+        conn.execute(
+            "INSERT INTO tasks (project_id, prompt, title, mode, status, summary, route_json, started_at) VALUES (?1, ?2, ?3, ?4, 'clarifying', ?5, ?6, datetime('now'))",
+            params![project_id, prompt, title, mode, question, pending],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn is_clarifying(&self, task_id: i64) -> Result<bool> {
+        let conn = self.0.lock().expect("store poisoned");
+        Ok(conn.query_row("SELECT status = 'clarifying' FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?.unwrap_or(false))
+    }
+
     /// A reply continues its task: the same row runs again on a new route. A
     /// running task, a task in a copy folder or another project's is refused.
     pub fn reopen_task(&self, project_id: i64, task_id: i64, route_json: Option<&str>) -> Result<()> {
@@ -1430,6 +1454,43 @@ mod tests {
 
         store.forget_project("C:/b").unwrap();
         assert_eq!(store.memory(Some(a.id)).unwrap().items.len(), 3);
+    }
+
+    #[test]
+    fn clarification_is_visible_and_reuses_its_task_row() {
+        let store = Store::in_memory().unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let id = store.ask_clarification(project.id, "fix this and that", "Fix this", "balanced", "What should change?", None).unwrap();
+        let rows = store.recent_tasks(project.id, 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "clarifying");
+        assert_eq!(rows[0].summary.as_deref(), Some("What should change?"));
+        assert_eq!(store.task_detail(project.id, id).unwrap().route.unwrap()["pendingPrompt"], "fix this and that");
+        assert!(store.is_clarifying(id).unwrap());
+        assert_eq!(store.ask_clarification(project.id, "fix the other part", "Fix this", "balanced", "Which part?", Some(id)).unwrap(), id);
+        assert_eq!(store.task_detail(project.id, id).unwrap().route.unwrap()["pendingPrompt"], "fix the other part");
+        store.reopen_task(project.id, id, None).unwrap();
+        assert!(!store.is_clarifying(id).unwrap());
+        assert_eq!(store.recent_tasks(project.id, 20).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pending_question_survives_reopening_the_store() {
+        let dir = std::env::temp_dir().join(format!("orteca-clarification-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.db");
+        let store = Store::open(&db).unwrap();
+        let project = store.touch_project("C:/a", "a").unwrap();
+        let id = store.ask_clarification(project.id, "fix this and that", "Fix this", "balanced", "Which part?", None).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&db).unwrap();
+        let pending = reopened.task_detail(project.id, id).unwrap();
+        assert_eq!(pending.status, "clarifying");
+        assert_eq!(pending.summary.as_deref(), Some("Which part?"));
+        assert_eq!(pending.route.unwrap()["pendingPrompt"], "fix this and that");
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

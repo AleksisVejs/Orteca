@@ -81,7 +81,7 @@ onMounted(() => { if (!finished.value) follow(); });
     <li v-if="entry.group" class="toolUse group">
       <details>
         <summary>{{ entry.group.every((l) => l.file) ? `Read ${entry.group.length} files` : `Read and searched ${entry.group.length} times` }}</summary>
-        <ul><li v-for="(l, j) in entry.group" :key="j">{{ l.text }} <FileLink v-if="l.file" :file="l.file" /></li></ul>
+        <ul><li v-for="(l, j) in entry.group" :key="j">{{ l.text }} <FileLink v-if="l.file" :file="l.file" /> <span v-if="l.lines" class="note">{{ l.lines }}</span></li></ul>
       </details>
     </li>
     <li v-else :class="[entry.line.kind, { failed: entry.line.failed }]">
@@ -117,7 +117,7 @@ onMounted(() => { if (!finished.value) follow(); });
           </div>
         </details>
       </template>
-      <template v-else>{{ entry.line.text }} <FileLink v-if="entry.line.file" :file="entry.line.file" /></template>
+      <template v-else>{{ entry.line.text }} <FileLink v-if="entry.line.file" :file="entry.line.file" /> <span v-if="entry.line.lines" class="note">{{ entry.line.lines }}</span></template>
     </li>
     </template>
   </ol>

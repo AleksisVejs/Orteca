@@ -8,6 +8,8 @@ use serde::Serialize;
 pub struct AppError {
     pub kind: ErrorKind,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -32,7 +34,13 @@ impl AppError {
         AppError {
             kind,
             message: message.into(),
+            task_id: None,
         }
+    }
+
+    pub fn with_task_id(mut self, task_id: i64) -> Self {
+        self.task_id = Some(task_id);
+        self
     }
 }
 

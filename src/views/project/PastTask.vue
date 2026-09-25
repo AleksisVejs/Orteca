@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject } from "vue";
+import { computed, inject, ref } from "vue";
 import { verificationSummary, savedArtifacts } from "./taskPresentation";
 import ActivityLog from "./ActivityLog.vue";
 import TaskChat from "./TaskChat.vue";
@@ -15,10 +15,12 @@ const {
   historyDetail, historyDetailLoading, historyDetailError,
   cacheHit, formatPayload, removedCopies, confirmRemove, removeCopy,
   removeError, linesOf, anyRunning, domId,
-  replyToPast, git, openGit, describeVerdict, rewindTo,
+  replyToPast, answerPastClarify, git, openGit, describeVerdict, rewindTo,
 } = inject(PROJECT)!;
+const clarifyAnswer = ref("");
 
 const d = computed(() => historyDetail.value);
+const pendingPrompt = computed(() => (d.value?.route as { pendingPrompt?: string } | null)?.pendingPrompt ?? d.value?.prompt ?? "");
 // One chat per task: every reply is its own exchange, each with the proof it logged.
 const parts = computed(() => (d.value ? splitExchanges(d.value) : []));
 const earlier = computed(() => parts.value.slice(0, -1).map((p) => {
@@ -113,6 +115,17 @@ const data = computed<Exchange>(() => current.value?.result ? exchangeOf(current
   <p v-if="historyDetailLoading" class="note" aria-live="polite">Loading task details…</p>
   <p v-else-if="historyDetailError" class="missing" role="alert">Task details unavailable.</p>
   <p v-else-if="!d" class="note">Pick a task on the left.</p>
+  <div v-else-if="d.status === 'clarifying'" class="chat">
+    <div class="thread">
+      <h1 class="bubble">{{ pendingPrompt }}</h1>
+      <form class="clarify" @submit.prevent="answerPastClarify(clarifyAnswer.trim())">
+        <p class="note">Before it starts: {{ d.summary }}</p>
+        <input v-model="clarifyAnswer" aria-label="Your answer" placeholder="Your answer" />
+        <button class="btn" :disabled="!clarifyAnswer.trim()">Answer and run</button>
+        <button type="button" class="link" @click="answerPastClarify('')">Skip</button>
+      </form>
+    </div>
+  </div>
   <TaskChat
     v-else
     :task-key="d.id"

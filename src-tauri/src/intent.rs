@@ -95,17 +95,23 @@ pub struct Reading {
     pub clarify: Option<String>,
     /// Talk, already answered in the same call.
     pub reply: Option<String>,
+    /// The latest message asks for files to change. Read on its own because
+    /// the type alone mixes "try it, it crashes" with "fix it": both debug.
+    pub change: Option<bool>,
+    /// It asks why something happened or broke: a cause to trace, which the
+    /// cheapest tier answered "No" to three times out of three.
+    pub cause: Option<bool>,
 }
 
 /// Below this the type falls back to the broader one: a question, not talk.
 const SURE: f64 = 0.6;
 
 // One line: it travels as an argument, and a Windows shim mangles newlines.
-const INSTRUCTION: &str = "You classify one request made to a coding agent working in a git repository. You run in an empty scratch folder, not in that repository, so its files are not here; the agent will have them. The request may be in any language. Fill every field. type: chat is small talk or a personal message with nothing to look up; question wants an answer and no file changes; plan wants a plan to approve before any change; debug wants something broken found and fixed; code_change is any other change. A request that asks a question and also asks for a change is not a question. difficulty: easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. confidence: from 0 to 1, how sure you are of the type. clarify: null, unless the type is code_change, debug or plan and the request itself leaves out what to change, holds conflicting requirements, or gives no way to tell when it is done, so that even an agent that reads the whole repository could not tell what the user wants; then one short question in the request's language about that missing part. The agent finds any file, page, project or existing code on its own, so never ask about those. title: at most six words in the request's language. job: security only for a security boundary or vulnerability; authentication for login, session or credential behavior; authorization for access or permission behavior; schema for a database or schema migration; otherwise general. Display text, translations, documentation or styling that merely mention these are general, and so are input validation, pagination, rate limits and other resource bounds unless the request is about an authentication or permission boundary. run: build, test or lint only when the user explicitly asks to run it. reply: for chat only, your answer in the request's language in at most three short sentences; otherwise null. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. When a previous type is given, keep it unless the reply asks for something different.";
+const INSTRUCTION: &str = "You classify one request made to a coding agent working in a git repository. You run in an empty scratch folder, not in that repository, so its files are not here; the agent will have them. The request may be in any language. Fill every field. type: chat is small talk or a personal message with nothing to look up; question wants an answer and no file changes; plan wants a plan to approve before any change; debug wants something broken found and fixed; code_change is any other change. A request that asks a question and also asks for a change is not a question. difficulty: easy is narrow; medium is ordinary work across a few files; hard is cross-cutting or design-heavy. confidence: from 0 to 1, how sure you are of the type. clarify: null, unless the type is code_change, debug or plan and the request itself leaves out what to change, holds conflicting requirements, or gives no way to tell when it is done, so that even an agent that reads the whole repository could not tell what the user wants; then one short question in the request's language about that missing part. The agent finds any file, page, project or existing code on its own, so never ask about those. title: at most six words in the request's language. job: security only for a security boundary or vulnerability; authentication for login, session or credential behavior; authorization for access or permission behavior; schema for a database or schema migration; otherwise general. Display text, translations, documentation or styling that merely mention these are general, and so are input validation, pagination, rate limits and other resource bounds unless the request is about an authentication or permission boundary. run: build, test or lint only when the user explicitly asks to run it. reply: for chat only, your answer in the request's language in at most three short sentences; otherwise null. change: true only when the latest message asks for files to be changed or something to be fixed, or accepts a change an answer proposed; asking to check, try, reproduce, investigate or explain something is false. cause: true when the latest message asks why something happened or does not work, whether something caused a problem, or what is broken; false for how-to, where-is, what-does-this-do and every other question. When the request has `My reply:`, classify only that reply; the answer before it is context, so a reply like `do that` means the change that answer proposed. When a previous type is given, keep it unless the reply asks for something different.";
 
 /// The reading's shape, enforced by `claude --json-schema` and
 /// `codex --output-schema`. Every field required, as Codex's strict mode wants.
-const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["type","difficulty","confidence","clarify","title","job","run","reply"],"properties":{"type":{"type":"string","enum":["chat","question","code_change","debug","plan"]},"difficulty":{"type":"string","enum":["easy","medium","hard"]},"confidence":{"type":"number"},"clarify":{"type":["string","null"]},"title":{"type":"string"},"job":{"type":"array","items":{"type":"string","enum":["general","security","authentication","authorization","schema"]}},"run":{"type":"array","items":{"type":"string","enum":["build","test","lint"]}},"reply":{"type":["string","null"]}}}"#;
+const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["type","difficulty","confidence","clarify","title","job","run","reply","change","cause"],"properties":{"change":{"type":"boolean"},"cause":{"type":"boolean"},"type":{"type":"string","enum":["chat","question","code_change","debug","plan"]},"difficulty":{"type":"string","enum":["easy","medium","hard"]},"confidence":{"type":"number"},"clarify":{"type":["string","null"]},"title":{"type":"string"},"job":{"type":"array","items":{"type":"string","enum":["general","security","authentication","authorization","schema"]}},"run":{"type":"array","items":{"type":"string","enum":["build","test","lint"]}},"reply":{"type":["string","null"]}}}"#;
 
 /// A classifier slower than this costs more waiting than it can save. The
 /// wait is the model, not the shim: the CLI itself starts in ~0.3s, and an
@@ -257,6 +263,8 @@ pub fn parse_reading(reply: &str) -> Option<Reading> {
         confidence,
         clarify: text("clarify").filter(|_| task_type.may_clarify()),
         reply: text("reply").filter(|_| task_type == TaskType::Chat),
+        change: v["change"].as_bool(),
+        cause: v["cause"].as_bool(),
     })
 }
 
@@ -393,7 +401,28 @@ pub async fn read(
         .ok()
         .flatten()
         .unwrap_or_default();
-    (parse_reading(&reply).unwrap_or_default(), events)
+    (parse_reading(&reply).unwrap_or_default().after(previous), events)
+}
+
+impl Reading {
+    /// Asking why something broke, or following up a question, without asking
+    /// for a change is a question. "Can you try it yourself? It will crash"
+    /// read as debug on every try and ran a $2 change route on a user who had
+    /// said "just tell me"; Claude read "what's causing the worker to use more
+    /// memory?" as debug 3 times in 3, and a crash report as talk, which reads
+    /// no file.
+    pub fn after(mut self, previous: Option<TaskType>) -> Self {
+        let cause = self.cause == Some(true);
+        let no_change = self.change == Some(false)
+            && matches!(self.task_type, Some(TaskType::Debug | TaskType::CodeChange))
+            && (cause || previous == Some(TaskType::Question));
+        if no_change || (cause && self.task_type == Some(TaskType::Chat)) {
+            self.task_type = Some(TaskType::Question);
+            self.intent = TaskType::Question.intent(None);
+            (self.clarify, self.reply) = (None, None);
+        }
+        self
+    }
 }
 
 async fn ask_with(
@@ -506,6 +535,113 @@ not a rule"), ["Use tabs.", "Be brief"]);
             println!("{prompt:?} -> {:?} conf {:?} clarify {:?} reply {:?} title {:?} | {:?} in {:?}", reading.task_type, reading.confidence, reading.clarify, reading.reply, reading.title, usage.map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens, u.cost_usd)), started.elapsed());
             assert!(reading.task_type.is_some(), "no reading for {prompt:?}");
         }
+    }
+
+    /// Spends a little. First questions, each read `LIVE_RUNS` times (default
+    /// 3): a cause to trace or not. A miss either way costs: a cheap wrong "No",
+    /// or a dear answer to "where is the login route?".
+    /// `LIVE_PROVIDER=codex cargo test live_cause -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_cause_questions() {
+        let id: ProviderId = serde_json::from_value(serde_json::Value::String(
+            std::env::var("LIVE_PROVIDER").unwrap_or_else(|_| "claude".into()),
+        ))
+        .unwrap();
+        let program = crate::providers::which(id.program()).unwrap().to_string_lossy().into_owned();
+        let runs: usize = std::env::var("LIVE_RUNS").ok().and_then(|n| n.parse().ok()).unwrap_or(3);
+        use TaskType::*;
+        const ASK: &[TaskType] = &[Question];
+        const WORK: &[TaskType] = &[Debug, CodeChange];
+        // The type `read` ends on, and the tier signal where it matters.
+        let cases: &[(&str, &[TaskType], Option<bool>)] = &[
+            ("i wrote \"fix this and that\" in orteca but when it was about to answer it closed the task, i believe it has to be something to do with a follow-up question from the AI but it crashed, just tell me if that is the case.", ASK, Some(true)),
+            ("why does the login page redirect twice?", ASK, Some(true)),
+            ("why is the build failing on CI but not on my machine?", ASK, Some(true)),
+            ("is the csv export broken? the files look wrong", ASK, Some(true)),
+            ("what's causing the worker to use more memory every hour?", ASK, Some(true)),
+            ("my tests passed yesterday and now 3 fail, what changed?", ASK, Some(true)),
+            ("kāpēc iestatījumu lapa ielādējas divreiz?", ASK, Some(true)),
+            ("how do I run the tests?", ASK, Some(false)),
+            ("where is the login route defined?", ASK, Some(false)),
+            ("what does routing.rs do?", ASK, Some(false)),
+            ("explain the architecture simply", ASK, Some(false)),
+            ("is this the best app for a claude+codex coding harness right now?", &[Question, Chat], Some(false)),
+            ("which model does the review stage use?", ASK, Some(false)),
+            ("kā palaist šo projektu lokāli?", ASK, Some(false)),
+            // Work stays work: a cause asked with a fix, or a bug to fix.
+            ("why does the login page redirect twice? fix it", WORK, None),
+            ("the export button crashes the app when the table is empty", WORK, None),
+            ("fix the failing test in scripts/app.test.mjs", WORK, None),
+            ("the build is failing on CI, find out why and fix it", WORK, None),
+            ("salabo, lai iestatījumu lapa neielādējas divreiz", WORK, None),
+            ("add a dark mode toggle to the settings page", &[CodeChange], None),
+        ];
+        // Seven at a time: 42 at once all ran past the classifier's deadline.
+        let asks: Vec<_> = cases.iter().flat_map(|&c| std::iter::repeat_n(c, runs)).collect();
+        let mut readings = Vec::new();
+        for batch in asks.chunks(7) {
+            let calls: Vec<_> = batch
+                .iter()
+                .map(|&(prompt, ok, cause)| {
+                    let program = program.clone();
+                    tokio::spawn(async move { (prompt, ok, cause, read(id, &program, prompt, None).await.0) })
+                })
+                .collect();
+            for call in calls {
+                readings.push(call.await.unwrap());
+            }
+        }
+        let mut tally: Vec<(&str, usize, Vec<String>)> = Vec::new();
+        for (prompt, ok, cause, reading) in readings {
+            let right = reading.task_type.is_some_and(|t| ok.contains(&t))
+                && cause.is_none_or(|c| reading.cause == Some(c));
+            let got = format!("{:?}/{:?}", reading.task_type, reading.cause);
+            match tally.iter_mut().find(|(p, ..)| *p == prompt) {
+                Some(row) => {
+                    row.1 += usize::from(right);
+                    row.2.push(got);
+                }
+                None => tally.push((prompt, usize::from(right), vec![got])),
+            }
+        }
+        let mut failed = Vec::new();
+        for (prompt, right, got) in &tally {
+            println!("{id:?} | {right}/{} {:.60}: {got:?}", got.len(), prompt);
+            if right * 2 <= got.len() {
+                failed.push(*prompt);
+            }
+        }
+        assert!(failed.is_empty(), "wrong on most runs: {failed:?}");
+    }
+
+    /// After a question, only a reply that asks for a change leaves the question.
+    #[test]
+    fn a_follow_up_to_a_question_changes_nothing_unless_it_asks_to() {
+        let read_as = |t: &str, change: bool, cause: bool, previous: Option<TaskType>| {
+            parse_reading(&format!(
+                r#"{{"type":"{t}","difficulty":"medium","confidence":0.9,"clarify":"Which?","title":"t","job":["general"],"run":[],"reply":"hi","change":{change},"cause":{cause}}}"#
+            ))
+            .unwrap()
+            .after(previous)
+        };
+        let read = |t: &str, change: bool, previous: Option<TaskType>| read_as(t, change, false, previous);
+        // Why something broke, with no change asked for, is a question on a first ask too.
+        assert_eq!(read_as("debug", false, true, None).task_type, Some(TaskType::Question));
+        assert_eq!(read_as("debug", true, true, None).task_type, Some(TaskType::Debug));
+        // A bug report that asks nothing and names no cause keeps its type.
+        assert_eq!(read_as("debug", false, false, None).task_type, Some(TaskType::Debug));
+        // A cause is looked up in the files, which talk never opens.
+        let talk = read_as("chat", false, true, None);
+        assert_eq!((talk.task_type, talk.reply), (Some(TaskType::Question), None));
+        assert_eq!(read_as("chat", false, false, None).task_type, Some(TaskType::Chat));
+        let tried = read("debug", false, Some(TaskType::Question));
+        assert_eq!((tried.task_type, tried.intent, tried.clarify), (Some(TaskType::Question), Some(Intent::Question), None));
+        assert_eq!(read("debug", true, Some(TaskType::Question)).task_type, Some(TaskType::Debug));
+        assert_eq!(read("code_change", true, Some(TaskType::Question)).task_type, Some(TaskType::CodeChange));
+        // Anywhere else the type stands: a debug task stays debug while it is tried.
+        assert_eq!(read("debug", false, Some(TaskType::Debug)).task_type, Some(TaskType::Debug));
+        assert_eq!(read("debug", false, None).task_type, Some(TaskType::Debug));
     }
 
     #[test]

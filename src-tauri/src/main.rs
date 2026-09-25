@@ -615,13 +615,17 @@ async fn begin(
         (reading.clarify, reading.reply) = (None, None);
     }
     // One question before a run a wrong guess would waste, unless the user
-    // turned it off. Nothing is recorded yet: the task starts with the answer.
+    // turned it off. Keep the pending request in history until it is answered.
     let ask = clarified.is_none() && store.setting("clarify")?.as_deref() != Some("off");
     if let Some(question) = reading.clarify.clone().filter(|_| ask) {
+        let id = store.ask_clarification(
+            scanned.project.id, &scanned.prompt, &reading.title, mode.name(), &question,
+            continue_task.filter(|_| isolation == Isolation::CurrentTree),
+        )?;
         if let (Some(text), Ok(mut slot)) = (words, ASKED.lock()) {
             *slot = Some((text, provider, reading, classified));
         }
-        return Err(AppError::new(ErrorKind::Clarify, question));
+        return Err(AppError::new(ErrorKind::Clarify, question).with_task_id(id));
     }
     if let Some(c) = clarified {
         let answer = c.answer.trim();
@@ -631,6 +635,7 @@ async fn begin(
             format!("\n\nOrteca asked: {}\nThe user answered: {answer}", c.question.trim())
         });
     }
+    scanned.signals.digs = previous == Some(intent::TaskType::Question) || reading.cause == Some(true);
     let planned = scanned.route(reading.intent, reading.job, reading.task_type);
     let routed = std::time::Instant::now();
     let mut request = tokio::task::block_in_place(|| {
@@ -764,7 +769,10 @@ fn prepare_run(
 
     // A reply goes on in its own task, unless it runs in a copy: that folder
     // is not where the task's work is.
-    let continued = continue_task.filter(|_| isolation == Isolation::CurrentTree);
+    let continued = match continue_task {
+        Some(id) if isolation == Isolation::CurrentTree || store.is_clarifying(id)? => Some(id),
+        _ => None,
+    };
     let task_id = match continued {
         Some(task_id) => {
             store.reopen_task(record.id, task_id, route_json.as_deref())?;
@@ -1767,6 +1775,78 @@ ELI5";
         assert_eq!(routing_words("  ", Some("")), None);
     }
 
+    /// Spends a little. Ten follow-ups, each classified `LIVE_RUNS` times
+    /// (default 3) the way `begin` reads one.
+    /// `LIVE_PROVIDER=codex cargo test live_follow_ups -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_follow_ups() {
+        use intent::TaskType::*;
+        let id: ProviderId = serde_json::from_value(serde_json::Value::String(
+            std::env::var("LIVE_PROVIDER").unwrap_or_else(|_| "claude".into()),
+        ))
+        .unwrap();
+        let program = providers::which(id.program()).unwrap().to_string_lossy().into_owned();
+        let runs: usize = std::env::var("LIVE_RUNS").ok().and_then(|n| n.parse().ok()).unwrap_or(3);
+        #[rustfmt::skip]
+        let cases: &[(&str, &str, &str, &str, intent::TaskType, &[intent::TaskType])] = &[
+            ("try after just-tell-me",
+             "i wrote \"fix this and that\" in orteca but when it was about to answer it closed the task, i believe it has to be something to do with a follow-up question from the AI but it crashed, just tell me if that is the case.",
+             "A follow-up question can end its first attempt, but the code treats that as a pause, not a crash. I can't tell from the code alone whether that's what happened.",
+             "can you try it yourself? run orteca and write \"fix this and that\" and it will crash the task and not even show up in history",
+             Question, &[Question]),
+            ("ELI5 after a change", "add a projects list to the sidebar", "Done, 85 tests pass.", "ELI5", CodeChange, &[Chat, Question]),
+            ("do that after a question", "why does the login page redirect twice?",
+             "The auth middleware is registered twice, in Kernel.php and in routes/web.php. Removing the route-level one would stop the second redirect.",
+             "okay do that", Question, &[CodeChange, Debug]),
+            ("fix it after just-tell-me", "is the csv export broken? just tell me, don't change anything",
+             "Yes. ExportController writes the header row twice, so every file starts with a duplicate header.",
+             "ok fix it", Question, &[CodeChange, Debug]),
+            ("simpler after a question", "why is the build so slow?", "vue-tsc type-checks every file before Vite builds.",
+             "explain it simpler", Question, &[Question, Chat]),
+            ("more change after a change", "add a logout button to the header",
+             "Added a Logout button to Header.vue; it calls auth.logout().", "also make it red", CodeChange, &[CodeChange]),
+            ("why after a change", "add pagination to the users list", "Done: 20 users per page, with next and previous links.",
+             "why did you pick 20 per page?", CodeChange, &[Question]),
+            ("Latvian explain after a change", "Pievieno tumšo režīmu iestatījumu lapai",
+             "Pievienoju tumšā režīma slēdzi iestatījumu lapā.", "paskaidro vienkāršāk, ko tu izdarīji", CodeChange, &[Question, Chat]),
+            ("reproduce inside a debug task", "the export button crashes the app, fix it",
+             "I couldn't reproduce it: the export ran fine with the sample data.", "try it with an empty table, it crashes then",
+             Debug, &[Debug]),
+            ("check after a plain question", "does the signup form validate emails?", "It checks only that the field is not empty.",
+             "can you double-check the server side too?", Question, &[Question]),
+        ];
+        let calls = cases.iter().flat_map(|&(name, asked, answer, reply, previous, ok)| {
+            let prompt = format!("{asked}\n\nYour answer:\n{answer}\n\nMy reply:\n{reply}");
+            let (words, program) = (routing_words(&prompt, Some(reply)).unwrap(), program.clone());
+            (0..runs).map(move |_| {
+                let (words, program) = (words.clone(), program.clone());
+                tokio::spawn(async move {
+                    let got = intent::read(id, &program, &words, Some(previous)).await.0.task_type;
+                    (name, ok, got)
+                })
+            })
+        });
+        let mut tally: Vec<(&str, usize, Vec<Option<intent::TaskType>>)> = Vec::new();
+        for call in calls.collect::<Vec<_>>() {
+            let (name, ok, got) = call.await.unwrap();
+            match tally.iter_mut().find(|(n, ..)| *n == name) {
+                Some(row) => row.2.push(got),
+                None => tally.push((name, 0, vec![got])),
+            }
+            let row = tally.iter_mut().find(|(n, ..)| *n == name).unwrap();
+            row.1 += usize::from(got.is_some_and(|t| ok.contains(&t)));
+        }
+        let mut failed = Vec::new();
+        for (name, right, got) in &tally {
+            println!("{id:?} | {right}/{} {name}: {got:?}", got.len());
+            if right * 2 <= got.len() {
+                failed.push(*name);
+            }
+        }
+        assert!(failed.is_empty(), "wrong on most runs: {failed:?}");
+    }
+
     #[test]
     fn trust_is_bound_to_the_canonical_directory() {
         let root = std::env::temp_dir().join(format!("orteca-run-trust-{}", std::process::id()));
@@ -1868,7 +1948,7 @@ ELI5";
         let mut request = begin(
             &store,
             None,
-            key,
+            key.clone(),
             var("BENCH_PROMPT"),
             None,
             json(var("BENCH_PROVIDER")),
@@ -1886,10 +1966,27 @@ ELI5";
         // command would wait forever.
         request.auto_wait = true;
         let begun = t0.elapsed().as_millis() as u64;
-        let result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
+        let mut result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
+        // BENCH_FOLLOWUP: the user's reply, sent the way the app sends one.
+        let mut turns = vec![serde_json::to_value(&result).unwrap()];
+        if let Ok(reply) = std::env::var("BENCH_FOLLOWUP") {
+            let prompt = format!("{}\n\nYour answer:\n{}\n\nMy reply:\n{reply}", var("BENCH_PROMPT"), result.summary);
+            let mut request = begin(
+                &store, None, key.clone(), prompt, Some(reply.clone()),
+                json(var("BENCH_PROVIDER")), json(var("BENCH_MODE")),
+                None, Isolation::CurrentTree, None, Some(result.task_id), None, None,
+            )
+            .await
+            .unwrap();
+            request.auto_wait = true;
+            request.resume = result.resume.clone().map(|r| run::Resume { reply, ..r });
+            result = run::stream(&store, &run::Live::default(), request, |_| Ok(())).await;
+            turns.push(serde_json::to_value(&result).unwrap());
+        }
         // Wall time from the prompt, classify and scan included, which is what
         // a plain CLI's time is compared with.
         let mut out = serde_json::to_value(&result).unwrap();
+        out["turns"] = turns.into();
         out["benchBeginMs"] = begun.into();
         out["benchWallMs"] = (t0.elapsed().as_millis() as u64).into();
         std::fs::write(var("BENCH_OUT"), serde_json::to_string_pretty(&out).unwrap()).unwrap();

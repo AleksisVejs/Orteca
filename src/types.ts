@@ -6,7 +6,7 @@ export interface TaskSummary {
   /** Named by the classifier call, or by the user. Empty means none yet. */
   title: string;
   prompt: string;
-  status: TaskResult["status"] | "running";
+  status: TaskResult["status"] | "running" | "clarifying";
   /** UTC, to the second. */
   startedAt: string;
   summary: string | null;
@@ -44,6 +44,7 @@ export type ErrorKind =
 export interface AppError {
   kind: ErrorKind;
   message: string;
+  taskId?: number;
 }
 
 export interface Project {

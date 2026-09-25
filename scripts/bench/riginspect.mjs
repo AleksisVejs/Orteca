@@ -7,6 +7,8 @@
 //   ARMS=orteca-claude,orteca-codex   which arms (default: all four)
 //   RESULTS=results.json              file under riginspect-bench/; finished rows are skipped
 //   NOEDITLOCK=1                      Claude may still edit through a shell, for the before arm
+//   ARMS=orteca-claude+cli            an arm on the CLI's own system prompt, beside the replaced one
+//   BENCH_READING='{"type":...}'      a classifier reply every Orteca arm takes as read: one route for all
 //   PARALLEL=1                        arms side by side, one child each (log: <results>-<arm>.log)
 // Reviews: node scripts/bench/reviews.mjs tallies what every saved run's Review found.
 // Free modes: SUITE=1 (composer test on HEAD), SUITE=shards (sharded vs serial), DRY=1|<task>, REGRADE, DIAG.
@@ -59,7 +61,9 @@ const TASKS = LIFTME ? (await import("./liftme.tasks.mjs")).TASKS : {
   },
 };
 const ARMS = (process.env.ARMS ?? "orteca-claude,claude,orteca-codex,codex").split(",");
-const usedProviders = () => new Set(ARMS.map((arm) => arm.replace("orteca-", "")));
+// `orteca-claude+cli` is the same arm on the CLI's own system prompt (NAV_CLIPROMPT).
+const provider = (arm) => arm.replace("orteca-", "").split("+")[0];
+const usedProviders = () => new Set(ARMS.map(provider));
 const limitStop = (now) => {
   const used = usedProviders();
   const over = Object.entries(now).find(([key, value]) => used.has(key.split(" ")[0]) && value >= (CAPS[key] ?? CAP_DEFAULT));
@@ -165,8 +169,8 @@ function runArm(arm, dir, prompt, extraEnv = {}) {
   if (arm.startsWith("orteca-")) {
     const out = join(ROOT, "out", `${arm}-${Date.now()}.json`);
     mkdirSync(dirname(out), { recursive: true });
-    const env = { ...ENV, ...extraEnv, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: arm.slice(7), BENCH_MODE: "efficient", BENCH_OUT: out,
-      ...(process.env.NOEDITLOCK ? { NAV_NOEDITLOCK: "1" } : {}) };
+    const env = { ...ENV, ...extraEnv, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: provider(arm), BENCH_MODE: "efficient", BENCH_OUT: out,
+      ...(process.env.NOEDITLOCK ? { NAV_NOEDITLOCK: "1" } : {}), ...(arm.endsWith("+cli") ? { NAV_CLIPROMPT: "1" } : {}) };
     const r = spawnSync("cargo", ["test", "bench_run", "--", "--ignored"], { cwd: TAURI, env, encoding: "utf8", shell: true, timeout: ARM_TIMEOUT });
     if (!existsSync(out)) return { status: "noResult", error: (r.stdout + r.stderr).slice(-400), ms: Date.now() - t0 };
     return ortecaRow(JSON.parse(readFileSync(out, "utf8")));
@@ -410,7 +414,7 @@ if (initialStop) { console.log(initialStop); process.exit(2); }
 // at the end. A child can only stop itself between its own arms, so the start
 // reserves an arm's share for every arm on the same provider.
 if (process.env.PARALLEL && ARMS.length > 1) {
-  const most = Math.max(...[...usedProviders()].map((p) => ARMS.filter((a) => a.replace("orteca-", "") === p).length));
+  const most = Math.max(...[...usedProviders()].map((p) => ARMS.filter((a) => provider(a) === p).length));
   const stop = weeklyHeadroomStop(start, usedProviders(), WEEKLY_FLOOR, WEEKLY_ARM_RESERVE * most);
   if (stop) { console.log(stop); process.exit(2); }
   const part = (arm) => RESULTS.replace(/\.json$/, `-${arm}`);

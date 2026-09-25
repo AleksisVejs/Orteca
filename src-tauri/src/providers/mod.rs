@@ -231,6 +231,9 @@ pub enum ProviderEvent {
         command: String,
         asking: bool,
     },
+    /// Runner-owned: the last lines a waited command printed, sent to the
+    /// screen as it runs and never saved; its log keeps every line.
+    WaitOutput(Vec<String>),
 }
 
 /// A provider-recorded edit. Missing patch means the CLI only named the file.
@@ -277,6 +280,7 @@ impl ProviderEvent {
             Self::Done { .. } => "done",
             Self::Failed { .. } => "failed",
             Self::Wait { .. } => "wait",
+            Self::WaitOutput(_) => "waitOutput",
         }
     }
 }
@@ -536,6 +540,17 @@ pub fn which(program: &str) -> Option<PathBuf> {
     which_in(program, &path, &pathext, &env::current_dir().ok()?)
 }
 
+/// `program` found the way a shell would find it: one with a folder in it,
+/// such as `vendor\bin\phpunit`, from `cwd`; a bare name on PATH.
+pub fn which_from(program: &str, cwd: &Path) -> Option<PathBuf> {
+    let path = Path::new(program);
+    let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return which(program);
+    };
+    let name = path.file_name()?.to_str()?;
+    which_in(name, dir.as_os_str(), &env::var("PATHEXT").unwrap_or_default(), cwd)
+}
+
 fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<PathBuf> {
     let pathext = if pathext.split(';').any(|ext| !ext.trim().is_empty()) {
         pathext
@@ -554,6 +569,14 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
             }
         })
         .collect();
+    // `node.exe` spelled out is looked for as itself before `node.exe.exe`.
+    let lower = program.to_ascii_lowercase();
+    let spelled = extensions.iter().any(|ext| lower.ends_with(&ext.to_ascii_lowercase()));
+    let suffixes: Vec<&str> = spelled
+        .then_some("")
+        .into_iter()
+        .chain(extensions.iter().map(String::as_str))
+        .collect();
 
     env::split_paths(path)
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -563,7 +586,7 @@ fn which_in(program: &str, path: &OsStr, pathext: &str, cwd: &Path) -> Option<Pa
             } else {
                 cwd.join(dir)
             };
-            extensions
+            suffixes
                 .iter()
                 .map(|ext| dir.join(format!("{program}{ext}")))
                 .find(|candidate| candidate.is_file())
@@ -935,6 +958,21 @@ echo agent 9.9.9
             found.extension().map(|e| e.to_ascii_lowercase()),
             Some("exe".into())
         );
+    }
+
+    #[test]
+    fn which_from_finds_a_spelled_extension_and_a_repo_path() {
+        assert!(which("cmd.exe").is_some_and(|found| found.is_file()));
+        let repo = std::env::temp_dir().join(format!("orteca-which-from-{}", std::process::id()));
+        let bin = repo.join("vendor").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("phpunit.bat"), "").unwrap();
+        // PATHEXT's case, not the file's: either names the same file.
+        let found = |program| which_from(program, &repo).is_some_and(|p| p.is_file());
+        assert!(found(r"vendor\bin\phpunit"));
+        assert!(found("vendor/bin/phpunit.bat"));
+        assert_eq!(which_from(r"vendor\bin\missing", &repo), None);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

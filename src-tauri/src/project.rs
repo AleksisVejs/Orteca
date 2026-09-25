@@ -380,7 +380,7 @@ pub enum Origin {
 
 /// Every file that was already changed when a run started, with a fingerprint
 /// of its contents. Taken before the first provider starts.
-#[derive(Debug, Clone, Default, Hash)]
+#[derive(Debug, Clone, Default, Hash, PartialEq)]
 pub struct Snapshot(Vec<(String, Option<u64>)>);
 
 /// Record what is already dirty, so the diff afterwards can tell the user's
@@ -2077,6 +2077,30 @@ mod tests {
         assert!(rewind_files(&dir, &saved, &["../x".to_string()]).is_err());
         assert!(rewind_files(&dir, "HEAD", &files).is_err());
         drop_saved(&dir, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Fix is judged by the snapshot, which has no size cap: behind 600 KB
+    /// of rebuilt assets the patch text stops before the file the Fix edited.
+    #[test]
+    fn a_snapshot_sees_an_edit_the_capped_patch_hides() {
+        let dir = temp_dir("snapshot-cap");
+        let git = |args: &[&str]| assert!(Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("public/app.js"), "old\n").unwrap();
+        std::fs::write(dir.join("src.txt"), "old\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        let base = git_state(&dir).head.unwrap();
+        std::fs::write(dir.join("public/app.js"), "x\n".repeat(300_000)).unwrap();
+        std::fs::write(dir.join("src.txt"), "first fix\n").unwrap();
+        let (patch, before) = (patch_since(&dir, Some(&base)).unwrap(), snapshot(&dir, Some(&base)));
+        std::fs::write(dir.join("src.txt"), "second fix\n").unwrap();
+        assert_eq!(patch_since(&dir, Some(&base)).unwrap(), patch, "the capped patch hides the edit");
+        assert_ne!(snapshot(&dir, Some(&base)), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

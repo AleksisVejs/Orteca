@@ -9,7 +9,7 @@ import { PROJECT } from "./state";
 const {
   activeRun, currentActivity, fileError, taskId, stopping, stopRun,
   instruction, sending, instructionError, steering, instruct, ranOn, stageLabel,
-  waitAsk, answerWaitFor, attachments, attachError, addAttachments, pasteImages, fileName,
+  waitAsk, waitTail, answerWaitFor, attachments, attachError, addAttachments, pasteImages, fileName,
 } = inject(PROJECT)!;
 // Orteca runs a command the agent handed over; a message now is a question the
 // paused session answers at once, whichever provider it is.
@@ -96,8 +96,10 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
     <div v-if="waitAsk" class="composer-row steer-row" role="group" aria-label="Command the agent asks Orteca to run">
       <span class="grow">Run this for the agent? <span class="mono">{{ waitAsk }}</span> <span class="note">It runs as you, outside the agent's sandbox.</span></span>
       <button class="btn" @click="answerWaitFor(false)">Don’t run</button>
+      <button class="btn" @click="answerWaitFor(true, true)">Always run this</button>
       <button class="btn" @click="answerWaitFor(true)">Run it</button>
     </div>
+    <pre v-if="waiting && waitTail?.length" class="wait-tail mono" aria-live="off" aria-label="Latest output of the command">{{ waitTail.join("\n") }}</pre>
     <textarea
       v-model="instruction"
       rows="1"
@@ -192,6 +194,19 @@ defineExpose({ orbRect: () => orb.value?.canvas?.getBoundingClientRect() ?? null
 .err-line {
   margin: 0;
   padding: 0 18px 12px;
+}
+
+/* A handed-over command's latest lines: a glance, not a terminal. */
+.wait-tail {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: calc(6 * 1.5em + 16px);
+  overflow: hidden;
 }
 
 @media (max-width: 600px) {

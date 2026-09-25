@@ -97,7 +97,7 @@ pub struct ModelChoice {
 }
 
 impl Tier {
-    fn up(self) -> Option<Tier> {
+    pub fn up(self) -> Option<Tier> {
         match self {
             Self::Cheapest => Some(Self::Standard),
             Self::Standard => Some(Self::Deep),
@@ -125,9 +125,10 @@ impl Tier {
             // Opus (5.5 since 2026-09-22), not Fable 5.1: 2.5x the price for a
             // lead that only shows on the hardest benchmarks.
             (ProviderId::Claude, Self::Deep) => ("opus", "high"),
-            // Luna low planned the validation refactor and fixed the duration
-            // regression with full hidden-check quality (§4.3.6, on 5.6 Luna).
-            (ProviderId::Codex, Self::Cheapest) => ("gpt-6-luna", "low"),
+            // Luna medium, not low: on the easy bench task GPT-6 Luna low passed
+            // 4 of 9 (it looped, or edited its own correct test instead of the
+            // code); medium passed 3 of 3 on fewer tokens, at under a cent.
+            (ProviderId::Codex, Self::Cheapest) => ("gpt-6-luna", "medium"),
             // GPT-6 Sol at medium, not a GPT-6 Terra (there is none): it costs
             // what 5.6 Terra did per input token and less per output token.
             (ProviderId::Codex, Self::Standard) => ("gpt-6-sol", "medium"),
@@ -373,9 +374,8 @@ pub struct Route {
     pub reason: &'static str,
     /// Why `budget.preferred_tier`, in the same way.
     pub tier_reason: &'static str,
-    /// Tracked paths the prompt appears to be about. Names only: the runner
-    /// pastes the few small ones into a Codex brief, and never into Claude's,
-    /// whose Edit tool makes it Read a file first anyway.
+    /// Tracked paths the prompt appears to be about. Names only: each CLI
+    /// opens the lines it needs itself.
     pub candidate_paths: Vec<String>,
     /// What the first few candidate paths define and use, from the code map,
     /// in the same order; empty where the map has nothing.
@@ -431,7 +431,7 @@ impl Route {
             model: "gpt-6-sol",
             effort: "medium",
         });
-        // NAV_EFFORT runs Implement and Fix at another effort, for the
+        // NAV_EFFORT runs Implement (and a Fix already on the top tier) at another effort, for the
         // benchmark's arms. It moves the effort and never the model, and the
         // Review keeps its own tier either way, so what it measures is the
         // writing effort alone.
@@ -711,6 +711,9 @@ pub struct RepoSignals {
     /// A question that needs a cause traced, or a follow-up in a task that
     /// was already a question (the first answer did not settle it).
     pub digs: bool,
+    /// The classifier was asked and gave no reading (it timed out or failed),
+    /// so keywords route a task whose difficulty nobody read.
+    pub unread: bool,
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1419,6 +1422,16 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
             tier_reason = "this prompt did not finish before, so it runs one tier up";
         }
     }
+    // Unknown difficulty is not easy: keywords read any change as ordinary,
+    // and a timed-out read sent the hardest bench task to Luna low (3/4,
+    // 20 minutes) where a read one gets a plan and Sol.
+    if repo.unread && kind != RouteKind::Answer && !raised {
+        if let Some(up) = budget.preferred_tier.up() {
+            budget.preferred_tier = up;
+            raised = true;
+            tier_reason = "the classifier gave no reading, so it runs one tier up";
+        }
+    }
     // Why something broke, or asked again: the cheapest tier answered "No" to
     // a traceable cause 3 times in 3, and a second cheap answer repeats "I
     // can't tell" and pushes the user towards a change route.
@@ -1827,7 +1840,8 @@ pub fn brief(
             "If a command will take more than about two minutes, such as a benchmark or a full \
              build, do not run it yourself: end your reply with the line \
              `ORTECA-WAIT: <command>` and stop. Orteca runs it, one program with its arguments \
-             and no shell, and sends you its output when it ends. Leading `NAME=value` words \
+             and no shell, and sends you its output when it ends. The program is a name on PATH \
+             or a path in the repository, such as `vendor\\bin\\phpunit`. Leading `NAME=value` words \
              set its environment variables. Keep every option the task names, such as which \
              variant to run, in that command.\n\n",
         ),
@@ -2540,6 +2554,18 @@ mod tests {
             None,
             "Balanced keeps the tier default"
         );
+    }
+
+    #[test]
+    fn a_change_the_classifier_could_not_read_runs_one_tier_up() {
+        let prompt = "make the equipment list always paginate";
+        let read = route(prompt, Mode::Efficient, &repo(REPO));
+        let unread = route(prompt, Mode::Efficient, &RepoSignals { unread: true, ..repo(REPO) });
+        assert_eq!(unread.kind, read.kind);
+        assert_eq!(Some(unread.budget.preferred_tier), read.budget.preferred_tier.up());
+        let question = "what does the equipment list return?";
+        let answer = route(question, Mode::Efficient, &RepoSignals { unread: true, ..repo(REPO) });
+        assert_eq!(answer.budget.preferred_tier, route(question, Mode::Efficient, &repo(REPO)).budget.preferred_tier);
     }
 
     #[test]

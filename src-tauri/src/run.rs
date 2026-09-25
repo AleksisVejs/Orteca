@@ -180,8 +180,9 @@ pub enum Control {
         attachments: Vec<PathBuf>,
         reply: oneshot::Sender<InstructionReceipt>,
     },
-    /// The user's answer to a command the agent asked Orteca to run.
-    Wait { run: bool },
+    /// The user's answer to a command the agent asked Orteca to run. `always`
+    /// runs that same command without asking for the rest of the run.
+    Wait { run: bool, always: bool },
 }
 
 /// What actually happened to an instruction, returned only after the run loop
@@ -493,7 +494,7 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
             plan.schema.as_deref().map_or_else(Vec::new, |path| {
                 vec![arg("--output-schema"), path.display().to_string()]
             }),
-            // Added to Codex's own prompt, never replacing it.
+            // In place of Codex's own prompt (`Ruleset::replaces`).
             plan.ruleset.as_ref().map_or_else(Vec::new, |rules| vec![arg("-c"), rules.codex_arg()]),
         ]
         .concat(),
@@ -557,7 +558,10 @@ pub fn args(id: ProviderId, plan: &StagePlan) -> Vec<String> {
                 args.extend([arg("--settings"), settings]);
             }
             if let Some(file) = plan.ruleset.as_ref().and_then(rules::Ruleset::file) {
-                let flag = if chat { "--system-prompt-file" } else { "--append-system-prompt-file" };
+                // Tool schemas and the environment block still load; only the
+                // CLI's own guidance goes. A resume keeps the prompt it began with.
+                let replaces = chat || plan.ruleset.as_ref().is_some_and(|r| r.replaces);
+                let flag = if replaces { "--system-prompt-file" } else { "--append-system-prompt-file" };
                 args.extend([arg(flag), file.display().to_string()]);
             }
             args
@@ -629,6 +633,11 @@ struct Outcome {
     banked_cost: Option<f64>,
     /// A Codex turn ran on a model with no known price. See `price_codex`.
     unpriced: bool,
+    /// A provider process started and has not reported usage yet.
+    awaiting: bool,
+    /// A process ended, stopped or crashed, before it reported what it spent,
+    /// so the task's totals are short by an unknown amount. See `settle_cost`.
+    unreported: bool,
     failure: Option<String>,
     /// The kind a provider reported with its failure. A specific kind outlives
     /// a later generic one: Claude's spent plan arrives as a rate-limit event,
@@ -691,14 +700,27 @@ impl Outcome {
         if let Some(cost) = self.usage.as_mut().and_then(|u| u.cost_usd.take()) {
             *self.banked_cost.get_or_insert(0.0) += cost;
         }
+        self.unreported |= std::mem::take(&mut self.awaiting);
     }
 
-    /// Put every process's cost, added up, on the task's usage.
+    /// A provider process is about to run. Until its usage arrives the task's
+    /// totals do not include it.
+    // ponytail: one flag per process, so a steered Codex process cut off in
+    // its second turn still counts as reported; per-turn if that shows up.
+    fn start_process(&mut self) {
+        self.begin_process();
+        self.awaiting = true;
+    }
+
+    /// Put every process's cost, added up, on the task's usage. A process
+    /// that never reported makes the total a guess on the low side: the
+    /// loop guard once stopped a 9-minute Codex stage that then showed as
+    /// 6k tokens and $0.001, labelled estimated.
     fn settle_cost(&mut self) {
         self.begin_process();
         if let Some(usage) = self.usage.as_mut() {
             usage.cost_usd = self.banked_cost;
-            if self.unpriced {
+            if self.unpriced || self.unreported {
                 usage.cost_usd = None;
                 usage.cost_quality = CostQuality::Unavailable;
             }
@@ -719,10 +741,13 @@ impl Outcome {
     fn absorb(&mut self, event: &ProviderEvent) {
         match event {
             ProviderEvent::Text(text) => self.last_text = text.clone(),
-            ProviderEvent::Usage(usage) => match &mut self.usage {
-                Some(total) => total.absorb(usage),
-                None => self.usage = Some(usage.clone()),
-            },
+            ProviderEvent::Usage(usage) => {
+                self.awaiting = false;
+                match &mut self.usage {
+                    Some(total) => total.absorb(usage),
+                    None => self.usage = Some(usage.clone()),
+                }
+            }
             ProviderEvent::Done { result, .. } => {
                 // A live provider's second result answers a message sent mid-run.
                 if self.done {
@@ -824,6 +849,8 @@ pub struct Request {
     /// Run a command the agent hands over (`ORTECA-WAIT:`) without asking the
     /// user first. The blocked-command list applies either way.
     pub auto_wait: bool,
+    /// Handed-over commands the user said to always run in this project.
+    pub wait_allowed: Vec<String>,
     /// The task's rules and repository profile, sent with every stage.
     pub ruleset: rules::Ruleset,
     /// Talk the classify call already answered: the run records it and
@@ -926,9 +953,13 @@ impl Launch {
     /// The session already holds the history, so only the new words are sent.
     fn resume(id: ProviderId, session: &str, held: &[String], plan: &StagePlan) -> Self {
         let mut argv = id.resume_args(session, plan.schema.as_deref(), plan.stage.writes());
-        // Without it a resumed session runs on the account's default model.
+        // Without it a resumed session runs on the account's default model,
+        // and with its default base instructions.
         if id == ProviderId::Codex {
             argv.extend(model_args(id, plan));
+            if let Some(rules) = plan.ruleset.as_ref().filter(|r| r.replaces) {
+                argv.extend(["-c".into(), rules.codex_arg()]);
+            }
         }
         Launch {
             argv,
@@ -1041,6 +1072,10 @@ struct State {
     read: Vec<String>,
     /// Watches the current stage for an agent going round in circles.
     loops: Loops,
+    /// Handed-over commands that run without asking, and how many have in a
+    /// row since the user last answered.
+    wait_allowed: Vec<String>,
+    unasked_waits: u32,
 }
 
 /// The same failing command three times with no edit between, or the same
@@ -1154,6 +1189,8 @@ impl State {
             first_edit: None,
             read: Vec::new(),
             loops: Loops::default(),
+            wait_allowed: Vec::new(),
+            unasked_waits: 0,
         }
     }
 
@@ -1228,6 +1265,7 @@ pub async fn stream(
         timings,
         checking,
         auto_wait,
+        wait_allowed,
         ruleset,
         reply,
     } = request;
@@ -1262,6 +1300,7 @@ pub async fn stream(
         .filter(|_| worktree.is_none())
         .and_then(|_| project::save_state(&ctx.dir, base_commit.as_deref(), task_id).or_else(|| base_commit.clone()));
     let mut state = State::new(Recording::new(None, task_id, Stage::Implement, id), timings);
+    state.wait_allowed = wait_allowed;
     // Memory is standing instructions that outlive the run: global, then project.
     state.constraints = store.memory_for_task(task_id).unwrap_or_default();
 
@@ -1396,9 +1435,12 @@ pub async fn stream(
         state.session = None;
         state.recording = Recording::new(recordings.as_deref(), task_id, stage, id);
         // What a Fix is measured against: one that leaves this unchanged made
-        // no progress, and another round would only repeat it.
+        // no progress, and another round would only repeat it. A hash per
+        // changed file, not the patch text: that stops at 512 KiB, and rebuilt
+        // assets sorting first once hid a real Fix, so the run said it changed
+        // nothing.
         let before_fix = (stage == Stage::Fix)
-            .then(|| project::patch_since(&ctx.dir, base_commit.as_deref()).ok())
+            .then(|| project::snapshot(&ctx.dir, base_commit.as_deref()))
             .flatten();
 
         // The tests and a Review both only read, so on a guarded route the
@@ -1533,9 +1575,6 @@ pub async fn stream(
             if resuming.is_some() && stage.writes() {
                 brief.insert_str(0, "This is new work, not the earlier question: you may change files now.\n\n");
             }
-            if id == ProviderId::Codex && stage == Stage::Implement && resuming.is_none() {
-                brief.push_str(&pasted_files(&ctx.dir, &route.candidate_paths));
-            }
             brief.push_str(&attached_note(&ctx.attachments));
             if stage == Stage::Review || (stage == Stage::Fix && resuming.is_none()) {
                 // A Fix edits, so Claude's Edit wants its own Read: no pasted files.
@@ -1605,7 +1644,7 @@ pub async fn stream(
         // that lost it: the constraint list carries it into the next brief.
         state.held.clear();
         if stage == Stage::Fix {
-            let after = project::patch_since(&ctx.dir, base_commit.as_deref()).ok();
+            let after = project::snapshot(&ctx.dir, base_commit.as_deref());
             state.fix_changed =
                 Some(before_fix.is_none() || after.is_none() || before_fix != after);
         }
@@ -2037,14 +2076,24 @@ fn stage_plan(
     ruleset: Option<&rules::Ruleset>,
 ) -> StagePlan {
     let stage = stages[index];
-    // A Fix stays on the tier that wrote the change.
+    // A Fix runs a tier above the one that wrote the change: the failed check
+    // says that tier was not enough. On the bench a Luna low Implement edited
+    // its own correct test five times instead of the code, and a Luna low Fix
+    // then edited nothing. A Fix starts a fresh session, so no cache is lost.
     let tier = match (stage, route.budget.review_tier) {
         (Stage::Review, Some(review)) => review,
+        (Stage::Fix, _) => match route.budget.preferred_tier.up() {
+            // Sonnet high, not Opus: a Claude Fix stops at Standard.
+            Some(routing::Tier::Deep) if id == ProviderId::Claude => routing::Tier::Standard,
+            up => up.unwrap_or(route.budget.preferred_tier),
+        },
         _ => route.budget.preferred_tier,
     };
     let choice = match stage {
         Stage::Plan => route.plan_model(id),
         Stage::Review => route.review_model(id),
+        // The raised tier's own model, over any Implement override.
+        Stage::Fix if tier != route.budget.preferred_tier => None,
         Stage::Implement | Stage::Fix => route.work_model(id),
         _ => None,
     };
@@ -2132,14 +2181,14 @@ fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snaps
     format!("{patch}{}", pasted_files(dir, &changed))
 }
 
-/// The candidate files, pasted whole so a stage does not spend a turn each
-/// opening them. Symlinks are skipped, because a tracked link can point outside
-/// the repository.
+/// The files a Review's patch touches, pasted whole so it does not spend a
+/// turn each opening them. Symlinks are skipped, because a tracked link can
+/// point outside the repository.
 ///
-/// Codex Implement gets these so it spends no shell call opening them; a Claude
-/// writing stage gets none, because its Edit tool refuses a file it has not Read
-/// in the same session and pasting would pay for the bytes twice. A Review edits
-/// nothing, so it gets them on either provider.
+/// No writing stage gets these: Claude's Edit refuses a file it has not Read,
+/// and a Codex Implement handed the ranked candidates got the wrong file on
+/// two of three bench tasks (the right one was over the cap), then re-sent
+/// ~13k unused tokens on every request.
 ///
 /// The caps are the size of a file worth pasting, not of one that is cheap to
 /// paste: at the old 8 KB the 42 KB Vue component three stages in a row re-read
@@ -3798,6 +3847,9 @@ async fn call(
 /// The last line of a turn that hands Orteca a slow command to run.
 const WAIT_MARK: &str = "ORTECA-WAIT:";
 
+/// How many of a waited command's last lines the screen shows as it runs.
+const WAIT_SHOWN: usize = 6;
+
 // ponytail: one hour for every waited command; make it per project when a benchmark needs longer.
 const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -3858,7 +3910,13 @@ fn refusal(command: &str, words: &[String]) -> Option<&'static str> {
     let Some(first) = words.first() else {
         return Some("there is no command in it.");
     };
-    if command.contains(['&', '|', ';', '<', '>']) {
+    // Inside double quotes they are only text in an argument, as `words` reads it.
+    let mut quoted = false;
+    let shell_syntax = command.chars().any(|c| {
+        quoted ^= c == '"';
+        !quoted && "&|;<>".contains(c)
+    });
+    if shell_syntax {
         return Some("Orteca runs one program with its arguments. There is no shell, so no `&&`, pipes or redirects.");
     }
     let program = Path::new(first)
@@ -3956,6 +4014,14 @@ impl Digest {
         }
     }
 
+    /// The last `n` lines so far, oldest first.
+    fn last(&self, n: usize) -> Vec<String> {
+        let mut out: Vec<String> = self.tail.iter().rev().take(n).map(|(_, line)| line.clone()).collect();
+        out.extend(self.head.iter().rev().take(n - out.len()).cloned());
+        out.reverse();
+        out
+    }
+
     fn render(&self) -> String {
         let tail_from = self.tail.front().map_or(self.total, |(n, _)| *n);
         let hits: Vec<String> = self
@@ -4020,8 +4086,13 @@ async fn waited(
     Some(Launch::fix(ctx.id, state.session.as_deref()?, &reply, &ctx.plan))
 }
 
-/// Whether the command may run: at once in auto mode, else when the user
-/// answers. A question meanwhile is answered. `None` is a Stop.
+/// Commands that run without asking before Orteca asks anyway: an agent that
+/// keeps handing work over is likely going round in circles.
+const WAIT_UNASKED: u32 = 5;
+
+/// Whether the command may run: at once in auto mode or when the user said to
+/// always run it, else when the user answers. A question meanwhile is
+/// answered. `None` is a Stop.
 async fn go_ahead(
     store: &Store,
     ctx: &Context,
@@ -4030,14 +4101,29 @@ async fn go_ahead(
     emit: &impl Fn(&ProviderEvent) -> crate::error::Result<()>,
     command: &str,
 ) -> Option<bool> {
-    if ctx.auto_wait {
+    let say = |event: ProviderEvent| {
+        let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    };
+    let trusted = ctx.auto_wait || state.wait_allowed.iter().any(|allowed| allowed == command);
+    if trusted && state.unasked_waits < WAIT_UNASKED {
+        state.unasked_waits += 1;
         return Some(true);
     }
-    let event = ProviderEvent::Wait { command: command.to_string(), asking: true };
-    let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+    if trusted {
+        say(ProviderEvent::Text(format!(
+            "The agent has handed over {WAIT_UNASKED} commands in a row, so Orteca asks before the next."
+        )));
+    }
+    say(ProviderEvent::Wait { command: command.to_string(), asking: true });
     loop {
         match control.recv().await? {
-            Control::Wait { run } => return Some(run),
+            Control::Wait { run, always } => {
+                state.unasked_waits = 0;
+                if run && always && !state.wait_allowed.iter().any(|allowed| allowed == command) {
+                    state.wait_allowed.push(command.to_string());
+                }
+                return Some(run);
+            }
             Control::Instruct { text, reply, attachments, .. } => {
                 state.attachments.extend(attachments);
                 ask_meanwhile(store, ctx, state, control, emit, command, text, reply).await;
@@ -4108,13 +4194,17 @@ async fn run_waited(
     command: &str,
     words: &[String],
 ) -> Option<String> {
+    use std::io::Write;
     let say = |event: ProviderEvent| {
         let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
     };
     let (env, words) = env_prefix(words);
-    let Some(program) = crate::providers::which(&words[0]) else {
-        say(ProviderEvent::Text(format!("`{}` is not on PATH, so `{command}` did not run.", words[0])));
-        return Some(format!("Orteca found no `{}` on PATH, so `{command}` did not run. Finish without it.", words[0]));
+    let Some(program) = crate::providers::which_from(&words[0], &ctx.dir) else {
+        say(ProviderEvent::Text(format!("`{}` was not found, so `{command}` did not run.", words[0])));
+        return Some(format!(
+            "Orteca found no `{}` on PATH or in the repository, so `{command}` did not run. Finish without it.",
+            words[0]
+        ));
     };
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
     let mut run = match proc::spawn_env(&program.to_string_lossy(), &args, &ctx.dir, &env) {
@@ -4131,15 +4221,38 @@ async fn run_waited(
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join(format!("wait-{}-{}.log", ctx.task_id, now_ms())))
     });
-    let lines = std::mem::replace(&mut run.lines, mpsc::unbounded_channel().1);
-    let mut reading = tokio::spawn(read_waited(lines, log.clone()));
+    let mut lines = std::mem::replace(&mut run.lines, mpsc::unbounded_channel().1);
+    // ponytail: blocking writes on a runtime worker, buffered; spawn_blocking if a chatty command stalls others.
+    let mut file = log
+        .as_ref()
+        .and_then(|path| std::fs::File::create(path).ok())
+        .map(std::io::BufWriter::new);
+    let (mut code, mut digest, mut shown) = (None, Digest::default(), 0);
+    // The screen gets the last few lines as it goes; only the log keeps them all.
+    let mut show = tokio::time::interval(std::time::Duration::from_millis(500));
+    show.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let started = now_ms();
     let deadline = tokio::time::sleep(WAIT_TIMEOUT);
     tokio::pin!(deadline);
     let mut timed_out = false;
-    let (code, digest) = loop {
+    loop {
         tokio::select! {
-            read = &mut reading => break read.unwrap_or_default(),
+            line = lines.recv() => {
+                let text = match line {
+                    None => break,
+                    Some(Line::Exit(exit)) => { code = exit; continue; }
+                    Some(Line::Text(text)) => text,
+                    Some(Line::Json(value)) => value.to_string(),
+                };
+                if let Some(out) = &mut file {
+                    let _ = writeln!(out, "{text}");
+                }
+                digest.push(&text);
+            }
+            _ = show.tick(), if digest.total != shown => {
+                shown = digest.total;
+                let _ = emit(&ProviderEvent::WaitOutput(digest.last(WAIT_SHOWN)));
+            }
             () = &mut deadline, if !timed_out => { timed_out = true; run.cancel(); }
             Some(action) = control.recv() => match action {
                 Control::Cancel => { stop(store, ctx, state); run.cancel(); }
@@ -4153,7 +4266,8 @@ async fn run_waited(
                 Control::Wait { .. } => {}
             },
         }
-    };
+    }
+    digest.saved = file.is_some_and(|mut out| out.flush().is_ok());
     if state.outcome.cancelled || state.outcome.failure.is_some() {
         return None;
     }
@@ -4175,32 +4289,6 @@ async fn run_waited(
         None => "Orteca could not save the whole output; this is all of it that is left.".to_string(),
     };
     Some(format!("Orteca ran `{command}`: {verdict}, after {after}. {whole}\n\n{}", digest.render()))
-}
-
-/// Every line of a waited command into its log and its digest, until it ends.
-async fn read_waited(mut lines: mpsc::UnboundedReceiver<Line>, log: Option<PathBuf>) -> (Option<i32>, Digest) {
-    use std::io::Write;
-    // ponytail: blocking writes on a runtime worker, buffered; spawn_blocking if a chatty command stalls others.
-    let mut file = log
-        .and_then(|path| std::fs::File::create(path).ok())
-        .map(std::io::BufWriter::new);
-    let (mut code, mut digest) = (None, Digest::default());
-    while let Some(line) = lines.recv().await {
-        let text = match line {
-            Line::Exit(exit) => {
-                code = exit;
-                continue;
-            }
-            Line::Text(text) => text,
-            Line::Json(value) => value.to_string(),
-        };
-        if let Some(out) = &mut file {
-            let _ = writeln!(out, "{text}");
-        }
-        digest.push(&text);
-    }
-    digest.saved = file.is_some_and(|mut out| out.flush().is_ok());
-    (code, digest)
 }
 
 /// A model call and a local check at once, each reading its own channel. A
@@ -4254,7 +4342,7 @@ async fn attempt(
     // Counted before the spawn can fail: a process Orteca tried to start is a
     // call it spent, and hiding the failures would flatter the metric.
     state.calls_used = state.calls_used.saturating_add(1);
-    state.outcome.begin_process();
+    state.outcome.start_process();
     // ponytail: bounded file snapshots and Git run on this worker like the
     // task's other Git checks; move to spawn_blocking if large repos need it.
     let mut edit_snapshots = if ctx.id == ProviderId::Codex && ctx.plan.stage.writes() {
@@ -4675,6 +4763,21 @@ mod tests {
         routing::route(prompt, Mode::Balanced, &RepoSignals::default())
     }
 
+    #[test]
+    fn a_fix_runs_one_tier_above_the_implement_unless_the_user_picked_a_model() {
+        let route = one_call("fix the typo");
+        assert_eq!(route.budget.preferred_tier, routing::Tier::Cheapest);
+        let stages = [Stage::Implement, Stage::Verify, Stage::Fix];
+        let plan = |selected: Option<&ModelOverride>, index| {
+            stage_plan(&route, selected, ProviderId::Codex, 0, &stages, index, None)
+        };
+        assert_eq!(plan(None, 0).model(ProviderId::Codex).model, "gpt-6-luna");
+        let fix = plan(None, 2).model(ProviderId::Codex);
+        assert_eq!((fix.model.as_str(), fix.effort.as_str()), ("gpt-6-sol", "medium"));
+        let picked = ModelOverride { model: "gpt-6-luna".into(), effort: "low".into() };
+        assert_eq!(plan(Some(&picked), 2).model(ProviderId::Codex).model, "gpt-6-luna");
+    }
+
     fn plan_for(stage: Stage) -> StagePlan {
         StagePlan {
             stage,
@@ -4824,6 +4927,7 @@ mod tests {
             timings: Vec::new(),
             checking: None,
             auto_wait: false,
+            wait_allowed: Vec::new(),
             ruleset: rules::Ruleset::new(TaskType::CodeChange, ""),
             reply: None,
             id: ProviderId::Codex,
@@ -5250,6 +5354,35 @@ ping -n 60 127.0.0.1 >nul
             "a finished run cannot be stopped"
         );
         drop(listening);
+    }
+
+    /// A process stopped before it reported leaves the total short, so the
+    /// cost is unavailable, never a small estimate.
+    #[test]
+    fn a_process_that_never_reported_voids_the_cost() {
+        let spent = ProviderEvent::Usage(Usage {
+            model: None,
+            input_tokens: 5,
+            cached_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.01),
+            cost_quality: CostQuality::Estimated,
+        });
+        let mut reported = Outcome::default();
+        reported.start_process();
+        reported.absorb(&spent);
+        reported.settle_cost();
+        assert_eq!(reported.usage.unwrap().cost_quality, CostQuality::Estimated);
+
+        let mut stopped = Outcome::default();
+        stopped.start_process();
+        stopped.absorb(&spent);
+        stopped.start_process(); // killed by the loop guard before it reported
+        stopped.settle_cost();
+        let total = stopped.usage.unwrap();
+        assert_eq!((total.cost_usd, total.cost_quality), (None, CostQuality::Unavailable));
+        assert_eq!(total.input_tokens, 5, "the tokens that did arrive are kept");
     }
 
     /// A result is not the same thing as an ending. A live provider reports one
@@ -5968,9 +6101,9 @@ ping -n 60 127.0.0.1 >nul
             ruleset: Some(rules::Ruleset::new(TaskType::Plan, "")),
         };
         let claude = args(ProviderId::Claude, &plan);
-        assert!(claude.contains(&"--append-system-prompt-file".to_string()));
+        assert!(claude.contains(&"--system-prompt-file".to_string()));
         assert!(claude.windows(2).any(|w| w == ["--fallback-model", "sonnet"]));
-        assert!(args(ProviderId::Codex, &plan).iter().any(|a| a.starts_with("developer_instructions=")));
+        assert!(args(ProviderId::Codex, &plan).iter().any(|a| a.starts_with("model_instructions_file=")));
         assert!(
             !claude.contains(&"--max-turns".to_string()),
             "a stage runs until it is done"
@@ -6015,6 +6148,7 @@ ping -n 60 127.0.0.1 >nul
             ]));
         let resumed = Launch::resume(ProviderId::Codex, "abc-123", &[], &plan).argv;
         assert!(resumed.windows(2).any(|w| w == ["--model", "gpt-6-sol"]));
+        assert!(resumed.iter().any(|a| a.starts_with("model_instructions_file=")), "a resume keeps the replaced prompt");
 
         let efficient_review = StagePlan {
             model: Some("gpt-5.6-terra".into()),
@@ -7305,7 +7439,7 @@ ping -n 60 127.0.0.1 >nul
     }
 
     /// A Verify that ends cleanly while one of its checks failed is not `done`,
-    /// whatever verdict it gave itself. It is fixed on the same tier and checked
+    /// whatever verdict it gave itself. It is fixed a tier up and checked
     /// again; when the Fix changes nothing the route ends as `verifyFailed`.
     #[tokio::test]
     async fn checks_a_fix_cannot_move_end_the_route_as_verify_failed() {
@@ -7351,11 +7485,8 @@ ping -n 60 127.0.0.1 >nul
                 .find(|v| v["kind"] == "stage" && v["data"]["stage"] == stage)
                 .map(|v| v["data"]["model"].clone())
         };
-        assert_eq!(
-            model("fix"),
-            model("implement"),
-            "the fix left the model that wrote the change"
-        );
+        assert_eq!(model("implement"), Some("sonnet".into()));
+        assert_eq!(model("fix"), Some("sonnet".into()), "a Claude fix stops at Sonnet high");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7638,6 +7769,8 @@ ping -n 60 127.0.0.1 >nul
         let refused = |c: &str| refusal(c, &words(c)).is_some();
         assert!(!refused("npm run bench"));
         assert!(refused("npm test && git push"));
+        assert!(refused("npm test \"x\" | tail"));
+        assert!(!refused("npm test -- --filter \"a|b\""));
         assert!(refused("powershell -Command npm test"));
         assert!(refused("git.exe push origin main"));
         assert!(refused("git -C . push origin main"));
@@ -7677,6 +7810,12 @@ ping -n 60 127.0.0.1 >nul
         let mut short = Digest::default();
         ["a", "b"].iter().for_each(|line| short.push(line));
         assert_eq!(short.render(), "a\nb");
+        // What the screen shows as it runs: the last lines, across head and tail.
+        assert_eq!(short.last(6), ["a", "b"]);
+        assert_eq!(digest.last(2), ["line 999", "line 1000"]);
+        let mut edge = Digest::default();
+        (1..=32).for_each(|n| edge.push(&format!("{n}")));
+        assert_eq!(edge.last(4), ["29", "30", "31", "32"]);
     }
 
     /// A turn that ends `ORTECA-WAIT:` has Orteca run the command, then the

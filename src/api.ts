@@ -193,6 +193,8 @@ export const startTask = (
   onChecking: (result: TaskResult) => void,
   // Run a command the agent hands over (`ORTECA-WAIT:`) without asking first.
   autoWait: boolean,
+  // Handed-over commands the user said to always run in this project.
+  waitAllowed: string[],
   resume: (Resume & { reply: string }) | null = null,
   // A reply that goes on in this task instead of opening a new one.
   continueTask: number | null = null,
@@ -211,12 +213,12 @@ export const startTask = (
   task.onmessage = onTask;
   const checking = new Channel<TaskResult>();
   checking.onmessage = onChecking;
-  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, autoWait, model, clarified, events, task, checking });
+  return invoke<TaskResult>("start_task", { path, prompt, asked, provider, mode, headroom, isolation, attachments, resume, continueTask, autoWait, waitAllowed, model, clarified, events, task, checking });
 };
 
-/** Runs, or declines, the command a run's agent is waiting on. */
-export const answerWait = (taskId: number, run: boolean) =>
-  invoke<void>("answer_wait", { taskId, run });
+/** Runs, or declines, the command a run's agent is waiting on; `always` stops asking about it in this run. */
+export const answerWait = (taskId: number, run: boolean, always = false) =>
+  invoke<void>("answer_wait", { taskId, run, always });
 
 /**
  * Stops a run and the whole process tree under it. Throws if the run has

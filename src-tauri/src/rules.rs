@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use crate::intent::TaskType;
 
 const BASE: &str = include_str!("../rulesets/base.md");
+/// What an agent needs from the CLI's own system prompt, which this replaces.
+const AGENT: &str = include_str!("../rulesets/agent.md");
 
 fn rules(task_type: TaskType) -> &'static str {
     match task_type {
@@ -28,12 +30,19 @@ pub struct Ruleset {
     /// Folders (ending in `/`) and file patterns not worth reading, which Claude is denied
     /// through its Read rules. A hint, not a fence: a shell still reads them.
     pub skip: Vec<String>,
+    /// The text replaces the CLI's own system prompt instead of adding to it:
+    /// ~6k fewer tokens a turn for Claude, ~3.5k a request for Codex.
+    /// `NAV_CLIPROMPT=1` keeps the CLI's prompt, for the benchmark's before arm.
+    pub replaces: bool,
 }
 
 impl Ruleset {
     pub fn new(task_type: TaskType, profile: &str) -> Self {
+        let replaces = std::env::var("NAV_CLIPROMPT").is_err();
+        // Talk has no tools, so it needs none of the agent guidance.
+        let agent = if replaces && task_type != TaskType::Chat { AGENT } else { "" };
         // A Windows checkout may have turned the files' line ends into CRLF.
-        let rules = format!("{BASE}{}", rules(task_type)).replace('\r', "");
+        let rules = format!("{agent}{BASE}{}", rules(task_type)).replace('\r', "");
         let label = format!("{}@{:08x}", task_type.name(), fnv(&rules) as u32);
         let mut text = rules;
         if !profile.trim().is_empty() {
@@ -41,7 +50,7 @@ impl Ruleset {
             text.push_str(profile.trim());
             text.push('\n');
         }
-        Ruleset { task_type, label, text, skip: Vec::new() }
+        Ruleset { task_type, label, text, skip: Vec::new(), replaces }
     }
 
     /// `claude --settings`: Read rules for `skip`, which also cover Grep and Glob.
@@ -65,9 +74,13 @@ impl Ruleset {
         Some(path)
     }
 
-    /// Codex's `developer_instructions`, which adds to its own prompt rather
-    /// than replacing it. One line: it is a TOML string passed through a shim.
+    /// Codex's `model_instructions_file`, which replaces its own base
+    /// instructions, or `developer_instructions`, which adds to them. Either is
+    /// one line: a TOML string passed through a shim.
     pub fn codex_arg(&self) -> String {
+        if let Some(file) = self.file().filter(|_| self.replaces) {
+            return format!("model_instructions_file=\"{}\"", file.display().to_string().replace('\\', "\\\\"));
+        }
         let escaped = self.text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
         format!("developer_instructions=\"{escaped}\"")
     }
@@ -89,7 +102,12 @@ mod tests {
         assert!(a.label.starts_with("debug@"));
         assert_eq!(a.label, Ruleset::new(TaskType::Debug, "").label, "the profile is not the ruleset's version");
         let arg = a.codex_arg();
-        assert!(!arg.contains('\n') && arg.contains(r#"\"cargo test\""#), "{arg}");
+        let file = arg.strip_prefix("model_instructions_file=\"").unwrap().trim_end_matches('"').replace("\\\\", "\\");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("You are a coding agent") && text.contains("\"cargo test\""), "{text}");
+        assert!(!Ruleset::new(TaskType::Chat, "").text.contains("coding agent"), "talk has no tools to explain");
+        let added = Ruleset { replaces: false, ..a.clone() }.codex_arg();
+        assert!(!added.contains('\n') && added.contains(r#"\"cargo test\""#), "{added}");
         let mut b = a.clone();
         b.skip = vec!["node_modules/".into(), "*.lock".into(), "package-lock.json".into()];
         assert_eq!(

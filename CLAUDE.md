@@ -64,8 +64,10 @@ drop, Ctrl+`) check the `active` flag before answering.
   Feeds `routing` as `RepoSignals::intent` and `task_type`; a failed read falls back
   to keywords, a `/plan`-style command skips it.
 - `rules.rs` — the per-type ruleset (`src-tauri/rulesets/*.md`) plus the repository
-  profile, sent as Claude's appended system prompt and Codex's
-  `developer_instructions`, byte-identical on every call. Never switched mid-session.
+  profile, led by `agent.md`, *replacing* each CLI's own system prompt
+  (`--system-prompt-file`, `model_instructions_file`), byte-identical on every call.
+  Never switched mid-session. `NAV_CLIPROMPT=1` keeps the CLIs' prompts, for the
+  benchmark's before arm (`ARMS=orteca-claude+cli`).
 - `run.rs` — runs a route stage by stage: argv, stream, event log, steering,
   fix rounds, diff, `TaskResult`. No call, turn or token ceiling. A failed
   Verify gets one Fix (resuming the session that wrote the change) and runs
@@ -76,9 +78,11 @@ drop, Ctrl+`) check the `active` flag before answering.
   up to 8 parallel shards, each with its own Laravel manifests and `storage/`
   tree; a failing shard's tests rerun in one process and that is the verdict.
   An Implement turn that ends `ORTECA-WAIT: <command>` hands Orteca a slow
-  command (`run::waited`; leading `NAME=value` words are its env): asked first unless the user picked "Run them", the
-  deny list applies, the whole output goes to `<git dir>/orteca/`, and the
-  session resumes with a digest. A message meanwhile resumes it read-only.
+  command (`run::waited`; leading `NAME=value` words are its env): asked first unless the user picked "Run them"
+  or "Always run this" for that command, and asked anyway after 5 in a row; the
+  deny list applies, the whole output goes to `<git dir>/orteca/` while its last
+  lines show live, and the session resumes with a digest. A message meanwhile
+  resumes it read-only.
 - `proc/` — spawns a child inside a **Win32 Job Object** (`KILL_ON_JOB_CLOSE`) and reads
   its stdout as JSONL while keeping stdin open for steering. Rust's `Child::kill()` only
   kills the direct child; `claude` spawns node → bash → npm, so cancel means closing the

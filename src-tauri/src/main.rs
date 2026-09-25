@@ -212,6 +212,8 @@ async fn start_task(
     continue_task: Option<i64>,
     // Run a command the agent hands over without asking first.
     auto_wait: bool,
+    // Handed-over commands the user said to always run in this project.
+    wait_allowed: Vec<String>,
     // The answer to the question a first try of this request asked, or an
     // empty answer when the user skipped it.
     clarified: Option<Clarified>,
@@ -264,6 +266,7 @@ async fn start_task(
     request.said = said;
     request.resume = resume;
     request.auto_wait = auto_wait;
+    request.wait_allowed = wait_allowed;
     request.checking = Some(Box::new(move |result| {
         let _ = checking.send(result.clone());
     }));
@@ -331,9 +334,10 @@ fn existing(attachments: &[String]) -> Result<Vec<std::path::PathBuf>> {
 }
 
 /// Run, or not, the command a run's agent handed Orteca (`ORTECA-WAIT:`).
+/// `always` runs it without asking for the rest of this run too.
 #[tauri::command]
-fn answer_wait(task_id: i64, run: bool, live: State<run::Live>) -> Result<()> {
-    live.send(task_id, run::Control::Wait { run })
+fn answer_wait(task_id: i64, run: bool, always: bool, live: State<run::Live>) -> Result<()> {
+    live.send(task_id, run::Control::Wait { run, always })
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -559,6 +563,9 @@ async fn begin(
         .and_then(|_| ASKED.lock().ok()?.take())
         .filter(|(text, id, ..)| Some(text) == words.as_ref() && *id == provider)
         .map(|(_, _, reading, events)| (reading, events));
+    // BENCH_READING: a classifier reply taken as read, so benchmark arms share
+    // a route instead of each one timing out, or not, on a busy machine.
+    let kept = kept.or_else(|| Some((intent::parse_reading(&std::env::var("BENCH_READING").ok()?)?, Vec::new())));
     let previous = continue_task
         .and_then(|id| store.task_type(id).ok().flatten())
         .and_then(|name| intent::TaskType::from_name(&name));
@@ -594,6 +601,7 @@ async fn begin(
             return Err(e);
         }
     };
+    let asked_reader = reading.is_some();
     let ((mut reading, classified), classify) = match (reading, kept) {
         (Some(handle), _) => match handle.await {
             Ok((read, took)) => (read, run::Timing { label: "classify".into(), ms: took }),
@@ -636,6 +644,7 @@ async fn begin(
         });
     }
     scanned.signals.digs = previous == Some(intent::TaskType::Question) || reading.cause == Some(true);
+    scanned.signals.unread = asked_reader && reading.task_type.is_none();
     let planned = scanned.route(reading.intent, reading.job, reading.task_type);
     let routed = std::time::Instant::now();
     let mut request = tokio::task::block_in_place(|| {
@@ -829,6 +838,7 @@ fn prepare_run(
         timings: Vec::new(),
         checking: None,
         auto_wait: false,
+        wait_allowed: Vec::new(),
         ruleset,
         reply: None,
     })

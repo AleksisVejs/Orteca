@@ -359,7 +359,7 @@ from the CLI refusing a wrong one.
 
 | Tier | Claude | $/M in · out | Codex | $/M in · out |
 |---|---|---:|---|---:|
-| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-6-luna`, `low` | 0.10 · 0.50 |
+| `cheapest` | `sonnet` (Sonnet 5), `low` | 2 · 10 | `gpt-6-luna`, `medium` | 0.10 · 0.50 |
 | `standard` | `sonnet`, `high` | 2 · 10 | `gpt-6-sol`, `medium` | 2 · 10 |
 | `deep` | `opus` (Opus 5.5), `high` | 4 · 20 | `gpt-6-sol`, `high` | 2 · 10 |
 
@@ -844,7 +844,48 @@ $0.17 / 336 s -> $0.01 / 268 s. Most of Codex's drop is the route: the JSON
 classifier read the task as easy, so it ran without the Sol Review the old
 run bought. One sample each; not yet a baseline.
 
-### Parked: replace the CLI's own system prompt
+### 4.3.12 Orteca's prompt replaces the CLI's own — 2026-09-25
+
+Shipped from the parked note below. `rulesets/agent.md` (seven lines: use the
+tools, finish then stop, read before editing, parallel reads, no git
+housekeeping, short final reply) leads every non-chat ruleset, and the whole
+text goes in as `claude --system-prompt-file` and `codex -c
+model_instructions_file=<file>`, the file in Orteca's temp directory. A Codex
+resume passes it again. `NAV_CLIPROMPT=1` restores the old append.
+
+Checked first, one-turn probes: Claude still loads all seven tool schemas and
+its environment block (cwd, platform, date, git state); first-turn context
+16.2k → 10.0k (haiku). Codex still edits through its shell and still gets its
+environment context; a two-request turn 25.3k → 18.3k.
+
+RigInspectBE, one round, four arms in parallel (`PARALLEL=1
+ARMS=orteca-claude,orteca-claude+cli,orteca-codex,orteca-codex+cli`,
+`results-prompt-r1.json`). New vs old prompt:
+
+| Task | Claude tokens / $ | Codex tokens | Grades |
+|---|---|---|---|
+| easy (same route) | 88k / $0.11 vs 104k / $0.13 | 537k vs 1,056k | all 3/3 |
+| medium (same Implement) | 60k / $0.07 vs 69k / $0.08 | 137k vs 927k* | all 2/2 |
+| tough (routes differed) | 976k / $0.76 vs 1,258k / $1.09 | 1,057k vs 897k | 4/4, 4/4 / **3/4**, 4/4 |
+
+\* the old arm also wrote tests, which set off a Review and a Fix.
+
+Code read by hand: easy and medium wrote the same change under both prompts
+(Codex's easy controller diff is byte-identical). Tough was not like for like:
+on old-Claude and new-Codex the intent call hit its 45 s deadline (four arms'
+suites on one machine) and the keyword router gave them the standard route;
+new-Codex's 3/4 is that Luna-low patch.
+
+Tough again with the route pinned (`BENCH_READING`, a classifier reply every
+arm takes as read; `results-prompt-tough-pinned.json`), Codex only - Claude's
+5-hour window was at 97%. Both Plan + Sol, both 4/4. New 849k tokens / 808 s
+(first Verify failed, one Fix), old 1,611k / 853 s. Same design both times
+(`App\Support\OfflineBootstrap`, one-second overlap cursor). The old patch was
+a little more careful: it converts `since` to UTC, where the new one compares
+it in its own offset (its Review caught that), and it keeps the cursor under a
+new meta key. One sample each; the Claude pair is still to run.
+
+Original note, kept for the checks it lists:
 
 Most of each turn's ~21k is the CLI's built-in system prompt, not Orteca's
 brief. Both CLIs can replace it, which would shrink every turn of every stage:
@@ -1340,7 +1381,8 @@ sandbox against a hostile one. A denied command is refused inside the CLI
 the user, with network, whatever the provider: the repository's own test
 suites in a local Verify (the agent may have edited them), a command the agent
 hands over with `ORTECA-WAIT:` (asked first unless the user picked "Run them"
-for that project; `run::refusal` blocks shells, inline code such as `node -e`,
+for that project or "Always run this" for that command, and asked anyway after
+5 in a row; `run::refusal` blocks shells, inline code such as `node -e`,
 and the denylist), and the repo's Git hooks on a git-bar commit. Trust consent
 covers all three, and is asked again when the agent configuration it covered
 changes (`project::trust_fingerprint`).

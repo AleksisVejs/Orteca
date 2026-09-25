@@ -360,6 +360,15 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     autoWait.value = on;
     try { localStorage.setItem(WAIT_KEY, on ? "1" : "0"); } catch { /* kept for this session */ }
   }
+  // Single commands the user said to always run, for when the answer is "ask me".
+  const ALLOWED_KEY = `orteca.waitAllowed:${opened.project.path}`;
+  let waitAllowed: string[] = [];
+  try { waitAllowed = JSON.parse(localStorage.getItem(ALLOWED_KEY) ?? "[]"); } catch { /* no storage: ask each time */ }
+  function allowWait(command: string) {
+    if (waitAllowed.includes(command)) return;
+    waitAllowed = [...waitAllowed, command];
+    try { localStorage.setItem(ALLOWED_KEY, JSON.stringify(waitAllowed)); } catch { /* kept for this session */ }
+  }
 
   // An unclear request that edits: ask one question first, or let the agent
   // guess and say how it read it. One setting for the whole app.
@@ -796,6 +805,8 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     queued: { line: ActivityLine; applyNow: boolean; attached: string[] }[];
     /** The command the agent handed over, while it waits for the user's OK. */
     waitAsk?: string | null;
+    /** The last lines a handed-over command printed, while it runs. */
+    waitTail?: string[] | null;
     /** The other CLI this run can carry on with, once its plan ran out. The
      *  user says yes first: it spends a different subscription. */
     handoff?: { to: ProviderId; opts: RunOpts } | null;
@@ -933,13 +944,16 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
 
   /** The command the run on screen is waiting on the user's OK for. */
   const waitAsk = computed(() => activeRun.value?.waitAsk ?? null);
-  async function answerWaitFor(run: boolean) {
+  /** The last lines the run on screen's handed-over command printed, while it runs. */
+  const waitTail = computed(() => activeRun.value?.waitTail ?? null);
+  async function answerWaitFor(run: boolean, always = false) {
     const live = activeRun.value;
     const asked = live?.waitAsk;
     if (!live || !asked || live.id === null) return;
     live.waitAsk = null;
+    if (always) allowWait(asked);
     try {
-      await answerWait(live.id, run);
+      await answerWait(live.id, run, always);
     } catch (e) {
       // The run is still waiting unless it ended; keep the question up.
       if (live.active) live.waitAsk = asked;
@@ -1442,7 +1456,13 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
             live.activity = { text: event.data.current.map((i) => stageLabel(event.data.stages[i] ?? "Working")).join(" + "), file: null };
             return;
           }
+          if (event.kind === "waitOutput") {
+            live.waitTail = event.data;
+            return;
+          }
           if (event.kind === "wait") live.waitAsk = event.data.asking ? event.data.command : null;
+          // The command's end, or a question answered meanwhile, puts the log back.
+          live.waitTail = null;
           const activity = activityFor(event);
           if (activity !== null) live.activity = activity;
           appendActivity(live.stream, event);
@@ -1462,6 +1482,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
           live.checking = early;
         },
         autoWait.value,
+        waitAllowed,
         opts.resume ?? null,
         opts.continueTask ?? null,
         // A follow-up's prompt carries the whole exchange so the agent has the
@@ -1487,6 +1508,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
       live.active = false;
       live.stopping = false;
       live.waitAsk = null;
+      live.waitTail = null;
       live.checking = null;
       if (!live.clarify) live.id = null;
       for (const q of live.queued.splice(0)) q.line.delivery = "Not sent · the run ended before it started";
@@ -2155,6 +2177,7 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     instruct,
     stopRun,
     waitAsk,
+    waitTail,
     answerWaitFor,
     history,
     historyError,

@@ -99,35 +99,23 @@ pub fn spawn_env(program: &str, args: &[&str], cwd: &Path, env: &[(&str, PathBuf
 
     let out_tx = tx.clone();
     let out = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        while let Ok(size) = reader.read_line(&mut line).await {
-            if size == 0 {
-                break;
-            }
+        let (mut reader, mut buf) = (BufReader::new(stdout), Vec::new());
+        while let Some((line, complete)) = read_lossy(&mut reader, &mut buf).await {
             // EOF can leave valid-looking JSON that was never a complete JSONL event.
-            let complete = line.ends_with('\n');
-            if complete {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
             let event = match complete.then(|| serde_json::from_str::<Value>(&line)) {
                 Some(Ok(v)) => Line::Json(v),
-                _ => Line::Text(line.clone()),
+                _ => Line::Text(line),
             };
             if out_tx.send(event).is_err() {
                 return;
             }
-            line.clear();
         }
     });
 
     let err_tx = tx.clone();
     let err = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let (mut reader, mut buf) = (BufReader::new(stderr), Vec::new());
+        while let Some((line, _)) = read_lossy(&mut reader, &mut buf).await {
             if err_tx.send(Line::Text(line)).is_err() {
                 return;
             }
@@ -187,6 +175,24 @@ pub fn can_change_acl(dir: &Path) -> bool {
         .is_ok()
 }
 
+/// The next line of output and whether it ended in a newline, whatever its
+/// encoding: a byte that is not UTF-8 becomes U+FFFD instead of ending the
+/// read, which would drop the rest and break the child's pipe. `None` at EOF.
+async fn read_lossy<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> Option<(String, bool)> {
+    buf.clear();
+    if reader.read_until(b'\n', buf).await.ok()? == 0 {
+        return None;
+    }
+    let complete = buf.last() == Some(&b'\n');
+    if complete {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    Some((String::from_utf8_lossy(buf).into_owned(), complete))
+}
+
 fn spawn_suspended(program: &str, args: &[&str], cwd: &Path, env: &[(&str, PathBuf)]) -> io::Result<Child> {
     let mut command = Command::new(program);
     command
@@ -228,6 +234,16 @@ mod tests {
             let _ = CloseHandle(handle);
             ok && code == STILL_ACTIVE.0 as u32
         }
+    }
+
+    #[tokio::test]
+    async fn a_byte_that_is_not_utf8_does_not_end_the_read() {
+        let mut reader: &[u8] = b"caf\xe9 ok\r\nnext\nlast";
+        let mut buf = Vec::new();
+        assert_eq!(read_lossy(&mut reader, &mut buf).await, Some(("caf\u{fffd} ok".into(), true)));
+        assert_eq!(read_lossy(&mut reader, &mut buf).await, Some(("next".into(), true)));
+        assert_eq!(read_lossy(&mut reader, &mut buf).await, Some(("last".into(), false)));
+        assert_eq!(read_lossy(&mut reader, &mut buf).await, None);
     }
 
     #[tokio::test]

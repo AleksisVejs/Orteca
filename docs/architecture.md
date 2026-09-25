@@ -824,6 +824,12 @@ the Codex binary; `codex exec resume` takes `--output-schema`.
   thinks <1k tokens; its 13k output is the code it writes, and its 1-hour cache
   writes are ~40% of its cost. The Plan and the build read the same file only
   once (`sync.js`), so handing the Plan's reads on would save little.
+  Codex's top tier is Sol again, only at high effort, so its hard Plan keeps
+  Sol high and Luna medium builds it. Same task, pinned hard: 4/4 twice, first
+  Verify passing, no Fix, $0.24 and $0.18 estimated, 7.6 and 8.4 min, against
+  Sol building 4/4 $0.67 with a Fix in 13 min (2026-09-24). Claude's second
+  opinion is not in those costs: $0.44 and $0.40 on Opus, one medium finding
+  each.
 - **Cache lifetime.** Claude gives a subscriber a 1-hour cache, and writing to
   it costs 2x input. Every stage but an Answer runs with
   `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` (1.25x), because turns are seconds apart.

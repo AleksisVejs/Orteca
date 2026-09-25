@@ -424,7 +424,11 @@ impl Route {
             return None;
         }
         let mut choice = self.budget.plan_tier.unwrap_or(self.budget.preferred_tier).model(id);
-        choice.effort = "low";
+        // A top tier on the tier below's model (Codex: Sol high over Sol
+        // medium) is stronger only by its effort, so a hard Plan keeps it.
+        if self.budget.plan_tier.is_none() || choice.model != self.budget.preferred_tier.model(id).model {
+            choice.effort = "low";
+        }
         Some(choice)
     }
 
@@ -445,10 +449,12 @@ impl Route {
         // After a top-tier Plan, Claude builds at medium: the thinking is in
         // the plan. RigInspect tough 4/4 twice at $0.41 and $0.50, against
         // $0.64 and $0.68 at high (2026-09-25).
-        let planned_build = (id == ProviderId::Claude && self.budget.plan_tier.is_some()).then(|| {
-            let mut choice = self.budget.preferred_tier.model(id);
-            choice.effort = "medium";
-            choice
+        // Codex's tier below is Sol again, so Luna builds Sol high's plan.
+        // RigInspect tough 4/4 twice at $0.24 and $0.18, no Fix, against $0.67
+        // with a Fix on Sol medium (2026-09-25).
+        let planned_build = self.budget.plan_tier.is_some().then(|| match id {
+            ProviderId::Claude => ModelChoice { effort: "medium", ..self.budget.preferred_tier.model(id) },
+            ProviderId::Codex => Tier::Cheapest.model(id),
         });
         let chosen = schema.or(efficient_deep).or(planned_build);
         // NAV_EFFORT runs Implement (and a Fix already on the top tier) at another effort, for the
@@ -2693,6 +2699,9 @@ mod tests {
         assert_eq!(efficient.plan_model(claude).map(|c| c.model), Some("opus"));
         let build = efficient.work_model(claude).unwrap();
         assert_eq!((build.model, build.effort), ("sonnet", "medium"));
+        let plan = efficient.plan_model(ProviderId::Codex).unwrap();
+        assert_eq!((plan.model, plan.effort), ("gpt-6-sol", "high"), "Codex's top tier is only its effort");
+        assert_eq!(efficient.work_model(ProviderId::Codex).map(|c| c.model), Some("gpt-6-luna"));
         assert_eq!(route(planned, Mode::Balanced, &hard).budget.preferred_tier, Tier::Deep);
         let medium = RepoSignals { intent: Some(Intent::Medium), ..repo(REPO) };
         assert_ne!(route("rework how the queue retries jobs", Mode::Efficient, &medium).budget.preferred_tier, Tier::Deep);

@@ -216,7 +216,9 @@ draggable divider, and `Ctrl+\`` shows and hides it.
   live run's status pill). Its state follows the stage and the current
   activity, each shown for at least 500 ms and blended into the next. Motion
   has one meaning each: rotation thinks, directional flow reads, a local change
-  edits, and an outward wave (needs input, nothing else) asks for the user.
+  edits, and an outward wave (needs input, nothing else) asks for the user;
+  a question before a run starts gathers it into a question mark of seven
+  dots, lit one after another.
   Its dots take the provider's tone (`--orb-claude` / `--orb-codex`, the one
   place provider gets a colour); tier sets the dot density. Under
   `prefers-reduced-motion` it keeps still and speaks in colour and opacity
@@ -270,6 +272,10 @@ the mock's chrome for features that are not wired up yet.
   opened fresh starts at the top of an answer too long to fit.
   A past task from the sidebar is the same chat. Details show recorded execution
   steps, labelled usage, and direct links to changes and activity.
+- A Codex change Claude's second opinion found serious problems in ends in a
+  "Recommended fix" box: what it sends behind a disclosure, a plain "Fix it"
+  button that sends it as a reply, and "Not now". It is never sent on its own
+  and never the primary button: Reply stays that.
 - A run that finished out of sight (another task, page or project on screen,
   or the window hidden) opens its answer with a short "While you were away"
   note: what was done, what failed, what needs a call. "Got it" clears it.

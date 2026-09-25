@@ -374,6 +374,9 @@ pub struct TaskResult {
     /// The commit holding the user's uncommitted work from before the run,
     /// which a `reverted` file is restored from. `None` for a clean folder.
     pub saved_state: Option<String>,
+    /// The follow-up the second opinion's serious findings ask for, offered to
+    /// the user as one click; never sent on its own.
+    pub recommended_fix: Option<String>,
 }
 
 /// What one stage asks of its CLI, beyond the prompt.
@@ -1384,6 +1387,7 @@ pub async fn stream(
             resume: None,
             timings: state.timings.clone(),
             saved_state: saved_state.clone(),
+            recommended_fix: None,
         });
     };
 
@@ -1902,7 +1906,8 @@ It changed existing tests the task did not ask about: {}. Check that it did not 
         let _ = store.append_event(task_id, "run", "flag", id.program(), &payload);
         summary.push_str(&flag);
     }
-    if let Some(review) = &second_opinion {
+    let (review, recommended_fix) = second_opinion.unzip();
+    if let Some(review) = &review {
         summary.push_str(review);
     }
     if status == "done" {
@@ -1986,6 +1991,7 @@ These checks failed once and passed when run again, so they count as passed: {}.
         worktree,
         timings: state.timings,
         saved_state,
+        recommended_fix: recommended_fix.flatten(),
     };
     // The task row keeps only the latest answer. Each exchange's own result goes
     // in the log too, so a task replied to later still shows what every answer
@@ -2022,7 +2028,8 @@ struct CrossReview<'a> {
     ruleset: &'a rules::Ruleset,
 }
 
-/// Claude's review of a large Codex change, as words for the summary, when
+/// Claude's review of a large Codex change, as words for the summary and a
+/// ready follow-up for its serious findings, when
 /// Claude is signed in to its plan. Its cost and findings are logged as a
 /// `crossReview` event, so whether it earns its keep can be counted.
 #[allow(clippy::too_many_arguments)]
@@ -2035,7 +2042,7 @@ async fn cross_review(
     base: Option<&str>,
     before: Option<&project::Snapshot>,
     recordings: Option<&Path>,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     let mut diff = project::diff_since(&ctx.dir, base).ok()?;
     project::attribute(&ctx.dir, &mut diff, before);
     let lines: u64 = diff
@@ -2078,7 +2085,7 @@ async fn cross_review(
     }});
     let _ = note(store, &review, "crossReview", &logged.to_string());
     if findings.is_empty() {
-        return artifact.map(|_| "\n\nClaude also reviewed this change and raised nothing.".into());
+        return artifact.map(|_| ("\n\nClaude also reviewed this change and raised nothing.".into(), None));
     }
     let listed: Vec<String> = findings
         .iter()
@@ -2092,10 +2099,41 @@ async fn cross_review(
             )
         })
         .collect();
-    Some(format!(
-        "\n\nClaude also reviewed this change. Its findings are advice; nothing was changed for them:\n{}",
-        listed.join("\n")
+    Some((
+        format!(
+            "\n\nClaude also reviewed this change. Its findings are advice; nothing was changed for them:\n{}",
+            listed.join("\n")
+        ),
+        fix_prompt(&findings),
     ))
+}
+
+/// The follow-up a "Fix it" sends for the second opinion's medium and high
+/// findings: each one's own `fix`, so the reply does not rediscover them. Low
+/// ones stay advice in the summary.
+fn fix_prompt(findings: &[serde_json::Value]) -> Option<String> {
+    let serious: Vec<String> = findings
+        .iter()
+        .filter(|f| f["severity"] != "low")
+        .enumerate()
+        .map(|(i, f)| {
+            format!(
+                "{}. `{}:{}` {}\n   Fix: {}",
+                i + 1,
+                f["file"].as_str().unwrap_or("?"),
+                f["line"],
+                f["issue"].as_str().unwrap_or_default(),
+                f["fix"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    (!serious.is_empty()).then(|| {
+        format!(
+            "A review of your change found the problems below. Fix each one and nothing beyond it, \
+             then run the focused checks that prove it.\n\n{}",
+            serious.join("\n")
+        )
+    })
 }
 
 /// What `stages[index]` asks of the CLI.
@@ -2121,6 +2159,16 @@ fn stage_plan(
             Some(routing::Tier::Deep) if id == ProviderId::Claude => routing::Tier::Standard,
             up => up.unwrap_or(route.budget.preferred_tier),
         },
+        // Luna answered questions right but thin on the bench: no file names,
+        // one cause of two (6 questions x 3 rounds, 2026-09-25). Sol medium
+        // still costs a fraction of a plain Codex answer.
+        (Stage::Answer, _)
+            if id == ProviderId::Codex
+                && route.task_type == crate::intent::TaskType::Question
+                && route.budget.preferred_tier == routing::Tier::Cheapest =>
+        {
+            routing::Tier::Standard
+        }
         _ => route.budget.preferred_tier,
     };
     let choice = match stage {
@@ -2461,12 +2509,32 @@ async fn verify_locally(
     }
     let commands: Vec<Vec<&str>> = argvs.iter().map(|a| a.iter().map(String::as_str).collect()).collect();
     let named: Vec<&str> = labels.iter().map(String::as_str).collect();
+    // A check leaves the tree as it found it. An unasked build writes over
+    // output a repository may commit: RigInspectBE's tracked public/build came
+    // back as 128 changed files beside the run's 6 (2026-09-25).
+    let before_checks = (!gates.is_empty() && !scope.requested_build)
+        .then(|| project::snapshot(&ctx.dir, scope.base_commit))
+        .flatten();
     let ran = if commands.is_empty() {
         Ok(Vec::new())
     } else {
         run_all(store, ctx, state, control, emit, &commands, &envs, &cwds, &named).await
     };
     let _ = std::fs::remove_dir_all(&scratch);
+    if let (Some(before), Some(base)) = (&before_checks, scope.base_commit) {
+        let built: Vec<String> =
+            project::dirtied_since(&ctx.dir, Some(base), before).into_iter().filter(|p| routing::generated(p)).collect();
+        // Chunked: a Windows command line holds about 32k characters.
+        let failed = built.chunks(200).find_map(|chunk| project::rewind_files(&ctx.dir, base, chunk).err());
+        if !built.is_empty() {
+            let text = match failed {
+                None => format!("Put back {} built files the checks wrote over", built.len()),
+                Some(e) => format!("Could not put back the built files the checks wrote over: {}", e.message),
+            };
+            let event = ProviderEvent::Text(text);
+            let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
+        }
+    }
     match ran {
         Err(Ran::Cancelled) => return Some(false),
         // Nothing started, and a check that did not start is left out, as ever.
@@ -3386,13 +3454,17 @@ async fn shards_verdict(
     let again = phpunit(&files);
     let args: Vec<&str> = again.iter().map(String::as_str).collect();
     let named = format!("{shown}: the failing shards' tests again, in one process");
-    match run_check(store, ctx, state, control, emit, &args, cwd, &named).await {
+    let first = match run_check(store, ctx, state, control, emit, &args, cwd, &named).await {
         Ran::Finished { passed, output } => Ran::Finished {
             passed: passed || php_warnings_only("php vendor/bin/phpunit", &output, changed),
             output,
         },
         other => other,
-    }
+    };
+    // Then the failing files alone, as any other suite gets: LiftMe's
+    // QuoteFlowTest failed in both runs above on a patch that never touched
+    // quotes, and the run ended verifyFailed (2026-09-25).
+    run_again(store, ctx, state, control, emit, first, &args, cwd, &named).await
 }
 
 /// The folder tree under `from`, without its files, recreated under `to`.
@@ -4853,6 +4925,15 @@ mod tests {
         assert_eq!(plan(Some(&picked), 2).model(ProviderId::Codex).model, "gpt-6-luna");
     }
 
+    #[test]
+    fn a_codex_question_is_answered_on_sol_and_a_claude_one_stays_cheapest() {
+        let route = one_call("does checkout retry a failed payment?");
+        assert_eq!((route.kind, route.task_type), (routing::RouteKind::Answer, crate::intent::TaskType::Question));
+        let plan = |id| stage_plan(&route, None, id, 0, &[Stage::Answer], 0, None).model(id);
+        assert_eq!(plan(ProviderId::Codex).model, "gpt-6-sol");
+        assert_eq!(plan(ProviderId::Claude).model, "sonnet");
+    }
+
     fn plan_for(stage: Stage) -> StagePlan {
         StagePlan {
             stage,
@@ -4863,6 +4944,20 @@ mod tests {
             shell: true,
             ruleset: None,
         }
+    }
+
+    /// The second opinion's "Fix it" carries each serious finding's own fix,
+    /// numbered; low ones stay out, and only low ones offer nothing.
+    #[test]
+    fn a_recommended_fix_lists_the_serious_findings_with_their_fixes() {
+        let finding = |severity, line| {
+            serde_json::json!({ "severity": severity, "file": "app/Sync.php", "line": line, "issue": "misses rows", "fix": "rows at the cursor are kept" })
+        };
+        let prompt = fix_prompt(&[finding("low", 1), finding("medium", 35), finding("high", 40)]).unwrap();
+        assert!(prompt.contains("1. `app/Sync.php:35` misses rows\n   Fix: rows at the cursor are kept"));
+        assert!(prompt.contains("2. `app/Sync.php:40`"));
+        assert!(!prompt.contains(":1`"));
+        assert_eq!(fix_prompt(&[finding("low", 1)]), None);
     }
 
     /// A stage without a shell (an Answer) gets no Bash or PowerShell on
@@ -6567,7 +6662,8 @@ ping -n 60 127.0.0.1 >nul
         .unwrap();
         std::fs::write(
             dir.join("vendor/bin/phpunit"),
-            "<?php\nforeach (array_slice($argv, 1) as $f) { $t = file_get_contents($f); if (str_contains($t, 'FAIL') || (str_contains($t, 'RACE') && getenv('LARAVEL_STORAGE_PATH'))) { echo \"1) Tests\\\\\" . basename($f, '.php') . \"::test_it\\nFAILURES!\\n\"; exit(1); } }\necho \"OK\\n\";\n",
+            // FLAKY fails in a shard and in its first run in one process, then passes.
+            "<?php\nforeach (array_slice($argv, 1) as $f) { $t = file_get_contents($f); $flaky = str_contains($t, 'FLAKY') && (getenv('LARAVEL_STORAGE_PATH') || !file_exists('flaky.seen') && touch('flaky.seen')); if (str_contains($t, 'FAIL') || $flaky || (str_contains($t, 'RACE') && getenv('LARAVEL_STORAGE_PATH'))) { echo \"1) Tests\\\\\" . basename($f, '.php') . \"::test_it\\nFAILURES!\\n\"; exit(1); } }\necho \"OK\\n\";\n",
         )
         .unwrap();
         std::fs::write(dir.join("tests/Feature/OrderTest.php"), "<?php\nclass OrderTest {}\n").unwrap();
@@ -6642,8 +6738,9 @@ ping -n 60 127.0.0.1 >nul
             return;
         }
         // A real failure fails the suite; one only running side by side
-        // causes passes its rerun in one process.
-        for (mark, status) in [("FAIL", "verifyFailed"), ("RACE", "done")] {
+        // causes passes its rerun in one process; a flaky one that fails that
+        // rerun too passes once more alone, and is named.
+        for (mark, status) in [("FAIL", "verifyFailed"), ("RACE", "done"), ("FLAKY", "done")] {
             let store = Store::in_memory().unwrap();
             let route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
             let mut request = routed(&store, &format!("shards-{mark}"), route);
@@ -6663,6 +6760,9 @@ ping -n 60 127.0.0.1 >nul
                 let output = failed_summary(verify.artifact.as_ref());
                 assert!(output.contains("Tests\\PriceTest::test_it"), "{output}");
                 assert!(!output.contains("OK"), "a passing shard's output is noise: {output}");
+            }
+            if mark == "FLAKY" {
+                assert!(result.summary.contains("failed once and passed when run again"), "{}", result.summary);
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -6744,6 +6844,54 @@ ping -n 60 127.0.0.1 >nul
         let (php, js) = (span("php "), span("js "));
         assert!(php.0 < js.1 && js.0 < php.1, "they overlap: {times}");
         assert!(result.timings.iter().any(|t| t.label == "npm test") && result.timings.iter().any(|t| t.label == "composer test"), "{:?}", result.timings);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An unasked build leaves committed build output as it found it: rewritten,
+    /// added and deleted files all go back, and the run's own work stays.
+    #[tokio::test]
+    async fn a_build_check_puts_back_the_output_it_wrote_over() {
+        if crate::providers::which("npm").is_none() {
+            eprintln!("skipped: npm is not on PATH");
+            return;
+        }
+        let store = Store::in_memory().unwrap();
+        let mut route = unreviewed("make the header bold", Mode::Balanced, &RepoSignals::default());
+        route.task_type = TaskType::CodeChange;
+        let mut request = routed(&store, "build-output", route);
+        let dir = request.dir.clone();
+        std::fs::create_dir_all(dir.join("public/build")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"test":"node -e 0","build":"node b.js"}}"#).unwrap();
+        std::fs::write(
+            dir.join("b.js"),
+            "const fs = require('fs');\nfs.writeFileSync('public/build/app.js', 'new');\nfs.writeFileSync('public/build/app-9f.js', 'new');\nfs.writeFileSync('public/build/manifest.json', '{}');\nfs.rmSync('public/build/old.js');\n",
+        )
+        .unwrap();
+        for (path, text) in [("public/build/app.js", "old"), ("public/build/old.js", "old"), ("public/build/manifest.json", "{\"v\":1}"), ("header.js", "export {};\n")] {
+            std::fs::write(dir.join(path), text).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        request.base_commit = Some(git(&["rev-parse", "HEAD"]));
+        std::fs::write(dir.join("header.js"), "export const bold = true;\n").unwrap();
+        let passing = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        claude_shim(&mut request, &passing);
+
+        let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+        assert_eq!(result.status, "done", "{:?}", result.failure);
+        assert!(result.timings.iter().any(|t| t.label == "npm run build"), "the build ran: {:?}", result.timings);
+        let status = git(&["status", "--porcelain"]);
+        assert_eq!(status.lines().filter(|l| !l.ends_with(".log") && !l.contains("fake")).collect::<Vec<_>>(), ["M header.js"], "{status}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

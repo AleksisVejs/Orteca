@@ -420,6 +420,17 @@ pub fn attribute(dir: &Path, diff: &mut Vec<FileStat>, before: Option<&Snapshot>
     diff.extend(reverted);
 }
 
+/// Files changed since `base` that `before` did not list: clean when that
+/// snapshot was taken, changed now.
+pub fn dirtied_since(dir: &Path, base: Option<&str>, before: &Snapshot) -> Vec<String> {
+    diff_since(dir, base)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.path)
+        .filter(|path| !before.0.iter().any(|(p, _)| p == path))
+        .collect()
+}
+
 /// Everything uncommitted, tracked and untracked, as a commit no branch holds,
 /// kept by `refs/orteca/before/<task>/<ms>`. Built in a throwaway index, so the
 /// working tree and the user's own index are not touched. What a run undoes

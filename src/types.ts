@@ -433,6 +433,9 @@ export interface TaskResult {
   /** The commit holding the user's uncommitted work from before the run; a
    *  `reverted` file is restored from it. Absent on older results. */
   savedState?: string | null;
+  /** The reply Claude's second opinion recommends for its serious findings,
+   *  offered as one click and never sent on its own. Absent on older results. */
+  recommendedFix?: string | null;
 }
 export interface TaskEvent {
   id: number;

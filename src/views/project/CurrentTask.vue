@@ -4,6 +4,7 @@ import Markdown from "../../components/Markdown.vue";
 import ActivityLog from "./ActivityLog.vue";
 import TaskChat from "./TaskChat.vue";
 import SteerBox from "./SteerBox.vue";
+import ClarifyBox from "./ClarifyBox.vue";
 import ExchangeView from "./Exchange.vue";
 import Story from "./Story.vue";
 import { PROJECT, exchangeOf, rewindCode, storyOf } from "./state";
@@ -18,8 +19,19 @@ const {
   removedCopies, confirmRemove, removeCopy, removeError, tokens,
   comparison, HISTORY_STATUS, formatTokens, sendReply, warmLeft,
   git, openGit, retryAt, waiting, waitForReset, cancelWait, formatWhen, lines, carryOn, rewindTo,
-  answerClarify,
+  answerClarify, reply,
 } = inject(PROJECT)!;
+// The second opinion's findings, as a reply the user sends or passes on.
+const passedOn = ref<number[]>([]);
+const recommended = computed(() => {
+  const r = result.value;
+  return r?.recommendedFix && canReply.value && !running.value && !passedOn.value.includes(r.taskId) ? r.recommendedFix : null;
+});
+function fixIt() {
+  if (!recommended.value) return;
+  reply.value = recommended.value;
+  void sendReply();
+}
 // A run that finished out of sight: what was done, what failed, what waits on the user.
 const away = computed(() => {
   const r = result.value;
@@ -37,8 +49,6 @@ const away = computed(() => {
     ].filter((l): l is string => typeof l === "string"),
   };
 });
-const clarifyAnswer = ref("");
-watch(() => activeRun.value?.clarify, () => (clarifyAnswer.value = ""));
 
 // A copy's committed work is on its branch; a fresh run would start without it.
 // A failed or stopped run takes a reply like any other: "try again, but…".
@@ -198,17 +208,11 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
     </template>
     <template v-else-if="activeRun.clarify" #current>
       <div class="mine"><h1 class="bubble">{{ said }}</h1></div>
-      <form class="clarify" @submit.prevent="answerClarify(clarifyAnswer.trim())">
-        <p class="note">Before it starts: {{ activeRun.clarify?.question }}</p>
-        <div class="clarify-row">
-          <input v-model="clarifyAnswer" aria-label="Your answer" placeholder="Your answer" />
-          <button class="btn" :disabled="!clarifyAnswer.trim()">Answer and run</button>
-          <button type="button" class="link" title="The agent says how it read the request, then does it" @click="answerClarify('')">Skip</button>
-        </div>
-      </form>
     </template>
     <template v-if="running" #composer><SteerBox ref="steer" /></template>
-    <template v-else-if="activeRun.clarify" #composer><div class="composer-bar" /></template>
+    <template v-else-if="activeRun.clarify" #composer>
+      <ClarifyBox :question="activeRun.clarify?.question ?? ''" :provider="activeRun.provider" @answer="answerClarify" />
+    </template>
 
     <template #notes>
       <section v-if="away" class="away" role="status" aria-label="While you were away">
@@ -245,6 +249,17 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
         </template>
         Run again if you want it to keep going.
       </p>
+      <section v-if="recommended" class="recommended" aria-label="Recommended fix">
+        <p><strong>Recommended fix</strong> · Claude’s review found problems worth fixing. Fix it sends each one with its fix as a reply.</p>
+        <details>
+          <summary class="note">What it sends</summary>
+          <p class="sends note">{{ recommended }}</p>
+        </details>
+        <div class="recommended-row">
+          <button class="btn" @click="fixIt">Fix it</button>
+          <button class="link" @click="passedOn.push(result.taskId)">Not now</button>
+        </div>
+      </section>
       <div v-if="result.worktree" class="copy" role="status">
         <p class="note">
           Worked in a separate copy on branch <span class="mono">{{ result.worktree.branch }}</span>.
@@ -300,36 +315,32 @@ watch([() => activeRun.value?.key, running], ([key, now], [was, before]) => {
 <style scoped src="./result.css"></style>
 <style scoped src="./chat.css"></style>
 <style scoped>
-.away {
+.away, .recommended {
   margin: 0 0 12px;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r);
   background: var(--surface);
 }
-.away p {
+.away p, .recommended p {
   margin: 0;
   color: var(--text);
+}
+.recommended details {
+  margin: 6px 0 8px;
+}
+.recommended .sends {
+  margin-top: 6px;
+  white-space: pre-wrap;
 }
 .away ul {
   margin: 6px 0;
   padding-left: 18px;
 }
-.clarify-row {
+.recommended-row {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.clarify-row input {
-  flex: 1;
-  min-width: 0;
-  min-height: 32px;
-  padding: 5px 8px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font: inherit;
 }
 .early {
   padding: 16px 18px;

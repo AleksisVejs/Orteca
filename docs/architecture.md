@@ -851,7 +851,9 @@ the Codex binary; `codex exec resume` takes `--output-schema`.
 - **Second opinion.** A Codex code change over 100 lines is reviewed by Claude
   (opus medium, fresh session) when Claude is signed in to its plan. Advisory:
   findings go in the summary, a `crossReview` event logs lines, findings and
-  cost. Claude's work is never sent to Codex.
+  cost. Claude's work is never sent to Codex. Medium and high findings, each
+  with its own `fix`, become `recommendedFix`: a reply the result offers as
+  "Fix it", sent only on that click.
 - **Checkpoints.** Every run in the current tree saves `refs/orteca/before/`,
   a clean one too, so a moved branch cannot take the undo point with it.
 - **Window anchoring** (`views/project/anchor.ts`, Settings page, off by
@@ -871,9 +873,11 @@ run bought. One sample each; not yet a baseline.
 
 ### 4.3.12 Orteca's prompt replaces the CLI's own — 2026-09-25
 
-Shipped from the parked note below. `rulesets/agent.md` (seven lines: use the
-tools, finish then stop, read before editing, parallel reads, no git
-housekeeping, short final reply) leads every non-chat ruleset, and the whole
+Shipped from the parked note below. `rulesets/agent.md` (eight lines: use the
+tools, finish then stop, read before editing, parallel reads, read UTF-8 as
+UTF-8 - Windows PowerShell's `Get-Content` turned `…` into `â€¦` and Codex
+reported it as a bug in tasks 15 and 57 - no git housekeeping, short final
+reply) leads every non-chat ruleset, and the whole
 text goes in as `claude --system-prompt-file` and `codex -c
 model_instructions_file=<file>`, the file in Orteca's temp directory. A Codex
 resume passes it again. `NAV_CLIPROMPT=1` restores the old append.

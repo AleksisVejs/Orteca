@@ -1,12 +1,12 @@
 <script lang="ts">
 export type OrbState =
   | "idle" | "user_typing" | "classifying" | "thinking" | "planning" | "searching" | "reading" | "editing" | "running"
-  | "testing" | "reviewing" | "needs_input" | "success" | "error" | "rate_limited" | "rollback" | "handoff" | "paused";
+  | "testing" | "reviewing" | "needs_input" | "asking" | "success" | "error" | "rate_limited" | "rollback" | "handoff" | "paused";
 
 export const ORB_LABEL: Record<OrbState, string> = {
   idle: "Idle", user_typing: "You're typing", classifying: "Sorting the request", thinking: "Thinking",
   planning: "Planning", searching: "Searching", reading: "Reading", editing: "Editing", running: "Running a command",
-  testing: "Testing", reviewing: "Reviewing", needs_input: "Needs your input", success: "Done", error: "Something went wrong",
+  testing: "Testing", reviewing: "Reviewing", needs_input: "Needs your input", asking: "Has a question", success: "Done", error: "Something went wrong",
   rate_limited: "Limit reached, waiting for reset", rollback: "Undoing", handoff: "Handing over", paused: "Paused",
 };
 </script>
@@ -26,7 +26,7 @@ const props = withDefaults(
 
 const ZERO = {
   spin: 0, breathe: 0, drift: 0, lean: 0, cluster: 0, twin: 0, rings: 0, sweep: 0, flow: 0, patch: 0, beat: 0,
-  fill: 0, layers: 0, wave: 0, settle: 0, rest: 0, bloom: 0, shake: 0, rewind: 0, rebuild: 0, alpha: 1,
+  fill: 0, layers: 0, wave: 0, settle: 0, rest: 0, bloom: 0, shake: 0, rewind: 0, rebuild: 0, ask: 0, alpha: 1,
 };
 type Look = typeof ZERO;
 const look = (l: Partial<Look>): Look => ({ ...ZERO, ...l });
@@ -44,6 +44,7 @@ const LOOKS: Record<OrbState, Look> = {
   testing: look({ spin: 0.25, fill: 1 }),
   reviewing: look({ spin: 0.5, layers: 1 }),
   needs_input: look({ wave: 1 }),
+  asking: look({ ask: 1 }),
   success: look({ ...IDLE, bloom: 1 }),
   error: look({ spin: 0.06, shake: 1, alpha: 0.9 }),
   rate_limited: look({ settle: 1, alpha: 0.85 }),
@@ -55,6 +56,19 @@ const KEYS = Object.keys(ZERO) as (keyof Look)[];
 
 const DENSITY: Record<Tier, number> = { cheapest: 56, standard: 88, deep: 120 };
 const TETRA = [[0, 1, 0], [0.94, -0.33, 0], [-0.47, -0.33, 0.82], [-0.47, -0.33, -0.82]] as const;
+// A question mark of a few dots, y down: six spaced along the hook and the
+// stem, one for the dot under them.
+const BEADS = 7;
+function bead(j: number): [number, number] {
+  if (j === BEADS - 1) return [0, 0.7];
+  const p = (j / (BEADS - 2)) * 2;
+  if (p < 1.72) {
+    const th = Math.PI * (-1 + (260 / 180) * (p / 1.72));
+    return [0.38 * Math.cos(th), -0.35 + 0.38 * Math.sin(th)];
+  }
+  const k = (p - 1.72) / 0.28;
+  return [0.066 * (1 - k), 0.024 + 0.276 * k];
+}
 function sphere(n: number) {
   return Array.from({ length: n }, (_, i) => {
     const y = 1 - (2 * (i + 0.5)) / n;
@@ -179,8 +193,24 @@ function draw(ctx: CanvasRenderingContext2D, px: number, f: Frame) {
       sy += (0.95 - seed * 0.35 * (1 - bx * bx) - sy) * down;
       sz += (0.3 - sz) * down;
     }
+    // Gathered into a few dots drawn as a question mark; the rest fold into
+    // them. A light runs along it, hook to dot, one dot at a time.
+    let lit = 0;
+    if (L.ask > 0) {
+      const j = i % BEADS;
+      const [qx, qy] = bead(j);
+      sx += (qx - sx) * L.ask;
+      sy += (qy - sy) * L.ask;
+      sz += (0.6 - sz) * L.ask;
+      if (i >= BEADS) alpha *= 1 - L.ask;
+      else if (motion) {
+        const d = ((t * 5) % (BEADS + 4)) - j;
+        lit = L.ask * Math.exp(-(d * d) / 0.8);
+        alpha *= 1 - 0.55 * L.ask;
+      }
+    }
     const depth = (sz + 1) / 2;
-    let size = 1;
+    let size = 1 + 0.6 * L.ask + 0.4 * lit;
     let r = R * bloom * (1 + 0.02 * L.breathe * Math.sin((t * TAU) / 4.5) + 0.09 * L.beat * pulse + 0.14 * gulp);
     const layer = Math.max(L.twin, L.layers);
     if (inner) r *= 1 - 0.3 * layer * (i % 6 === 3 && L.layers > 0 ? 0.5 + 0.5 * Math.sin(t * 1.3 + i) : 1);
@@ -209,7 +239,7 @@ function draw(ctx: CanvasRenderingContext2D, px: number, f: Frame) {
     const drift = L.drift * (i % 11 === 0 ? 0.05 : 0);
     const X = c + shake + sx * r + drift * R * Math.sin(t * 0.6 + i);
     const Y = c + sy * r + drift * R * Math.cos(t * 0.45 + i * 1.7) + L.lean * 0.1 * R * (0.5 + 0.5 * sy);
-    const glow = 0.8 * hit + 0.4 * L.beat * pulse + 0.5 * bump + 0.5 * gulp;
+    const glow = 0.8 * hit + 0.4 * L.beat * pulse + 0.5 * bump + 0.5 * gulp + 0.8 * lit;
     dot(X, Y, px * (0.012 + 0.02 * depth) * size * (1 + 0.8 * hit), L.alpha * rest * (alpha * (0.15 + 0.85 * depth) + glow));
   });
 
@@ -286,7 +316,7 @@ onMounted(() => {
     const green = L.bloom * clamp(1 - Math.abs(s - 0.8) / 0.8);
     if (green > 0) color = color.map((v, j) => v + (tone.ok[j]! - v) * green);
     if (motion && state === "error" && s < 0.5 && Math.sin(s * 60) < 0) color = base();
-    const Lm = motion ? L : look({ alpha: L.alpha * (1 + 0.3 * L.bloom * green), rest: Math.max(L.rest, L.wave, L.beat) });
+    const Lm = motion ? L : look({ alpha: L.alpha * (1 + 0.3 * L.bloom * green), rest: Math.max(L.rest, L.wave, L.beat), ask: L.ask });
     draw(ctx, px, {
       L: Lm, t: (now - t0) / 1000, s, aOut, aIn, motion,
       rgb: `rgb(${color.map(Math.round).join(" ")})`,

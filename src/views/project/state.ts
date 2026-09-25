@@ -1106,7 +1106,10 @@ export function useProject(opened: OpenedProject, active: Ref<boolean> = ref(tru
     try {
       await deleteTask(opened.project.path, id);
       history.value = history.value.filter((t) => t.id !== id);
-      if (historyDetail.value?.id === id) {
+      // A finished run or a waiting question is on screen from memory, not history.
+      const shown = activeRun.value?.id === id;
+      runs.value = runs.value.filter((r) => r.active || r.id !== id);
+      if (shown || historyDetail.value?.id === id) {
         historyDetail.value = null;
         newTask();
       }

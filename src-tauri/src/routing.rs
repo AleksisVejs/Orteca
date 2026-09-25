@@ -780,10 +780,14 @@ fn nouns(prompt: &str) -> Vec<String> {
 
 /// A built bundle a tracked `public/` folder or a `dist/` holds. Its symbols are
 /// minified and its names hashed, so it matches many ordinary words at once and
-/// outranks the one source file the prompt names.
+/// outranks the one source file the prompt names. Vite's Laravel output folder
+/// is all built, its `manifest.json` too.
 pub fn generated(path: &str) -> bool {
     let built = path.ends_with(".js") || path.ends_with(".css") || path.ends_with(".map");
-    (path.starts_with("public/") && built) || path.starts_with("dist/") || path.contains("/dist/")
+    (path.starts_with("public/") && built)
+        || path.starts_with("public/build/")
+        || path.starts_with("dist/")
+        || path.contains("/dist/")
 }
 
 const TEST_WORDS: &[&str] = &["test", "tests", "spec"];
@@ -1864,13 +1868,16 @@ pub fn brief(
         Stage::Answer if route.task_type == TaskType::Plan => out.push_str(
             "Plan the work below. Read what you need and change no file. Reply with numbered \
              steps, the files each step touches, and the risks, then stop: the user approves \
-             the plan before anything changes. Reply in the language it was asked in.\n\n",
+             the plan before anything changes. Reply in the human language the request below \
+             is written in, whatever language the code you read is in.\n\n",
         ),
         Stage::Answer => out.push_str(
-            "Answer the question below. Read what you need, change no file, and reply in \
-             the language it was asked in. When the answer is in this project, stop reading \
+            "Answer the question below. Read what you need and change no file. Reply in the \
+             human language the question below is written in, whatever language the code, \
+             comments or files you read are in. When the answer is in this project, stop reading \
              as soon as you can answer every part of it; do not search again to \
-             double-check. A cause or a claim about what code does must come from the code \
+             double-check. When several things in the code cause what was asked about, \
+             name each one, the biggest first, with the file and function it is in. A cause or a claim about what code does must come from the code \
              or output you read, and never state a cause you only guessed. When the \
              question is why something happened or what caused it, follow the code from \
              what the user did to each thing they say went wrong, step by step, until every \
@@ -2947,6 +2954,7 @@ mod tests {
         let r = route("fix the quote controller", Mode::Balanced, &signals);
         assert_eq!(r.candidate_paths, ["app/Http/Controllers/QuoteController.php"]);
         assert!(generated("public/build/assets/x.js") && !generated("public/index.php"));
+        assert!(generated("public/build/manifest.json") && !generated("public/robots.txt"));
     }
 
     #[test]

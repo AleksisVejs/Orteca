@@ -59,6 +59,67 @@ const TASKS = LIFTME ? (await import("./liftme.tasks.mjs")).TASKS : {
     vitest: true,
     grep: [["resources/js/src/offline/sync.js", /since/]],
   },
+  // Questions: run only when named. Graded by the facts the answer must name
+  // (the code behind easy/medium/tough), and by leaving the tree untouched.
+  "q-easy": {
+    question: true,
+    prompt: "What does GET /api/equipment return when the request has no per_page? Point me to the code that decides it.",
+    facts: [
+      ["EquipmentController", /EquipmentController/],
+      ["whole list, unpaginated", /unpaginat|not paginat|no pagination|without pagination|whole|entire|every (piece|item|row)|all (of )?(the )?(admin's |matching )?(equipment|items|rows|records)|->get\(\)/i],
+      ["per_page defaults to 0", /'per_page',\s*0|per_page[^.\n]{0,50}\b(0|zero)\b|default[^.\n]{0,40}\b(0|zero)\b/i],
+      ["capped at 100", /\b100\b/],
+    ],
+  },
+  "q-medium": {
+    question: true,
+    prompt: "Global equipment search gets slow when many results match. Why? Name the exact code responsible.",
+    facts: [
+      ["GlobalSearchService::searchEquipment", /searchEquipment/],
+      ["a Client query per assigned client in the loop", /N\s*\+\s*1|one query (per|for each)|a query (per|for each)|quer(y|ies) (per|for each|for every) (assigned )?client|inside the (results )?(foreach|loop)|in(side)? (the|a|that) (foreach|loop)/i],
+      ["eager-loads the full checkup history", /checkupHistory|checkup[_ ]history/i],
+    ],
+  },
+  "q-tough": {
+    question: true,
+    prompt: "Technicians on slow connections say every offline sync takes ages and uses a lot of data, even when almost nothing changed. Why?",
+    facts: [
+      ["the sync bootstrap endpoint", /bootstrap/i],
+      ["full snapshot every time, no delta", /no (delta|incremental|since|diff)|not (incremental|a delta)|full (snapshot|download|payload|dump|dataset|list|inventory)|whole (inventory|list|dataset|payload)|entire (inventory|list|dataset|payload)|every time|re-?download/i],
+      ["the client wipes and rewrites its cache", /(delet|wip|clear|replac|rewrit)\w*[^.\n]{0,80}(cache|IndexedDB|Dexie|cachedEquipment)|(cache|IndexedDB|Dexie|cachedEquipment)[^.\n]{0,80}(delet|wip|clear|replac|rewrit)/i],
+    ],
+  },
+  // Abstract: no single function holds the answer.
+  "q-overview": {
+    question: true,
+    prompt: "Give me the big picture of this project: what it is for, who uses it, and how it is built.",
+    facts: [
+      ["Laravel backend", /Laravel/i],
+      ["Vue frontend", /Vue/i],
+      ["equipment inspections", /inspect|checkup/i],
+      ["admin, technician and client roles", /^(?=[\s\S]*admin)(?=[\s\S]*technician)(?=[\s\S]*client)/i],
+      ["works offline", /offline|PWA|IndexedDB|Dexie/i],
+    ],
+  },
+  "q-tenancy": {
+    question: true,
+    prompt: "How does this app keep one company's data away from another company's? Is that approach safe?",
+    facts: [
+      ["admin_id is the tenant key", /admin_id/],
+      ["filtered by hand per query, no global scope", /no global scope|not? (use )?(a )?global scope|without (a )?global scope|by hand|manual|each (query|controller|endpoint)|every (query|controller|endpoint)|per[- ](query|controller|endpoint)|explicit/i],
+      ["one missed filter leaks data", /forg[eo]t|miss(ed|ing)? (a |one |the )?(filter|where|check|scope)|omit|leak|easy to/i],
+    ],
+  },
+  "q-offline-work": {
+    question: true,
+    prompt: "What happens to an inspection a technician saves with no signal, and how does the app make sure it is neither lost nor saved twice?",
+    facts: [
+      ["queued in an IndexedDB outbox", /outbox|IndexedDB|Dexie/i],
+      ["sent when back online", /online|reconnect/i],
+      ["a client-made checkup id dedupes retries", /clientCheckupId|client_checkup_id|checkup_id|client[- ](supplied|generated|side) (id|checkup)|idempot/i],
+      ["kept and retried on failure", /retr(y|ies|ied)|backoff|back-off|nextAttemptAt|lease/i],
+    ],
+  },
 };
 const ARMS = (process.env.ARMS ?? "orteca-claude,claude,orteca-codex,codex").split(",");
 // `orteca-claude+cli` is the same arm on the CLI's own system prompt (NAV_CLIPROMPT).
@@ -161,6 +222,7 @@ function ortecaRow(x) {
     stageMs: x.stages?.map((s) => `${s.stage} ${s.durationMs}`), timings: x.timings?.map((t) => `${t.label} ${t.ms}`),
     // From the prompt, classify included: when the change was shown, and when the suite said done.
     resultMs: x.benchBeginMs + (x.timings?.find((t) => t.label === "result shown")?.ms ?? x.durationMs), doneMs: x.benchWallMs,
+    answer: x.summary,
   };
 }
 
@@ -185,21 +247,22 @@ function runArm(arm, dir, prompt, extraEnv = {}) {
     return {
       status: j.subtype, calls: 1, turns: j.num_turns, model: Object.keys(j.modelUsage ?? {}).join(","),
       input: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), cached: u.cache_read_input_tokens, output: u.output_tokens,
-      cost: j.total_cost_usd, costQuality: "estimated", ms: Date.now() - t0,
+      cost: j.total_cost_usd, costQuality: "estimated", ms: Date.now() - t0, answer: j.result,
     };
   }
   const r = spawnSync("codex", CODEX_ARGS, { cwd: dir, input: prompt, encoding: "utf8", shell: true, env: ENV, timeout: ARM_TIMEOUT, maxBuffer: 64e6 });
-  let input = 0, cached = 0, output = 0, status = "noTurn";
+  let input = 0, cached = 0, output = 0, status = "noTurn", answer = "";
   for (const line of (r.stdout ?? "").split("\n")) {
     try {
       const v = JSON.parse(line);
+      if (v.type === "item.completed" && v.item?.type === "agent_message") answer = v.item.text;
       if (v.type === "turn.completed") { status = "done"; input += v.usage.input_tokens ?? 0; cached += v.usage.cached_input_tokens ?? 0; output += v.usage.output_tokens ?? 0; }
       if (v.type === "turn.failed" || v.type === "error") status = "failed";
     } catch {}
   }
   input -= cached; // Codex input includes cached; report uncached like the others.
   const cost = terra ? (input * terra.input + cached * terra.cache_read + output * terra.output) / 1e6 : null;
-  return { status, calls: 1, model: CODEX_MODEL, input, cached, output, cost, costQuality: cost == null ? "unavailable" : "estimated", ms: Date.now() - t0 };
+  return { status, calls: 1, model: CODEX_MODEL, input, cached, output, cost, costQuality: cost == null ? "unavailable" : "estimated", ms: Date.now() - t0, answer };
 }
 
 function phpunit(dir, file) {
@@ -210,7 +273,7 @@ function phpunit(dir, file) {
   return "FAIL " + (plain.match(/Tests: .*/)?.[0] ?? `exit ${r.status}`) + " " + detail.replace(/\s+/g, " ");
 }
 
-function grade(dir, task, name, arm) {
+function grade(dir, task, name, arm, answer = "") {
   // The patch is saved before the hidden tests go in, so it is only the agent's work.
   git("-C", dir, "add", "-A");
   const patch = git("-C", dir, "diff", "--cached", "HEAD");
@@ -218,12 +281,14 @@ function grade(dir, task, name, arm) {
   writeFileSync(join(ROOT, "patches", `${name}-${arm}.patch`), patch);
   const stat = git("-C", dir, "diff", "--cached", "--shortstat", "HEAD").trim();
   const checks = {};
-  for (const h of task.hidden) {
+  for (const [label, re] of task.facts ?? []) checks[label] = re.test(answer ?? "") ? "pass" : "FAIL";
+  if (task.question) checks["tree untouched"] = stat ? `FAIL ${stat}` : "pass";
+  for (const h of task.hidden ?? []) {
     const file = `tests/Feature/${h.split("/").pop()}`;
     copyFileSync(join(here, "hidden", h), join(dir, file));
     checks[h] = phpunit(dir, file);
   }
-  for (const f of task.also) checks[f] = phpunit(dir, f);
+  for (const f of task.also ?? []) checks[f] = phpunit(dir, f);
   if (task.vitest) {
     const r = spawnSync("npx", ["vitest", "run"], { cwd: dir, encoding: "utf8", shell: true, env: ENV, timeout: 10 * 60_000 });
     checks.vitest = r.status === 0 ? "pass" : "FAIL " + ((r.stdout ?? "").replace(/\x1b\[[0-9;]*m/g, "").match(/Tests\s+.*/)?.[0] ?? "");
@@ -435,14 +500,14 @@ if (process.env.PARALLEL && ARMS.length > 1) {
   console.log("done");
   process.exit(0);
 }
-for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS).filter((n) => !TASKS[n].trap)) {
+for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(TASKS).filter((n) => !TASKS[n].trap && !TASKS[n].question)) {
   for (const arm of ARMS) {
     if (results.some((r) => r.task === name && r.arm === arm)) continue;
     const dir = join(ROOT, "wt", `${name}-${arm}`);
     makeWorktree(dir);
     console.log(`running ${name} / ${arm}`);
     const m = runArm(arm, dir, TASKS[name].prompt);
-    const row = { task: name, arm, ...grade(dir, TASKS[name], name, arm), ...m };
+    const row = { task: name, arm, ...grade(dir, TASKS[name], name, arm, m.answer), ...m };
     dropWorktree(dir);
     console.log(JSON.stringify(row, null, 1));
     results.push(row);

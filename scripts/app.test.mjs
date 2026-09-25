@@ -39,7 +39,7 @@ for (const answer of ['Fix the broken task flow', '']) {
 
     const view = readFileSync(new URL('../src/views/Project.vue', import.meta.url), 'utf8');
     const current = readFileSync(new URL('../src/views/project/CurrentTask.vue', import.meta.url), 'utf8');
-    assert.match(current, /<template v-else-if="activeRun\.clarify" #current>[\s\S]*?<form class="clarify"/, 'the question form renders before a result exists');
+    assert.match(current, /<template v-else-if="activeRun\.clarify" #composer>\s*<ClarifyBox /, 'the question box renders before a result exists');
     const condition = view.match(/<CurrentTask v-if="([^"]+)"/)[1];
     const visible = () => vm.runInNewContext(condition, {
       running: state.running.value,
@@ -61,6 +61,22 @@ for (const answer of ['Fix the broken task flow', '']) {
     assert.equal(Boolean(visible()), true);
   });
 }
+
+test('deleting a task waiting on its question leaves it for a new task', async () => {
+  const deleted = [];
+  const { state } = await projectView({
+    recentTasks: async () => [],
+    startTask: async () => { throw { kind: 'clarify', message: 'Which part?', taskId: 7 }; },
+    deleteTask: async (_path, id) => { deleted.push(id); },
+  });
+  state.task.value = 'fix this and that';
+  await state.run();
+  state.askDelete({ id: 7 });
+  await state.removeTask();
+  assert.deepEqual(deleted, [7]);
+  assert.equal(state.activeRun.value, null, 'the deleted question is no longer on screen');
+  assert.equal(state.runs.value.length, 0);
+});
 
 test('a clarification reopened from history resumes the saved request', async () => {
   const calls = [];

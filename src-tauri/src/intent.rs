@@ -453,7 +453,9 @@ async fn ask_with(
             Line::Json(v) => {
                 // Every call carries the plan's usage: keep it, for free.
                 crate::providers::limits::remember(id, &v);
+                let mut done = false;
                 for event in id.parse_line(&v) {
+                    done |= matches!(event, ProviderEvent::Done { .. });
                     match &event {
                         ProviderEvent::Text(text) => reply = text.clone(),
                         // A schema's answer arrives as data, not as words.
@@ -464,6 +466,11 @@ async fn ask_with(
                         _ => {}
                     }
                     events.push(event);
+                }
+                // The answer is in. Codex took another 3-4.5s to exit after it
+                // (2026-09-25); dropping `run` closes its job instead.
+                if done {
+                    break;
                 }
             }
             Line::Exit(_) => break,
@@ -476,6 +483,26 @@ async fn ask_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CLI that answers and then lingers is read at its answer, not its exit.
+    #[tokio::test]
+    async fn the_reading_is_taken_when_the_answer_arrives_not_at_exit() {
+        let dir = std::env::temp_dir().join(format!("orteca-linger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("fake.cmd");
+        std::fs::write(&program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+        let answer = r#"{"type":"question","difficulty":"easy","confidence":0.9,"clarify":null,"title":"Why","job":["general"],"run":[],"reply":null,"change":false,"cause":true}"#;
+        std::fs::write(
+            dir.join("fake.js"),
+            format!("console.log(JSON.stringify({{type:'result',subtype:'success',result:'',structured_output:{answer},usage:{{input_tokens:1,output_tokens:1}}}}));\nsetTimeout(() => {{}}, 20000);\n"),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let (reading, _) = read(ProviderId::Claude, &program.to_string_lossy(), "why?", None).await;
+        assert_eq!(reading.task_type, Some(TaskType::Question));
+        assert!(started.elapsed() < Duration::from_secs(10), "waited for exit: {:?}", started.elapsed());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reads_rules_only_from_list_lines() {

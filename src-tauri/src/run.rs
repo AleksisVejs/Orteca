@@ -1072,6 +1072,9 @@ struct State {
     read: Vec<String>,
     /// Watches the current stage for an agent going round in circles.
     loops: Loops,
+    /// What the loop guard stopped this stage for. The stage loop decides
+    /// whether a Fix a tier up takes over or the run ends.
+    looped: Option<String>,
     /// Handed-over commands that run without asking, and how many have in a
     /// row since the user last answered.
     wait_allowed: Vec<String>,
@@ -1189,6 +1192,7 @@ impl State {
             first_edit: None,
             read: Vec::new(),
             loops: Loops::default(),
+            looped: None,
             wait_allowed: Vec::new(),
             unasked_waits: 0,
         }
@@ -1401,6 +1405,9 @@ pub async fn stream(
     let config = project::trust_fingerprint(&ctx.dir, &project::trust_scan(&ctx.dir));
     while index < stages.len() {
         let stage = stages[index];
+        if let Some(message) = state.looped.take() {
+            loop_stop(store, &ctx, &mut state, message);
+        }
         if state.outcome.failure.is_some()
             || state.outcome.cancelled
             || state.halt
@@ -1664,6 +1671,28 @@ pub async fn stream(
             }
         }
         note_for_stage.duration_ms = Some(now_ms().saturating_sub(stage_started));
+        // A stuck Implement hands its work to a Fix, when the Fix runs on
+        // something stronger: on the same model it would go round again. The
+        // Fix is checked by a Verify, so it cannot chain into more Fixes.
+        let hand_over = stage == Stage::Implement && state.outcome.failure.is_none() && !state.outcome.cancelled;
+        if let Some(message) = state.looped.take_if(|_| hand_over) {
+            let mut next = stages.clone();
+            next.insert(index + 1, Stage::Fix);
+            if next.get(index + 2) != Some(&Stage::Verify) {
+                next.insert(index + 2, Stage::Verify);
+            }
+            let fix = stage_plan(&route, model.as_ref(), id, task_id, &next, index + 1, None).model(id);
+            if fix != ctx.plan.model(id) {
+                note_for_stage.summary = message;
+                state.notes.push(note_for_stage);
+                stages = next;
+                let event = ProviderEvent::Text(format!("A Fix on {} {} takes over.", fix.model, fix.effort));
+                let _ = record(store, task_id, ctx.stage(), id, &event).and_then(|()| emit(&event));
+                index += 1;
+                continue;
+            }
+            state.looped = Some(message);
+        }
         state.notes.push(note_for_stage);
         // Only the first failure asks: after a Fix the one-Fix limit decides.
         if checked_locally
@@ -1720,6 +1749,10 @@ pub async fn stream(
             }
         }
         index += 1;
+    }
+
+    if let Some(message) = state.looped.take() {
+        loop_stop(store, &ctx, &mut state, message);
     }
 
     // Codex wrote a large change: Claude reads it in a fresh session. Never
@@ -2082,6 +2115,7 @@ fn stage_plan(
     // then edited nothing. A Fix starts a fresh session, so no cache is lost.
     let tier = match (stage, route.budget.review_tier) {
         (Stage::Review, Some(review)) => review,
+        (Stage::Plan, _) => route.budget.plan_tier.unwrap_or(route.budget.preferred_tier),
         (Stage::Fix, _) => match route.budget.preferred_tier.up() {
             // Sonnet high, not Opus: a Claude Fix stops at Standard.
             Some(routing::Tier::Deep) if id == ProviderId::Claude => routing::Tier::Standard,
@@ -2164,12 +2198,27 @@ fn review_context(dir: &Path, base: Option<&str>, before: Option<&project::Snaps
             .map(|f| f.path)
             .collect::<Vec<_>>()
     });
+    // Rebuilt bundles are named, not pasted: one Vite build is past the cap on
+    // its own, and the Review then got no patch at all for a 20-line change.
+    let (built, only) = match only {
+        Some(paths) => {
+            let (built, source): (Vec<String>, Vec<String>) =
+                paths.into_iter().partition(|p| routing::generated(p));
+            (built, Some(source))
+        }
+        None => (Vec::new(), None),
+    };
     let patch = match project::patch_of(dir, base, only.as_deref()) {
         Ok(patch) if !patch.trim().is_empty() && patch.len() <= MAX_BYTES => format!(
             "\nThe change under review, as a patch: what this run wrote, and only that. \
              The tree may hold other edits that were already there when the run started; \
-             they are not under review and are not shown:\n```diff\n{}\n```\n",
-            patch.trim_end()
+             they are not under review and are not shown:\n```diff\n{}\n```\n{}",
+            patch.trim_end(),
+            if built.is_empty() {
+                String::new()
+            } else {
+                format!("Also rebuilt by the run, not shown: {}\n", built.join(", "))
+            }
         ),
         // A patch too large to paste is left for the reviewer to open, and the
         // files it touches are not pasted either - that is the same bytes twice.
@@ -3448,6 +3497,15 @@ fn after_stage(round: Round<'_>) -> Then {
     Then::Retry(vec![Stage::Fix])
 }
 
+/// The loop guard's stop when no Fix takes over: the work so far stays, and
+/// the stall counts against this tier, so the next run of the route goes one up.
+fn loop_stop(store: &Store, ctx: &Context, state: &mut State, message: String) {
+    let stop = BudgetStop { limit: "loop", allowed: LOOP.into(), observed: LOOP.into(), remaining: Vec::new(), message };
+    let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
+    state.budget_stop = Some(stop);
+    state.halt = true;
+}
+
 /// The stop a Fix that changed nothing leaves behind: the check it answered
 /// still does not pass, and another round would only repeat it.
 fn stuck(notes: &[StageNote], remaining: Vec<Stage>) -> BudgetStop {
@@ -4328,6 +4386,26 @@ async fn side_by_side<A, B>(
     (called, checked.expect("the loop ends only once the check has"))
 }
 
+/// What a Claude stage runs with beside its argv.
+///
+/// A subscriber's cache lives an hour and a write to it costs twice the input
+/// price, 1.25x for five minutes. Turns within a stage are seconds apart, so
+/// every stage but an Answer takes five minutes: cache writes were ~40% of an
+/// Opus run and of a Sonnet build. A follow-up that resumes a writing stage
+/// more than five minutes later writes its history again at 1.25x, where the
+/// hour would have read it at 0.1x; that costs less than the saving unless
+/// most runs get one. An Answer keeps the hour, because a question is the
+/// stage most often followed up.
+// ponytail: one TTL per stage; recordings of real follow-ups (how often, how
+// late) would say whether writing stages should keep the hour after all.
+fn claude_env(stage: Stage) -> Vec<(&'static str, PathBuf)> {
+    let mut env = vec![("CLAUDE_CODE_DISABLE_CLAUDE_MDS", PathBuf::from("1"))];
+    if stage != Stage::Answer {
+        env.push(("CLAUDE_CODE_PROMPT_CACHE_TTL", PathBuf::from("5m")));
+    }
+    env
+}
+
 async fn attempt(
     store: &Store,
     ctx: &Context,
@@ -4350,11 +4428,11 @@ async fn attempt(
     } else { None };
     // The repo's `CLAUDE.md` files stay out too: what the agent is told from
     // the project is what the user imported into Orteca's memory.
-    let env: &[(&str, PathBuf)] = match ctx.id {
-        ProviderId::Claude => &[("CLAUDE_CODE_DISABLE_CLAUDE_MDS", PathBuf::from("1"))],
-        ProviderId::Codex => &[],
+    let env = match ctx.id {
+        ProviderId::Claude => claude_env(ctx.plan.stage),
+        ProviderId::Codex => Vec::new(),
     };
-    let mut run = match proc::spawn_env(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir, env) {
+    let mut run = match proc::spawn_env(&ctx.program.to_string_lossy(), &borrowed, &ctx.dir, &env) {
         Ok(run) => run,
         Err(e) => {
             state.outcome.failure = Some(format!("could not start {}: {e}", ctx.id.program()));
@@ -4531,17 +4609,14 @@ async fn attempt(
                 if state.outcome.failure.is_some() {
                     break;
                 }
-                // Stopped, not failed: the work so far stays, and the stall
-                // counts against this tier, so the next run of the route goes
-                // one up. Leaving the loop closes the process's job.
+                // Stopped, not failed: the work so far stays, and the stage
+                // loop hands it to a Fix a tier up or ends the run. Leaving
+                // the loop closes the process's job.
                 if let Some(why) = looped.filter(|_| ending.is_none()) {
                     let message = format!("Orteca stopped {}: it {why}.", ctx.id.program());
-                    let stop = BudgetStop { limit: "loop", allowed: LOOP.into(), observed: LOOP.into(), remaining: Vec::new(), message: message.clone() };
-                    let _ = note(store, ctx, "budget", &budget_payload("stopped", &stop));
-                    let event = ProviderEvent::Text(message);
+                    let event = ProviderEvent::Text(message.clone());
                     let _ = record(store, ctx.task_id, ctx.stage(), ctx.id, &event).and_then(|()| emit(&event));
-                    state.budget_stop = Some(stop);
-                    state.halt = true;
+                    state.looped = Some(message);
                     break;
                 }
                 if ending.is_none() && state.apply_now_pending {
@@ -4890,6 +4965,47 @@ mod tests {
         assert!(loops.saw(&failed).is_some());
         assert!(loops.saw(&edit).is_none());
         assert!(loops.saw(&edit).is_some(), "the same edit a third time");
+    }
+
+    /// Every stage but an Answer takes the cheaper five-minute cache.
+    #[test]
+    fn only_an_answer_keeps_the_hour_long_cache() {
+        let short = |stage| claude_env(stage).iter().any(|(k, v)| *k == "CLAUDE_CODE_PROMPT_CACHE_TTL" && v.as_os_str() == "5m");
+        assert!([Stage::Plan, Stage::Implement, Stage::Fix, Stage::Review, Stage::Verify].into_iter().all(short));
+        assert!(!short(Stage::Answer));
+    }
+
+    /// A rebuilt bundle past the cap no longer costs the Review its patch: the
+    /// source change is shown and the bundle only named.
+    #[test]
+    fn a_rebuilt_bundle_does_not_hide_the_patch() {
+        let dir = std::env::temp_dir().join(format!("orteca-built-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("public/build")).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("app.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(dir.join("public/build/app.js"), "x\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("app.ts"), "export const a = 2;\n").unwrap();
+        std::fs::write(dir.join("public/build/app.js"), "y".repeat(200 * 1024)).unwrap();
+
+        let context = review_context(&dir, Some(&base), None, false);
+
+        assert!(context.contains("+export const a = 2;"), "{context}");
+        assert!(context.contains("not shown: public/build/app.js"), "{context}");
+        assert!(context.len() < 4096, "the bundle was pasted");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn task_request(store: &Store, label: &str) -> Request {
@@ -7280,6 +7396,62 @@ ping -n 60 127.0.0.1 >nul
         assert!(calls[2].contains("header is not bold"), "the Fix lost the failing tests: {}", calls[2]);
         assert!(calls[2].contains("owner check is missing"), "the Fix lost the review: {}", calls[2]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An Implement the loop guard stops hands its work to a Fix a tier up,
+    /// which a Verify then judges. On a model the user picked the Fix would
+    /// run on the same one, so the run stops as before.
+    #[tokio::test]
+    async fn a_stuck_implement_hands_over_to_a_stronger_fix() {
+        let store = Store::in_memory().unwrap();
+        let stages = |result: &TaskResult| result.stages.iter().map(|n| n.stage).collect::<Vec<_>>();
+        let passed = serde_json::json!({"checks": [{"command": "npm test", "passed": true, "output": "ok"}], "verdict": "pass"});
+        for picked in [false, true] {
+            let mut request = routed(&store, &format!("loop-handover-{picked}"), one_call("fix the typo in the readme"));
+            if picked {
+                request.model = Some(ModelOverride { model: "sonnet".into(), effort: "low".into() });
+            }
+            let dir = request.dir.clone();
+            request.id = ProviderId::Claude;
+            std::fs::write(&request.program, "@echo off\r\nnode \"%~dp0fake.js\"\r\n").unwrap();
+            let log = dir.join("briefs.log").to_string_lossy().replace('\\', "/");
+            // Call one runs a failing `npm test` three times and never ends;
+            // the Fix after it edits and passes, and so does the Verify.
+            std::fs::write(
+                dir.join("fake.js"),
+                format!(
+                    "const fs=require('fs');const out=v=>console.log(JSON.stringify(v));let buf='',answered=false;\
+                     process.stdin.setEncoding('utf8');\
+                     process.stdin.on('data',d=>{{buf+=d;const ls=buf.split('\\n');buf=ls.pop();\
+                     for(const l of ls){{if(!l.trim()||answered)continue;answered=true;\
+                     const n=fs.existsSync('{log}')?fs.readFileSync('{log}','utf8').split('=== CA'+'LL ===').length-1:0;\
+                     fs.appendFileSync('{log}','=== CA'+'LL ===' + JSON.parse(l).message.content);\
+                     if(n===0){{for(let i=0;i<3;i++){{\
+                     out({{type:'assistant',message:{{content:[{{type:'tool_use',id:'t'+i,name:'Bash',input:{{command:'npm test'}}}}]}}}});\
+                     out({{type:'user',message:{{content:[{{type:'tool_result',tool_use_id:'t'+i,is_error:true,content:'no'}}]}}}});}}\
+                     return;}}\
+                     if(n===1)fs.writeFileSync('fixed.txt','ok\\n');\
+                     out({{type:'result',subtype:'success',result:'stage answered',structured_output:{passed},\
+                     usage:{{input_tokens:10,output_tokens:1}},total_cost_usd:0.01}});}}}});\
+                     process.stdin.on('end',()=>process.exit(0));"
+                ),
+            )
+            .unwrap();
+
+            let result = stream(&store, &Live::default(), request, |_| Ok(())).await;
+
+            if picked {
+                assert_eq!(result.budget_stop.as_ref().map(|s| s.limit), Some("loop"));
+                assert_eq!(stages(&result), [Stage::Implement]);
+            } else {
+                assert_eq!(result.status, "done", "{:?} {:?}", result.failure, result.budget_stop);
+                assert_eq!(stages(&result), [Stage::Implement, Stage::Fix, Stage::Verify]);
+                let calls = briefs(&dir);
+                assert!(calls[1].contains("went round in circles"), "{}", calls[1]);
+                assert!(calls[1].contains("ran `npm test` 3 times"), "the Fix was not told why: {}", calls[1]);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// One Stop ends the model call and the check beside it; a check result

@@ -1955,9 +1955,12 @@ ELI5";
         }
         // Nobody is there to answer a question before the run either.
         store.set_setting("clarify", "off").unwrap();
+        // BENCH_RECORD: a folder for each stage's raw JSONL, as the app keeps
+        // them, so a run's cost can be read turn by turn.
+        let recordings = std::env::var("BENCH_RECORD").ok().map(std::path::PathBuf::from);
         let mut request = begin(
             &store,
-            None,
+            recordings.clone(),
             key.clone(),
             var("BENCH_PROMPT"),
             None,
@@ -1982,7 +1985,7 @@ ELI5";
         if let Ok(reply) = std::env::var("BENCH_FOLLOWUP") {
             let prompt = format!("{}\n\nYour answer:\n{}\n\nMy reply:\n{reply}", var("BENCH_PROMPT"), result.summary);
             let mut request = begin(
-                &store, None, key.clone(), prompt, Some(reply.clone()),
+                &store, recordings, key.clone(), prompt, Some(reply.clone()),
                 json(var("BENCH_PROVIDER")), json(var("BENCH_MODE")),
                 None, Isolation::CurrentTree, None, Some(result.task_id), None, None,
             )

@@ -810,8 +810,27 @@ the Codex binary; `codex exec resume` takes `--output-schema`.
   `limited` until its window resets (`limits::block`); the next task's pick
   skips it. `--fallback-model` is set per alias (`routing::claude_fallback`).
 - **Loops.** The same failing command three times with no edit between, or the
-  same edit three times, stops the stage as `budgetReached` (limit `loop`),
+  same edit three times, stops the stage. A stuck Implement hands its work to
+  a Fix when the Fix runs on a stronger model (one tier up), and a Verify
+  judges that Fix. Otherwise the run stops as `budgetReached` (limit `loop`),
   which counts toward `stalled_tiers`. No turn ceiling came back (§4.3.8).
+- **Hard work.** A task the intent read calls hard gets the top tier on every
+  route. On a route with a Plan in Efficient mode, Opus plans (low effort) and
+  Sonnet medium builds (`budget.plan_tier`). Without a Plan it runs on Opus 5.5:
+  medium in Efficient, high in Balanced. RigInspect tough, pinned hard, one run
+  each (2026-09-25): Sonnet everywhere 3/4 $0.87; Opus everywhere 4/4 $1.19;
+  Opus plan + Sonnet high build 4/4 $0.64 and $0.68; + Sonnet medium build
+  4/4 $0.41 and $0.50, 4.4-4.9 min. In the medium runs' recordings the build
+  thinks <1k tokens; its 13k output is the code it writes, and its 1-hour cache
+  writes are ~40% of its cost. The Plan and the build read the same file only
+  once (`sync.js`), so handing the Plan's reads on would save little.
+- **Cache lifetime.** Claude gives a subscriber a 1-hour cache, and writing to
+  it costs 2x input. Every stage but an Answer runs with
+  `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` (1.25x), because turns are seconds apart.
+  A Haiku call went from $0.072 to $0.045 on the same 35k-token write. The
+  cost: a follow-up that resumes an Implement or Fix more than 5 minutes later
+  writes its history again. An Answer keeps the hour, because questions get
+  the most follow-ups.
 - **Gates.** Code changes and fixes that touch JS also run the repository's
   lint, type-check and build scripts (on a PHP-only change `npm run build`
   cost 26-75 s a Verify and could fail nothing); one counts only when its output names a file

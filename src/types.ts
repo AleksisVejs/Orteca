@@ -280,6 +280,8 @@ export interface ExecutionBudget {
   preferredTier: Tier;
   /** Guarded work is reviewed on this tier rather than `preferredTier`. */
   reviewTier: Tier | null;
+  /** Hard work is planned on this tier and built on `preferredTier`. Absent on older rows. */
+  planTier?: Tier | null;
 }
 
 export interface Route {

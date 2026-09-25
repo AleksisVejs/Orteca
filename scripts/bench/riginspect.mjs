@@ -169,11 +169,13 @@ function runArm(arm, dir, prompt, extraEnv = {}) {
   if (arm.startsWith("orteca-")) {
     const out = join(ROOT, "out", `${arm}-${Date.now()}.json`);
     mkdirSync(dirname(out), { recursive: true });
-    const env = { ...ENV, ...extraEnv, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: provider(arm), BENCH_MODE: "efficient", BENCH_OUT: out,
+    // Each stage's raw JSONL beside the result, for `turns.mjs`.
+    const record = out.replace(/\.json$/, "");
+    const env = { ...ENV, ...extraEnv, BENCH_DIR: dir, BENCH_PROMPT: prompt, BENCH_PROVIDER: provider(arm), BENCH_MODE: "efficient", BENCH_OUT: out, BENCH_RECORD: record,
       ...(process.env.NOEDITLOCK ? { NAV_NOEDITLOCK: "1" } : {}), ...(arm.endsWith("+cli") ? { NAV_CLIPROMPT: "1" } : {}) };
     const r = spawnSync("cargo", ["test", "bench_run", "--", "--ignored"], { cwd: TAURI, env, encoding: "utf8", shell: true, timeout: ARM_TIMEOUT });
     if (!existsSync(out)) return { status: "noResult", error: (r.stdout + r.stderr).slice(-400), ms: Date.now() - t0 };
-    return ortecaRow(JSON.parse(readFileSync(out, "utf8")));
+    return { ...ortecaRow(JSON.parse(readFileSync(out, "utf8"))), record };
   }
   if (arm === "claude") {
     const r = spawnSync("claude", CLAUDE_ARGS, { cwd: dir, input: prompt, encoding: "utf8", shell: true, env: ENV, timeout: ARM_TIMEOUT, maxBuffer: 64e6 });

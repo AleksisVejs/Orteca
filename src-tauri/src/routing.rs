@@ -344,6 +344,10 @@ pub struct ExecutionBudget {
     /// is built a tier below and reviewed on `deep`: a read-only look at a
     /// finished diff is where the stronger model earns its price.
     pub review_tier: Option<Tier>,
+    /// The tier a Plan runs on when it is not `preferred_tier`: hard work is
+    /// planned on the top tier and built a tier below, where most tokens go.
+    #[serde(default)]
+    pub plan_tier: Option<Tier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,12 +416,14 @@ impl Route {
 
     /// Efficient plans keep the route's model and lower only its effort. The
     /// implementation and its checks still protect the result, while keeping
-    /// the same model preserves the provider's prompt cache.
+    /// the same model preserves the provider's prompt cache. Hard work is the
+    /// exception: its Plan runs on `plan_tier`, a short answer from the top
+    /// tier that the tier below then builds.
     pub fn plan_model(&self, id: ProviderId) -> Option<ModelChoice> {
         if self.mode != Mode::Efficient || !self.stages.contains(&Stage::Plan) {
             return None;
         }
-        let mut choice = self.budget.preferred_tier.model(id);
+        let mut choice = self.budget.plan_tier.unwrap_or(self.budget.preferred_tier).model(id);
         choice.effort = "low";
         Some(choice)
     }
@@ -431,14 +437,28 @@ impl Route {
             model: "gpt-6-sol",
             effort: "medium",
         });
+        // Efficient runs Opus at medium, Balanced at the tier's high.
+        let efficient_deep = (id == ProviderId::Claude
+            && self.mode == Mode::Efficient
+            && self.budget.preferred_tier == Tier::Deep)
+            .then_some(ModelChoice { model: "opus", effort: "medium" });
+        // After a top-tier Plan, Claude builds at medium: the thinking is in
+        // the plan. RigInspect tough 4/4 twice at $0.41 and $0.50, against
+        // $0.64 and $0.68 at high (2026-09-25).
+        let planned_build = (id == ProviderId::Claude && self.budget.plan_tier.is_some()).then(|| {
+            let mut choice = self.budget.preferred_tier.model(id);
+            choice.effort = "medium";
+            choice
+        });
+        let chosen = schema.or(efficient_deep).or(planned_build);
         // NAV_EFFORT runs Implement (and a Fix already on the top tier) at another effort, for the
         // benchmark's arms. It moves the effort and never the model, and the
         // Review keeps its own tier either way, so what it measures is the
         // writing effort alone.
         let Some(effort) = bench_effort() else {
-            return schema;
+            return chosen;
         };
-        let mut choice = schema.unwrap_or_else(|| self.budget.preferred_tier.model(id));
+        let mut choice = chosen.unwrap_or_else(|| self.budget.preferred_tier.model(id));
         choice.effort = effort;
         Some(choice)
     }
@@ -755,7 +775,7 @@ fn nouns(prompt: &str) -> Vec<String> {
 /// A built bundle a tracked `public/` folder or a `dist/` holds. Its symbols are
 /// minified and its names hashed, so it matches many ordinary words at once and
 /// outranks the one source file the prompt names.
-fn generated(path: &str) -> bool {
+pub fn generated(path: &str) -> bool {
     let built = path.ends_with(".js") || path.ends_with(".css") || path.ends_with(".map");
     (path.starts_with("public/") && built) || path.starts_with("dist/") || path.contains("/dist/")
 }
@@ -1455,6 +1475,22 @@ pub fn route(prompt: &str, mode: Mode, repo: &RepoSignals) -> Route {
         tier_reason =
             "this tier stalled on 2 in 5 recent runs of this route here, so it runs one tier up";
     }
+    // Hard work gets the top tier on every route, guarded and schema work
+    // included, and is never stepped down for allowance: a cheaper tier that
+    // stalls on it costs the same calls again. With a Plan, the top tier
+    // plans and the build runs a tier below: the plan is a short answer, the
+    // build is where the tokens go.
+    if intent == Some(Intent::Hard) && kind != RouteKind::Answer && budget.preferred_tier != Tier::Deep {
+        raised = true;
+        if stages.contains(&Stage::Plan) {
+            budget.plan_tier = Some(Tier::Deep);
+            budget.preferred_tier = Tier::Standard;
+            tier_reason = "read as hard, so the top tier plans it and the tier below builds it";
+        } else {
+            budget.preferred_tier = Tier::Deep;
+            tier_reason = "read as hard, so it runs on the top tier";
+        }
+    }
     // Short on plan allowance, the one step down, and only where the run still
     // finishes: a Review or Verify catches a miss and the Fix after it repairs
     // it. Never on a tier evidence raised, never on guarded or twice-failed
@@ -1614,6 +1650,7 @@ fn budget_for(kind: RouteKind, mode: Mode) -> ExecutionBudget {
         // Standard reviews on deep too: Sonnet missed a seeded regression Opus
         // medium caught, for no saving (§4.3.6). Schema Standard has no Review.
         review_tier: matches!(kind, RouteKind::Guarded | RouteKind::Standard).then_some(Tier::Deep),
+        plan_tier: None,
     }
 }
 
@@ -1790,6 +1827,16 @@ pub fn brief(
              check you ran, whether it passed, and what it printed. `pass` means at least one \
              check ran and every check passed.\n\n",
         ),
+        // A stuck Implement handed over: the task is not done, so "nothing
+        // beyond it" would stop the Fix short of it.
+        Stage::Fix if carried.last().is_some_and(|n| n.stage == Stage::Implement) => out.push_str(
+            "The session implementing this task went round in circles and was stopped; what \
+             it kept repeating is below, and what it changed is still in the working tree. \
+             Finish the task without repeating that: read why it failed before trying again. \
+             Then run the focused checks that prove it. Return only the structured result: \
+             every check you ran, whether it passed, and what it printed. `pass` means at \
+             least one check ran and every check passed. The checks run again after this call.\n\n",
+        ),
         Stage::Fix => out.push_str(
             "An earlier stage of this task did not pass; what it found is below. Fix that and \
              nothing beyond it, then run the focused checks that prove the fix. Every input \
@@ -1929,7 +1976,9 @@ pub fn brief(
                     carried
                         .iter()
                         .rev()
-                        .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix)),
+                        // An Implement only when it is the last note: one
+                        // the loop guard stopped and handed over.
+                        .find(|n| matches!(n.stage, Stage::Review | Stage::Verify | Stage::Fix | Stage::Implement)),
                 );
             }
             failed.reverse();
@@ -2617,6 +2666,36 @@ mod tests {
         assert_eq!(tier(TaskType::Question, Intent::Question, false), Tier::Cheapest);
         assert_eq!(tier(TaskType::Chat, Intent::Chat, true), Tier::Cheapest);
         assert_eq!(tier(TaskType::Plan, Intent::Question, true), Tier::Cheapest);
+    }
+
+    /// Hard work is Opus's: a guarded route with no Plan runs on it (medium
+    /// when efficient, high when balanced), and an efficient Plan is Opus's
+    /// while Sonnet medium builds it. A balanced Plan route was already Opus.
+    #[test]
+    fn hard_work_runs_on_opus_in_either_mode() {
+        let hard = RepoSignals { intent: Some(Intent::Hard), ..repo(REPO) };
+        let claude = ProviderId::Claude;
+        let guarded = "fix the authorization check on invoices";
+        let efficient = route(guarded, Mode::Efficient, &hard);
+        assert!(!efficient.stages.contains(&Stage::Plan));
+        assert_eq!(efficient.budget.preferred_tier, Tier::Deep);
+        let work = efficient.work_model(claude).unwrap();
+        assert_eq!((work.model, work.effort), ("opus", "medium"));
+        let balanced = route(guarded, Mode::Balanced, &hard);
+        assert_eq!(balanced.budget.preferred_tier, Tier::Deep);
+        assert_eq!(balanced.work_model(claude), None, "the tier's own opus high");
+        assert_eq!(Tier::Deep.model(claude), ModelChoice { model: "opus", effort: "high" });
+
+        let planned = "rework how the queue retries jobs";
+        let efficient = route(planned, Mode::Efficient, &hard);
+        assert_eq!(efficient.stages[0], Stage::Plan);
+        assert_eq!((efficient.budget.plan_tier, efficient.budget.preferred_tier), (Some(Tier::Deep), Tier::Standard));
+        assert_eq!(efficient.plan_model(claude).map(|c| c.model), Some("opus"));
+        let build = efficient.work_model(claude).unwrap();
+        assert_eq!((build.model, build.effort), ("sonnet", "medium"));
+        assert_eq!(route(planned, Mode::Balanced, &hard).budget.preferred_tier, Tier::Deep);
+        let medium = RepoSignals { intent: Some(Intent::Medium), ..repo(REPO) };
+        assert_ne!(route("rework how the queue retries jobs", Mode::Efficient, &medium).budget.preferred_tier, Tier::Deep);
     }
 
     /// The small model's reading picks the route in any language, and the
